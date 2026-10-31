@@ -1,0 +1,59 @@
+use std::{
+    hint::black_box,
+    time::{Duration, Instant},
+};
+
+use lune_vt::{Event, Parser};
+
+fn measure(name: &str, input: &[u8], chunk_size: usize) {
+    let mut samples = [0.0_f64; 3];
+
+    for sample in &mut samples {
+        let start = Instant::now();
+        let mut iterations = 0_u64;
+        let mut checksum = 0_usize;
+        let mut parser = Parser::default();
+
+        while start.elapsed() < Duration::from_millis(200) {
+            for chunk in black_box(input).chunks(chunk_size) {
+                parser.advance(chunk, |event| {
+                    checksum = checksum.wrapping_add(match event {
+                        Event::Text(text) => text.len(),
+                        Event::Execute(byte) => usize::from(byte),
+                        Event::Escape(sequence) => usize::from(sequence.final_byte),
+                        Event::Csi(sequence) => {
+                            sequence.parameters.len() + usize::from(sequence.final_byte)
+                        }
+                        Event::Error(_) => 1,
+                    });
+                });
+            }
+            iterations += 1;
+        }
+
+        black_box(checksum);
+        *sample = input.len() as f64 * iterations as f64
+            / start.elapsed().as_secs_f64()
+            / (1024.0 * 1024.0);
+    }
+
+    samples.sort_by(f64::total_cmp);
+    println!("{name:<20} {:>10.1} MiB/s", samples[1]);
+}
+
+fn main() {
+    let ascii =
+        b"abcdefghijklmnopqrstuvwxyz 0123456789 ABCDEFGHIJKLMNOPQRSTUVWXYZ\r\n".repeat(1024);
+    let unicode = "终端解析 🌙 cafe\u{301} Ελληνικά\r\n"
+        .repeat(2048)
+        .into_bytes();
+    let csi = b"\x1b[?25l\x1b[38:2::12:34:56mtext\x1b[0m\r\n\x1b[12;40H".repeat(2048);
+    let strings = b"\x1b]0;synthetic title\x07\x1bPsynthetic payload\x1b\\".repeat(2048);
+
+    measure("ascii", &ascii, ascii.len());
+    measure("utf8", &unicode, unicode.len());
+    measure("csi", &csi, csi.len());
+    measure("discarded strings", &strings, strings.len());
+    measure("ascii / 17-byte", &ascii, 17);
+    measure("utf8 / 1-byte", &unicode, 1);
+}

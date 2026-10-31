@@ -2,8 +2,10 @@
 
 ## Development Scope
 
-- Build the foundation in small, coherent steps before expanding terminal features.
+- Define required capabilities and acceptance criteria before implementation, then implement and harden the foundation in small, coherent steps.
+- Measure progress by correctness, robustness, and clear boundaries of each foundational component.
 - Keep changes focused on the current request.
+- Treat performance as a core requirement. Measure hot paths with representative workloads, validate optimizations against correctness invariants, and account for regressions across workloads.
 
 ## Language
 

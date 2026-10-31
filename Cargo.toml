@@ -1,4 +1,3 @@
 [workspace]
 members = ["app", "crates/vt", "crates/pty"]
-default-members = ["app"]
 resolver = "3"

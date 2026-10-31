@@ -3,3 +3,13 @@ name = "lune-vt"
 version = "0.1.0"
 edition = "2024"
 description = "VT protocol parsing, terminal state, and input encoding"
+
+[[bench]]
+name = "parser"
+harness = false
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

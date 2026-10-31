@@ -7,3 +7,9 @@ publish = false
 [dependencies]
 lune-vt = { path = "../crates/vt" }
 lune-pty = { path = "../crates/pty" }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
