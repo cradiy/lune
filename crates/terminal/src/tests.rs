@@ -145,7 +145,7 @@ fn resizing_preserves_the_intersection_and_repairs_cut_wide_units() {
     grid.write(1, 3, "界\u{301}", CellWidth::Double, StyleId(3))
         .unwrap();
     grid.write_ascii(2, 0, b"third", StyleId(4)).unwrap();
-    grid.scroll_up(1, StyleId(0));
+    grid.scroll_up(0..grid.rows(), 1, StyleId(0)).unwrap();
     grid.resize(4, 2, StyleId(9)).unwrap();
     assert_invariants(&grid);
     assert_eq!(
@@ -170,36 +170,77 @@ fn resizing_preserves_the_intersection_and_repairs_cut_wide_units() {
 }
 
 #[test]
-fn scrolling_moves_owned_rows_and_recycles_their_cell_buffers() {
-    let mut grid = Grid::new(4, 3).unwrap();
-    grid.write(1, 0, "水\u{301}", CellWidth::Double, StyleId(2))
-        .unwrap();
-    grid.write_ascii(2, 0, b"last", StyleId(3)).unwrap();
-    let buffers: Vec<_> = grid.iter_rows().map(|row| row.cells().as_ptr()).collect();
-
-    grid.scroll_up(1, StyleId(4));
-    assert_eq!(grid.row(0).unwrap().cells().as_ptr(), buffers[1]);
-    assert_eq!(grid.row(2).unwrap().cells().as_ptr(), buffers[0]);
-    assert_eq!(
-        grid.row(0).unwrap().text(0),
-        Some(CellText::Extended("水\u{301}"))
-    );
-    grid.scroll_down(1, StyleId(5));
-    assert_eq!(grid.row(0).unwrap().cells().as_ptr(), buffers[0]);
-    assert_eq!(
-        grid.row(1).unwrap().text(0),
-        Some(CellText::Extended("水\u{301}"))
-    );
-    assert_invariants(&grid);
-
-    grid.scroll_up(usize::MAX, StyleId(6));
-    assert_invariants(&grid);
-    for row in grid.iter_rows() {
-        assert!(
-            row.cells()
-                .iter()
-                .all(|cell| cell.character() == Some(' ') && cell.style() == StyleId(6))
-        );
+fn scrolling_preserves_region_boundaries_and_owned_buffers() {
+    let height = 9;
+    for offset in 0..height {
+        for start in 0..=height {
+            for end in start..=height {
+                for lines in (0..=height).chain([usize::MAX]) {
+                    for upward in [true, false] {
+                        let mut grid = Grid::new(4, height).unwrap();
+                        grid.scroll_up(0..height, offset, StyleId(0)).unwrap();
+                        for row in 0..height {
+                            grid.write_ascii(row, 0, &[b'a' + row as u8], StyleId(row as u32))
+                                .unwrap();
+                            grid.write(row, 1, "水\u{301}", CellWidth::Double, StyleId(2))
+                                .unwrap();
+                        }
+                        let before = snapshot(&grid);
+                        let buffers: Vec<_> = grid
+                            .iter_rows()
+                            .map(|row| {
+                                let Some(CellText::Extended(text)) = row.text(1) else {
+                                    panic!("Extended text is present");
+                                };
+                                (row.cells().as_ptr(), text.as_ptr())
+                            })
+                            .collect();
+                        let style = StyleId(9);
+                        if upward {
+                            grid.scroll_up(start..end, lines, style).unwrap();
+                        } else {
+                            grid.scroll_down(start..end, lines, style).unwrap();
+                        }
+                        let after = snapshot(&grid);
+                        for row in 0..height {
+                            let inside = (start..end).contains(&row);
+                            let count = lines.min(end - start);
+                            let source = if !inside {
+                                Some(row)
+                            } else if upward {
+                                (row + count < end).then_some(row + count)
+                            } else {
+                                row.checked_sub(count).filter(|&source| source >= start)
+                            };
+                            let buffer_row = if !inside || count == end - start {
+                                row
+                            } else if upward {
+                                start + (row - start + count) % (end - start)
+                            } else {
+                                start + (row - start + end - start - count) % (end - start)
+                            };
+                            assert_eq!(
+                                grid.row(row).unwrap().cells().as_ptr(),
+                                buffers[buffer_row].0
+                            );
+                            if let Some(source) = source {
+                                assert_eq!(after.rows[row], before.rows[source]);
+                                let Some(CellText::Extended(text)) = grid.row(row).unwrap().text(1)
+                                else {
+                                    panic!("Moved extended text is present");
+                                };
+                                assert_eq!(text.as_ptr(), buffers[source].1);
+                            } else {
+                                assert!(after.rows[row].iter().all(|cell| {
+                                    cell.text == " " && cell.width == 1 && cell.style == style
+                                }));
+                            }
+                        }
+                        assert_invariants(&grid);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -225,6 +266,18 @@ fn rejected_mutations_preserve_visible_contents() {
         grid.clear_row(0, Range { start: 3, end: 1 }, StyleId(1))
             .is_err()
     );
+    for region in [Range { start: 2, end: 1 }, 0..3, 3..3, 0..usize::MAX] {
+        for lines in [0, 1, usize::MAX] {
+            assert!(matches!(
+                grid.scroll_up(region.clone(), lines, StyleId(1)),
+                Err(StorageError::OutOfBounds)
+            ));
+            assert!(matches!(
+                grid.scroll_down(region.clone(), lines, StyleId(1)),
+                Err(StorageError::OutOfBounds)
+            ));
+        }
+    }
     assert!(grid.resize(0, 2, StyleId(1)).is_err());
     assert!(grid.resize(2048, MAX_CELLS / 2048 + 1, StyleId(1)).is_err());
     let large = "x".repeat(MAX_CELL_TEXT_BYTES);
@@ -262,14 +315,16 @@ fn mixed_mutations_preserve_occupancy_and_failure_atomicity() {
                 (bits >> 20) as usize % 8 + 1,
                 style,
             ),
-            6 => {
-                grid.scroll_up((bits >> 12) as usize % 10, style);
-                Ok(())
-            }
-            _ => {
-                grid.scroll_down((bits >> 12) as usize % 10, style);
-                Ok(())
-            }
+            6 => grid.scroll_up(
+                row..(bits >> 20) as usize % (grid.rows() + 2),
+                (bits >> 12) as usize % 10,
+                style,
+            ),
+            _ => grid.scroll_down(
+                row..(bits >> 20) as usize % (grid.rows() + 2),
+                (bits >> 12) as usize % 10,
+                style,
+            ),
         };
         if result.is_err() {
             assert_eq!(snapshot(&grid), before);

@@ -6,7 +6,8 @@
 //! keys; terminal interpretation owns their meaning.
 //!
 //! Resizing preserves the upper-left intersection. A wide unit cut by the new
-//! right edge is cleared. Full-screen scrolling recycles row buffers. Fallible
+//! right edge is cleared. Scrolling an exclusive row range recycles row buffers
+//! and clears exposed rows. Rows outside the range remain unchanged. Fallible
 //! operations reserve storage before changing visible contents.
 //!
 //! [`MAX_CELLS`] bounds the logical cell count. Cell buffers and the row queue

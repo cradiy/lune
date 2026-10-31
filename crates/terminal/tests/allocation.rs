@@ -199,8 +199,11 @@ fn warm_ascii_scrolling_and_column_growth_make_no_allocation_requests() {
         for _ in 0..32 {
             grid.write_ascii(0, 0, black_box(&ascii), StyleId(1))?;
             grid.write(1, 0, "水", CellWidth::Double, StyleId(2))?;
-            grid.scroll_up(1, StyleId(0));
-            grid.scroll_down(1, StyleId(0));
+            grid.scroll_up(0..80, 17, StyleId(0))?;
+            grid.scroll_down(1..79, 1, StyleId(0))?;
+            grid.scroll_up(1..79, 17, StyleId(0))?;
+            grid.scroll_down(0..80, 1, StyleId(0))?;
+            grid.scroll_up(2..78, usize::MAX, StyleId(0))?;
             grid.clear_row(0, 0..120, StyleId(0))?;
             grid.resize(240, 80, StyleId(0))?;
             grid.resize(120, 80, StyleId(0))?;
@@ -210,6 +213,22 @@ fn warm_ascii_scrolling_and_column_growth_make_no_allocation_requests() {
     result.unwrap();
     assert_eq!(stats.attempts, 0);
     assert_eq!(stats.live_bytes, 0);
+    snapshot(&grid);
+
+    let mut grid = Grid::new(4, 9).unwrap();
+    for row in 0..9 {
+        grid.write(row, 1, "水\u{301}", CellWidth::Double, StyleId(2))
+            .unwrap();
+    }
+    grid.scroll_up(0..9, 3, StyleId(0)).unwrap();
+    let (result, stats) = allocator::measure(Some(0), || {
+        grid.scroll_down(1..8, 2, StyleId(0))?;
+        grid.scroll_up(1..8, 3, StyleId(0))?;
+        grid.scroll_down(1..8, 4, StyleId(0))
+    });
+    result.unwrap();
+    assert_eq!(stats.attempts, 0);
+    assert!(stats.live_bytes <= 0);
     snapshot(&grid);
 }
 

@@ -63,12 +63,29 @@ fn main() {
         let blank = grid.row(0).unwrap().cells()[0];
         let mut flat = vec![blank; columns * rows];
         measure(&format!("ring scroll / {rows} rows"), 1, || {
-            black_box(&mut grid).scroll_up(1, StyleId(0));
+            black_box(&mut grid)
+                .scroll_up(0..rows, 1, StyleId(0))
+                .unwrap();
         });
         measure(&format!("flat copy scroll / {rows} rows"), 1, || {
             let cells = black_box(&mut flat);
             cells.copy_within(columns.., 0);
             cells[(rows - 1) * columns..].fill(blank);
         });
+        for lines in [1, (rows - 2) / 3, (rows - 2) / 2] {
+            for offset in [0, rows / 4, rows / 2] {
+                let mut grid = Grid::new(columns, rows).unwrap();
+                grid.scroll_up(0..rows, offset, StyleId(0)).unwrap();
+                measure(
+                    &format!("region {rows}/{lines}, offset={offset}"),
+                    1,
+                    || {
+                        black_box(&mut grid)
+                            .scroll_up(1..rows - 1, lines, StyleId(0))
+                            .unwrap();
+                    },
+                );
+            }
+        }
     }
 }
