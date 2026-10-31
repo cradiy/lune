@@ -1,0 +1,29 @@
+[package]
+name = "lune-vt-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+lune-vt = { path = ".." }
+
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "chunking"
+path = "fuzz_targets/chunking.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "lifecycle"
+path = "fuzz_targets/lifecycle.rs"
+test = false
+doc = false
+bench = false

@@ -236,4 +236,38 @@ fn stream_boundaries_finalize_or_discard_pending_input_explicitly() {
             OwnedEvent::Print('Z'),
         ]
     );
+
+    for prefix in [
+        b"\x1b".as_slice(),
+        b"\x1b(",
+        b"\x1b[",
+        b"\x1b[1$",
+        b"\x1b]title",
+        b"\x1bPpayload",
+        b"\x1bXpayload",
+        b"\x1b^payload",
+        b"\x1b_payload",
+        b"\x1b]title\x1b",
+    ] {
+        let mut parser = Parser::default();
+        let mut events = Vec::new();
+        parser.advance(prefix, |_| {});
+        parser.finish(|event| capture(&mut events, event));
+        assert_eq!(
+            events,
+            [OwnedEvent::Error(ParseError::IncompleteSequence)],
+            "{prefix:?}"
+        );
+        parser.finish(|_| panic!("Repeated finish emitted an event"));
+        events.clear();
+        parser.advance(b"Z", |event| capture(&mut events, event));
+        assert_eq!(events, [OwnedEvent::Print('Z')]);
+
+        parser.advance(prefix, |_| {});
+        parser.reset();
+        parser.reset();
+        events.clear();
+        parser.advance(b"\x1b[2mZ", |event| capture(&mut events, event));
+        assert_eq!(events, [csi(2, b'm'), OwnedEvent::Print('Z')]);
+    }
 }

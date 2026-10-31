@@ -7,6 +7,7 @@ pub const MAX_INTERMEDIATES: usize = 4;
 /// Maximum number of leading private marker bytes in a CSI sequence.
 pub const MAX_PRIVATE_MARKERS: usize = 4;
 /// Maximum number of bytes after ESC in an ESC or CSI sequence.
+/// Embedded C0 controls and DEL count toward this wire-byte limit.
 pub const MAX_SEQUENCE_BYTES: usize = 256;
 
 /// A numeric field whose omission is distinct from an explicit zero.
@@ -35,6 +36,8 @@ pub struct CsiSequence<'a> {
 }
 
 /// A framing or capacity error encountered while consuming a stream.
+/// Rejected header bytes are discarded through the final byte; control bytes
+/// remain active and can cancel or restart the sequence.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ParseError {
     InvalidSequence,

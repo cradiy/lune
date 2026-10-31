@@ -1,4 +1,4 @@
-//! Development API for incremental VT stream parsing.
+//! Incremental VT stream parsing.
 //!
 //! [`Parser`] accepts UTF-8 text and seven-bit control sequences. It emits text spans,
 //! C0 controls, ESC sequences, and CSI sequences through a synchronous callback.

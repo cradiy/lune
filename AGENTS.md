@@ -13,9 +13,9 @@
 
 ## Documentation
 
-- Treat every document as development documentation until the user explicitly confirms its status as official documentation.
+- Treat documentation as development material by default and state each document's purpose directly.
 - Describe the current design, behavior, and usage accurately. Keep provisional decisions identifiable as provisional.
-- Obtain explicit user confirmation before presenting documentation as official or making stability and compatibility commitments.
+- Make stability and compatibility commitments only when explicitly requested by the user.
 
 ## Compatibility
 

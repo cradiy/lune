@@ -13,21 +13,23 @@ fn measure(name: &str, input: &[u8], chunk_size: usize) {
         let mut iterations = 0_u64;
         let mut checksum = 0_usize;
         let mut parser = Parser::default();
+        let mut emit = |event: Event<'_>| {
+            checksum = checksum.wrapping_add(match event {
+                Event::Text(text) => text.len(),
+                Event::Execute(byte) => usize::from(byte),
+                Event::Escape(sequence) => usize::from(sequence.final_byte),
+                Event::Csi(sequence) => {
+                    sequence.parameters.len() + usize::from(sequence.final_byte)
+                }
+                Event::Error(_) => 1,
+            });
+        };
 
         while start.elapsed() < Duration::from_millis(200) {
             for chunk in black_box(input).chunks(chunk_size) {
-                parser.advance(chunk, |event| {
-                    checksum = checksum.wrapping_add(match event {
-                        Event::Text(text) => text.len(),
-                        Event::Execute(byte) => usize::from(byte),
-                        Event::Escape(sequence) => usize::from(sequence.final_byte),
-                        Event::Csi(sequence) => {
-                            sequence.parameters.len() + usize::from(sequence.final_byte)
-                        }
-                        Event::Error(_) => 1,
-                    });
-                });
+                parser.advance(chunk, &mut emit);
             }
+            parser.finish(&mut emit);
             iterations += 1;
         }
 
@@ -38,7 +40,11 @@ fn measure(name: &str, input: &[u8], chunk_size: usize) {
     }
 
     samples.sort_by(f64::total_cmp);
-    println!("{name:<20} {:>10.1} MiB/s", samples[1]);
+    let nanos_per_byte = 1e9 / (samples[1] * 1024.0 * 1024.0);
+    println!(
+        "{name:<28} {:>10.1} MiB/s  {nanos_per_byte:>6.2} ns/B",
+        samples[1]
+    );
 }
 
 fn main() {
@@ -56,4 +62,26 @@ fn main() {
     measure("discarded strings", &strings, strings.len());
     measure("ascii / 17-byte", &ascii, 17);
     measure("utf8 / 1-byte", &unicode, 1);
+
+    for size in [1024, 65536, 1048576] {
+        let invalid_utf8 = b"\xf4\x90\x80\x80".repeat(size / 4);
+        measure(
+            &format!("invalid utf8 / {size}"),
+            &invalid_utf8,
+            invalid_utf8.len(),
+        );
+
+        let mut parameter = b"\x1b[".to_vec();
+        parameter.extend(std::iter::repeat_n(b'0', size));
+        parameter.push(b'm');
+        measure(
+            &format!("long parameter / {size}"),
+            &parameter,
+            parameter.len(),
+        );
+
+        let mut string = b"\x1b]".to_vec();
+        string.extend(std::iter::repeat_n(b'x', size));
+        measure(&format!("open string / {size}"), &string, string.len());
+    }
 }
