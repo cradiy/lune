@@ -9,9 +9,9 @@
 //! right edge is cleared. Full-screen scrolling recycles row buffers. Fallible
 //! operations reserve storage before changing visible contents.
 //!
-//! [`MAX_CELLS`] bounds logical grid dimensions; row buffers retain capacity for
-//! reuse after shrinking. [`MAX_CELL_TEXT_BYTES`] bounds each display unit's
-//! UTF-8 payload. Protocol interpretation is a separate consumer of [`lune_vt::Event`].
+//! [`MAX_CELLS`] bounds the logical cell count. Cell buffers and the row queue
+//! retain capacity after shrinking. [`MAX_CELL_TEXT_BYTES`] bounds the UTF-8
+//! payload of each display unit. Protocol interpretation consumes [`lune_vt::Event`].
 
 mod cell;
 mod error;

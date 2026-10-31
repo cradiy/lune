@@ -121,7 +121,7 @@ impl Grid {
 
     /// Preserves the upper-left intersection and fills newly exposed cells with
     /// spaces using `style`. A wide unit cut by the right edge is cleared.
-    /// Row buffers retain capacity for subsequent growth.
+    /// Cell buffers and row-queue storage retain capacity for subsequent growth.
     pub fn resize(
         &mut self,
         columns: usize,

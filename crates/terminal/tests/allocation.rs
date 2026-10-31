@@ -1,0 +1,257 @@
+#[path = "support/allocator.rs"]
+mod allocator;
+
+use std::hint::black_box;
+
+use lune_terminal::{CellText, CellWidth, Grid, StorageError, StyleId};
+
+#[global_allocator]
+static ALLOCATOR: allocator::TestAllocator = allocator::TestAllocator;
+
+#[derive(Debug, PartialEq, Eq)]
+struct SnapshotCell {
+    text: String,
+    width: usize,
+    style: StyleId,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct Snapshot {
+    columns: usize,
+    rows: Vec<Vec<SnapshotCell>>,
+}
+
+fn snapshot(grid: &Grid) -> Snapshot {
+    let rows = grid
+        .iter_rows()
+        .map(|row| {
+            assert_eq!(row.cells().len(), grid.columns());
+            row.cells()
+                .iter()
+                .enumerate()
+                .map(|(column, cell)| {
+                    if cell.is_continuation() {
+                        assert!(column > 0);
+                        assert_eq!(row.cells()[column - 1].width(), 2);
+                        assert_eq!(row.cells()[column - 1].style(), cell.style());
+                    } else if cell.width() == 2 {
+                        assert!(column + 1 < grid.columns());
+                        assert!(row.cells()[column + 1].is_continuation());
+                    }
+                    let text = match row.text(column).unwrap() {
+                        CellText::Scalar(character) => character.to_string(),
+                        CellText::Extended(text) => text.to_owned(),
+                        CellText::Continuation => String::new(),
+                    };
+                    SnapshotCell {
+                        text,
+                        width: cell.width(),
+                        style: cell.style(),
+                    }
+                })
+                .collect()
+        })
+        .collect();
+    Snapshot {
+        columns: grid.columns(),
+        rows,
+    }
+}
+
+fn populated() -> Grid {
+    let mut grid = Grid::new(4, 3).unwrap();
+    grid.write(0, 0, "水", CellWidth::Double, StyleId(1))
+        .unwrap();
+    grid.write(1, 2, "界\u{301}", CellWidth::Double, StyleId(2))
+        .unwrap();
+    grid.write_ascii(2, 0, b"last", StyleId(3)).unwrap();
+    grid
+}
+
+fn extended() -> Grid {
+    let mut grid = Grid::new(6, 3).unwrap();
+    grid.write(0, 0, "e\u{301}", CellWidth::Single, StyleId(1))
+        .unwrap();
+    grid.write(0, 1, "水\u{301}", CellWidth::Double, StyleId(2))
+        .unwrap();
+    grid
+}
+
+fn dense() -> Grid {
+    let mut grid = Grid::new(32, 2).unwrap();
+    for column in 0..16 {
+        grid.write(0, column, "e\u{301}", CellWidth::Single, StyleId(1))
+            .unwrap();
+    }
+    grid
+}
+
+struct Scenario {
+    name: &'static str,
+    setup: fn() -> Grid,
+    mutate: fn(&mut Grid) -> Result<(), StorageError>,
+}
+
+#[test]
+fn allocation_failures_preserve_contents_and_allow_retry() {
+    let scenarios = [
+        Scenario {
+            name: "write new extended text over a continuation",
+            setup: populated,
+            mutate: |grid| grid.write(0, 1, "e\u{301}", CellWidth::Single, StyleId(4)),
+        },
+        Scenario {
+            name: "grow existing text while replacing a neighboring wide unit",
+            setup: extended,
+            mutate: |grid| {
+                grid.write(
+                    0,
+                    0,
+                    "e\u{301}\u{302}\u{303}\u{304}",
+                    CellWidth::Double,
+                    StyleId(4),
+                )
+            },
+        },
+        Scenario {
+            name: "grow the extended-text index",
+            setup: dense,
+            mutate: |grid| grid.write(0, 16, "e\u{301}", CellWidth::Single, StyleId(4)),
+        },
+        Scenario {
+            name: "append first extended text through a continuation",
+            setup: populated,
+            mutate: |grid| grid.append_text(0, 1, "\u{301}"),
+        },
+        Scenario {
+            name: "grow appended text",
+            setup: extended,
+            mutate: |grid| grid.append_text(0, 0, "\u{301}\u{302}\u{303}\u{304}"),
+        },
+        Scenario {
+            name: "grow rows and columns",
+            setup: populated,
+            mutate: |grid| grid.resize(12, 6, StyleId(4)),
+        },
+        Scenario {
+            name: "grow columns before discarding bottom rows",
+            setup: populated,
+            mutate: |grid| grid.resize(12, 1, StyleId(4)),
+        },
+        Scenario {
+            name: "allocate new rows before cropping a wide unit",
+            setup: populated,
+            mutate: |grid| grid.resize(3, 6, StyleId(4)),
+        },
+    ];
+
+    for scenario in scenarios {
+        let mut baseline = (scenario.setup)();
+        let (result, measured) =
+            allocator::measure(None, || (scenario.mutate)(black_box(&mut baseline)));
+        result.unwrap();
+        assert!(
+            measured.attempts > 0,
+            "{} did not exercise allocation",
+            scenario.name
+        );
+        let expected = snapshot(&baseline);
+
+        for point in 0..measured.attempts {
+            let mut grid = (scenario.setup)();
+            let before = snapshot(&grid);
+            let (result, failed) =
+                allocator::measure(Some(point), || (scenario.mutate)(black_box(&mut grid)));
+            assert!(
+                matches!(result, Err(StorageError::Allocation(_))),
+                "{} at {point}: {result:?}",
+                scenario.name
+            );
+            assert_eq!(failed.failures, 1, "{} at {point}", scenario.name);
+            assert_eq!(failed.attempts, point + 1, "{} at {point}", scenario.name);
+            assert_eq!(snapshot(&grid), before, "{} at {point}", scenario.name);
+
+            (scenario.mutate)(&mut grid).unwrap();
+            assert_eq!(
+                snapshot(&grid),
+                expected,
+                "{} retry at {point}",
+                scenario.name
+            );
+            grid.write_ascii(0, 0, b"Z", StyleId(5)).unwrap();
+            grid.append_text(0, 0, "\u{301}").unwrap();
+            grid.resize(6, 4, StyleId(5)).unwrap();
+            snapshot(&grid);
+        }
+        eprintln!(
+            "{}: {} failure points covered",
+            scenario.name, measured.attempts
+        );
+    }
+}
+
+#[test]
+fn warm_ascii_scrolling_and_column_growth_make_no_allocation_requests() {
+    let mut grid = Grid::new(240, 80).unwrap();
+    grid.resize(120, 80, StyleId(0)).unwrap();
+    let ascii = [b'x'; 120];
+    let (result, stats) = allocator::measure(Some(0), || {
+        for _ in 0..32 {
+            grid.write_ascii(0, 0, black_box(&ascii), StyleId(1))?;
+            grid.write(1, 0, "水", CellWidth::Double, StyleId(2))?;
+            grid.scroll_up(1, StyleId(0));
+            grid.scroll_down(1, StyleId(0));
+            grid.clear_row(0, 0..120, StyleId(0))?;
+            grid.resize(240, 80, StyleId(0))?;
+            grid.resize(120, 80, StyleId(0))?;
+        }
+        Ok::<_, StorageError>(())
+    });
+    result.unwrap();
+    assert_eq!(stats.attempts, 0);
+    assert_eq!(stats.live_bytes, 0);
+    snapshot(&grid);
+}
+
+#[test]
+fn resize_history_reaches_a_stable_requested_memory_high_water() {
+    let ((initial, retained, peaks), released) = allocator::measure(None, || {
+        let mut grid = Grid::new(128, 8).unwrap();
+        let initial = allocator::stats().live_bytes;
+        let mut retained = [0; 16];
+        let mut peaks = [0; 16];
+        for cycle in 0..16 {
+            for (columns, rows) in [
+                (128, 8),
+                (64, 16),
+                (32, 32),
+                (16, 64),
+                (8, 128),
+                (4, 256),
+                (2, 512),
+                (1, 1024),
+            ] {
+                grid.resize(columns, rows, StyleId(0)).unwrap();
+            }
+            grid.resize(128, 8, StyleId(0)).unwrap();
+            grid.write(0, 0, "水\u{301}", CellWidth::Double, StyleId(1))
+                .unwrap();
+            grid.append_text(0, 1, "\u{302}").unwrap();
+            let measured = allocator::stats();
+            retained[cycle] = measured.live_bytes;
+            peaks[cycle] = measured.peak_bytes;
+        }
+        drop(grid);
+        (initial, retained, peaks)
+    });
+
+    assert!(initial > 0);
+    assert!(retained[0] >= initial);
+    assert!(retained.iter().all(|&bytes| bytes == retained[0]));
+    assert!(peaks[1..].iter().all(|&bytes| bytes == peaks[1]));
+    assert_eq!(released.live_bytes, 0);
+    eprintln!(
+        "Requested heap bytes: initial={initial}, retained={}, peak={}, after_drop={}",
+        retained[0], released.peak_bytes, released.live_bytes
+    );
+}
