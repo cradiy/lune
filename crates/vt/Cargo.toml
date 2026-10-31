@@ -2,7 +2,7 @@
 name = "lune-vt"
 version = "0.1.0"
 edition = "2024"
-description = "VT protocol parsing, terminal state, and input encoding"
+description = "Incremental VT protocol parsing"
 
 [[bench]]
 name = "parser"

@@ -8,8 +8,8 @@
 //! four-byte buffer joins UTF-8 scalars split across input chunks.
 //!
 //! OSC, DCS, SOS, PM, and APC payloads are discarded until their terminator or
-//! cancellation. OSC also accepts BEL as a terminator. String command dispatch
-//! and terminal screen behavior belong to later development increments.
+//! cancellation. OSC also accepts BEL as a terminator. Consumers interpret the
+//! emitted protocol events.
 //!
 //! The parsing rules follow the control-sequence structure described in
 //! [XTerm Control Sequences](https://invisible-island.net/xterm/ctlseqs/ctlseqs.html).

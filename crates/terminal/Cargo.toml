@@ -1,0 +1,18 @@
+[package]
+name = "lune-terminal"
+version = "0.1.0"
+edition = "2024"
+description = "Terminal state and screen storage"
+
+[[bench]]
+name = "storage"
+harness = false
+
+[dependencies]
+lune-vt = { path = "../vt" }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

@@ -7,12 +7,19 @@ name = "lune"
 version = "0.1.0"
 dependencies = [
  "lune-pty",
- "lune-vt",
+ "lune-terminal",
 ]
 
 [[package]]
 name = "lune-pty"
 version = "0.1.0"
+
+[[package]]
+name = "lune-terminal"
+version = "0.1.0"
+dependencies = [
+ "lune-vt",
+]
 
 [[package]]
 name = "lune-vt"
