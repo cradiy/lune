@@ -89,6 +89,36 @@ impl Grid {
         self.row_mut(row)?.clear_range(range, style)
     }
 
+    /// Inserts blank cells at `column`, shifting the suffix right and discarding
+    /// overflow. Counts are clamped to the remaining columns. A zero count or
+    /// `column == self.columns()` leaves the row unchanged.
+    /// Wide units split at insertion or cropping boundaries are cleared with
+    /// `style`. Other units retain their text and style. This does not allocate.
+    /// Invalid row or column indices fail before mutation, including zero counts.
+    pub fn insert_cells(
+        &mut self,
+        row: usize,
+        column: usize,
+        count: usize,
+        style: StyleId,
+    ) -> Result<(), StorageError> {
+        self.row_mut(row)?.insert_cells(column, count, style)
+    }
+
+    /// Deletes cells at `column`, shifting the suffix left and filling the right
+    /// edge with blanks. Wide units intersecting the deleted range are cleared
+    /// completely with `style`. Boundary, count, and allocation rules follow
+    /// [`Self::insert_cells`].
+    pub fn delete_cells(
+        &mut self,
+        row: usize,
+        column: usize,
+        count: usize,
+        style: StyleId,
+    ) -> Result<(), StorageError> {
+        self.row_mut(row)?.delete_cells(column, count, style)
+    }
+
     pub fn clear(&mut self, style: StyleId) {
         for row in &mut self.rows {
             row.clear(style);

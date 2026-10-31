@@ -9,6 +9,8 @@
 //! right edge is cleared. Scrolling an exclusive row range recycles row buffers
 //! and clears exposed rows. Rows outside the range remain unchanged. Fallible
 //! operations reserve storage before changing visible contents.
+//! In-row insertion and deletion shift cells and their owned text without
+//! allocating. Wide units split by an edit boundary are cleared completely.
 //!
 //! [`MAX_CELLS`] bounds the logical cell count. Cell buffers and the row queue
 //! retain capacity after shrinking. [`MAX_CELL_TEXT_BYTES`] bounds the UTF-8

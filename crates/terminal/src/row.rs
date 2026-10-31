@@ -195,6 +195,57 @@ impl Row {
         self.cells.fill(Cell::blank(style));
     }
 
+    pub(crate) fn insert_cells(
+        &mut self,
+        column: usize,
+        count: usize,
+        style: StyleId,
+    ) -> Result<(), StorageError> {
+        self.end(column, 0)?;
+        let count = count.min(self.cells.len() - column);
+        if count == 0 {
+            return Ok(());
+        }
+
+        if self.cells[column].is_continuation() {
+            self.prepare_overwrite(column..column + 1, style, None);
+            self.cells[column] = Cell::blank(style);
+        }
+        let retained = self.cells.len() - count;
+        self.prepare_overwrite(retained..self.cells.len(), style, None);
+        self.cells.copy_within(column..retained, column + count);
+        self.cells[column..column + count].fill(Cell::blank(style));
+        let first = self.extended.partition_point(|entry| entry.column < column);
+        for entry in &mut self.extended[first..] {
+            entry.column += count;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn delete_cells(
+        &mut self,
+        column: usize,
+        count: usize,
+        style: StyleId,
+    ) -> Result<(), StorageError> {
+        self.end(column, 0)?;
+        let count = count.min(self.cells.len() - column);
+        if count == 0 {
+            return Ok(());
+        }
+
+        let end = column + count;
+        self.prepare_overwrite(column..end, style, None);
+        self.cells.copy_within(end.., column);
+        let retained = self.cells.len() - count;
+        self.cells[retained..].fill(Cell::blank(style));
+        let first = self.extended.partition_point(|entry| entry.column < end);
+        for entry in &mut self.extended[first..] {
+            entry.column -= count;
+        }
+        Ok(())
+    }
+
     pub(crate) fn reserve_columns(&mut self, columns: usize) -> Result<(), StorageError> {
         self.cells
             .try_reserve_exact(columns.saturating_sub(self.cells.len()))?;

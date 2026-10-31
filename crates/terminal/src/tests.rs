@@ -39,7 +39,7 @@ fn assert_invariants(grid: &Grid) {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct SnapshotCell {
     text: String,
     width: usize,
@@ -245,6 +245,101 @@ fn scrolling_preserves_region_boundaries_and_owned_buffers() {
 }
 
 #[test]
+fn cell_edits_move_complete_units_and_retain_text_buffers() {
+    let columns = 9;
+    for phase in 0..3 {
+        for column in 0..=columns {
+            for count in (0..=columns + 1).chain([usize::MAX]) {
+                for insert in [true, false] {
+                    let mut grid = Grid::new(columns, 3).unwrap();
+                    grid.write_ascii(0, 0, b"upper row", StyleId(3)).unwrap();
+                    grid.write_ascii(2, 0, b"lower row", StyleId(4)).unwrap();
+                    let mut source = 0;
+                    while source < columns {
+                        let width = if (source + phase) % 3 == 1 && source + 1 < columns {
+                            CellWidth::Double
+                        } else {
+                            CellWidth::Single
+                        };
+                        let mut text = char::from(b'a' + source as u8).to_string();
+                        if source % 2 == 1 {
+                            text.push('\u{301}');
+                        }
+                        grid.write(1, source, &text, width, StyleId(source as u32 + 1))
+                            .unwrap();
+                        source += width.columns();
+                    }
+                    let before = snapshot(&grid);
+                    let buffers: Vec<_> =
+                        grid.iter_rows().map(|row| row.cells().as_ptr()).collect();
+                    let text_buffers: Vec<_> = (0..columns)
+                        .map(|source| match grid.row(1).unwrap().text(source) {
+                            Some(CellText::Extended(text)) => Some(text.as_ptr()),
+                            _ => None,
+                        })
+                        .collect();
+                    let style = StyleId(99);
+                    let blank = SnapshotCell {
+                        text: " ".into(),
+                        width: 1,
+                        style,
+                    };
+                    let mut expected = vec![blank; columns];
+                    let requested = count;
+                    let count = requested.min(columns - column);
+                    let mut retained_text = Vec::new();
+                    for (source, cell) in before.rows[1].iter().enumerate() {
+                        if cell.width == 0 {
+                            continue;
+                        }
+                        let end = source + cell.width;
+                        let target = if count == 0 || end <= column {
+                            Some(source)
+                        } else if insert && source >= column && end <= columns - count {
+                            Some(source + count)
+                        } else if !insert && source >= column + count {
+                            Some(source - count)
+                        } else {
+                            None
+                        };
+                        if let Some(target) = target {
+                            expected[target..target + cell.width]
+                                .clone_from_slice(&before.rows[1][source..end]);
+                            if let Some(buffer) = text_buffers[source] {
+                                retained_text.push((target, buffer));
+                            }
+                        }
+                    }
+                    if insert {
+                        grid.insert_cells(1, column, requested, style).unwrap();
+                    } else {
+                        grid.delete_cells(1, column, requested, style).unwrap();
+                    }
+                    let after = snapshot(&grid);
+                    assert_eq!(after.rows[0], before.rows[0]);
+                    assert_eq!(
+                        after.rows[1], expected,
+                        "phase={phase}, column={column}, count={requested}, insert={insert}"
+                    );
+                    assert_eq!(after.rows[2], before.rows[2]);
+                    for (row, buffer) in grid.iter_rows().zip(buffers) {
+                        assert_eq!(row.cells().as_ptr(), buffer);
+                    }
+                    for (target, buffer) in retained_text {
+                        let Some(CellText::Extended(text)) = grid.row(1).unwrap().text(target)
+                        else {
+                            panic!("Retained text is present");
+                        };
+                        assert_eq!(text.as_ptr(), buffer);
+                    }
+                    assert_invariants(&grid);
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn rejected_mutations_preserve_visible_contents() {
     let mut grid = Grid::new(4, 2).unwrap();
     grid.write(0, 0, "e\u{301}", CellWidth::Single, StyleId(u32::MAX))
@@ -278,6 +373,18 @@ fn rejected_mutations_preserve_visible_contents() {
             ));
         }
     }
+    for (row, column) in [(2, 0), (0, 5), (0, usize::MAX)] {
+        for count in [0, 1, usize::MAX] {
+            assert!(matches!(
+                grid.insert_cells(row, column, count, StyleId(1)),
+                Err(StorageError::OutOfBounds)
+            ));
+            assert!(matches!(
+                grid.delete_cells(row, column, count, StyleId(1)),
+                Err(StorageError::OutOfBounds)
+            ));
+        }
+    }
     assert!(grid.resize(0, 2, StyleId(1)).is_err());
     assert!(grid.resize(2048, MAX_CELLS / 2048 + 1, StyleId(1)).is_err());
     let large = "x".repeat(MAX_CELL_TEXT_BYTES);
@@ -304,7 +411,7 @@ fn mixed_mutations_preserve_occupancy_and_failure_atomicity() {
         let column = (bits >> 8) as usize % grid.columns();
         let style = StyleId((bits >> 16) as u32);
         let before = snapshot(&grid);
-        let result = match bits % 8 {
+        let result = match bits % 10 {
             0 => grid.write(row, column, "\u{10ffff}", CellWidth::Single, style),
             1 => grid.write(row, column, "👩\u{200d}💻", CellWidth::Double, style),
             2 => grid.append_text(row, column, "\u{301}"),
@@ -320,11 +427,13 @@ fn mixed_mutations_preserve_occupancy_and_failure_atomicity() {
                 (bits >> 12) as usize % 10,
                 style,
             ),
-            _ => grid.scroll_down(
+            7 => grid.scroll_down(
                 row..(bits >> 20) as usize % (grid.rows() + 2),
                 (bits >> 12) as usize % 10,
                 style,
             ),
+            8 => grid.insert_cells(row, column, (bits >> 12) as usize % 20, style),
+            _ => grid.delete_cells(row, column, (bits >> 12) as usize % 20, style),
         };
         if result.is_err() {
             assert_eq!(snapshot(&grid), before);

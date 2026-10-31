@@ -88,4 +88,32 @@ fn main() {
             }
         }
     }
+
+    for columns in [80, 240, 4096] {
+        for count in [1, 16] {
+            for extended in [false, true] {
+                let mut grid = Grid::new(columns, 1).unwrap();
+                for column in 0..columns - count {
+                    grid.write(
+                        0,
+                        column,
+                        if extended { "e\u{301}" } else { "x" },
+                        CellWidth::Single,
+                        StyleId(1),
+                    )
+                    .unwrap();
+                }
+                let kind = if extended { "extended" } else { "ASCII" };
+                // The blank suffix absorbs insertion overflow; deletion restores
+                // the populated row, keeping text density constant across samples.
+                measure(&format!("{kind} edit / {columns}/{count}"), 2, || {
+                    let grid = black_box(&mut grid);
+                    grid.insert_cells(0, columns / 4, count, StyleId(0))
+                        .unwrap();
+                    grid.delete_cells(0, columns / 4, count, StyleId(0))
+                        .unwrap();
+                });
+            }
+        }
+    }
 }
