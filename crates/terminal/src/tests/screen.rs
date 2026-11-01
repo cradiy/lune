@@ -1,5 +1,5 @@
 use super::{assert_invariants, snapshot};
-use crate::{CellText, CellWidth, Cursor, Screen, StorageError, StyleId};
+use crate::{CellText, CellWidth, Cursor, EraseMode, Screen, StorageError, StyleId};
 
 #[test]
 fn ascii_batches_match_unit_writes_across_wraps_and_scrolls() {
@@ -394,4 +394,161 @@ fn regional_wide_wraps_preserve_units_and_handle_the_physical_bottom() {
         }
     );
     assert_invariants(screen.grid());
+}
+
+#[test]
+fn erasure_clears_intersecting_units_and_preserves_screen_state_and_buffers() {
+    for columns in 1..=9 {
+        for rows in 1..=4 {
+            for offset in 0..rows {
+                for phase in 0..2 {
+                    for cursor_row in 0..rows {
+                        for cursor_column in 0..=columns {
+                            for mode in [EraseMode::FromCursor, EraseMode::ToCursor, EraseMode::All]
+                            {
+                                for display in [false, true] {
+                                    let mut screen = Screen::new(columns, rows).unwrap();
+                                    screen.set_cursor(rows - 1, 0).unwrap();
+                                    for _ in 0..offset {
+                                        screen.line_feed(StyleId(0));
+                                    }
+                                    for row in 0..rows {
+                                        let mut column = 0;
+                                        while column < columns {
+                                            let width = if (column + phase) % 3 == 0
+                                                && column + 1 < columns
+                                            {
+                                                CellWidth::Double
+                                            } else {
+                                                CellWidth::Single
+                                            };
+                                            let mut text =
+                                                char::from(b'a' + column as u8).to_string();
+                                            if (row + column + phase) % 2 == 0 {
+                                                text.push('\u{301}');
+                                            }
+                                            screen.set_cursor(row, column).unwrap();
+                                            screen
+                                                .write(
+                                                    &text,
+                                                    width,
+                                                    StyleId((row * columns + column + 1) as u32),
+                                                )
+                                                .unwrap();
+                                            column += width.columns();
+                                        }
+                                    }
+                                    let region = if rows > 2 { 1..rows - 1 } else { 0..rows };
+                                    screen.set_scroll_region(region.clone()).unwrap();
+                                    screen
+                                        .set_cursor(cursor_row, cursor_column.min(columns - 1))
+                                        .unwrap();
+                                    if cursor_column == columns {
+                                        screen.write("!", CellWidth::Single, StyleId(42)).unwrap();
+                                    }
+                                    let cursor = screen.cursor();
+                                    let before = snapshot(screen.grid());
+                                    let buffers: Vec<_> = screen
+                                        .grid()
+                                        .iter_rows()
+                                        .map(|row| row.cells().as_ptr())
+                                        .collect();
+                                    let text_buffers: Vec<Vec<_>> = screen
+                                        .grid()
+                                        .iter_rows()
+                                        .map(|row| {
+                                            (0..columns)
+                                                .map(|column| match row.text(column) {
+                                                    Some(CellText::Extended(text)) => {
+                                                        Some(text.as_ptr())
+                                                    }
+                                                    _ => None,
+                                                })
+                                                .collect()
+                                        })
+                                        .collect();
+                                    let style = StyleId(u32::MAX);
+                                    let mut expected = before.rows.clone();
+                                    let cursor_offset = cursor.row * columns + cursor.column;
+                                    for (row, cells) in before.rows.iter().enumerate() {
+                                        for (column, cell) in cells
+                                            .iter()
+                                            .enumerate()
+                                            .filter(|(_, cell)| cell.width > 0)
+                                        {
+                                            let start = row * columns + column;
+                                            let erase = (display || row == cursor.row)
+                                                && match mode {
+                                                    EraseMode::FromCursor => {
+                                                        start + cell.width > cursor_offset
+                                                    }
+                                                    EraseMode::ToCursor => start <= cursor_offset,
+                                                    EraseMode::All => true,
+                                                };
+                                            if erase {
+                                                for blank in
+                                                    &mut expected[row][column..column + cell.width]
+                                                {
+                                                    blank.text = " ".into();
+                                                    blank.width = 1;
+                                                    blank.style = style;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if display {
+                                        screen.erase_display(mode, style);
+                                    } else {
+                                        screen.erase_line(mode, style);
+                                    }
+                                    assert_eq!(
+                                        snapshot(screen.grid()).rows,
+                                        expected,
+                                        "{columns}x{rows}, cursor={cursor:?}, mode={mode:?}, display={display}"
+                                    );
+                                    assert_eq!(
+                                        screen.cursor(),
+                                        Cursor {
+                                            wrap_pending: false,
+                                            ..cursor
+                                        }
+                                    );
+                                    assert_eq!(screen.scroll_region(), region);
+                                    for (row, actual) in screen.grid().iter_rows().enumerate() {
+                                        assert_eq!(actual.cells().as_ptr(), buffers[row]);
+                                        for column in 0..columns {
+                                            if expected[row][column].text
+                                                == before.rows[row][column].text
+                                                && let Some(buffer) = text_buffers[row][column]
+                                            {
+                                                let Some(CellText::Extended(text)) =
+                                                    actual.text(column)
+                                                else {
+                                                    panic!("Retained text is present");
+                                                };
+                                                assert_eq!(text.as_ptr(), buffer);
+                                            }
+                                        }
+                                    }
+                                    assert_invariants(screen.grid());
+                                    if cursor.wrap_pending {
+                                        screen.write("Z", CellWidth::Single, StyleId(7)).unwrap();
+                                        assert_eq!(screen.cursor().row, cursor.row);
+                                        assert_eq!(
+                                            screen
+                                                .grid()
+                                                .row(cursor.row)
+                                                .unwrap()
+                                                .text(cursor.column),
+                                            Some(CellText::Scalar('Z'))
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }

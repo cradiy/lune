@@ -2,6 +2,18 @@ use std::ops::Range;
 
 use crate::{CellWidth, Grid, StorageError, StyleId};
 
+/// Cursor-relative extent for line or display erasure. Both directions include
+/// the cursor cell and complete wide units intersecting the extent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EraseMode {
+    /// Erase from the cursor through the end of the line or display.
+    FromCursor,
+    /// Erase from the start of the line or display through the cursor.
+    ToCursor,
+    /// Erase the entire line or display.
+    All,
+}
+
 /// A zero-based cursor snapshot. Columns may address wide-unit continuations.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Cursor {
@@ -134,6 +146,46 @@ impl Screen {
             bytes = &bytes[length..];
         }
         Ok(())
+    }
+
+    /// Erases part or all of the physical cursor row using `style`. Cursor
+    /// coordinates and scrolling boundaries are preserved; pending wrapping is
+    /// canceled. Cell and text-index buffers retain capacity. This does not allocate.
+    pub fn erase_line(&mut self, mode: EraseMode, style: StyleId) {
+        let columns = self.grid.columns();
+        let range = match mode {
+            EraseMode::FromCursor => self.cursor.column..columns,
+            EraseMode::ToCursor => 0..self.cursor.column + 1,
+            EraseMode::All => 0..columns,
+        };
+        if range.start == 0 && range.end == columns {
+            self.grid
+                .clear_rows(self.cursor.row..self.cursor.row + 1, style);
+        } else {
+            self.grid
+                .clear_row(self.cursor.row, range, style)
+                .expect("The cursor row and erasure range are in bounds");
+        }
+        self.cursor.wrap_pending = false;
+    }
+
+    /// Erases part or all of the physical display using `style`. The extent
+    /// includes rows outside the scrolling region. Cursor coordinates and region
+    /// boundaries are preserved; pending wrapping is canceled. This does not allocate.
+    pub fn erase_display(&mut self, mode: EraseMode, style: StyleId) {
+        match mode {
+            EraseMode::FromCursor => {
+                self.erase_line(mode, style);
+                self.grid
+                    .clear_rows(self.cursor.row + 1..self.grid.rows(), style);
+            }
+            EraseMode::ToCursor => {
+                self.grid.clear_rows(0..self.cursor.row, style);
+                self.erase_line(mode, style);
+            }
+            EraseMode::All => self.grid.clear(style),
+        }
+        self.cursor.wrap_pending = false;
     }
 
     /// Moves to column zero and cancels pending wrapping.

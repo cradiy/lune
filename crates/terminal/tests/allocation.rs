@@ -3,7 +3,7 @@ mod allocator;
 
 use std::hint::black_box;
 
-use lune_terminal::{CellText, CellWidth, Grid, Screen, StorageError, StyleId};
+use lune_terminal::{CellText, CellWidth, EraseMode, Grid, Screen, StorageError, StyleId};
 
 #[global_allocator]
 static ALLOCATOR: allocator::TestAllocator = allocator::TestAllocator;
@@ -411,6 +411,40 @@ fn warm_writes_edits_scrolling_and_column_growth_make_no_allocation_requests() {
     assert_eq!(stats.attempts, 0);
     assert_eq!(stats.live_bytes, 0);
     snapshot(screen.grid());
+
+    let mut screens: Vec<_> = [false, true]
+        .into_iter()
+        .flat_map(|display| {
+            [EraseMode::FromCursor, EraseMode::ToCursor, EraseMode::All].map(|mode| {
+                let mut screen = Screen::new(8, 4).unwrap();
+                for row in 0..4 {
+                    for column in [0, 2, 4, 6] {
+                        screen.set_cursor(row, column).unwrap();
+                        screen
+                            .write("水\u{301}", CellWidth::Double, StyleId(1))
+                            .unwrap();
+                    }
+                }
+                screen.set_scroll_region(1..3).unwrap();
+                screen.set_cursor(2, 3).unwrap();
+                (display, mode, screen)
+            })
+        })
+        .collect();
+    let ((), stats) = allocator::measure(Some(0), || {
+        for (display, mode, screen) in &mut screens {
+            if *display {
+                screen.erase_display(*mode, StyleId(9));
+            } else {
+                screen.erase_line(*mode, StyleId(9));
+            }
+        }
+    });
+    assert_eq!(stats.attempts, 0);
+    assert!(stats.live_bytes <= 0);
+    for (_, _, screen) in &screens {
+        snapshot(screen.grid());
+    }
 }
 
 #[test]

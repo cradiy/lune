@@ -233,7 +233,8 @@ impl Grid {
         Ok(())
     }
 
-    fn clear_rows(&mut self, region: Range<usize>, style: StyleId) {
+    /// The caller supplies a valid, possibly empty row range.
+    pub(crate) fn clear_rows(&mut self, region: Range<usize>, style: StyleId) {
         for row in self.rows.range_mut(region) {
             row.clear(style);
         }

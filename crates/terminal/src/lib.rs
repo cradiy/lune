@@ -21,6 +21,9 @@
 //! backspace. ASCII runs are written in batches;
 //! other display units use caller-supplied widths. Writes and resizing preserve
 //! grid contents, cursor state, and the scrolling region on error.
+//! [`EraseMode`] selects cursor-inclusive line or display erasure. Erasure
+//! preserves cursor coordinates and region boundaries, cancels pending wrapping,
+//! and fills complete affected display units with styled spaces without allocating.
 
 mod cell;
 mod error;
@@ -35,4 +38,4 @@ pub use cell::{Cell, CellText, CellWidth, MAX_CELL_TEXT_BYTES, StyleId};
 pub use error::StorageError;
 pub use grid::{Grid, MAX_CELLS, MAX_DIMENSION};
 pub use row::Row;
-pub use screen::{Cursor, Screen};
+pub use screen::{Cursor, EraseMode, Screen};
