@@ -241,32 +241,35 @@ impl Grid {
     }
 
     fn rotate_rows_left(&mut self, region: Range<usize>, lines: usize) {
+        let right = region.len() - lines;
+        let short = lines.min(right);
         let (front, back) = self.rows.as_mut_slices();
         if region.end <= front.len() {
-            front[region].rotate_left(lines);
+            rotate_row_slice(&mut front[region], lines);
             return;
         }
         if region.start >= front.len() {
-            back[region.start - front.len()..region.end - front.len()].rotate_left(lines);
+            rotate_row_slice(
+                &mut back[region.start - front.len()..region.end - front.len()],
+                lines,
+            );
             return;
         }
 
         let split = front.len();
         let front = &mut front[region.start..];
         let back = &mut back[..region.end - split];
-        let right = region.len() - lines;
-        let short = lines.min(right);
         if short <= front.len().min(back.len()) {
             // Rotate each physical slice, then exchange the boundary blocks.
             if lines <= right {
-                front.rotate_left(short);
-                back.rotate_left(short);
+                rotate_row_slice(front, short);
+                rotate_row_slice(back, short);
                 let front_start = front.len() - short;
                 let back_start = back.len() - short;
                 front[front_start..].swap_with_slice(&mut back[back_start..]);
             } else {
-                front.rotate_right(short);
-                back.rotate_right(short);
+                rotate_row_slice(front, front.len() - short);
+                rotate_row_slice(back, back.len() - short);
                 front[..short].swap_with_slice(&mut back[..short]);
             }
         } else {
@@ -335,6 +338,20 @@ impl Grid {
 
     fn row_mut(&mut self, row: usize) -> Result<&mut Row, StorageError> {
         self.rows.get_mut(row).ok_or(StorageError::OutOfBounds)
+    }
+}
+
+#[inline]
+fn rotate_row_slice(rows: &mut [Row], left: usize) {
+    // Short shifts fit the buffered rotation path; larger shifts benefit
+    // from sequential swaps of the row metadata.
+    let buffered_rows = 32 * size_of::<usize>() / size_of::<Row>();
+    if left.min(rows.len() - left) <= buffered_rows {
+        rows.rotate_left(left);
+    } else {
+        rows[..left].reverse();
+        rows[left..].reverse();
+        rows.reverse();
     }
 }
 

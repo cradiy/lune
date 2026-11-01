@@ -200,6 +200,35 @@ impl Screen {
         }
     }
 
+    /// Inserts blank rows at the cursor, shifting rows down through the scrolling
+    /// region's bottom and discarding overflow. Counts are clamped to that suffix.
+    /// Zero counts and cursors outside the region preserve all state. Effective
+    /// edits cancel pending wrapping and preserve cursor coordinates and region
+    /// boundaries. Recycled rows use `style`; retained rows keep their text and
+    /// style. Buffers are reused without allocating.
+    pub fn insert_lines(&mut self, count: usize, style: StyleId) {
+        if count == 0 || !self.scroll_region.contains(&self.cursor.row) {
+            return;
+        }
+        self.grid
+            .scroll_down(self.cursor.row..self.scroll_region.end, count, style)
+            .expect("The cursor suffix is a valid row range");
+        self.cursor.wrap_pending = false;
+    }
+
+    /// Deletes rows at the cursor, shifting remaining rows up through the
+    /// scrolling region's bottom and filling exposed rows using `style`.
+    /// Count, cursor, region, and allocation rules follow [`Self::insert_lines`].
+    pub fn delete_lines(&mut self, count: usize, style: StyleId) {
+        if count == 0 || !self.scroll_region.contains(&self.cursor.row) {
+            return;
+        }
+        self.grid
+            .scroll_up(self.cursor.row..self.scroll_region.end, count, style)
+            .expect("The cursor suffix is a valid row range");
+        self.cursor.wrap_pending = false;
+    }
+
     /// Erases part or all of the physical cursor row using `style`. Cursor
     /// coordinates and scrolling boundaries are preserved; pending wrapping is
     /// canceled. Cell and text-index buffers retain capacity. This does not allocate.

@@ -692,3 +692,106 @@ fn cursor_cell_edits_preserve_units_buffers_and_zero_count_state() {
         }
     }
 }
+
+#[test]
+fn line_edits_recycle_owned_rows_only_within_the_cursor_suffix() {
+    for rows in 1..=6 {
+        for offset in 0..rows {
+            for region in (0..rows).flat_map(|start| (start + 1..=rows).map(move |end| start..end))
+            {
+                for cursor_row in 0..rows {
+                    for requested in (0..=rows + 1).chain([usize::MAX]) {
+                        for insert in [false, true] {
+                            let mut screen = Screen::new(4, rows).unwrap();
+                            screen.set_cursor(rows - 1, 0).unwrap();
+                            for _ in 0..offset {
+                                screen.line_feed(StyleId(0));
+                            }
+                            for row in 0..rows {
+                                screen.set_cursor(row, 0).unwrap();
+                                screen
+                                    .write_ascii(&[b'a' + row as u8; 4], StyleId(row as u32))
+                                    .unwrap();
+                                screen.set_cursor(row, 1).unwrap();
+                                screen
+                                    .write("水\u{301}", CellWidth::Double, StyleId(row as u32))
+                                    .unwrap();
+                            }
+                            screen.set_scroll_region(region.clone()).unwrap();
+                            screen.set_cursor(cursor_row, 3).unwrap();
+                            screen.write("!", CellWidth::Single, StyleId(8)).unwrap();
+                            let cursor = screen.cursor();
+                            let before = snapshot(screen.grid());
+                            let buffers: Vec<_> = screen
+                                .grid()
+                                .iter_rows()
+                                .map(|row| {
+                                    let Some(CellText::Extended(text)) = row.text(1) else {
+                                        unreachable!()
+                                    };
+                                    (row.cells().as_ptr(), text.as_ptr())
+                                })
+                                .collect();
+                            let active = requested != 0 && region.contains(&cursor_row);
+                            let height = region.end.saturating_sub(cursor_row);
+                            let count = if active { requested.min(height) } else { 0 };
+                            if insert {
+                                screen.insert_lines(requested, StyleId(9));
+                            } else {
+                                screen.delete_lines(requested, StyleId(9));
+                            }
+                            assert_eq!(
+                                screen.cursor(),
+                                Cursor {
+                                    wrap_pending: !active && cursor.wrap_pending,
+                                    ..cursor
+                                }
+                            );
+                            assert_eq!(screen.scroll_region(), region);
+                            let after = snapshot(screen.grid());
+                            for row in 0..rows {
+                                let inside = active && (cursor_row..region.end).contains(&row);
+                                let source = if !inside {
+                                    Some(row)
+                                } else if insert {
+                                    row.checked_sub(count)
+                                        .filter(|&source| source >= cursor_row)
+                                } else {
+                                    (row + count < region.end).then_some(row + count)
+                                };
+                                let buffer = if !inside {
+                                    row
+                                } else if insert {
+                                    cursor_row + (row - cursor_row + height - count) % height
+                                } else {
+                                    cursor_row + (row - cursor_row + count) % height
+                                };
+                                assert_eq!(
+                                    screen.grid().row(row).unwrap().cells().as_ptr(),
+                                    buffers[buffer].0
+                                );
+                                if let Some(source) = source {
+                                    assert_eq!(
+                                        after.rows[row], before.rows[source],
+                                        "rows={rows}, region={region:?}, cursor={cursor_row}, count={requested}, insert={insert}"
+                                    );
+                                    let Some(CellText::Extended(text)) =
+                                        screen.grid().row(row).unwrap().text(1)
+                                    else {
+                                        panic!("Moved text is present");
+                                    };
+                                    assert_eq!(text.as_ptr(), buffers[source].1);
+                                } else {
+                                    assert!(after.rows[row].iter().all(|cell| cell.text == " "
+                                        && cell.width == 1
+                                        && cell.style == StyleId(9)));
+                                }
+                            }
+                            assert_invariants(screen.grid());
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

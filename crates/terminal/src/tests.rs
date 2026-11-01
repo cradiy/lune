@@ -173,7 +173,7 @@ fn resizing_preserves_the_intersection_and_repairs_cut_wide_units() {
 
 #[test]
 fn scrolling_preserves_region_boundaries_and_owned_buffers() {
-    let height = 9;
+    let height = 17;
     for offset in 0..height {
         for start in 0..=height {
             for end in start..=height {

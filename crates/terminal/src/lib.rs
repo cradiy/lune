@@ -27,6 +27,9 @@
 //! Cursor-relative cell insertion, deletion, and counted erasure operate in
 //! physical columns. They clamp counts at the right edge, preserve coordinates
 //! and scrolling boundaries, and cancel pending wrapping for positive counts.
+//! Whole-row insertion and deletion affect the cursor row through the scrolling
+//! region's bottom. They reuse row buffers and preserve retained text ownership;
+//! zero counts and cursors outside the region preserve all state.
 
 mod cell;
 mod error;

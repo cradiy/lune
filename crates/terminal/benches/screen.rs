@@ -228,4 +228,56 @@ fn main() {
             |screen| edit(screen, 16, StyleId(2)),
         );
     }
+
+    let line_edits: [fn(&mut Screen, usize, StyleId); 2] =
+        [Screen::insert_lines, Screen::delete_lines];
+    for (name, edit) in ["IL", "DL"].into_iter().zip(line_edits) {
+        let mut screen = Screen::new(120, 24).unwrap();
+        screen.set_cursor(0, 17).unwrap();
+        measure(&format!("{name} full / 24/1"), 1, || {
+            edit(black_box(&mut screen), black_box(1), StyleId(2));
+        });
+        for rows in [24, 240, 4096] {
+            for wrapped in [false, true] {
+                let mut screen = Screen::new(120, rows).unwrap();
+                screen.set_cursor(rows - 1, 0).unwrap();
+                if wrapped {
+                    for _ in 0..rows / 4 {
+                        screen.line_feed(StyleId(0));
+                    }
+                }
+                screen.set_scroll_region(1..rows - 1).unwrap();
+                screen.set_cursor(rows / 2, 17).unwrap();
+                for count in [1, 8] {
+                    measure(
+                        &format!("{name} / {rows}/{count}, wrapped={wrapped}"),
+                        1,
+                        || {
+                            edit(black_box(&mut screen), black_box(count), StyleId(2));
+                        },
+                    );
+                }
+            }
+        }
+        for count in [1, 8] {
+            measure_prepared(
+                &format!("{name} extended / 240x24/{count}"),
+                || {
+                    let mut screen = Screen::new(240, 24).unwrap();
+                    for row in 0..24 {
+                        screen.set_cursor(row, 0).unwrap();
+                        for _ in 0..240 {
+                            screen
+                                .write("e\u{301}", CellWidth::Single, StyleId(1))
+                                .unwrap();
+                        }
+                    }
+                    screen.set_scroll_region(1..23).unwrap();
+                    screen.set_cursor(12, 17).unwrap();
+                    screen
+                },
+                |screen| edit(screen, count, StyleId(2)),
+            );
+        }
+    }
 }
