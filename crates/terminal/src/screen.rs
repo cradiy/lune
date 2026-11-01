@@ -33,6 +33,7 @@ pub struct Screen {
     scroll_region: Range<usize>,
     tabs: TabStops,
     auto_wrap: bool,
+    origin_mode: bool,
 }
 
 impl Screen {
@@ -43,6 +44,7 @@ impl Screen {
             scroll_region: 0..rows,
             tabs: TabStops::new(columns)?,
             auto_wrap: true,
+            origin_mode: false,
         })
     }
 
@@ -52,6 +54,20 @@ impl Screen {
 
     pub fn cursor(&self) -> Cursor {
         self.cursor
+    }
+
+    /// Whether cursor addressing uses the scrolling region as its origin.
+    /// Disabled initially. Cursor snapshots always use physical coordinates.
+    pub fn origin_mode(&self) -> bool {
+        self.origin_mode
+    }
+
+    /// Sets origin mode and homes the cursor, including repeated settings.
+    /// Homing clears pending wrapping and preserves contents, tabs, automatic
+    /// wrapping, and the scrolling region. This does not allocate.
+    pub fn set_origin_mode(&mut self, enabled: bool) {
+        self.origin_mode = enabled;
+        self.set_cursor(0, 0);
     }
 
     /// Whether writes automatically wrap at the right edge. Enabled initially.
@@ -117,29 +133,34 @@ impl Screen {
         self.scroll_region.clone()
     }
 
-    /// Sets a nonempty exclusive row range, preserving absolute cursor coordinates
-    /// and canceling pending wrapping. Invalid ranges preserve all screen state.
+    /// Sets a nonempty exclusive row range and homes the cursor according to
+    /// origin mode, clearing pending wrapping. Single-row regions are valid.
+    /// Invalid ranges preserve all screen state. This does not allocate.
     pub fn set_scroll_region(&mut self, region: Range<usize>) -> Result<(), StorageError> {
         if region.start >= region.end || region.end > self.grid.rows() {
             return Err(StorageError::OutOfBounds);
         }
         self.scroll_region = region;
-        self.cursor.wrap_pending = false;
+        self.set_cursor(0, 0);
         Ok(())
     }
 
-    /// Sets an absolute cell position and cancels pending wrapping.
-    /// Invalid coordinates preserve the entire screen state.
-    pub fn set_cursor(&mut self, row: usize, column: usize) -> Result<(), StorageError> {
-        if row >= self.grid.rows() || column >= self.grid.columns() {
-            return Err(StorageError::OutOfBounds);
-        }
+    /// Addresses a zero-based position, clearing pending wrapping. With origin
+    /// mode enabled, rows are relative to the scrolling region's top and clamp
+    /// at its bottom. Otherwise rows address the full screen. Columns clamp at
+    /// the physical right edge and may address wide-unit continuations.
+    /// Coordinates through `usize::MAX` are accepted without allocating.
+    pub fn set_cursor(&mut self, row: usize, column: usize) {
+        let (top, height) = if self.origin_mode {
+            (self.scroll_region.start, self.scroll_region.len())
+        } else {
+            (0, self.grid.rows())
+        };
         self.cursor = Cursor {
-            row,
-            column,
+            row: top + row.min(height - 1),
+            column: column.min(self.grid.columns() - 1),
             wrap_pending: false,
         };
-        Ok(())
     }
 
     /// Moves upward in physical rows, stopping at the scrolling region's top.
@@ -507,8 +528,9 @@ impl Screen {
     /// changes preserve it. Tab stops in the width intersection are preserved;
     /// cropped stops are discarded and added columns receive default stops.
     /// Height-only changes preserve stops. Every error preserves contents, cursor,
-    /// region, and stops. Automatic wrapping mode is preserved. Reserved tab
-    /// capacity survives shrinking.
+    /// region, and stops. Automatic wrapping and origin modes are preserved.
+    /// The cursor remains in the active region while origin mode is enabled.
+    /// Reserved tab capacity survives shrinking.
     pub fn resize(
         &mut self,
         columns: usize,

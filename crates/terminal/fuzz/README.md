@@ -18,11 +18,11 @@ The `screen` target shares the complete-unit storage model and represents pendin
 wrapping with a column one past the right edge. Its ASCII oracle writes individual
 display units, and erasure selects ranges in a flattened physical display.
 
-Commands interleave unit and ASCII writes, absolute cursor positioning, scrolling
+Commands interleave unit and ASCII writes, clamped cursor addressing, scrolling
 regions, carriage return, backspace, line feed, reverse index, line and display
 erasure, counted erasure, cell and whole-row insertion/deletion, resizing,
-relative cursor movement, tabulation and tab-stop editing, automatic-wrap toggles,
-and explicit
+relative cursor movement, tabulation and tab-stop editing, automatic-wrap and
+origin-mode settings, and explicit
 upward/downward scrolling of the active region. Explicit scrolling preserves
 cursor coordinates and pending wrapping,
 including when the cursor is outside the region. The movement oracle walks one
@@ -35,6 +35,11 @@ enabling preserves it. The scalar write oracle clamps writes at the last column
 when wrapping is disabled and ignores validated wide units that cannot fit the
 remaining columns. Its per-byte ASCII writes check the optimized batch path.
 An explicit same-size resize command exercises pending-wrap preservation.
+Origin mode selects a full-screen or regional row iterator for addressing.
+Mode and region settings home the cursor and clear pending wrapping. Every
+command compares both mode flags and checks that origin-mode cursors remain
+within the scrolling region. Width changes retain the region; height changes
+reset it to the full screen while preserving origin mode.
 
 Every command checks cell text, width, continuation occupancy, styles, dimensions,
 cursor coordinates, pending wrapping, scrolling boundaries, and error categories.
@@ -53,13 +58,14 @@ columns to exercise bitmap word boundaries. Other valid widths and heights are
 limited to 16. Zero, overlarge, and invalid arguments are included.
 For screen coordinates, bytes `fc`, `fd`, `fe`, and `ff` select the last cell, the
 exclusive bound, zero, and `usize::MAX`; other bytes are reduced by the dimension
-plus two. Screen opcodes modulo 29 select: 0 unit write, 1 ASCII, 2 cursor, 3 region,
+plus two. Screen opcodes modulo 30 select: 0 unit write, 1 ASCII, 2 cursor, 3 region,
 4 resize, 5 carriage return, 6 backspace, 7 line feed, 8 reverse index, 9 line erasure,
 10 display erasure, 11 cell insertion, 12 cell deletion, 13 counted erasure,
 14 line insertion, 15 line deletion, 16 same-size resize, 17 move up, 18 move down,
 19 move left, 20 move right, 21 scroll up, 22 scroll down, 23 tab forward,
-24 tab backward, 25 set current tab, 26 clear current tab, 27 clear all tabs, and
-28 set automatic wrapping from the low bit of byte 3.
+24 tab backward, 25 set current tab, 26 clear current tab, 27 clear all tabs,
+28 set automatic wrapping, and 29 set origin mode. Both settings use the low bit
+of byte 3.
 Byte 3 selects width, count (`ff` means `usize::MAX`), or erasure mode.
 Byte 4 selects synthetic text;
 bytes 4 through 7 also form the style key.

@@ -33,6 +33,7 @@ pub enum Command<'a> {
     ClearTab,
     ClearTabs,
     AutoWrap(bool),
+    OriginMode(bool),
 }
 
 /// Uses complete display units and copying row edits. A column one past the
@@ -44,6 +45,7 @@ pub struct ScreenModel {
     region: Range<usize>,
     tabs: BTreeSet<usize>,
     auto_wrap: bool,
+    origin_mode: bool,
 }
 
 impl ScreenModel {
@@ -55,6 +57,7 @@ impl ScreenModel {
             region: 0..rows,
             tabs: (0..columns).step_by(8).collect(),
             auto_wrap: true,
+            origin_mode: false,
         }
     }
 
@@ -66,6 +69,8 @@ impl ScreenModel {
         assert_eq!(cursor.wrap_pending, self.column == self.storage.columns());
         assert_eq!(screen.scroll_region(), self.region);
         assert_eq!(screen.auto_wrap(), self.auto_wrap);
+        assert_eq!(screen.origin_mode(), self.origin_mode);
+        assert!(!self.origin_mode || self.region.contains(&self.row));
         assert!(self.auto_wrap || self.column < self.storage.columns());
         for column in 0..self.storage.columns() {
             assert_eq!(
@@ -90,18 +95,22 @@ impl ScreenModel {
                 }
             }
             Command::Cursor(row, column) => {
-                if *row >= self.storage.rows() || *column >= self.storage.columns() {
-                    return Err(StorageError::OutOfBounds);
-                }
-                self.row = *row;
-                self.column = *column;
+                let mut rows = if self.origin_mode {
+                    self.region.clone()
+                } else {
+                    0..self.storage.rows()
+                };
+                let last = rows.end - 1;
+                self.row = rows.nth(*row).unwrap_or(last);
+                self.column = (*column).min(self.storage.columns() - 1);
             }
             Command::Region(region) => {
                 if region.start >= region.end || region.end > self.storage.rows() {
                     return Err(StorageError::OutOfBounds);
                 }
                 self.region = region.clone();
-                self.cancel_wrap();
+                self.row = if self.origin_mode { region.start } else { 0 };
+                self.column = 0;
             }
             Command::Resize(columns, rows) => {
                 if *columns == self.storage.columns() && *rows == self.storage.rows() {
@@ -164,6 +173,11 @@ impl ScreenModel {
                 if !enabled {
                     self.cancel_wrap();
                 }
+            }
+            Command::OriginMode(enabled) => {
+                self.origin_mode = *enabled;
+                self.row = if *enabled { self.region.start } else { 0 };
+                self.column = 0;
             }
             Command::SetTab => {
                 self.tabs.insert(self.visible_column());

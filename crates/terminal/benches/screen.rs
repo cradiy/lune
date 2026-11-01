@@ -68,7 +68,7 @@ fn main() {
     }
     for rows in [1, 24, 4096] {
         let mut screen = Screen::new(120, rows).unwrap();
-        screen.set_cursor(rows - 1, 0).unwrap();
+        screen.set_cursor(rows - 1, 0);
         let ascii = [b'x'; 240];
         measure(
             &format!("ASCII + scroll / cell, {rows} rows"),
@@ -81,13 +81,13 @@ fn main() {
         );
     }
     let mut screen = Screen::new(120, 24).unwrap();
-    screen.set_cursor(23, 0).unwrap();
+    screen.set_cursor(23, 0);
     measure("line feed + scroll", 1, || {
         black_box(&mut screen).line_feed(StyleId(0));
     });
     measure("wide edge + scroll + placement", 1, || {
         let screen = black_box(&mut screen);
-        screen.set_cursor(23, 119).unwrap();
+        screen.set_cursor(23, 119);
         screen
             .write(black_box("水"), CellWidth::Double, StyleId(1))
             .unwrap();
@@ -96,14 +96,14 @@ fn main() {
     for rows in [24, 240, 4096] {
         for wrapped in [false, true] {
             let mut screen = Screen::new(120, rows).unwrap();
-            screen.set_cursor(rows - 1, 0).unwrap();
+            screen.set_cursor(rows - 1, 0);
             if wrapped {
                 for _ in 0..rows / 2 {
                     screen.line_feed(StyleId(0));
                 }
             }
             screen.set_scroll_region(1..rows - 1).unwrap();
-            screen.set_cursor(rows - 2, 0).unwrap();
+            screen.set_cursor(rows - 2, 0);
             measure(&format!("region LF / {rows}, wrapped={wrapped}"), 1, || {
                 black_box(&mut screen).line_feed(StyleId(0));
             });
@@ -122,13 +122,13 @@ fn main() {
                 1,
                 || {
                     let screen = black_box(&mut screen);
-                    screen.set_cursor(rows - 2, 119).unwrap();
+                    screen.set_cursor(rows - 2, 119);
                     screen
                         .write(black_box("水"), CellWidth::Double, StyleId(1))
                         .unwrap();
                 },
             );
-            screen.set_cursor(1, 0).unwrap();
+            screen.set_cursor(1, 0);
             measure(&format!("region RI / {rows}, wrapped={wrapped}"), 1, || {
                 black_box(&mut screen).reverse_index(StyleId(0));
             });
@@ -138,7 +138,7 @@ fn main() {
     for (columns, rows) in [(120, 24), (120, 4096), (4096, 240)] {
         let mut screen = Screen::new(columns, rows).unwrap();
         screen.set_scroll_region(1..rows - 1).unwrap();
-        screen.set_cursor(rows / 2, columns / 2).unwrap();
+        screen.set_cursor(rows / 2, columns / 2);
         for mode in [EraseMode::FromCursor, EraseMode::ToCursor, EraseMode::All] {
             measure(&format!("EL {mode:?} / {columns}x{rows}"), 1, || {
                 black_box(&mut screen).erase_line(mode, StyleId(1));
@@ -161,14 +161,14 @@ fn main() {
                 let mut screen = Screen::new(240, 24).unwrap();
                 let rows = if display { 0..24 } else { 12..13 };
                 for row in rows {
-                    screen.set_cursor(row, 0).unwrap();
+                    screen.set_cursor(row, 0);
                     for _ in 0..240 {
                         screen
                             .write("e\u{301}", CellWidth::Single, StyleId(1))
                             .unwrap();
                     }
                 }
-                screen.set_cursor(12, 120).unwrap();
+                screen.set_cursor(12, 120);
                 screen
             },
             |screen| {
@@ -194,7 +194,7 @@ fn main() {
                         )
                         .unwrap();
                 }
-                screen.set_cursor(0, columns / 4).unwrap();
+                screen.set_cursor(0, columns / 4);
                 let kind = if extended { "extended" } else { "ASCII" };
                 // The blank suffix absorbs insertion overflow; deletion restores
                 // the original density, so each sample moves the same amount of text.
@@ -209,7 +209,7 @@ fn main() {
                 );
             }
             let mut screen = Screen::new(columns, 1).unwrap();
-            screen.set_cursor(0, columns / 4).unwrap();
+            screen.set_cursor(0, columns / 4);
             measure(&format!("screen ECH / {columns}/{count}"), 1, || {
                 black_box(&mut screen).erase_cells(black_box(count), StyleId(2));
             });
@@ -230,7 +230,7 @@ fn main() {
                         .write("e\u{301}", CellWidth::Single, StyleId(1))
                         .unwrap();
                 }
-                screen.set_cursor(0, 60).unwrap();
+                screen.set_cursor(0, 60);
                 screen
             },
             |screen| edit(screen, 16, StyleId(2)),
@@ -245,21 +245,21 @@ fn main() {
     ];
     for (name, edit) in ["IL", "DL", "SD", "SU"].into_iter().zip(line_edits) {
         let mut screen = Screen::new(120, 24).unwrap();
-        screen.set_cursor(0, 17).unwrap();
+        screen.set_cursor(0, 17);
         measure(&format!("{name} full / 24/1"), 1, || {
             edit(black_box(&mut screen), black_box(1), StyleId(2));
         });
         for rows in [24, 240, 4096] {
             for wrapped in [false, true] {
                 let mut screen = Screen::new(120, rows).unwrap();
-                screen.set_cursor(rows - 1, 0).unwrap();
+                screen.set_cursor(rows - 1, 0);
                 if wrapped {
                     for _ in 0..rows / 4 {
                         screen.line_feed(StyleId(0));
                     }
                 }
                 screen.set_scroll_region(1..rows - 1).unwrap();
-                screen.set_cursor(rows / 2, 17).unwrap();
+                screen.set_cursor(rows / 2, 17);
                 for count in [1, 8] {
                     measure(
                         &format!("{name} / {rows}/{count}, wrapped={wrapped}"),
@@ -277,7 +277,7 @@ fn main() {
                 || {
                     let mut screen = Screen::new(240, 24).unwrap();
                     for row in 0..24 {
-                        screen.set_cursor(row, 0).unwrap();
+                        screen.set_cursor(row, 0);
                         for _ in 0..240 {
                             screen
                                 .write("e\u{301}", CellWidth::Single, StyleId(1))
@@ -285,13 +285,46 @@ fn main() {
                         }
                     }
                     screen.set_scroll_region(1..23).unwrap();
-                    screen.set_cursor(12, 17).unwrap();
+                    screen.set_cursor(12, 17);
                     screen
                 },
                 |screen| edit(screen, count, StyleId(2)),
             );
         }
     }
+    for origin in [false, true] {
+        let mut screen = Screen::new(120, 24).unwrap();
+        screen.set_scroll_region(3..21).unwrap();
+        screen.set_origin_mode(origin);
+        measure(&format!("address pair / origin={origin}"), 2, || {
+            black_box(&mut screen).set_cursor(black_box(0), black_box(0));
+            black_box(&mut screen).set_cursor(black_box(usize::MAX), black_box(usize::MAX));
+        });
+        for count in [0, 1, usize::MAX] {
+            measure(
+                &format!("origin relative / {origin}, count={count}"),
+                4,
+                || {
+                    black_box(&mut screen).move_cursor_up(black_box(count));
+                    black_box(&mut screen).move_cursor_down(black_box(count));
+                    black_box(&mut screen).move_cursor_left(black_box(count));
+                    black_box(&mut screen).move_cursor_right(black_box(count));
+                },
+            );
+        }
+        screen.set_cursor(if origin { 17 } else { 20 }, 0);
+        measure(&format!("origin ASCII / {origin}, per cell"), 240, || {
+            black_box(&mut screen)
+                .write_ascii(black_box(&[b'x'; 240]), StyleId(1))
+                .unwrap();
+        });
+    }
+    let mut screen = Screen::new(120, 24).unwrap();
+    screen.set_scroll_region(3..21).unwrap();
+    measure("origin mode set/reset / setting", 2, || {
+        black_box(&mut screen).set_origin_mode(black_box(true));
+        black_box(&mut screen).set_origin_mode(black_box(false));
+    });
     for (columns, rows) in [(1, 1), (120, 24), (240, 4096)] {
         for regional in [false, true] {
             if regional && rows == 1 {
@@ -302,7 +335,7 @@ fn main() {
                 if regional {
                     screen.set_scroll_region(rows / 4..rows * 3 / 4).unwrap();
                 }
-                screen.set_cursor(rows / 2, columns - 1).unwrap();
+                screen.set_cursor(rows / 2, columns - 1);
                 screen.write("x", CellWidth::Single, StyleId(1)).unwrap();
                 measure(
                     &format!("relative / {columns}x{rows}, region={regional}, count={count}"),
@@ -328,16 +361,16 @@ fn main() {
             }
             if layout == "sparse" {
                 for column in [columns / 2, columns - 2] {
-                    screen.set_cursor(0, column).unwrap();
+                    screen.set_cursor(0, column);
                     screen.set_tab_stop();
                 }
             } else if layout == "dense" {
                 for column in 0..columns {
-                    screen.set_cursor(0, column).unwrap();
+                    screen.set_cursor(0, column);
                     screen.set_tab_stop();
                 }
             }
-            screen.set_cursor(0, 0).unwrap();
+            screen.set_cursor(0, 0);
             for count in [1, if layout == "dense" { 512 } else { 8 }, usize::MAX] {
                 measure(
                     &format!("tab pair / {columns}, {layout}, count={count}"),
@@ -367,7 +400,7 @@ fn main() {
         }
     }
     let mut screen = Screen::new(120, 24).unwrap();
-    screen.set_cursor(23, 119).unwrap();
+    screen.set_cursor(23, 119);
     screen.set_auto_wrap(false);
     measure("scalar no-wrap at edge", 1, || {
         black_box(&mut screen)

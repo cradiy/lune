@@ -70,7 +70,7 @@ fn apply(screen: &mut Screen, command: &Command<'_>, style: StyleId) -> Result<(
     match command {
         Command::Write(text, width) => return screen.write(text, *width, style),
         Command::Ascii(bytes) => return screen.write_ascii(bytes, style),
-        Command::Cursor(row, column) => return screen.set_cursor(*row, *column),
+        Command::Cursor(row, column) => screen.set_cursor(*row, *column),
         Command::Region(region) => return screen.set_scroll_region(region.clone()),
         Command::Resize(columns, rows) => return screen.resize(*columns, *rows, style),
         Command::CarriageReturn => screen.carriage_return(),
@@ -96,6 +96,7 @@ fn apply(screen: &mut Screen, command: &Command<'_>, style: StyleId) -> Result<(
         Command::ClearTab => screen.clear_tab_stop(),
         Command::ClearTabs => screen.clear_tab_stops(),
         Command::AutoWrap(enabled) => screen.set_auto_wrap(*enabled),
+        Command::OriginMode(enabled) => screen.set_origin_mode(*enabled),
     }
     Ok(())
 }
@@ -103,6 +104,7 @@ fn apply(screen: &mut Screen, command: &Command<'_>, style: StyleId) -> Result<(
 fuzz_target!(|data: &[u8]| {
     let mut screen = Screen::new(8, 4).unwrap();
     let mut model = ScreenModel::new(8, 4);
+    model.check(&screen);
     let long_text = "x".repeat(MAX_CELL_TEXT_BYTES + 1);
     for bytes in data.as_chunks::<8>().0.iter().take(512) {
         let rows = screen.grid().rows();
@@ -120,7 +122,7 @@ fuzz_target!(|data: &[u8]| {
             1 => EraseMode::ToCursor,
             _ => EraseMode::All,
         };
-        let command = match bytes[0] % 29 {
+        let command = match bytes[0] % 30 {
             0 => {
                 let text = match bytes[4] % 10 {
                     8 => &long_text[..MAX_CELL_TEXT_BYTES],
@@ -161,7 +163,8 @@ fuzz_target!(|data: &[u8]| {
             25 => Command::SetTab,
             26 => Command::ClearTab,
             27 => Command::ClearTabs,
-            _ => Command::AutoWrap(bytes[3] & 1 != 0),
+            28 => Command::AutoWrap(bytes[3] & 1 != 0),
+            _ => Command::OriginMode(bytes[3] & 1 != 0),
         };
         match (
             apply(&mut screen, &command, style),

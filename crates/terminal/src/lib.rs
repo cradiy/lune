@@ -46,6 +46,12 @@
 //! output then stays on its physical row and repeated writes replace the last
 //! column. Valid display units that cannot fit the remaining columns are ignored,
 //! while units wider than the entire grid fail. Resizing preserves this mode.
+//! Origin mode starts disabled. [`Screen::set_cursor`] takes zero-based rows
+//! relative to the scrolling region when enabled and the full screen otherwise;
+//! coordinates clamp at the applicable edges. Cursor snapshots stay physical.
+//! Setting origin mode or a valid scrolling region homes the cursor and clears
+//! pending wrapping. Resizing preserves origin mode and keeps the cursor in
+//! bounds; a height change resets the scrolling region to the full screen.
 
 mod cell;
 mod error;

@@ -111,10 +111,10 @@ fn screen_failures_preserve_contents_cursor_and_pending_wrap() {
     fn pending(rows: usize, gap: bool) -> Screen {
         let mut screen = Screen::new(4, rows).unwrap();
         screen.write_ascii(b"top!", StyleId(1)).unwrap();
-        screen.set_cursor(rows - 1, 2).unwrap();
+        screen.set_cursor(rows - 1, 2);
         screen.write("旧", CellWidth::Double, StyleId(2)).unwrap();
         if gap {
-            screen.set_cursor(rows - 1, 3).unwrap();
+            screen.set_cursor(rows - 1, 3);
         }
         screen
     }
@@ -127,14 +127,36 @@ fn screen_failures_preserve_contents_cursor_and_pending_wrap() {
     fn regional(region: std::ops::Range<usize>, gap: bool) -> Screen {
         let mut screen = pending(4, false);
         screen.set_scroll_region(region.clone()).unwrap();
-        screen.set_cursor(region.end - 1, 2).unwrap();
+        screen.set_cursor(region.end - 1, 2);
         screen.write("旧", CellWidth::Double, StyleId(2)).unwrap();
         if gap {
-            screen.set_cursor(region.end - 1, 3).unwrap();
+            screen.set_cursor(region.end - 1, 3);
         }
         screen
     }
-    let cases: [Case; 12] = [
+    let cases: [Case; 14] = [
+        (
+            "origin-mode wrap with owned text",
+            || {
+                let mut screen = regional(1..3, false);
+                screen.set_origin_mode(true);
+                screen.set_cursor(usize::MAX, usize::MAX);
+                screen.write("!", CellWidth::Single, StyleId(2)).unwrap();
+                screen
+            },
+            |screen| screen.write("水\u{301}", CellWidth::Double, StyleId(3)),
+        ),
+        (
+            "origin-mode resize with pending wrap",
+            || {
+                let mut screen = regional(1..3, false);
+                screen.set_origin_mode(true);
+                screen.set_cursor(usize::MAX, usize::MAX);
+                screen.write("!", CellWidth::Single, StyleId(2)).unwrap();
+                screen
+            },
+            |screen| screen.resize(130, 6, StyleId(3)),
+        ),
         (
             "write within row",
             || Screen::new(4, 2).unwrap(),
@@ -144,7 +166,7 @@ fn screen_failures_preserve_contents_cursor_and_pending_wrap() {
             "wrap into next row",
             || {
                 let mut screen = pending(2, false);
-                screen.set_cursor(0, 3).unwrap();
+                screen.set_cursor(0, 3);
                 screen.write("x", CellWidth::Single, StyleId(1)).unwrap();
                 screen
             },
@@ -169,11 +191,11 @@ fn screen_failures_preserve_contents_cursor_and_pending_wrap() {
             "grow recycled text",
             || {
                 let mut screen = pending(2, false);
-                screen.set_cursor(0, 0).unwrap();
+                screen.set_cursor(0, 0);
                 screen
                     .write("e\u{301}", CellWidth::Single, StyleId(1))
                     .unwrap();
-                screen.set_cursor(1, 3).unwrap();
+                screen.set_cursor(1, 3);
                 screen.write("x", CellWidth::Single, StyleId(1)).unwrap();
                 screen
             },
@@ -195,9 +217,9 @@ fn screen_failures_preserve_contents_cursor_and_pending_wrap() {
             || {
                 let mut screen = regional(1..3, false);
                 screen.clear_tab_stops();
-                screen.set_cursor(0, 2).unwrap();
+                screen.set_cursor(0, 2);
                 screen.set_tab_stop();
-                screen.set_cursor(2, 3).unwrap();
+                screen.set_cursor(2, 3);
                 screen.write("!", CellWidth::Single, StyleId(2)).unwrap();
                 screen
             },
@@ -239,6 +261,7 @@ fn screen_failures_preserve_contents_cursor_and_pending_wrap() {
             baseline.scroll_region(),
             tab_stops(&baseline),
             baseline.auto_wrap(),
+            baseline.origin_mode(),
         );
         for point in 0..measured.attempts {
             let mut screen = setup();
@@ -248,6 +271,7 @@ fn screen_failures_preserve_contents_cursor_and_pending_wrap() {
                 screen.scroll_region(),
                 tab_stops(&screen),
                 screen.auto_wrap(),
+                screen.origin_mode(),
             );
             let (result, failed) = allocator::measure(Some(point), || mutate(&mut screen));
             assert!(
@@ -261,7 +285,8 @@ fn screen_failures_preserve_contents_cursor_and_pending_wrap() {
                     screen.cursor(),
                     screen.scroll_region(),
                     tab_stops(&screen),
-                    screen.auto_wrap()
+                    screen.auto_wrap(),
+                    screen.origin_mode()
                 ),
                 before,
                 "{name} at {point}"
@@ -273,7 +298,8 @@ fn screen_failures_preserve_contents_cursor_and_pending_wrap() {
                     screen.cursor(),
                     screen.scroll_region(),
                     tab_stops(&screen),
-                    screen.auto_wrap()
+                    screen.auto_wrap(),
+                    screen.origin_mode()
                 ),
                 expected,
                 "{name} retry at {point}"
@@ -435,7 +461,7 @@ fn warm_writes_edits_scrolling_and_column_growth_make_no_allocation_requests() {
     let (result, stats) = allocator::measure(Some(0), || {
         for _ in 0..64 {
             screen.set_auto_wrap(false);
-            screen.set_cursor(21, 119)?;
+            screen.set_cursor(21, 119);
             screen.write("水\u{301}", CellWidth::Double, StyleId(2))?;
             screen.write_ascii(&[b'x'; 240], StyleId(1))?;
             screen.set_auto_wrap(true);
@@ -448,19 +474,21 @@ fn warm_writes_edits_scrolling_and_column_growth_make_no_allocation_requests() {
             screen.tab_forward(usize::MAX);
             screen.tab_backward(usize::MAX);
             screen.set_scroll_region(2..22)?;
-            screen.set_cursor(21, 119)?;
+            screen.set_origin_mode(true);
+            screen.set_cursor(usize::MAX, usize::MAX);
             screen.write_ascii(&[b'x'; 240], StyleId(1))?;
             screen.backspace();
             screen.write("水", CellWidth::Double, StyleId(2))?;
             screen.carriage_return();
             screen.line_feed(StyleId(0));
-            screen.set_cursor(2, 0)?;
+            screen.set_cursor(0, 0);
             screen.reverse_index(StyleId(0));
             screen.set_scroll_region(0..24)?;
-            screen.set_cursor(23, 0)?;
+            screen.set_cursor(23, 0);
             screen.write_ascii(&[b'x'; 240], StyleId(1))?;
             screen.resize(240, 24, StyleId(0))?;
             screen.resize(120, 24, StyleId(0))?;
+            screen.set_origin_mode(false);
         }
         Ok::<_, StorageError>(())
     });
@@ -473,14 +501,14 @@ fn warm_writes_edits_scrolling_and_column_growth_make_no_allocation_requests() {
         let mut screen = Screen::new(8, 4).unwrap();
         for row in 0..4 {
             for column in [0, 2, 4, 6] {
-                screen.set_cursor(row, column).unwrap();
+                screen.set_cursor(row, column);
                 screen
                     .write("水\u{301}", CellWidth::Double, StyleId(1))
                     .unwrap();
             }
         }
         screen.set_scroll_region(1..3).unwrap();
-        screen.set_cursor(2, 3).unwrap();
+        screen.set_cursor(2, 3);
         screen
     };
     let mut screens: Vec<_> = [false, true]
@@ -501,11 +529,11 @@ fn warm_writes_edits_scrolling_and_column_growth_make_no_allocation_requests() {
     let scrolls = [Screen::scroll_up, Screen::scroll_down];
     let mut scroll_screens = [prepare(), prepare()];
     for screen in &mut scroll_screens {
-        screen.set_cursor(0, 7).unwrap();
+        screen.set_cursor(0, 7);
         screen.write("!", CellWidth::Single, StyleId(1)).unwrap();
     }
     for screen in &mut line_screens {
-        screen.set_cursor(1, 7).unwrap();
+        screen.set_cursor(1, 7);
         screen.write("!", CellWidth::Single, StyleId(1)).unwrap();
     }
     let mut moving = prepare();
@@ -518,7 +546,7 @@ fn warm_writes_edits_scrolling_and_column_growth_make_no_allocation_requests() {
     let ((), stats) = allocator::measure(Some(0), || {
         for move_cursor in moves {
             for row in 0..4 {
-                moving.set_cursor(row, 7).unwrap();
+                moving.set_cursor(row, 7);
                 moving.write("!", CellWidth::Single, StyleId(1)).unwrap();
                 for count in [0, 1, usize::MAX] {
                     move_cursor(&mut moving, count);

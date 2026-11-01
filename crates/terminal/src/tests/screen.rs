@@ -2,6 +2,166 @@ use super::{assert_invariants, snapshot};
 use crate::{CellText, CellWidth, Cursor, EraseMode, Screen, StorageError, StyleId};
 
 #[test]
+fn origin_addressing_clamps_and_homes_without_changing_storage_or_modes() {
+    for columns in [1, 4] {
+        for rows in 1..=5 {
+            for region in (0..rows).flat_map(|start| (start + 1..=rows).map(move |end| start..end))
+            {
+                for enabled in [false, true] {
+                    let mut screen = Screen::new(columns, rows).unwrap();
+                    screen
+                        .write("e\u{301}", CellWidth::Single, StyleId(1))
+                        .unwrap();
+                    if columns > 1 {
+                        screen.set_cursor(rows - 1, columns - 2);
+                        screen.write("水", CellWidth::Double, StyleId(2)).unwrap();
+                    }
+                    screen.clear_tab_stops();
+                    screen.set_tab_stop();
+                    let tabs: Vec<_> = (0..columns)
+                        .map(|column| screen.is_tab_stop(column))
+                        .collect();
+                    let before = snapshot(screen.grid());
+                    screen.set_scroll_region(region.clone()).unwrap();
+                    screen.set_origin_mode(enabled);
+                    let top = if enabled { region.start } else { 0 };
+                    let bottom = if enabled { region.end - 1 } else { rows - 1 };
+                    for row in [0, 1, bottom - top, rows, usize::MAX] {
+                        for column in [0, columns - 1, columns, usize::MAX] {
+                            screen.set_cursor(row, column);
+                            assert_eq!(
+                                screen.cursor(),
+                                Cursor {
+                                    row: top + row.min(bottom - top),
+                                    column: column.min(columns - 1),
+                                    wrap_pending: false,
+                                }
+                            );
+                        }
+                    }
+                    assert_eq!(snapshot(screen.grid()), before);
+                    screen.write("!", CellWidth::Single, StyleId(3)).unwrap();
+                    assert!(screen.cursor().wrap_pending);
+                    let written = snapshot(screen.grid());
+                    screen.set_origin_mode(enabled);
+                    assert_eq!(
+                        screen.cursor(),
+                        Cursor {
+                            row: top,
+                            ..Cursor::default()
+                        }
+                    );
+                    assert_eq!(snapshot(screen.grid()), written);
+                    screen.set_cursor(usize::MAX, usize::MAX);
+                    screen.write("!", CellWidth::Single, StyleId(3)).unwrap();
+                    screen.set_scroll_region(region.clone()).unwrap();
+                    assert_eq!(
+                        screen.cursor(),
+                        Cursor {
+                            row: top,
+                            ..Cursor::default()
+                        }
+                    );
+                    screen.set_auto_wrap(false);
+                    screen.set_origin_mode(!enabled);
+                    assert_eq!(
+                        screen.cursor(),
+                        Cursor {
+                            row: if enabled { 0 } else { region.start },
+                            ..Cursor::default()
+                        }
+                    );
+                    assert!(!screen.auto_wrap());
+                    assert_eq!(screen.scroll_region(), region);
+                    assert_eq!(
+                        (0..columns)
+                            .map(|column| screen.is_tab_stop(column))
+                            .collect::<Vec<_>>(),
+                        tabs
+                    );
+                    assert_invariants(screen.grid());
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn origin_writes_movement_and_resize_preserve_region_bounds_and_error_state() {
+    let mut screen = Screen::new(4, 5).unwrap();
+    for row in 0..5 {
+        screen.set_cursor(row, 0);
+        screen
+            .write_ascii(&[b'a' + row as u8; 4], StyleId(row as u32))
+            .unwrap();
+    }
+    let populated = snapshot(screen.grid());
+    screen.set_scroll_region(1..4).unwrap();
+    screen.set_origin_mode(true);
+    for _ in 0..8 {
+        screen.set_cursor(usize::MAX, usize::MAX);
+        screen
+            .write("水\u{301}", CellWidth::Double, StyleId(9))
+            .unwrap();
+        screen.write_ascii(b"abcdefghi", StyleId(8)).unwrap();
+        screen.move_cursor_up(usize::MAX);
+        assert_eq!(screen.cursor().row, 1);
+        screen.reverse_index(StyleId(7));
+        screen.move_cursor_down(usize::MAX);
+        assert_eq!(screen.cursor().row, 3);
+        screen.line_feed(StyleId(7));
+    }
+    let scrolled = snapshot(screen.grid());
+    for row in [0, 4] {
+        assert_eq!(scrolled.rows[row], populated.rows[row]);
+    }
+    screen.set_cursor(usize::MAX, usize::MAX);
+    screen.write("!", CellWidth::Single, StyleId(3)).unwrap();
+    let cursor = screen.cursor();
+    screen.resize(4, 5, StyleId(0)).unwrap();
+    assert_eq!(screen.cursor(), cursor);
+    let before = snapshot(screen.grid());
+    for region in [0..0, 0..6, 0..usize::MAX] {
+        assert!(screen.set_scroll_region(region).is_err());
+        assert_eq!(screen.cursor(), cursor);
+        assert_eq!(screen.scroll_region(), 1..4);
+    }
+    assert!(screen.resize(0, 5, StyleId(0)).is_err());
+    assert_eq!(screen.cursor(), cursor);
+    assert_eq!(snapshot(screen.grid()), before);
+    screen.resize(6, 5, StyleId(0)).unwrap();
+    assert_eq!(screen.scroll_region(), 1..4);
+    assert_eq!(
+        screen.cursor(),
+        Cursor {
+            row: 3,
+            column: 3,
+            wrap_pending: false
+        }
+    );
+    screen.set_cursor(usize::MAX, usize::MAX);
+    screen.write("!", CellWidth::Single, StyleId(3)).unwrap();
+    screen.resize(6, 2, StyleId(0)).unwrap();
+    assert_eq!(screen.scroll_region(), 0..2);
+    assert_eq!(
+        screen.cursor(),
+        Cursor {
+            row: 1,
+            column: 5,
+            wrap_pending: false
+        }
+    );
+    assert!(screen.origin_mode());
+    screen.set_scroll_region(1..2).unwrap();
+    screen.set_cursor(usize::MAX, usize::MAX);
+    screen.move_cursor_up(usize::MAX);
+    screen.reverse_index(StyleId(0));
+    screen.write_ascii(b"single row wraps", StyleId(1)).unwrap();
+    assert_eq!(screen.cursor().row, 1);
+    assert_invariants(screen.grid());
+}
+
+#[test]
 fn ascii_batches_match_unit_writes_across_wraps_and_scrolls() {
     let input = b"abcdefghijklmnopqrstuvwxyz0123456789";
     for columns in 1..=12 {
@@ -19,11 +179,11 @@ fn ascii_batches_match_unit_writes_across_wraps_and_scrolls() {
                                 .write("e\u{301}", CellWidth::Single, StyleId(1))
                                 .unwrap();
                             if columns > 1 {
-                                screen.set_cursor(rows - 1, columns - 2).unwrap();
+                                screen.set_cursor(rows - 1, columns - 2);
                                 screen.write("界", CellWidth::Double, StyleId(2)).unwrap();
                             }
                             screen.set_scroll_region(region.clone()).unwrap();
-                            screen.set_cursor(row, column.min(columns - 1)).unwrap();
+                            screen.set_cursor(row, column.min(columns - 1));
                             if column == columns {
                                 screen.write("!", CellWidth::Single, StyleId(3)).unwrap();
                             }
@@ -66,7 +226,7 @@ fn wide_units_wrap_whole_and_repair_the_old_edge() {
         for at_bottom in [false, true] {
             let mut screen = Screen::new(4, rows).unwrap();
             let row = if at_bottom { rows - 1 } else { 0 };
-            screen.set_cursor(row, 2).unwrap();
+            screen.set_cursor(row, 2);
             screen.write("旧", CellWidth::Double, StyleId(1)).unwrap();
             screen
                 .write("水\u{301}", CellWidth::Double, StyleId(2))
@@ -92,9 +252,9 @@ fn wide_units_wrap_whole_and_repair_the_old_edge() {
                 }
             );
 
-            screen.set_cursor(target, 2).unwrap();
+            screen.set_cursor(target, 2);
             screen.write("旧", CellWidth::Double, StyleId(1)).unwrap();
-            screen.set_cursor(target, 3).unwrap();
+            screen.set_cursor(target, 3);
             screen.write("新", CellWidth::Double, StyleId(3)).unwrap();
             if rows > 1 {
                 let previous = if target == rows - 1 {
@@ -169,13 +329,8 @@ fn controls_and_resize_cancel_wrapping_without_losing_cursor_bounds() {
     screen.carriage_return();
     screen.backspace();
     screen.write_ascii(b"end", StyleId(6)).unwrap();
-    let position = screen.cursor();
     screen.set_scroll_region(0..1).unwrap();
-    assert_eq!(
-        (screen.cursor().row, screen.cursor().column),
-        (position.row, position.column)
-    );
-    assert!(!screen.cursor().wrap_pending);
+    assert_eq!(screen.cursor(), Cursor::default());
     screen.write("Z", CellWidth::Single, StyleId(6)).unwrap();
     let cursor = screen.cursor();
     let before = snapshot(screen.grid());
@@ -191,7 +346,6 @@ fn controls_and_resize_cancel_wrapping_without_losing_cursor_bounds() {
             Err(StorageError::OutOfBounds)
         ));
     }
-    assert!(screen.set_cursor(usize::MAX, 0).is_err());
     assert!(screen.resize(0, 1, StyleId(7)).is_err());
     assert!(screen.write("", CellWidth::Single, StyleId(7)).is_err());
     assert_eq!(screen.cursor(), cursor);
@@ -226,22 +380,22 @@ fn regional_indices_preserve_outside_rows_and_recycle_owned_buffers() {
                 for cursor_row in 0..rows {
                     for up in [true, false] {
                         let mut screen = Screen::new(4, rows).unwrap();
-                        screen.set_cursor(rows - 1, 0).unwrap();
+                        screen.set_cursor(rows - 1, 0);
                         for _ in 0..offset {
                             screen.line_feed(StyleId(0));
                         }
                         for row in 0..rows {
-                            screen.set_cursor(row, 0).unwrap();
+                            screen.set_cursor(row, 0);
                             screen
                                 .write_ascii(&[b'a' + row as u8; 4], StyleId(row as u32))
                                 .unwrap();
-                            screen.set_cursor(row, 1).unwrap();
+                            screen.set_cursor(row, 1);
                             screen
                                 .write("水\u{301}", CellWidth::Double, StyleId(row as u32))
                                 .unwrap();
                         }
                         screen.set_scroll_region(region.clone()).unwrap();
-                        screen.set_cursor(cursor_row, 3).unwrap();
+                        screen.set_cursor(cursor_row, 3);
                         screen.write("!", CellWidth::Single, StyleId(8)).unwrap();
                         let before = snapshot(screen.grid());
                         let buffers: Vec<_> = screen
@@ -323,13 +477,13 @@ fn regional_indices_preserve_outside_rows_and_recycle_owned_buffers() {
 #[test]
 fn regional_wide_wraps_preserve_units_and_handle_the_physical_bottom() {
     let mut screen = Screen::new(2, 4).unwrap();
-    screen.set_cursor(3, 0).unwrap();
+    screen.set_cursor(3, 0);
     screen.line_feed(StyleId(0));
     screen.line_feed(StyleId(0));
-    screen.set_cursor(0, 0).unwrap();
+    screen.set_cursor(0, 0);
     screen.write_ascii(b"abcdefgh", StyleId(1)).unwrap();
     screen.set_scroll_region(1..3).unwrap();
-    screen.set_cursor(2, 1).unwrap();
+    screen.set_cursor(2, 1);
     let before = snapshot(screen.grid());
     let outside = [0, 3].map(|row| screen.grid().row(row).unwrap().cells().as_ptr());
     screen
@@ -365,7 +519,7 @@ fn regional_wide_wraps_preserve_units_and_handle_the_physical_bottom() {
         assert_eq!(before.rows[row], after.rows[row]);
         assert_eq!(screen.grid().row(row).unwrap().cells().as_ptr(), buffer);
     }
-    screen.set_cursor(3, 1).unwrap();
+    screen.set_cursor(3, 1);
     let before = snapshot(screen.grid());
     screen.write("外", CellWidth::Double, StyleId(4)).unwrap();
     assert_eq!(
@@ -382,7 +536,7 @@ fn regional_wide_wraps_preserve_units_and_handle_the_physical_bottom() {
     );
     assert_eq!(snapshot(screen.grid()).rows[..3], before.rows[..3]);
     screen.set_scroll_region(1..2).unwrap();
-    screen.set_cursor(1, 1).unwrap();
+    screen.set_cursor(1, 1);
     screen.write("月", CellWidth::Double, StyleId(5)).unwrap();
     assert_eq!(
         screen.grid().row(1).unwrap().text(0),
@@ -411,7 +565,7 @@ fn erasure_clears_intersecting_units_and_preserves_screen_state_and_buffers() {
                             {
                                 for display in [false, true] {
                                     let mut screen = Screen::new(columns, rows).unwrap();
-                                    screen.set_cursor(rows - 1, 0).unwrap();
+                                    screen.set_cursor(rows - 1, 0);
                                     for _ in 0..offset {
                                         screen.line_feed(StyleId(0));
                                     }
@@ -430,7 +584,7 @@ fn erasure_clears_intersecting_units_and_preserves_screen_state_and_buffers() {
                                             if (row + column + phase) % 2 == 0 {
                                                 text.push('\u{301}');
                                             }
-                                            screen.set_cursor(row, column).unwrap();
+                                            screen.set_cursor(row, column);
                                             screen
                                                 .write(
                                                     &text,
@@ -443,9 +597,7 @@ fn erasure_clears_intersecting_units_and_preserves_screen_state_and_buffers() {
                                     }
                                     let region = if rows > 2 { 1..rows - 1 } else { 0..rows };
                                     screen.set_scroll_region(region.clone()).unwrap();
-                                    screen
-                                        .set_cursor(cursor_row, cursor_column.min(columns - 1))
-                                        .unwrap();
+                                    screen.set_cursor(cursor_row, cursor_column.min(columns - 1));
                                     if cursor_column == columns {
                                         screen.write("!", CellWidth::Single, StyleId(42)).unwrap();
                                     }
@@ -571,12 +723,12 @@ fn cursor_cell_edits_preserve_units_buffers_and_zero_count_state() {
                         for requested in (0..=columns + 1).chain([usize::MAX]) {
                             for (kind, edit) in edits.iter().enumerate() {
                                 let mut screen = Screen::new(columns, 4).unwrap();
-                                screen.set_cursor(3, 0).unwrap();
+                                screen.set_cursor(3, 0);
                                 for _ in 0..offset {
                                     screen.line_feed(StyleId(0));
                                 }
                                 for target in 0..4 {
-                                    screen.set_cursor(target, 0).unwrap();
+                                    screen.set_cursor(target, 0);
                                     screen
                                         .write_ascii(
                                             &vec![b'A' + target as u8; columns],
@@ -596,14 +748,14 @@ fn cursor_cell_edits_preserve_units_buffers_and_zero_count_state() {
                                     if source % 2 == 1 {
                                         text.push('\u{301}');
                                     }
-                                    screen.set_cursor(row, source).unwrap();
+                                    screen.set_cursor(row, source);
                                     screen
                                         .write(&text, width, StyleId(source as u32 + 1))
                                         .unwrap();
                                     source += width.columns();
                                 }
                                 screen.set_scroll_region(1..3).unwrap();
-                                screen.set_cursor(row, column.min(columns - 1)).unwrap();
+                                screen.set_cursor(row, column.min(columns - 1));
                                 if column == columns {
                                     screen.write("!", CellWidth::Single, StyleId(42)).unwrap();
                                 }
@@ -716,22 +868,22 @@ fn line_edits_and_scrolls_preserve_state_and_recycle_rows_within_their_extent() 
                     for requested in (0..=rows + 1).chain([usize::MAX]) {
                         for (edit, cursor_relative, insert) in operations {
                             let mut screen = Screen::new(4, rows).unwrap();
-                            screen.set_cursor(rows - 1, 0).unwrap();
+                            screen.set_cursor(rows - 1, 0);
                             for _ in 0..offset {
                                 screen.line_feed(StyleId(0));
                             }
                             for row in 0..rows {
-                                screen.set_cursor(row, 0).unwrap();
+                                screen.set_cursor(row, 0);
                                 screen
                                     .write_ascii(&[b'a' + row as u8; 4], StyleId(row as u32))
                                     .unwrap();
-                                screen.set_cursor(row, 1).unwrap();
+                                screen.set_cursor(row, 1);
                                 screen
                                     .write("水\u{301}", CellWidth::Double, StyleId(row as u32))
                                     .unwrap();
                             }
                             screen.set_scroll_region(region.clone()).unwrap();
-                            screen.set_cursor(cursor_row, 3).unwrap();
+                            screen.set_cursor(cursor_row, 3);
                             screen.write("!", CellWidth::Single, StyleId(8)).unwrap();
                             let cursor = screen.cursor();
                             let before = snapshot(screen.grid());
@@ -886,16 +1038,16 @@ fn relative_moves_stop_at_directional_boundaries_and_preserve_owned_contents() {
     ] {
         let mut screen = Screen::new(5, rows).unwrap();
         for row in 0..rows {
-            screen.set_cursor(row, 0).unwrap();
+            screen.set_cursor(row, 0);
             screen.write_ascii(b"abcde", StyleId(row as u32)).unwrap();
-            screen.set_cursor(row, 1).unwrap();
+            screen.set_cursor(row, 1);
             screen
                 .write("水\u{301}", CellWidth::Double, StyleId(8))
                 .unwrap();
         }
         screen.set_scroll_region(region.clone()).unwrap();
         for (move_cursor, (row, column)) in moves.into_iter().zip(destinations) {
-            screen.set_cursor(start.0, start.1).unwrap();
+            screen.set_cursor(start.0, start.1);
             if pending {
                 screen.write("!", CellWidth::Single, StyleId(9)).unwrap();
             }
@@ -954,11 +1106,11 @@ fn relative_moves_stop_at_directional_boundaries_and_preserve_owned_contents() {
 fn tabs_cross_word_boundaries_preserve_contents_and_follow_width_changes() {
     let mut screen = Screen::new(130, 2).unwrap();
     screen.set_scroll_region(1..2).unwrap();
-    screen.set_cursor(0, 64).unwrap();
+    screen.set_cursor(0, 64);
     screen
         .write("水\u{301}", CellWidth::Double, StyleId(1))
         .unwrap();
-    screen.set_cursor(0, 129).unwrap();
+    screen.set_cursor(0, 129);
     screen.write("!", CellWidth::Single, StyleId(2)).unwrap();
     let pending = screen.cursor();
     let contents = snapshot(screen.grid());
@@ -978,7 +1130,7 @@ fn tabs_cross_word_boundaries_preserve_contents_and_follow_width_changes() {
     assert_eq!(screen.cursor().column, 129);
     assert!(!screen.cursor().wrap_pending);
     for column in [0, 1, 63, 64, 65, 127, 129] {
-        screen.set_cursor(0, column).unwrap();
+        screen.set_cursor(0, column);
         screen.set_tab_stop();
     }
     for (backward, start, count, end) in [
@@ -999,7 +1151,7 @@ fn tabs_cross_word_boundaries_preserve_contents_and_follow_width_changes() {
         (true, 129, usize::MAX, 0),
         (true, 0, 1, 0),
     ] {
-        screen.set_cursor(0, start).unwrap();
+        screen.set_cursor(0, start);
         if backward {
             screen.tab_backward(count);
         } else {
@@ -1016,7 +1168,7 @@ fn tabs_cross_word_boundaries_preserve_contents_and_follow_width_changes() {
         assert_eq!(screen.scroll_region(), 1..2);
         assert_eq!(snapshot(screen.grid()), contents);
     }
-    screen.set_cursor(0, 129).unwrap();
+    screen.set_cursor(0, 129);
     screen.write("!", CellWidth::Single, StyleId(2)).unwrap();
     screen.tab_backward(1);
     assert_eq!(
@@ -1029,7 +1181,7 @@ fn tabs_cross_word_boundaries_preserve_contents_and_follow_width_changes() {
     );
     screen.clear_tab_stops();
     for column in [3, 63, 64, 65, 127, 129] {
-        screen.set_cursor(0, column).unwrap();
+        screen.set_cursor(0, column);
         screen.set_tab_stop();
     }
     screen.resize(65, 2, StyleId(3)).unwrap();
@@ -1038,7 +1190,7 @@ fn tabs_cross_word_boundaries_preserve_contents_and_follow_width_changes() {
         let expected = [3, 63, 64].contains(&column) || (column >= 65 && column.is_multiple_of(8));
         assert_eq!(screen.is_tab_stop(column), Some(expected));
     }
-    screen.set_cursor(0, 64).unwrap();
+    screen.set_cursor(0, 64);
     screen.clear_tab_stop();
     screen.resize(130, 3, StyleId(3)).unwrap();
     assert_eq!(screen.is_tab_stop(64), Some(false));
@@ -1058,9 +1210,9 @@ fn tabs_cross_word_boundaries_preserve_contents_and_follow_width_changes() {
     wide.tab_backward(8191);
     assert_eq!(wide.cursor().column, 8);
     wide.clear_tab_stops();
-    wide.set_cursor(0, crate::MAX_DIMENSION - 2).unwrap();
+    wide.set_cursor(0, crate::MAX_DIMENSION - 2);
     wide.set_tab_stop();
-    wide.set_cursor(0, 0).unwrap();
+    wide.set_cursor(0, 0);
     wide.tab_forward(1);
     assert_eq!(wide.cursor().column, crate::MAX_DIMENSION - 2);
 }
@@ -1073,7 +1225,7 @@ fn automatic_wrap_modes_preserve_wide_units_and_reject_invalid_ignored_writes() 
             for row in 0..rows {
                 let mut screen = Screen::new(columns, rows).unwrap();
                 screen.set_scroll_region(0..1).unwrap();
-                screen.set_cursor(row, columns.saturating_sub(2)).unwrap();
+                screen.set_cursor(row, columns.saturating_sub(2));
                 if columns > 1 {
                     screen
                         .write("水\u{301}", CellWidth::Double, StyleId(1))
