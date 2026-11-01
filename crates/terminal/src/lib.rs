@@ -24,6 +24,9 @@
 //! [`EraseMode`] selects cursor-inclusive line or display erasure. Erasure
 //! preserves cursor coordinates and region boundaries, cancels pending wrapping,
 //! and fills complete affected display units with styled spaces without allocating.
+//! Cursor-relative cell insertion, deletion, and counted erasure operate in
+//! physical columns. They clamp counts at the right edge, preserve coordinates
+//! and scrolling boundaries, and cancel pending wrapping for positive counts.
 
 mod cell;
 mod error;

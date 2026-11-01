@@ -148,6 +148,58 @@ impl Screen {
         Ok(())
     }
 
+    /// Inserts `count` blank columns at the cursor, shifting the suffix right
+    /// and discarding overflow. Counts are clamped to the remaining columns;
+    /// zero preserves all state. Split wide units are cleared with `style`.
+    /// Cursor coordinates and region boundaries are preserved. Positive counts
+    /// cancel pending wrapping. Retained units keep their text and style.
+    /// This does not allocate.
+    pub fn insert_cells(&mut self, count: usize, style: StyleId) {
+        if count == 0 {
+            return;
+        }
+        self.grid
+            .insert_cells(self.cursor.row, self.cursor.column, count, style)
+            .expect("The cursor position is in bounds");
+        self.cursor.wrap_pending = false;
+    }
+
+    /// Deletes `count` columns at the cursor, shifting the suffix left and
+    /// filling the right edge with blanks using `style`. Intersecting wide
+    /// units are cleared completely. Count, cursor, region, and allocation
+    /// rules follow [`Self::insert_cells`].
+    pub fn delete_cells(&mut self, count: usize, style: StyleId) {
+        if count == 0 {
+            return;
+        }
+        self.grid
+            .delete_cells(self.cursor.row, self.cursor.column, count, style)
+            .expect("The cursor position is in bounds");
+        self.cursor.wrap_pending = false;
+    }
+
+    /// Erases `count` columns starting at the cursor, including complete wide
+    /// units intersecting either boundary, using `style` for all cleared cells.
+    /// Count, cursor, region, and allocation rules follow [`Self::insert_cells`].
+    pub fn erase_cells(&mut self, count: usize, style: StyleId) {
+        if count == 0 {
+            return;
+        }
+        let remaining = self.grid.columns() - self.cursor.column;
+        if count >= remaining {
+            self.erase_line(EraseMode::FromCursor, style);
+        } else {
+            self.grid
+                .clear_row(
+                    self.cursor.row,
+                    self.cursor.column..self.cursor.column + count,
+                    style,
+                )
+                .expect("The cursor row and erasure range are in bounds");
+            self.cursor.wrap_pending = false;
+        }
+    }
+
     /// Erases part or all of the physical cursor row using `style`. Cursor
     /// coordinates and scrolling boundaries are preserved; pending wrapping is
     /// canceled. Cell and text-index buffers retain capacity. This does not allocate.

@@ -172,4 +172,60 @@ fn main() {
             },
         );
     }
+
+    for columns in [80, 240, 4096] {
+        for count in [1, 16] {
+            for extended in [false, true] {
+                let mut screen = Screen::new(columns, 1).unwrap();
+                for _ in 0..columns - count {
+                    screen
+                        .write(
+                            if extended { "e\u{301}" } else { "x" },
+                            CellWidth::Single,
+                            StyleId(1),
+                        )
+                        .unwrap();
+                }
+                screen.set_cursor(0, columns / 4).unwrap();
+                let kind = if extended { "extended" } else { "ASCII" };
+                // The blank suffix absorbs insertion overflow; deletion restores
+                // the original density, so each sample moves the same amount of text.
+                measure(
+                    &format!("screen {kind} edit / {columns}/{count}"),
+                    2,
+                    || {
+                        let screen = black_box(&mut screen);
+                        screen.insert_cells(black_box(count), StyleId(2));
+                        screen.delete_cells(black_box(count), StyleId(2));
+                    },
+                );
+            }
+            let mut screen = Screen::new(columns, 1).unwrap();
+            screen.set_cursor(0, columns / 4).unwrap();
+            measure(&format!("screen ECH / {columns}/{count}"), 1, || {
+                black_box(&mut screen).erase_cells(black_box(count), StyleId(2));
+            });
+        }
+    }
+    let edits: [fn(&mut Screen, usize, StyleId); 3] = [
+        Screen::insert_cells,
+        Screen::delete_cells,
+        Screen::erase_cells,
+    ];
+    for (name, edit) in ["ICH", "DCH", "ECH"].into_iter().zip(edits) {
+        measure_prepared(
+            &format!("{name} populated extended / 240/16"),
+            || {
+                let mut screen = Screen::new(240, 1).unwrap();
+                for _ in 0..240 {
+                    screen
+                        .write("e\u{301}", CellWidth::Single, StyleId(1))
+                        .unwrap();
+                }
+                screen.set_cursor(0, 60).unwrap();
+                screen
+            },
+            |screen| edit(screen, 16, StyleId(2)),
+        );
+    }
 }

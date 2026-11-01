@@ -552,3 +552,143 @@ fn erasure_clears_intersecting_units_and_preserves_screen_state_and_buffers() {
         }
     }
 }
+
+#[test]
+fn cursor_cell_edits_preserve_units_buffers_and_zero_count_state() {
+    let edits: [fn(&mut Screen, usize, StyleId); 3] = [
+        Screen::insert_cells,
+        Screen::delete_cells,
+        Screen::erase_cells,
+    ];
+    for columns in 1..=9 {
+        for offset in [0, 2] {
+            for phase in 0..2 {
+                for row in 0..4 {
+                    for column in 0..=columns {
+                        for requested in (0..=columns + 1).chain([usize::MAX]) {
+                            for (kind, edit) in edits.iter().enumerate() {
+                                let mut screen = Screen::new(columns, 4).unwrap();
+                                screen.set_cursor(3, 0).unwrap();
+                                for _ in 0..offset {
+                                    screen.line_feed(StyleId(0));
+                                }
+                                for target in 0..4 {
+                                    screen.set_cursor(target, 0).unwrap();
+                                    screen
+                                        .write_ascii(
+                                            &vec![b'A' + target as u8; columns],
+                                            StyleId(100 + target as u32),
+                                        )
+                                        .unwrap();
+                                }
+                                let mut source = 0;
+                                while source < columns {
+                                    let width = if (source + phase) % 3 == 1 && source + 1 < columns
+                                    {
+                                        CellWidth::Double
+                                    } else {
+                                        CellWidth::Single
+                                    };
+                                    let mut text = char::from(b'a' + source as u8).to_string();
+                                    if source % 2 == 1 {
+                                        text.push('\u{301}');
+                                    }
+                                    screen.set_cursor(row, source).unwrap();
+                                    screen
+                                        .write(&text, width, StyleId(source as u32 + 1))
+                                        .unwrap();
+                                    source += width.columns();
+                                }
+                                screen.set_scroll_region(1..3).unwrap();
+                                screen.set_cursor(row, column.min(columns - 1)).unwrap();
+                                if column == columns {
+                                    screen.write("!", CellWidth::Single, StyleId(42)).unwrap();
+                                }
+                                let cursor = screen.cursor();
+                                let before = snapshot(screen.grid());
+                                let buffers: Vec<_> = screen
+                                    .grid()
+                                    .iter_rows()
+                                    .map(|row| row.cells().as_ptr())
+                                    .collect();
+                                let text_buffers: Vec<_> = (0..columns)
+                                    .map(|column| {
+                                        match screen.grid().row(row).unwrap().text(column) {
+                                            Some(CellText::Extended(text)) => Some(text.as_ptr()),
+                                            _ => None,
+                                        }
+                                    })
+                                    .collect();
+                                let style = StyleId(u32::MAX);
+                                let count = requested.min(columns - cursor.column);
+                                let mut expected = before.rows.clone();
+                                for cell in &mut expected[row] {
+                                    cell.text = " ".into();
+                                    cell.width = 1;
+                                    cell.style = style;
+                                }
+                                let mut retained = Vec::new();
+                                for (source, cell) in before.rows[row]
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(_, cell)| cell.width > 0)
+                                {
+                                    let end = source + cell.width;
+                                    let target = if count == 0 || end <= cursor.column {
+                                        Some(source)
+                                    } else {
+                                        match kind {
+                                            0 if source >= cursor.column
+                                                && end <= columns - count =>
+                                            {
+                                                Some(source + count)
+                                            }
+                                            1 if source >= cursor.column + count => {
+                                                Some(source - count)
+                                            }
+                                            2 if source >= cursor.column + count => Some(source),
+                                            _ => None,
+                                        }
+                                    };
+                                    if let Some(target) = target {
+                                        expected[row][target..target + cell.width]
+                                            .clone_from_slice(&before.rows[row][source..end]);
+                                        if let Some(buffer) = text_buffers[source] {
+                                            retained.push((target, buffer));
+                                        }
+                                    }
+                                }
+                                edit(&mut screen, requested, style);
+                                assert_eq!(
+                                    snapshot(screen.grid()).rows,
+                                    expected,
+                                    "columns={columns}, cursor={cursor:?}, count={requested}, kind={kind}"
+                                );
+                                assert_eq!(
+                                    screen.cursor(),
+                                    Cursor {
+                                        wrap_pending: requested == 0 && cursor.wrap_pending,
+                                        ..cursor
+                                    }
+                                );
+                                assert_eq!(screen.scroll_region(), 1..3);
+                                for (actual, buffer) in screen.grid().iter_rows().zip(buffers) {
+                                    assert_eq!(actual.cells().as_ptr(), buffer);
+                                }
+                                for (column, buffer) in retained {
+                                    let Some(CellText::Extended(text)) =
+                                        screen.grid().row(row).unwrap().text(column)
+                                    else {
+                                        panic!("Retained text is present");
+                                    };
+                                    assert_eq!(text.as_ptr(), buffer);
+                                }
+                                assert_invariants(screen.grid());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
