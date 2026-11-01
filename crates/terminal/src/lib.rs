@@ -36,12 +36,19 @@
 //! Explicit upward and downward scrolling affects the entire active region,
 //! preserves cursor coordinates and pending wrapping even outside the region,
 //! and recycles row buffers without allocating.
+//! Horizontal tab stops use one bit per column and default to columns 0, 8, 16,
+//! and so on. Stops can be set or cleared at the cursor, or cleared together.
+//! Forward and backward tabulation preserve contents and clamp at screen edges;
+//! positive counts cancel pending wrapping and zero preserves all state.
+//! Width changes retain overlapping stops, discard cropped stops, and initialize
+//! added columns with defaults. Resizing preserves stops on error.
 
 mod cell;
 mod error;
 mod grid;
 mod row;
 mod screen;
+mod tabs;
 
 #[cfg(test)]
 mod tests;

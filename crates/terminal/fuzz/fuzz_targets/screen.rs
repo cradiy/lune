@@ -54,6 +54,18 @@ fn dimension(byte: u8) -> usize {
     }
 }
 
+fn column_dimension(byte: u8) -> usize {
+    match byte {
+        249 => 63,
+        250 => 64,
+        251 => 65,
+        252 => 127,
+        253 => 128,
+        254 => 129,
+        _ => dimension(byte),
+    }
+}
+
 fn apply(screen: &mut Screen, command: &Command<'_>, style: StyleId) -> Result<(), StorageError> {
     match command {
         Command::Write(text, width) => return screen.write(text, *width, style),
@@ -78,6 +90,11 @@ fn apply(screen: &mut Screen, command: &Command<'_>, style: StyleId) -> Result<(
         Command::MoveRight(count) => screen.move_cursor_right(*count),
         Command::ScrollUp(count) => screen.scroll_up(*count, style),
         Command::ScrollDown(count) => screen.scroll_down(*count, style),
+        Command::TabForward(count) => screen.tab_forward(*count),
+        Command::TabBackward(count) => screen.tab_backward(*count),
+        Command::SetTab => screen.set_tab_stop(),
+        Command::ClearTab => screen.clear_tab_stop(),
+        Command::ClearTabs => screen.clear_tab_stops(),
     }
     Ok(())
 }
@@ -102,7 +119,7 @@ fuzz_target!(|data: &[u8]| {
             1 => EraseMode::ToCursor,
             _ => EraseMode::All,
         };
-        let command = match bytes[0] % 23 {
+        let command = match bytes[0] % 28 {
             0 => {
                 let text = match bytes[4] % 10 {
                     8 => &long_text[..MAX_CELL_TEXT_BYTES],
@@ -119,7 +136,7 @@ fuzz_target!(|data: &[u8]| {
             1 => Command::Ascii(ASCII[bytes[4] as usize % ASCII.len()]),
             2 => Command::Cursor(row, column),
             3 => Command::Region(row..coordinate(bytes[2], rows)),
-            4 => Command::Resize(dimension(bytes[1]), dimension(bytes[2])),
+            4 => Command::Resize(column_dimension(bytes[1]), dimension(bytes[2])),
             5 => Command::CarriageReturn,
             6 => Command::Backspace,
             7 => Command::LineFeed,
@@ -137,7 +154,12 @@ fuzz_target!(|data: &[u8]| {
             19 => Command::MoveLeft(count),
             20 => Command::MoveRight(count),
             21 => Command::ScrollUp(count),
-            _ => Command::ScrollDown(count),
+            22 => Command::ScrollDown(count),
+            23 => Command::TabForward(count),
+            24 => Command::TabBackward(count),
+            25 => Command::SetTab,
+            26 => Command::ClearTab,
+            _ => Command::ClearTabs,
         };
         match (
             apply(&mut screen, &command, style),

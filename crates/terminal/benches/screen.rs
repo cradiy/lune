@@ -309,4 +309,37 @@ fn main() {
             }
         }
     }
+    for columns in [80, 240, 4096, lune_terminal::MAX_DIMENSION] {
+        for layout in ["default", "empty", "sparse", "dense"] {
+            if layout == "dense" && columns != 4096 {
+                continue;
+            }
+            let mut screen = Screen::new(columns, 1).unwrap();
+            if layout != "default" {
+                screen.clear_tab_stops();
+            }
+            if layout == "sparse" {
+                for column in [columns / 2, columns - 2] {
+                    screen.set_cursor(0, column).unwrap();
+                    screen.set_tab_stop();
+                }
+            } else if layout == "dense" {
+                for column in 0..columns {
+                    screen.set_cursor(0, column).unwrap();
+                    screen.set_tab_stop();
+                }
+            }
+            screen.set_cursor(0, 0).unwrap();
+            for count in [1, if layout == "dense" { 512 } else { 8 }, usize::MAX] {
+                measure(
+                    &format!("tab pair / {columns}, {layout}, count={count}"),
+                    2,
+                    || {
+                        black_box(&mut screen).tab_forward(black_box(count));
+                        black_box(&mut screen).tab_backward(black_box(count));
+                    },
+                );
+            }
+        }
+    }
 }

@@ -166,8 +166,9 @@ impl Model {
         if columns == 0 || rows == 0 {
             return Err(StorageError::InvalidDimensions);
         }
-        // The decoder supplies dimensions up to 16, or a deliberately invalid sentinel.
-        if columns > 16 || rows > 16 {
+        // Screen inputs include bitmap word boundaries through 129 columns;
+        // storage inputs stay within 16 columns. Both bound height at 16.
+        if columns > 129 || rows > 16 {
             return Err(StorageError::CapacityExceeded);
         }
         self.rows.truncate(rows);

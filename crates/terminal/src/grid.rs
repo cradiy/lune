@@ -355,7 +355,7 @@ fn rotate_row_slice(rows: &mut [Row], left: usize) {
     }
 }
 
-fn validate_dimensions(columns: usize, rows: usize) -> Result<(), StorageError> {
+pub(crate) fn validate_dimensions(columns: usize, rows: usize) -> Result<(), StorageError> {
     if columns == 0 || rows == 0 {
         return Err(StorageError::InvalidDimensions);
     }

@@ -946,3 +946,118 @@ fn relative_moves_stop_at_directional_boundaries_and_preserve_owned_contents() {
         assert_eq!(snapshot(single.grid()), before);
     }
 }
+
+#[test]
+fn tabs_cross_word_boundaries_preserve_contents_and_follow_width_changes() {
+    let mut screen = Screen::new(130, 2).unwrap();
+    screen.set_scroll_region(1..2).unwrap();
+    screen.set_cursor(0, 64).unwrap();
+    screen
+        .write("水\u{301}", CellWidth::Double, StyleId(1))
+        .unwrap();
+    screen.set_cursor(0, 129).unwrap();
+    screen.write("!", CellWidth::Single, StyleId(2)).unwrap();
+    let pending = screen.cursor();
+    let contents = snapshot(screen.grid());
+    for column in 0_usize..130 {
+        assert_eq!(screen.is_tab_stop(column), Some(column.is_multiple_of(8)));
+    }
+    assert_eq!(screen.is_tab_stop(130), None);
+    assert_eq!(screen.is_tab_stop(usize::MAX), None);
+    screen.set_tab_stop();
+    screen.clear_tab_stop();
+    screen.clear_tab_stops();
+    assert_eq!(screen.cursor(), pending);
+    screen.tab_forward(0);
+    screen.tab_backward(0);
+    assert_eq!(screen.cursor(), pending);
+    screen.tab_forward(1);
+    assert_eq!(screen.cursor().column, 129);
+    assert!(!screen.cursor().wrap_pending);
+    for column in [0, 1, 63, 64, 65, 127, 129] {
+        screen.set_cursor(0, column).unwrap();
+        screen.set_tab_stop();
+    }
+    for (backward, start, count, end) in [
+        (false, 62, 1, 63),
+        (false, 63, 1, 64),
+        (false, 64, 1, 65),
+        (false, 65, 1, 127),
+        (false, 63, 2, 65),
+        (false, 65, 2, 129),
+        (false, 128, 1, 129),
+        (false, 64, usize::MAX, 129),
+        (true, 66, 1, 65),
+        (true, 65, 1, 64),
+        (true, 64, 1, 63),
+        (true, 127, 2, 64),
+        (true, 129, 1, 127),
+        (true, 128, 3, 64),
+        (true, 129, usize::MAX, 0),
+        (true, 0, 1, 0),
+    ] {
+        screen.set_cursor(0, start).unwrap();
+        if backward {
+            screen.tab_backward(count);
+        } else {
+            screen.tab_forward(count);
+        }
+        assert_eq!(
+            screen.cursor(),
+            Cursor {
+                row: 0,
+                column: end,
+                wrap_pending: false
+            }
+        );
+        assert_eq!(screen.scroll_region(), 1..2);
+        assert_eq!(snapshot(screen.grid()), contents);
+    }
+    screen.set_cursor(0, 129).unwrap();
+    screen.write("!", CellWidth::Single, StyleId(2)).unwrap();
+    screen.tab_backward(1);
+    assert_eq!(
+        screen.cursor(),
+        Cursor {
+            row: 0,
+            column: 127,
+            wrap_pending: false
+        }
+    );
+    screen.clear_tab_stops();
+    for column in [3, 63, 64, 65, 127, 129] {
+        screen.set_cursor(0, column).unwrap();
+        screen.set_tab_stop();
+    }
+    screen.resize(65, 2, StyleId(3)).unwrap();
+    screen.resize(130, 2, StyleId(3)).unwrap();
+    for column in 0_usize..130 {
+        let expected = [3, 63, 64].contains(&column) || (column >= 65 && column.is_multiple_of(8));
+        assert_eq!(screen.is_tab_stop(column), Some(expected));
+    }
+    screen.set_cursor(0, 64).unwrap();
+    screen.clear_tab_stop();
+    screen.resize(130, 3, StyleId(3)).unwrap();
+    assert_eq!(screen.is_tab_stop(64), Some(false));
+    screen.resize(63, 3, StyleId(3)).unwrap();
+    screen.resize(64, 3, StyleId(3)).unwrap();
+    assert_eq!(screen.is_tab_stop(63), Some(false));
+    screen.resize(65, 3, StyleId(3)).unwrap();
+    assert_eq!(screen.is_tab_stop(64), Some(true));
+    assert_eq!(screen.is_tab_stop(3), Some(true));
+    assert_invariants(screen.grid());
+
+    let mut wide = Screen::new(crate::MAX_DIMENSION, 1).unwrap();
+    wide.tab_forward(8191);
+    assert_eq!(wide.cursor().column, 65528);
+    wide.tab_forward(1);
+    assert_eq!(wide.cursor().column, crate::MAX_DIMENSION - 1);
+    wide.tab_backward(8191);
+    assert_eq!(wide.cursor().column, 8);
+    wide.clear_tab_stops();
+    wide.set_cursor(0, crate::MAX_DIMENSION - 2).unwrap();
+    wide.set_tab_stop();
+    wide.set_cursor(0, 0).unwrap();
+    wide.tab_forward(1);
+    assert_eq!(wide.cursor().column, crate::MAX_DIMENSION - 2);
+}

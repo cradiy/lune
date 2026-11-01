@@ -1,6 +1,7 @@
 use std::ops::Range;
 
 use crate::{CellWidth, Grid, StorageError, StyleId};
+use crate::{grid::validate_dimensions, tabs::TabStops};
 
 /// Cursor-relative extent for line or display erasure. Both directions include
 /// the cursor cell and complete wide units intersecting the extent.
@@ -30,6 +31,7 @@ pub struct Screen {
     grid: Grid,
     cursor: Cursor,
     scroll_region: Range<usize>,
+    tabs: TabStops,
 }
 
 impl Screen {
@@ -38,6 +40,7 @@ impl Screen {
             grid: Grid::new(columns, rows)?,
             cursor: Cursor::default(),
             scroll_region: 0..rows,
+            tabs: TabStops::new(columns)?,
         })
     }
 
@@ -47,6 +50,51 @@ impl Screen {
 
     pub fn cursor(&self) -> Cursor {
         self.cursor
+    }
+
+    /// Returns whether a physical column has a tab stop, or `None` outside the
+    /// screen. Defaults are zero-based columns 0, 8, 16, and so on.
+    pub fn is_tab_stop(&self, column: usize) -> Option<bool> {
+        (column < self.grid.columns()).then(|| self.tabs.contains(column))
+    }
+
+    /// Sets a tab stop at the cursor's physical column. Contents, cursor state,
+    /// and scrolling boundaries are preserved. This does not allocate.
+    pub fn set_tab_stop(&mut self) {
+        self.tabs.set(self.cursor.column);
+    }
+
+    /// Clears the cursor column's tab stop, preserving all other state.
+    pub fn clear_tab_stop(&mut self) {
+        self.tabs.clear(self.cursor.column);
+    }
+
+    /// Clears all active tab stops, preserving all other state.
+    pub fn clear_tab_stops(&mut self) {
+        self.tabs.clear_all();
+    }
+
+    /// Advances across `count` tab stops strictly after the cursor, stopping at
+    /// the last column when stops are exhausted. Zero preserves all state;
+    /// positive counts cancel pending wrapping, including at an edge. Physical
+    /// columns can address wide-unit continuations. Row, contents, stops, and
+    /// region are preserved. Counts through `usize::MAX` do not allocate.
+    pub fn tab_forward(&mut self, count: usize) {
+        if count != 0 {
+            self.cursor.column = self
+                .tabs
+                .forward(self.cursor.column, count, self.grid.columns());
+            self.cursor.wrap_pending = false;
+        }
+    }
+
+    /// Moves across `count` tab stops strictly before the cursor, stopping at
+    /// column zero when stops are exhausted. Other rules follow [`Self::tab_forward`].
+    pub fn tab_backward(&mut self, count: usize) {
+        if count != 0 {
+            self.cursor.column = self.tabs.backward(self.cursor.column, count);
+            self.cursor.wrap_pending = false;
+        }
     }
 
     /// Returns the active exclusive row range. Single-row regions are valid.
@@ -190,6 +238,7 @@ impl Screen {
 
     /// Writes printable ASCII in row-sized batches. The entire input is validated
     /// before mutation. Empty input preserves pending wrapping. This does not allocate.
+    #[inline]
     pub fn write_ascii(&mut self, mut bytes: &[u8], style: StyleId) -> Result<(), StorageError> {
         if bytes.iter().any(|&byte| !(b' '..=b'~').contains(&byte)) {
             return Err(StorageError::InvalidAscii);
@@ -401,7 +450,10 @@ impl Screen {
     /// Preserves the upper-left grid intersection and clamps cursor coordinates.
     /// A size change cancels pending wrapping; an unchanged size preserves it.
     /// Height changes reset the scrolling region to the full grid; width-only
-    /// changes preserve it. Every error preserves contents, cursor, and region.
+    /// changes preserve it. Tab stops in the width intersection are preserved;
+    /// cropped stops are discarded and added columns receive default stops.
+    /// Height-only changes preserve stops. Every error preserves contents, cursor,
+    /// region, and stops. Reserved tab capacity survives shrinking.
     pub fn resize(
         &mut self,
         columns: usize,
@@ -411,8 +463,12 @@ impl Screen {
         if columns == self.grid.columns() && rows == self.grid.rows() {
             return Ok(());
         }
+        validate_dimensions(columns, rows)?;
+        self.tabs.reserve_columns(columns)?;
+        let old_columns = self.grid.columns();
         let height_changed = rows != self.grid.rows();
         self.grid.resize(columns, rows, style)?;
+        self.tabs.resize_prepared(old_columns, columns);
         if height_changed {
             self.scroll_region = 0..rows;
         }

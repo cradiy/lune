@@ -1,4 +1,4 @@
-use std::ops::Range;
+use std::{collections::BTreeSet, ops::Range};
 
 use lune_terminal::{CellWidth, EraseMode, MAX_CELL_TEXT_BYTES, Screen, StorageError, StyleId};
 
@@ -27,6 +27,11 @@ pub enum Command<'a> {
     MoveRight(usize),
     ScrollUp(usize),
     ScrollDown(usize),
+    TabForward(usize),
+    TabBackward(usize),
+    SetTab,
+    ClearTab,
+    ClearTabs,
 }
 
 /// Uses complete display units and copying row edits. A column one past the
@@ -36,6 +41,7 @@ pub struct ScreenModel {
     row: usize,
     column: usize,
     region: Range<usize>,
+    tabs: BTreeSet<usize>,
 }
 
 impl ScreenModel {
@@ -45,6 +51,7 @@ impl ScreenModel {
             row: 0,
             column: 0,
             region: 0..rows,
+            tabs: (0..columns).step_by(8).collect(),
         }
     }
 
@@ -55,6 +62,12 @@ impl ScreenModel {
         assert_eq!(cursor.column, self.visible_column());
         assert_eq!(cursor.wrap_pending, self.column == self.storage.columns());
         assert_eq!(screen.scroll_region(), self.region);
+        for column in 0..self.storage.columns() {
+            assert_eq!(
+                screen.is_tab_stop(column),
+                Some(self.tabs.contains(&column))
+            );
+        }
         assert!(self.row < self.storage.rows());
         assert!(self.column <= self.storage.columns());
         assert!(self.region.start < self.region.end && self.region.end <= self.storage.rows());
@@ -90,8 +103,14 @@ impl ScreenModel {
                     return Ok(());
                 }
                 let old_rows = self.storage.rows();
+                let old_columns = self.storage.columns();
                 let column = self.visible_column();
                 self.storage.resize(*columns, *rows, style)?;
+                self.tabs.retain(|column| column < columns);
+                if *columns > old_columns {
+                    self.tabs
+                        .extend((old_columns..*columns).filter(|column| column.is_multiple_of(8)));
+                }
                 self.row = self.row.min(rows - 1);
                 self.column = column.min(columns - 1);
                 if *rows != old_rows {
@@ -133,6 +152,33 @@ impl ScreenModel {
                         style,
                     )?;
                     self.cancel_wrap();
+                }
+            }
+            Command::SetTab => {
+                self.tabs.insert(self.visible_column());
+            }
+            Command::ClearTab => {
+                self.tabs.remove(&self.visible_column());
+            }
+            Command::ClearTabs => self.tabs.clear(),
+            Command::TabForward(count) | Command::TabBackward(count) => {
+                if *count != 0 {
+                    let column = self.visible_column();
+                    let rank = (*count).min(self.storage.columns()) - 1;
+                    self.column = if matches!(command, Command::TabForward(_)) {
+                        self.tabs
+                            .range(column + 1..)
+                            .nth(rank)
+                            .copied()
+                            .unwrap_or(self.storage.columns() - 1)
+                    } else {
+                        self.tabs
+                            .range(..column)
+                            .rev()
+                            .nth(rank)
+                            .copied()
+                            .unwrap_or(0)
+                    };
                 }
             }
             Command::ScrollUp(count) | Command::ScrollDown(count) => {

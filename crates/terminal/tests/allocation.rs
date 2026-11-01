@@ -58,6 +58,12 @@ fn snapshot(grid: &Grid) -> Snapshot {
     }
 }
 
+fn tab_stops(screen: &Screen) -> Vec<usize> {
+    (0..screen.grid().columns())
+        .filter(|&column| screen.is_tab_stop(column).unwrap())
+        .collect()
+}
+
 fn populated() -> Grid {
     let mut grid = Grid::new(4, 3).unwrap();
     grid.write(0, 0, "水", CellWidth::Double, StyleId(1))
@@ -94,6 +100,14 @@ struct Scenario {
 
 #[test]
 fn screen_failures_preserve_contents_cursor_and_pending_wrap() {
+    let (created, stats) = allocator::measure(None, || Screen::new(130, 2));
+    drop(created.unwrap());
+    for point in 0..stats.attempts {
+        let (result, failed) = allocator::measure(Some(point), || Screen::new(130, 2));
+        assert!(matches!(result, Err(StorageError::Allocation(_))));
+        assert_eq!(failed.failures, 1);
+        assert_eq!(failed.live_bytes, 0);
+    }
     fn pending(rows: usize, gap: bool) -> Screen {
         let mut screen = Screen::new(4, rows).unwrap();
         screen.write_ascii(b"top!", StyleId(1)).unwrap();
@@ -120,7 +134,7 @@ fn screen_failures_preserve_contents_cursor_and_pending_wrap() {
         }
         screen
     }
-    let cases: [Case; 10] = [
+    let cases: [Case; 11] = [
         (
             "write within row",
             || Screen::new(4, 2).unwrap(),
@@ -177,6 +191,19 @@ fn screen_failures_preserve_contents_cursor_and_pending_wrap() {
             |screen| screen.resize(12, 6, StyleId(3)),
         ),
         (
+            "grow tabs and grid with pending wrap",
+            || {
+                let mut screen = regional(1..3, false);
+                screen.clear_tab_stops();
+                screen.set_cursor(0, 2).unwrap();
+                screen.set_tab_stop();
+                screen.set_cursor(2, 3).unwrap();
+                screen.write("!", CellWidth::Single, StyleId(2)).unwrap();
+                screen
+            },
+            |screen| screen.resize(130, 6, StyleId(3)),
+        ),
+        (
             "regional wrap",
             || regional(1..3, false),
             |screen| screen.write("水\u{301}", CellWidth::Double, StyleId(3)),
@@ -201,6 +228,7 @@ fn screen_failures_preserve_contents_cursor_and_pending_wrap() {
             snapshot(baseline.grid()),
             baseline.cursor(),
             baseline.scroll_region(),
+            tab_stops(&baseline),
         );
         for point in 0..measured.attempts {
             let mut screen = setup();
@@ -208,6 +236,7 @@ fn screen_failures_preserve_contents_cursor_and_pending_wrap() {
                 snapshot(screen.grid()),
                 screen.cursor(),
                 screen.scroll_region(),
+                tab_stops(&screen),
             );
             let (result, failed) = allocator::measure(Some(point), || mutate(&mut screen));
             assert!(
@@ -219,7 +248,8 @@ fn screen_failures_preserve_contents_cursor_and_pending_wrap() {
                 (
                     snapshot(screen.grid()),
                     screen.cursor(),
-                    screen.scroll_region()
+                    screen.scroll_region(),
+                    tab_stops(&screen)
                 ),
                 before,
                 "{name} at {point}"
@@ -229,7 +259,8 @@ fn screen_failures_preserve_contents_cursor_and_pending_wrap() {
                 (
                     snapshot(screen.grid()),
                     screen.cursor(),
-                    screen.scroll_region()
+                    screen.scroll_region(),
+                    tab_stops(&screen)
                 ),
                 expected,
                 "{name} retry at {point}"
@@ -390,6 +421,14 @@ fn warm_writes_edits_scrolling_and_column_growth_make_no_allocation_requests() {
     screen.resize(120, 24, StyleId(0)).unwrap();
     let (result, stats) = allocator::measure(Some(0), || {
         for _ in 0..64 {
+            screen.set_tab_stop();
+            screen.clear_tab_stop();
+            screen.clear_tab_stops();
+            screen.tab_forward(0);
+            screen.tab_forward(1);
+            screen.tab_backward(8);
+            screen.tab_forward(usize::MAX);
+            screen.tab_backward(usize::MAX);
             screen.set_scroll_region(2..22)?;
             screen.set_cursor(21, 119)?;
             screen.write_ascii(&[b'x'; 240], StyleId(1))?;
