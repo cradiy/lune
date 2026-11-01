@@ -76,6 +76,8 @@ fn apply(screen: &mut Screen, command: &Command<'_>, style: StyleId) -> Result<(
         Command::MoveDown(count) => screen.move_cursor_down(*count),
         Command::MoveLeft(count) => screen.move_cursor_left(*count),
         Command::MoveRight(count) => screen.move_cursor_right(*count),
+        Command::ScrollUp(count) => screen.scroll_up(*count, style),
+        Command::ScrollDown(count) => screen.scroll_down(*count, style),
     }
     Ok(())
 }
@@ -100,7 +102,7 @@ fuzz_target!(|data: &[u8]| {
             1 => EraseMode::ToCursor,
             _ => EraseMode::All,
         };
-        let command = match bytes[0] % 21 {
+        let command = match bytes[0] % 23 {
             0 => {
                 let text = match bytes[4] % 10 {
                     8 => &long_text[..MAX_CELL_TEXT_BYTES],
@@ -133,7 +135,9 @@ fuzz_target!(|data: &[u8]| {
             17 => Command::MoveUp(count),
             18 => Command::MoveDown(count),
             19 => Command::MoveLeft(count),
-            _ => Command::MoveRight(count),
+            20 => Command::MoveRight(count),
+            21 => Command::ScrollUp(count),
+            _ => Command::ScrollDown(count),
         };
         match (
             apply(&mut screen, &command, style),

@@ -229,9 +229,13 @@ fn main() {
         );
     }
 
-    let line_edits: [fn(&mut Screen, usize, StyleId); 2] =
-        [Screen::insert_lines, Screen::delete_lines];
-    for (name, edit) in ["IL", "DL"].into_iter().zip(line_edits) {
+    let line_edits: [fn(&mut Screen, usize, StyleId); 4] = [
+        Screen::insert_lines,
+        Screen::delete_lines,
+        Screen::scroll_down,
+        Screen::scroll_up,
+    ];
+    for (name, edit) in ["IL", "DL", "SD", "SU"].into_iter().zip(line_edits) {
         let mut screen = Screen::new(120, 24).unwrap();
         screen.set_cursor(0, 17).unwrap();
         measure(&format!("{name} full / 24/1"), 1, || {

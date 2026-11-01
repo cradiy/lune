@@ -694,14 +694,24 @@ fn cursor_cell_edits_preserve_units_buffers_and_zero_count_state() {
 }
 
 #[test]
-fn line_edits_recycle_owned_rows_only_within_the_cursor_suffix() {
+fn line_edits_and_scrolls_preserve_state_and_recycle_rows_within_their_extent() {
+    let operations = [
+        (
+            Screen::insert_lines as fn(&mut Screen, usize, StyleId),
+            true,
+            true,
+        ),
+        (Screen::delete_lines, true, false),
+        (Screen::scroll_down, false, true),
+        (Screen::scroll_up, false, false),
+    ];
     for rows in 1..=6 {
         for offset in 0..rows {
             for region in (0..rows).flat_map(|start| (start + 1..=rows).map(move |end| start..end))
             {
                 for cursor_row in 0..rows {
                     for requested in (0..=rows + 1).chain([usize::MAX]) {
-                        for insert in [false, true] {
+                        for (edit, cursor_relative, insert) in operations {
                             let mut screen = Screen::new(4, rows).unwrap();
                             screen.set_cursor(rows - 1, 0).unwrap();
                             for _ in 0..offset {
@@ -732,39 +742,42 @@ fn line_edits_recycle_owned_rows_only_within_the_cursor_suffix() {
                                     (row.cells().as_ptr(), text.as_ptr())
                                 })
                                 .collect();
-                            let active = requested != 0 && region.contains(&cursor_row);
-                            let height = region.end.saturating_sub(cursor_row);
-                            let count = if active { requested.min(height) } else { 0 };
-                            if insert {
-                                screen.insert_lines(requested, StyleId(9));
+                            let extent = if cursor_relative {
+                                cursor_row..region.end
                             } else {
-                                screen.delete_lines(requested, StyleId(9));
-                            }
+                                region.clone()
+                            };
+                            let active = requested != 0
+                                && (!cursor_relative || region.contains(&cursor_row));
+                            let height = extent.end.saturating_sub(extent.start);
+                            let count = if active { requested.min(height) } else { 0 };
+                            edit(&mut screen, requested, StyleId(9));
                             assert_eq!(
                                 screen.cursor(),
                                 Cursor {
-                                    wrap_pending: !active && cursor.wrap_pending,
+                                    wrap_pending: !(active && cursor_relative)
+                                        && cursor.wrap_pending,
                                     ..cursor
                                 }
                             );
                             assert_eq!(screen.scroll_region(), region);
                             let after = snapshot(screen.grid());
                             for row in 0..rows {
-                                let inside = active && (cursor_row..region.end).contains(&row);
+                                let inside = active && extent.contains(&row);
                                 let source = if !inside {
                                     Some(row)
                                 } else if insert {
                                     row.checked_sub(count)
-                                        .filter(|&source| source >= cursor_row)
+                                        .filter(|&source| source >= extent.start)
                                 } else {
-                                    (row + count < region.end).then_some(row + count)
+                                    (row + count < extent.end).then_some(row + count)
                                 };
                                 let buffer = if !inside {
                                     row
                                 } else if insert {
-                                    cursor_row + (row - cursor_row + height - count) % height
+                                    extent.start + (row - extent.start + height - count) % height
                                 } else {
-                                    cursor_row + (row - cursor_row + count) % height
+                                    extent.start + (row - extent.start + count) % height
                                 };
                                 assert_eq!(
                                     screen.grid().row(row).unwrap().cells().as_ptr(),
@@ -773,7 +786,7 @@ fn line_edits_recycle_owned_rows_only_within_the_cursor_suffix() {
                                 if let Some(source) = source {
                                     assert_eq!(
                                         after.rows[row], before.rows[source],
-                                        "rows={rows}, region={region:?}, cursor={cursor_row}, count={requested}, insert={insert}"
+                                        "rows={rows}, region={region:?}, cursor={cursor_row}, count={requested}, insert={insert}, cursor_relative={cursor_relative}"
                                     );
                                     let Some(CellText::Extended(text)) =
                                         screen.grid().row(row).unwrap().text(1)

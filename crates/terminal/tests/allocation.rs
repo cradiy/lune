@@ -441,6 +441,12 @@ fn warm_writes_edits_scrolling_and_column_growth_make_no_allocation_requests() {
     let mut edit_screens = [prepare(), prepare(), prepare()];
     let line_edits = [Screen::insert_lines, Screen::delete_lines];
     let mut line_screens = [prepare(), prepare()];
+    let scrolls = [Screen::scroll_up, Screen::scroll_down];
+    let mut scroll_screens = [prepare(), prepare()];
+    for screen in &mut scroll_screens {
+        screen.set_cursor(0, 7).unwrap();
+        screen.write("!", CellWidth::Single, StyleId(1)).unwrap();
+    }
     for screen in &mut line_screens {
         screen.set_cursor(1, 7).unwrap();
         screen.write("!", CellWidth::Single, StyleId(1)).unwrap();
@@ -479,6 +485,11 @@ fn warm_writes_edits_scrolling_and_column_growth_make_no_allocation_requests() {
             edit(screen, 0, StyleId(8));
             edit(screen, usize::MAX, StyleId(9));
         }
+        for (scroll, screen) in scrolls.iter().zip(&mut scroll_screens) {
+            scroll(screen, 0, StyleId(8));
+            scroll(screen, 1, StyleId(9));
+            scroll(screen, usize::MAX, StyleId(9));
+        }
     });
     assert_eq!(stats.attempts, 0);
     assert!(stats.live_bytes <= 0);
@@ -486,6 +497,9 @@ fn warm_writes_edits_scrolling_and_column_growth_make_no_allocation_requests() {
         snapshot(screen.grid());
     }
     for screen in edit_screens.iter().chain(&line_screens) {
+        snapshot(screen.grid());
+    }
+    for screen in &scroll_screens {
         snapshot(screen.grid());
     }
 }

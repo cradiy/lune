@@ -20,9 +20,11 @@ display units, and erasure selects ranges in a flattened physical display.
 
 Commands interleave unit and ASCII writes, absolute cursor positioning, scrolling
 regions, carriage return, backspace, line feed, reverse index, line and display
-erasure, counted erasure, cell and whole-row insertion/deletion, resizing, and
-relative cursor movement. The movement oracle walks one physical cell at a time
-until reaching its directional barrier.
+erasure, counted erasure, cell and whole-row insertion/deletion, resizing,
+relative cursor movement, and explicit upward/downward scrolling of the active
+region. Explicit scrolling preserves cursor coordinates and pending wrapping,
+including when the cursor is outside the region. The movement oracle walks one
+physical cell at a time until reaching its directional barrier.
 An explicit same-size resize command exercises pending-wrap preservation.
 
 Every command checks cell text, width, continuation occupancy, styles, dimensions,
@@ -39,11 +41,11 @@ text and style values. Executions process at most 512 commands and retain at mos
 16 by 16 logical cells. Zero, overlarge, and invalid arguments are included.
 For screen coordinates, bytes `fc`, `fd`, `fe`, and `ff` select the last cell, the
 exclusive bound, zero, and `usize::MAX`; other bytes are reduced by the dimension
-plus two. Screen opcodes modulo 21 select: 0 unit write, 1 ASCII, 2 cursor, 3 region,
+plus two. Screen opcodes modulo 23 select: 0 unit write, 1 ASCII, 2 cursor, 3 region,
 4 resize, 5 carriage return, 6 backspace, 7 line feed, 8 reverse index, 9 line erasure,
 10 display erasure, 11 cell insertion, 12 cell deletion, 13 counted erasure,
 14 line insertion, 15 line deletion, 16 same-size resize, 17 move up, 18 move down,
-19 move left, and 20 move right. Byte 3 selects width,
+19 move left, 20 move right, 21 scroll up, and 22 scroll down. Byte 3 selects width,
 count (`ff` means `usize::MAX`), or erasure mode. Byte 4 selects synthetic text;
 bytes 4 through 7 also form the style key.
 Generated corpus, artifacts, coverage, and build output are ignored by Git.

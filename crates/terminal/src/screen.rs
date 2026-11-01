@@ -264,6 +264,29 @@ impl Screen {
         }
     }
 
+    /// Scrolls the entire active region upward, discarding rows at its top and
+    /// filling exposed bottom rows using `style`. Counts are clamped to the
+    /// region's height; zero preserves all state. The cursor position, pending
+    /// wrapping, and region boundaries are preserved, including when the cursor
+    /// is outside the region. Retained rows keep their text and style; recycled
+    /// row buffers are reused without allocating.
+    #[inline]
+    pub fn scroll_up(&mut self, count: usize, style: StyleId) {
+        self.grid
+            .scroll_up(self.scroll_region.clone(), count, style)
+            .expect("The scrolling region is valid");
+    }
+
+    /// Scrolls the entire active region downward, discarding rows at its bottom
+    /// and filling exposed top rows using `style`. Count, cursor, region, and
+    /// allocation rules follow [`Self::scroll_up`].
+    #[inline]
+    pub fn scroll_down(&mut self, count: usize, style: StyleId) {
+        self.grid
+            .scroll_down(self.scroll_region.clone(), count, style)
+            .expect("The scrolling region is valid");
+    }
+
     /// Inserts blank rows at the cursor, shifting rows down through the scrolling
     /// region's bottom and discarding overflow. Counts are clamped to that suffix.
     /// Zero counts and cursors outside the region preserve all state. Effective

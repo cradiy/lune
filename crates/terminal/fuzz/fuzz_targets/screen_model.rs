@@ -25,6 +25,8 @@ pub enum Command<'a> {
     MoveDown(usize),
     MoveLeft(usize),
     MoveRight(usize),
+    ScrollUp(usize),
+    ScrollDown(usize),
 }
 
 /// Uses complete display units and copying row edits. A column one past the
@@ -132,6 +134,14 @@ impl ScreenModel {
                     )?;
                     self.cancel_wrap();
                 }
+            }
+            Command::ScrollUp(count) | Command::ScrollDown(count) => {
+                self.storage.scroll(
+                    self.region.clone(),
+                    *count,
+                    matches!(command, Command::ScrollUp(_)),
+                    style,
+                )?;
             }
             Command::MoveUp(count)
             | Command::MoveDown(count)

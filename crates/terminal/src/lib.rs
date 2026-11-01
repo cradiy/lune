@@ -33,6 +33,9 @@
 //! Relative cursor movement addresses physical cells and stops at directional
 //! scrolling boundaries or screen edges. It preserves contents and the region;
 //! zero counts preserve all state and positive counts cancel pending wrapping.
+//! Explicit upward and downward scrolling affects the entire active region,
+//! preserves cursor coordinates and pending wrapping even outside the region,
+//! and recycles row buffers without allocating.
 
 mod cell;
 mod error;
