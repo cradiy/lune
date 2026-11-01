@@ -15,11 +15,17 @@
 //! [`MAX_CELLS`] bounds the logical cell count. Cell buffers and the row queue
 //! retain capacity after shrinking. [`MAX_CELL_TEXT_BYTES`] bounds the UTF-8
 //! payload of each display unit. Protocol interpretation consumes [`lune_vt::Event`].
+//!
+//! [`Screen`] combines storage with a cell-addressed [`Cursor`], delayed wrapping,
+//! carriage return, line feed, and backspace. ASCII runs are written in batches;
+//! other display units use caller-supplied widths. Writes and resizing preserve
+//! both grid contents and cursor state on error.
 
 mod cell;
 mod error;
 mod grid;
 mod row;
+mod screen;
 
 #[cfg(test)]
 mod tests;
@@ -28,3 +34,4 @@ pub use cell::{Cell, CellText, CellWidth, MAX_CELL_TEXT_BYTES, StyleId};
 pub use error::StorageError;
 pub use grid::{Grid, MAX_CELLS, MAX_DIMENSION};
 pub use row::Row;
+pub use screen::{Cursor, Screen};

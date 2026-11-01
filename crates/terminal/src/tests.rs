@@ -1,5 +1,7 @@
 use std::ops::Range;
 
+mod screen;
+
 use crate::{CellText, CellWidth, Grid, MAX_CELL_TEXT_BYTES, MAX_CELLS, StorageError, StyleId};
 
 fn assert_invariants(grid: &Grid) {

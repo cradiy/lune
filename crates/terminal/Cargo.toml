@@ -8,6 +8,10 @@ description = "Terminal state and screen storage"
 name = "storage"
 harness = false
 
+[[bench]]
+name = "screen"
+harness = false
+
 [dependencies]
 lune-vt = { path = "../vt" }
 

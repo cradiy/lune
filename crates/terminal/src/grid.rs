@@ -68,6 +68,16 @@ impl Grid {
         self.row_mut(row)?.write_ascii(column, bytes, style)
     }
 
+    pub(crate) fn write_ascii_validated(
+        &mut self,
+        row: usize,
+        column: usize,
+        bytes: &[u8],
+        style: StyleId,
+    ) {
+        self.rows[row].write_ascii_validated(column, bytes, style);
+    }
+
     /// Appends text to a display unit while retaining its width and style.
     /// Addressing a continuation appends to its leading cell.
     pub fn append_text(
@@ -125,26 +135,56 @@ impl Grid {
         }
     }
 
+    pub(crate) fn write_scrolling(
+        &mut self,
+        text: &str,
+        width: CellWidth,
+        style: StyleId,
+        clear_gap: bool,
+    ) -> Result<(), StorageError> {
+        // Complete the fallible write before clearing or rotating any rows.
+        // The first row becomes the new bottom row after the rotation.
+        self.rows[0].write(0, text, width, style)?;
+        self.rows[0]
+            .clear_range(width.columns()..self.columns, style)
+            .expect("The written unit fits the row");
+        if clear_gap && self.rows.len() > 1 {
+            self.rows
+                .back_mut()
+                .unwrap()
+                .clear_range(self.columns - 1..self.columns, style)
+                .expect("The last column is in bounds");
+        }
+        self.rows.rotate_left(1);
+        Ok(())
+    }
+
     /// Scrolls an exclusive row range upward, clearing exposed rows with `style`.
     /// Empty ranges and zero lines leave contents unchanged. A count at least as
     /// large as the range clears it. Invalid ranges fail before any mutation.
     /// Row buffers are recycled without allocating.
+    #[inline]
     pub fn scroll_up(
         &mut self,
         region: Range<usize>,
         lines: usize,
         style: StyleId,
     ) -> Result<(), StorageError> {
+        if region.start == 0 && region.end == self.rows.len() && lines < region.end {
+            self.rows.rotate_left(lines);
+            if lines == 1 {
+                self.rows.back_mut().unwrap().clear(style);
+            } else {
+                for row in self.rows.iter_mut().rev().take(lines) {
+                    row.clear(style);
+                }
+            }
+            return Ok(());
+        }
         self.validate_region(&region)?;
         let height = region.len();
         if lines >= height {
             self.clear_rows(region, style);
-        } else if region.start == 0 && region.end == self.rows.len() {
-            for _ in 0..lines {
-                let mut row = self.rows.pop_front().expect("The grid contains rows");
-                row.clear(style);
-                self.rows.push_back(row);
-            }
         } else if lines != 0 {
             self.rotate_rows_left(region.clone(), lines);
             self.clear_rows(region.end - lines..region.end, style);
@@ -154,22 +194,28 @@ impl Grid {
 
     /// Scrolls an exclusive row range downward with the same boundary and
     /// allocation rules as [`Self::scroll_up`].
+    #[inline]
     pub fn scroll_down(
         &mut self,
         region: Range<usize>,
         lines: usize,
         style: StyleId,
     ) -> Result<(), StorageError> {
+        if region.start == 0 && region.end == self.rows.len() && lines < region.end {
+            self.rows.rotate_right(lines);
+            if lines == 1 {
+                self.rows.front_mut().unwrap().clear(style);
+            } else {
+                for row in self.rows.iter_mut().take(lines) {
+                    row.clear(style);
+                }
+            }
+            return Ok(());
+        }
         self.validate_region(&region)?;
         let height = region.len();
         if lines >= height {
             self.clear_rows(region, style);
-        } else if region.start == 0 && region.end == self.rows.len() {
-            for _ in 0..lines {
-                let mut row = self.rows.pop_back().expect("The grid contains rows");
-                row.clear(style);
-                self.rows.push_front(row);
-            }
         } else if lines != 0 {
             self.rotate_rows_left(region.clone(), height - lines);
             self.clear_rows(region.start..region.start + lines, style);

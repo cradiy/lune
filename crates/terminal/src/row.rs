@@ -121,17 +121,23 @@ impl Row {
         bytes: &[u8],
         style: StyleId,
     ) -> Result<(), StorageError> {
-        let end = self.end(column, bytes.len())?;
+        self.end(column, bytes.len())?;
         if bytes.iter().any(|&byte| !(b' '..=b'~').contains(&byte)) {
             return Err(StorageError::InvalidAscii);
         }
+        self.write_ascii_validated(column, bytes, style);
+        Ok(())
+    }
+
+    /// The caller validates printable ASCII and the destination cell range.
+    pub(crate) fn write_ascii_validated(&mut self, column: usize, bytes: &[u8], style: StyleId) {
         if !bytes.is_empty() {
+            let end = column + bytes.len();
             self.prepare_overwrite(column..end, style, None);
             for (cell, &byte) in self.cells[column..end].iter_mut().zip(bytes) {
                 *cell = Cell::scalar(char::from(byte), CellWidth::Single, style);
             }
         }
-        Ok(())
     }
 
     pub(crate) fn append_text(&mut self, column: usize, text: &str) -> Result<(), StorageError> {
