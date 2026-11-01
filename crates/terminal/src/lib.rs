@@ -17,9 +17,10 @@
 //! payload of each display unit. Protocol interpretation consumes [`lune_vt::Event`].
 //!
 //! [`Screen`] combines storage with a cell-addressed [`Cursor`], delayed wrapping,
-//! carriage return, line feed, and backspace. ASCII runs are written in batches;
+//! a vertical scrolling region, carriage return, line feed, reverse index, and
+//! backspace. ASCII runs are written in batches;
 //! other display units use caller-supplied widths. Writes and resizing preserve
-//! both grid contents and cursor state on error.
+//! grid contents, cursor state, and the scrolling region on error.
 
 mod cell;
 mod error;

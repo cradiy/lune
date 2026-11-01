@@ -137,25 +137,28 @@ impl Grid {
 
     pub(crate) fn write_scrolling(
         &mut self,
+        region: Range<usize>,
         text: &str,
         width: CellWidth,
         style: StyleId,
         clear_gap: bool,
     ) -> Result<(), StorageError> {
         // Complete the fallible write before clearing or rotating any rows.
-        // The first row becomes the new bottom row after the rotation.
-        self.rows[0].write(0, text, width, style)?;
-        self.rows[0]
+        // The region is valid and nonempty. Its first row becomes its new bottom row.
+        self.rows[region.start].write(0, text, width, style)?;
+        self.rows[region.start]
             .clear_range(width.columns()..self.columns, style)
             .expect("The written unit fits the row");
-        if clear_gap && self.rows.len() > 1 {
-            self.rows
-                .back_mut()
-                .unwrap()
+        if clear_gap && region.len() > 1 {
+            self.rows[region.end - 1]
                 .clear_range(self.columns - 1..self.columns, style)
                 .expect("The last column is in bounds");
         }
-        self.rows.rotate_left(1);
+        if region.start == 0 && region.end == self.rows.len() {
+            self.rows.rotate_left(1);
+        } else if region.len() > 1 {
+            self.rotate_rows_left(region, 1);
+        }
         Ok(())
     }
 

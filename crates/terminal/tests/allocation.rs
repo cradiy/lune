@@ -110,7 +110,17 @@ fn screen_failures_preserve_contents_cursor_and_pending_wrap() {
         fn() -> Screen,
         fn(&mut Screen) -> Result<(), StorageError>,
     );
-    let cases: [Case; 7] = [
+    fn regional(region: std::ops::Range<usize>, gap: bool) -> Screen {
+        let mut screen = pending(4, false);
+        screen.set_scroll_region(region.clone()).unwrap();
+        screen.set_cursor(region.end - 1, 2).unwrap();
+        screen.write("旧", CellWidth::Double, StyleId(2)).unwrap();
+        if gap {
+            screen.set_cursor(region.end - 1, 3).unwrap();
+        }
+        screen
+    }
+    let cases: [Case; 10] = [
         (
             "write within row",
             || Screen::new(4, 2).unwrap(),
@@ -163,8 +173,23 @@ fn screen_failures_preserve_contents_cursor_and_pending_wrap() {
         ),
         (
             "resize with pending wrap",
-            || pending(2, false),
+            || regional(1..3, false),
             |screen| screen.resize(12, 6, StyleId(3)),
+        ),
+        (
+            "regional wrap",
+            || regional(1..3, false),
+            |screen| screen.write("水\u{301}", CellWidth::Double, StyleId(3)),
+        ),
+        (
+            "regional wide edge",
+            || regional(1..3, true),
+            |screen| screen.write("水\u{301}", CellWidth::Double, StyleId(3)),
+        ),
+        (
+            "single-row region",
+            || regional(1..2, false),
+            |screen| screen.write("水\u{301}", CellWidth::Double, StyleId(3)),
         ),
     ];
     for (name, setup, mutate) in cases {
@@ -172,10 +197,18 @@ fn screen_failures_preserve_contents_cursor_and_pending_wrap() {
         let (result, measured) = allocator::measure(None, || mutate(&mut baseline));
         result.unwrap();
         assert!(measured.attempts > 0, "{name}");
-        let expected = (snapshot(baseline.grid()), baseline.cursor());
+        let expected = (
+            snapshot(baseline.grid()),
+            baseline.cursor(),
+            baseline.scroll_region(),
+        );
         for point in 0..measured.attempts {
             let mut screen = setup();
-            let before = (snapshot(screen.grid()), screen.cursor());
+            let before = (
+                snapshot(screen.grid()),
+                screen.cursor(),
+                screen.scroll_region(),
+            );
             let (result, failed) = allocator::measure(Some(point), || mutate(&mut screen));
             assert!(
                 matches!(result, Err(StorageError::Allocation(_))),
@@ -183,13 +216,21 @@ fn screen_failures_preserve_contents_cursor_and_pending_wrap() {
             );
             assert_eq!(failed.failures, 1);
             assert_eq!(
-                (snapshot(screen.grid()), screen.cursor()),
+                (
+                    snapshot(screen.grid()),
+                    screen.cursor(),
+                    screen.scroll_region()
+                ),
                 before,
                 "{name} at {point}"
             );
             mutate(&mut screen).unwrap();
             assert_eq!(
-                (snapshot(screen.grid()), screen.cursor()),
+                (
+                    snapshot(screen.grid()),
+                    screen.cursor(),
+                    screen.scroll_region()
+                ),
                 expected,
                 "{name} retry at {point}"
             );
@@ -349,11 +390,18 @@ fn warm_writes_edits_scrolling_and_column_growth_make_no_allocation_requests() {
     screen.resize(120, 24, StyleId(0)).unwrap();
     let (result, stats) = allocator::measure(Some(0), || {
         for _ in 0..64 {
+            screen.set_scroll_region(2..22)?;
+            screen.set_cursor(21, 119)?;
             screen.write_ascii(&[b'x'; 240], StyleId(1))?;
             screen.backspace();
             screen.write("水", CellWidth::Double, StyleId(2))?;
             screen.carriage_return();
             screen.line_feed(StyleId(0));
+            screen.set_cursor(2, 0)?;
+            screen.reverse_index(StyleId(0));
+            screen.set_scroll_region(0..24)?;
+            screen.set_cursor(23, 0)?;
+            screen.write_ascii(&[b'x'; 240], StyleId(1))?;
             screen.resize(240, 24, StyleId(0))?;
             screen.resize(120, 24, StyleId(0))?;
         }
