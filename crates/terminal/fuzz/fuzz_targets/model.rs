@@ -32,6 +32,14 @@ impl Model {
         }
     }
 
+    pub fn columns(&self) -> usize {
+        self.columns
+    }
+
+    pub fn rows(&self) -> usize {
+        self.rows.len()
+    }
+
     pub fn check(&self, grid: &Grid) {
         assert_eq!(grid.columns(), self.columns);
         assert_eq!(grid.rows(), self.rows.len());

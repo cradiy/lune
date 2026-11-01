@@ -40,11 +40,11 @@ fuzz_target!(|data: &[u8]| {
     let mut grid = Grid::new(8, 4).unwrap();
     let mut model = Model::new(8, 4);
     for bytes in data.as_chunks::<8>().0.iter().take(512) {
-        let row = bytes[1] as usize % (grid.rows() + 2);
+        let row = bytes[1] as usize % (model.rows() + 2);
         let column = if bytes[2] == u8::MAX {
             usize::MAX
         } else {
-            bytes[2] as usize % (grid.columns() + 2)
+            bytes[2] as usize % (model.columns() + 2)
         };
         let count = count(bytes[3]);
         let style = StyleId(u32::from_le_bytes(bytes[4..8].try_into().unwrap()));

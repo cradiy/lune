@@ -20,3 +20,10 @@ path = "fuzz_targets/storage.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "screen"
+path = "fuzz_targets/screen.rs"
+test = false
+doc = false
+bench = false
