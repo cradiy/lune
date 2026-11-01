@@ -95,6 +95,7 @@ fn apply(screen: &mut Screen, command: &Command<'_>, style: StyleId) -> Result<(
         Command::SetTab => screen.set_tab_stop(),
         Command::ClearTab => screen.clear_tab_stop(),
         Command::ClearTabs => screen.clear_tab_stops(),
+        Command::AutoWrap(enabled) => screen.set_auto_wrap(*enabled),
     }
     Ok(())
 }
@@ -119,7 +120,7 @@ fuzz_target!(|data: &[u8]| {
             1 => EraseMode::ToCursor,
             _ => EraseMode::All,
         };
-        let command = match bytes[0] % 28 {
+        let command = match bytes[0] % 29 {
             0 => {
                 let text = match bytes[4] % 10 {
                     8 => &long_text[..MAX_CELL_TEXT_BYTES],
@@ -159,7 +160,8 @@ fuzz_target!(|data: &[u8]| {
             24 => Command::TabBackward(count),
             25 => Command::SetTab,
             26 => Command::ClearTab,
-            _ => Command::ClearTabs,
+            27 => Command::ClearTabs,
+            _ => Command::AutoWrap(bytes[3] & 1 != 0),
         };
         match (
             apply(&mut screen, &command, style),

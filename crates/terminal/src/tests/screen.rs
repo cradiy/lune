@@ -9,7 +9,9 @@ fn ascii_batches_match_unit_writes_across_wraps_and_scrolls() {
             for region in (0..rows).flat_map(|start| (start + 1..=rows).map(move |end| start..end))
             {
                 for row in 0..rows {
-                    for column in 0..=columns {
+                    for (column, auto_wrap) in (0..=columns)
+                        .flat_map(|column| [false, true].map(move |mode| (column, mode)))
+                    {
                         let mut bulk = Screen::new(columns, rows).unwrap();
                         let mut scalar = Screen::new(columns, rows).unwrap();
                         for screen in [&mut bulk, &mut scalar] {
@@ -25,6 +27,7 @@ fn ascii_batches_match_unit_writes_across_wraps_and_scrolls() {
                             if column == columns {
                                 screen.write("!", CellWidth::Single, StyleId(3)).unwrap();
                             }
+                            screen.set_auto_wrap(auto_wrap);
                         }
                         for chunk in input.chunks(7) {
                             bulk.write_ascii(chunk, StyleId(4)).unwrap();
@@ -1060,4 +1063,107 @@ fn tabs_cross_word_boundaries_preserve_contents_and_follow_width_changes() {
     wide.set_cursor(0, 0).unwrap();
     wide.tab_forward(1);
     assert_eq!(wide.cursor().column, crate::MAX_DIMENSION - 2);
+}
+
+#[test]
+fn automatic_wrap_modes_preserve_wide_units_and_reject_invalid_ignored_writes() {
+    let too_long = "x".repeat(crate::MAX_CELL_TEXT_BYTES + 1);
+    for columns in 1..=4 {
+        for rows in [1, 3] {
+            for row in 0..rows {
+                let mut screen = Screen::new(columns, rows).unwrap();
+                screen.set_scroll_region(0..1).unwrap();
+                screen.set_cursor(row, columns.saturating_sub(2)).unwrap();
+                if columns > 1 {
+                    screen
+                        .write("水\u{301}", CellWidth::Double, StyleId(1))
+                        .unwrap();
+                } else {
+                    screen.write("x", CellWidth::Single, StyleId(1)).unwrap();
+                }
+                let pending = screen.cursor();
+                screen.set_auto_wrap(true);
+                assert_eq!(screen.cursor(), pending);
+                screen.set_auto_wrap(false);
+                let cursor = screen.cursor();
+                let before = snapshot(screen.grid());
+                assert!(!cursor.wrap_pending);
+                if columns > 1 {
+                    screen
+                        .write("界\u{301}", CellWidth::Double, StyleId(9))
+                        .unwrap();
+                    assert!(matches!(
+                        screen.write("", CellWidth::Double, StyleId(9)),
+                        Err(StorageError::EmptyText)
+                    ));
+                    assert!(matches!(
+                        screen.write(&too_long, CellWidth::Double, StyleId(9)),
+                        Err(StorageError::TextTooLong)
+                    ));
+                } else {
+                    assert!(matches!(
+                        screen.write("界", CellWidth::Double, StyleId(9)),
+                        Err(StorageError::OutOfBounds)
+                    ));
+                }
+                screen.write_ascii(b"", StyleId(9)).unwrap();
+                assert!(matches!(
+                    screen.write_ascii(b"ab\nc", StyleId(9)),
+                    Err(StorageError::InvalidAscii)
+                ));
+                assert_eq!(screen.cursor(), cursor);
+                assert_eq!(snapshot(screen.grid()), before);
+                assert!(!screen.auto_wrap());
+                assert_eq!(screen.scroll_region(), 0..1);
+                screen.write("A", CellWidth::Single, StyleId(2)).unwrap();
+                screen.write("B", CellWidth::Single, StyleId(3)).unwrap();
+                assert_eq!(screen.cursor(), cursor);
+                assert_eq!(
+                    screen.grid().row(row).unwrap().text(columns - 1),
+                    Some(CellText::Scalar('B'))
+                );
+                if columns > 1 {
+                    assert_eq!(
+                        screen.grid().row(row).unwrap().text(columns - 2),
+                        Some(CellText::Scalar(' '))
+                    );
+                }
+                assert_invariants(screen.grid());
+                screen.set_auto_wrap(true);
+                screen.write("C", CellWidth::Single, StyleId(4)).unwrap();
+                assert_eq!(
+                    screen.cursor(),
+                    Cursor {
+                        wrap_pending: true,
+                        ..cursor
+                    }
+                );
+                screen.set_auto_wrap(true);
+                assert!(screen.cursor().wrap_pending);
+                screen.set_auto_wrap(false);
+                screen.set_auto_wrap(true);
+                screen.write("D", CellWidth::Single, StyleId(4)).unwrap();
+                assert_eq!(
+                    screen.cursor(),
+                    Cursor {
+                        wrap_pending: true,
+                        ..cursor
+                    }
+                );
+                screen.set_auto_wrap(false);
+                screen.resize(columns + 1, rows + 1, StyleId(4)).unwrap();
+                assert!(!screen.auto_wrap());
+                screen.write_ascii(b"abcdefghijklmnop", StyleId(5)).unwrap();
+                assert_eq!(
+                    screen.cursor(),
+                    Cursor {
+                        row,
+                        column: columns,
+                        wrap_pending: false
+                    }
+                );
+                assert_invariants(screen.grid());
+            }
+        }
+    }
 }

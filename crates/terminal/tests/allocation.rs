@@ -134,7 +134,7 @@ fn screen_failures_preserve_contents_cursor_and_pending_wrap() {
         }
         screen
     }
-    let cases: [Case; 11] = [
+    let cases: [Case; 12] = [
         (
             "write within row",
             || Screen::new(4, 2).unwrap(),
@@ -204,6 +204,15 @@ fn screen_failures_preserve_contents_cursor_and_pending_wrap() {
             |screen| screen.resize(130, 6, StyleId(3)),
         ),
         (
+            "write owned text with automatic wrapping disabled",
+            || {
+                let mut screen = regional(1..3, false);
+                screen.set_auto_wrap(false);
+                screen
+            },
+            |screen| screen.write("e\u{301}", CellWidth::Single, StyleId(3)),
+        ),
+        (
             "regional wrap",
             || regional(1..3, false),
             |screen| screen.write("水\u{301}", CellWidth::Double, StyleId(3)),
@@ -229,6 +238,7 @@ fn screen_failures_preserve_contents_cursor_and_pending_wrap() {
             baseline.cursor(),
             baseline.scroll_region(),
             tab_stops(&baseline),
+            baseline.auto_wrap(),
         );
         for point in 0..measured.attempts {
             let mut screen = setup();
@@ -237,6 +247,7 @@ fn screen_failures_preserve_contents_cursor_and_pending_wrap() {
                 screen.cursor(),
                 screen.scroll_region(),
                 tab_stops(&screen),
+                screen.auto_wrap(),
             );
             let (result, failed) = allocator::measure(Some(point), || mutate(&mut screen));
             assert!(
@@ -249,7 +260,8 @@ fn screen_failures_preserve_contents_cursor_and_pending_wrap() {
                     snapshot(screen.grid()),
                     screen.cursor(),
                     screen.scroll_region(),
-                    tab_stops(&screen)
+                    tab_stops(&screen),
+                    screen.auto_wrap()
                 ),
                 before,
                 "{name} at {point}"
@@ -260,7 +272,8 @@ fn screen_failures_preserve_contents_cursor_and_pending_wrap() {
                     snapshot(screen.grid()),
                     screen.cursor(),
                     screen.scroll_region(),
-                    tab_stops(&screen)
+                    tab_stops(&screen),
+                    screen.auto_wrap()
                 ),
                 expected,
                 "{name} retry at {point}"
@@ -421,6 +434,11 @@ fn warm_writes_edits_scrolling_and_column_growth_make_no_allocation_requests() {
     screen.resize(120, 24, StyleId(0)).unwrap();
     let (result, stats) = allocator::measure(Some(0), || {
         for _ in 0..64 {
+            screen.set_auto_wrap(false);
+            screen.set_cursor(21, 119)?;
+            screen.write("水\u{301}", CellWidth::Double, StyleId(2))?;
+            screen.write_ascii(&[b'x'; 240], StyleId(1))?;
+            screen.set_auto_wrap(true);
             screen.set_tab_stop();
             screen.clear_tab_stop();
             screen.clear_tab_stops();

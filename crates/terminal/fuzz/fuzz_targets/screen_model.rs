@@ -32,6 +32,7 @@ pub enum Command<'a> {
     SetTab,
     ClearTab,
     ClearTabs,
+    AutoWrap(bool),
 }
 
 /// Uses complete display units and copying row edits. A column one past the
@@ -42,6 +43,7 @@ pub struct ScreenModel {
     column: usize,
     region: Range<usize>,
     tabs: BTreeSet<usize>,
+    auto_wrap: bool,
 }
 
 impl ScreenModel {
@@ -52,6 +54,7 @@ impl ScreenModel {
             column: 0,
             region: 0..rows,
             tabs: (0..columns).step_by(8).collect(),
+            auto_wrap: true,
         }
     }
 
@@ -62,6 +65,8 @@ impl ScreenModel {
         assert_eq!(cursor.column, self.visible_column());
         assert_eq!(cursor.wrap_pending, self.column == self.storage.columns());
         assert_eq!(screen.scroll_region(), self.region);
+        assert_eq!(screen.auto_wrap(), self.auto_wrap);
+        assert!(self.auto_wrap || self.column < self.storage.columns());
         for column in 0..self.storage.columns() {
             assert_eq!(
                 screen.is_tab_stop(column),
@@ -154,6 +159,12 @@ impl ScreenModel {
                     self.cancel_wrap();
                 }
             }
+            Command::AutoWrap(enabled) => {
+                self.auto_wrap = *enabled;
+                if !enabled {
+                    self.cancel_wrap();
+                }
+            }
             Command::SetTab => {
                 self.tabs.insert(self.visible_column());
             }
@@ -232,6 +243,19 @@ impl ScreenModel {
         }
         if text.len() > MAX_CELL_TEXT_BYTES {
             return Err(StorageError::TextTooLong);
+        }
+        if !self.auto_wrap {
+            if self.column + width <= columns {
+                let cell_width = if width == 1 {
+                    CellWidth::Single
+                } else {
+                    CellWidth::Double
+                };
+                self.storage
+                    .write(self.row, self.column, text, cell_width, style)?;
+                self.column = (self.column + width).min(columns - 1);
+            }
+            return Ok(());
         }
         if self.column + width > columns {
             if self.column < columns {

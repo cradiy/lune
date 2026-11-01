@@ -42,6 +42,10 @@
 //! positive counts cancel pending wrapping and zero preserves all state.
 //! Width changes retain overlapping stops, discard cropped stops, and initialize
 //! added columns with defaults. Resizing preserves stops on error.
+//! Automatic wrapping starts enabled. Disabling it clears pending wrapping;
+//! output then stays on its physical row and repeated writes replace the last
+//! column. Valid display units that cannot fit the remaining columns are ignored,
+//! while units wider than the entire grid fail. Resizing preserves this mode.
 
 mod cell;
 mod error;

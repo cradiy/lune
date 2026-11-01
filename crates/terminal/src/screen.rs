@@ -1,6 +1,6 @@
 use std::ops::Range;
 
-use crate::{CellWidth, Grid, StorageError, StyleId};
+use crate::{CellWidth, Grid, MAX_CELL_TEXT_BYTES, StorageError, StyleId};
 use crate::{grid::validate_dimensions, tabs::TabStops};
 
 /// Cursor-relative extent for line or display erasure. Both directions include
@@ -32,6 +32,7 @@ pub struct Screen {
     cursor: Cursor,
     scroll_region: Range<usize>,
     tabs: TabStops,
+    auto_wrap: bool,
 }
 
 impl Screen {
@@ -41,6 +42,7 @@ impl Screen {
             cursor: Cursor::default(),
             scroll_region: 0..rows,
             tabs: TabStops::new(columns)?,
+            auto_wrap: true,
         })
     }
 
@@ -50,6 +52,19 @@ impl Screen {
 
     pub fn cursor(&self) -> Cursor {
         self.cursor
+    }
+
+    /// Whether writes automatically wrap at the right edge. Enabled initially.
+    pub fn auto_wrap(&self) -> bool {
+        self.auto_wrap
+    }
+
+    /// Controls automatic wrapping, preserving contents, coordinates, region,
+    /// and tab stops. Disabling clears pending wrapping; enabling preserves the
+    /// current cursor state. This does not allocate.
+    pub fn set_auto_wrap(&mut self, enabled: bool) {
+        self.auto_wrap = enabled;
+        self.cursor.wrap_pending &= enabled;
     }
 
     /// Returns whether a physical column has a tab stop, or `None` outside the
@@ -192,12 +207,16 @@ impl Screen {
     }
 
     /// Writes a complete display unit, then advances by its supplied width.
-    /// Filling the right edge leaves the cursor in the last column with wrapping
-    /// pending. A double-width unit that cannot fit wraps as a whole; the split
-    /// unit at the old right edge is cleared using `style`.
+    /// With automatic wrapping enabled, filling the right edge leaves the cursor
+    /// in the last column with wrapping pending. A double-width unit that cannot
+    /// fit wraps whole; units intersecting the old right-edge gap are cleared
+    /// using `style`.
     /// Wrapping at the region's bottom scrolls only that region. Outside the
     /// region, wrapping stops at the physical bottom and returns to column zero.
     /// Units wider than the grid fail. Every error preserves contents and cursor.
+    /// With automatic wrapping disabled, a unit that cannot fit the remaining
+    /// columns is validated and ignored. Writes ending at the right edge keep
+    /// the cursor in the last column with pending wrapping clear.
     pub fn write(
         &mut self,
         text: &str,
@@ -210,6 +229,15 @@ impl Screen {
             return Err(StorageError::OutOfBounds);
         }
         let gap = !self.cursor.wrap_pending && self.cursor.column + width_columns > columns;
+        if gap && !self.auto_wrap {
+            if text.is_empty() {
+                return Err(StorageError::EmptyText);
+            }
+            if text.len() > MAX_CELL_TEXT_BYTES {
+                return Err(StorageError::TextTooLong);
+            }
+            return Ok(());
+        }
         let wrap = self.cursor.wrap_pending || gap;
         let (row, column) = if wrap {
             let row = if self.cursor.row == self.scroll_region.end - 1 {
@@ -238,10 +266,36 @@ impl Screen {
 
     /// Writes printable ASCII in row-sized batches. The entire input is validated
     /// before mutation. Empty input preserves pending wrapping. This does not allocate.
+    /// With automatic wrapping disabled, excess bytes overwrite the last column;
+    /// the final byte supplies that cell without writing intermediate values.
     #[inline]
     pub fn write_ascii(&mut self, mut bytes: &[u8], style: StyleId) -> Result<(), StorageError> {
         if bytes.iter().any(|&byte| !(b' '..=b'~').contains(&byte)) {
             return Err(StorageError::InvalidAscii);
+        }
+        if !self.auto_wrap && !bytes.is_empty() {
+            let last = self.grid.columns() - 1;
+            let prefix = bytes.len().min(last - self.cursor.column);
+            if prefix != 0 {
+                self.grid.write_ascii_validated(
+                    self.cursor.row,
+                    self.cursor.column,
+                    &bytes[..prefix],
+                    style,
+                );
+            }
+            self.cursor.column += prefix;
+            if prefix < bytes.len() {
+                self.grid.write_ascii_validated(
+                    self.cursor.row,
+                    last,
+                    &bytes[bytes.len() - 1..],
+                    style,
+                );
+                self.cursor.column = last;
+            }
+            self.cursor.wrap_pending = false;
+            return Ok(());
         }
         while !bytes.is_empty() {
             if self.cursor.wrap_pending {
@@ -453,7 +507,8 @@ impl Screen {
     /// changes preserve it. Tab stops in the width intersection are preserved;
     /// cropped stops are discarded and added columns receive default stops.
     /// Height-only changes preserve stops. Every error preserves contents, cursor,
-    /// region, and stops. Reserved tab capacity survives shrinking.
+    /// region, and stops. Automatic wrapping mode is preserved. Reserved tab
+    /// capacity survives shrinking.
     pub fn resize(
         &mut self,
         columns: usize,
@@ -482,7 +537,7 @@ impl Screen {
         self.cursor = Cursor {
             row,
             column: end.min(self.grid.columns() - 1),
-            wrap_pending: end == self.grid.columns(),
+            wrap_pending: end == self.grid.columns() && self.auto_wrap,
         };
     }
 }

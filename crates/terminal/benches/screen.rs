@@ -342,4 +342,33 @@ fn main() {
             }
         }
     }
+    for (columns, rows) in [(1, 24), (120, 24), (4096, 1)] {
+        for length in [1, 240, 16384] {
+            let mut screen = Screen::new(columns, rows).unwrap();
+            screen.set_auto_wrap(false);
+            let bytes = vec![b'x'; length];
+            measure(
+                &format!("ASCII no-wrap / input byte, {columns}x{rows}/{length}"),
+                length,
+                || {
+                    black_box(&mut screen)
+                        .write_ascii(black_box(&bytes), StyleId(1))
+                        .unwrap();
+                },
+            );
+        }
+    }
+    let mut screen = Screen::new(120, 24).unwrap();
+    screen.set_cursor(23, 119).unwrap();
+    screen.set_auto_wrap(false);
+    measure("scalar no-wrap at edge", 1, || {
+        black_box(&mut screen)
+            .write(black_box("x"), CellWidth::Single, StyleId(1))
+            .unwrap();
+    });
+    measure("ignored wide no-wrap at edge", 1, || {
+        black_box(&mut screen)
+            .write(black_box("水\u{301}"), CellWidth::Double, StyleId(1))
+            .unwrap();
+    });
 }
