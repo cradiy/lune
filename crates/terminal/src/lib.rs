@@ -30,6 +30,9 @@
 //! Whole-row insertion and deletion affect the cursor row through the scrolling
 //! region's bottom. They reuse row buffers and preserve retained text ownership;
 //! zero counts and cursors outside the region preserve all state.
+//! Relative cursor movement addresses physical cells and stops at directional
+//! scrolling boundaries or screen edges. It preserves contents and the region;
+//! zero counts preserve all state and positive counts cancel pending wrapping.
 
 mod cell;
 mod error;

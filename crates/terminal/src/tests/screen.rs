@@ -795,3 +795,141 @@ fn line_edits_recycle_owned_rows_only_within_the_cursor_suffix() {
         }
     }
 }
+
+#[test]
+fn relative_moves_stop_at_directional_boundaries_and_preserve_owned_contents() {
+    let moves = [
+        Screen::move_cursor_up,
+        Screen::move_cursor_down,
+        Screen::move_cursor_left,
+        Screen::move_cursor_right,
+    ];
+    for (rows, region, start, count, pending, destinations) in [
+        (7, 2..5, (0, 0), 0, false, [(0, 0); 4]),
+        (7, 2..5, (0, 4), 1, true, [(0, 4), (1, 4), (0, 3), (0, 4)]),
+        (
+            7,
+            2..5,
+            (1, 2),
+            usize::MAX,
+            false,
+            [(0, 2), (4, 2), (1, 0), (1, 4)],
+        ),
+        (
+            7,
+            2..5,
+            (2, 2),
+            usize::MAX,
+            false,
+            [(2, 2), (4, 2), (2, 0), (2, 4)],
+        ),
+        (7, 2..5, (3, 1), 1, false, [(2, 1), (4, 1), (3, 0), (3, 2)]),
+        (
+            7,
+            2..5,
+            (4, 2),
+            usize::MAX - 1,
+            false,
+            [(2, 2), (4, 2), (4, 0), (4, 4)],
+        ),
+        (
+            7,
+            2..5,
+            (5, 2),
+            usize::MAX,
+            false,
+            [(2, 2), (6, 2), (5, 0), (5, 4)],
+        ),
+        (7, 2..5, (6, 2), 1, false, [(5, 2), (6, 2), (6, 1), (6, 3)]),
+        (
+            7,
+            2..5,
+            (6, 2),
+            usize::MAX,
+            false,
+            [(2, 2), (6, 2), (6, 0), (6, 4)],
+        ),
+        (7, 2..5, (2, 4), 0, true, [(2, 4); 4]),
+        (7, 2..5, (4, 4), 1, true, [(3, 4), (4, 4), (4, 3), (4, 4)]),
+        (
+            7,
+            3..4,
+            (3, 4),
+            usize::MAX,
+            true,
+            [(3, 4), (3, 4), (3, 0), (3, 4)],
+        ),
+        (
+            1,
+            0..1,
+            (0, 4),
+            usize::MAX,
+            true,
+            [(0, 4), (0, 4), (0, 0), (0, 4)],
+        ),
+    ] {
+        let mut screen = Screen::new(5, rows).unwrap();
+        for row in 0..rows {
+            screen.set_cursor(row, 0).unwrap();
+            screen.write_ascii(b"abcde", StyleId(row as u32)).unwrap();
+            screen.set_cursor(row, 1).unwrap();
+            screen
+                .write("水\u{301}", CellWidth::Double, StyleId(8))
+                .unwrap();
+        }
+        screen.set_scroll_region(region.clone()).unwrap();
+        for (move_cursor, (row, column)) in moves.into_iter().zip(destinations) {
+            screen.set_cursor(start.0, start.1).unwrap();
+            if pending {
+                screen.write("!", CellWidth::Single, StyleId(9)).unwrap();
+            }
+            let before = snapshot(screen.grid());
+            let buffers: Vec<_> = screen
+                .grid()
+                .iter_rows()
+                .map(|row| {
+                    let Some(CellText::Extended(text)) = row.text(1) else {
+                        unreachable!()
+                    };
+                    (row.cells().as_ptr(), text.as_ptr())
+                })
+                .collect();
+            move_cursor(&mut screen, count);
+            assert_eq!(
+                screen.cursor(),
+                Cursor {
+                    row,
+                    column,
+                    wrap_pending: pending && count == 0
+                }
+            );
+            assert_eq!(screen.scroll_region(), region);
+            assert_eq!(snapshot(screen.grid()), before);
+            for (row, (cells, text)) in screen.grid().iter_rows().zip(buffers) {
+                assert_eq!(row.cells().as_ptr(), cells);
+                let Some(CellText::Extended(current)) = row.text(1) else {
+                    unreachable!()
+                };
+                assert_eq!(current.as_ptr(), text);
+            }
+            assert_invariants(screen.grid());
+        }
+    }
+    let mut single = Screen::new(1, 1).unwrap();
+    single
+        .write("e\u{301}", CellWidth::Single, StyleId(1))
+        .unwrap();
+    let before = snapshot(single.grid());
+    for move_cursor in moves {
+        move_cursor(&mut single, 0);
+        assert!(single.cursor().wrap_pending);
+    }
+    for move_cursor in moves {
+        single
+            .write("e\u{301}", CellWidth::Single, StyleId(1))
+            .unwrap();
+        move_cursor(&mut single, usize::MAX);
+        assert_eq!(single.cursor(), Cursor::default());
+        assert_eq!(snapshot(single.grid()), before);
+    }
+}

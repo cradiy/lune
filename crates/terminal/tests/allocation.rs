@@ -445,7 +445,23 @@ fn warm_writes_edits_scrolling_and_column_growth_make_no_allocation_requests() {
         screen.set_cursor(1, 7).unwrap();
         screen.write("!", CellWidth::Single, StyleId(1)).unwrap();
     }
+    let mut moving = prepare();
+    let moves = [
+        Screen::move_cursor_up,
+        Screen::move_cursor_down,
+        Screen::move_cursor_left,
+        Screen::move_cursor_right,
+    ];
     let ((), stats) = allocator::measure(Some(0), || {
+        for move_cursor in moves {
+            for row in 0..4 {
+                moving.set_cursor(row, 7).unwrap();
+                moving.write("!", CellWidth::Single, StyleId(1)).unwrap();
+                for count in [0, 1, usize::MAX] {
+                    move_cursor(&mut moving, count);
+                }
+            }
+        }
         for (display, mode, screen) in &mut screens {
             if *display {
                 screen.erase_display(*mode, StyleId(9));

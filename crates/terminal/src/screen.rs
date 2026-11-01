@@ -79,6 +79,70 @@ impl Screen {
         Ok(())
     }
 
+    /// Moves upward in physical rows, stopping at the scrolling region's top.
+    /// A cursor already above that boundary stops at the physical screen top.
+    /// Zero counts preserve all state; positive counts cancel pending wrapping,
+    /// including at a boundary. Contents, column, and region are preserved.
+    /// Counts up to `usize::MAX` are accepted. This does not allocate.
+    #[inline]
+    pub fn move_cursor_up(&mut self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let top = if self.cursor.row < self.scroll_region.start {
+            0
+        } else {
+            self.scroll_region.start
+        };
+        self.cursor.row = self.cursor.row.saturating_sub(count).max(top);
+        self.cursor.wrap_pending = false;
+    }
+
+    /// Moves downward in physical rows, stopping at the scrolling region's bottom.
+    /// A cursor already below that boundary stops at the physical screen bottom.
+    /// Count, wrapping, content, column, and allocation rules follow
+    /// [`Self::move_cursor_up`].
+    #[inline]
+    pub fn move_cursor_down(&mut self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let bottom = if self.cursor.row >= self.scroll_region.end {
+            self.grid.rows() - 1
+        } else {
+            self.scroll_region.end - 1
+        };
+        self.cursor.row = self.cursor.row.saturating_add(count).min(bottom);
+        self.cursor.wrap_pending = false;
+    }
+
+    /// Moves left in physical columns, stopping at column zero. Wide-unit
+    /// continuations are addressable. Count, wrapping, content, and allocation
+    /// rules follow [`Self::move_cursor_up`]; the row and region are preserved.
+    #[inline]
+    pub fn move_cursor_left(&mut self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        self.cursor.column = self.cursor.column.saturating_sub(count);
+        self.cursor.wrap_pending = false;
+    }
+
+    /// Moves right in physical columns, stopping at the last column. Other
+    /// movement rules follow [`Self::move_cursor_left`].
+    #[inline]
+    pub fn move_cursor_right(&mut self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        self.cursor.column = self
+            .cursor
+            .column
+            .saturating_add(count)
+            .min(self.grid.columns() - 1);
+        self.cursor.wrap_pending = false;
+    }
+
     /// Writes a complete display unit, then advances by its supplied width.
     /// Filling the right edge leaves the cursor in the last column with wrapping
     /// pending. A double-width unit that cannot fit wraps as a whole; the split

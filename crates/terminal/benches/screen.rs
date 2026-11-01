@@ -280,4 +280,29 @@ fn main() {
             );
         }
     }
+    for (columns, rows) in [(1, 1), (120, 24), (240, 4096)] {
+        for regional in [false, true] {
+            if regional && rows == 1 {
+                continue;
+            }
+            for count in [0, 1, 8, usize::MAX] {
+                let mut screen = Screen::new(columns, rows).unwrap();
+                if regional {
+                    screen.set_scroll_region(rows / 4..rows * 3 / 4).unwrap();
+                }
+                screen.set_cursor(rows / 2, columns - 1).unwrap();
+                screen.write("x", CellWidth::Single, StyleId(1)).unwrap();
+                measure(
+                    &format!("relative / {columns}x{rows}, region={regional}, count={count}"),
+                    4,
+                    || {
+                        black_box(&mut screen).move_cursor_up(black_box(count));
+                        black_box(&mut screen).move_cursor_down(black_box(count));
+                        black_box(&mut screen).move_cursor_left(black_box(count));
+                        black_box(&mut screen).move_cursor_right(black_box(count));
+                    },
+                );
+            }
+        }
+    }
 }

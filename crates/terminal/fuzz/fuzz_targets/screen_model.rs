@@ -21,6 +21,10 @@ pub enum Command<'a> {
     EraseCells(usize),
     InsertLines(usize),
     DeleteLines(usize),
+    MoveUp(usize),
+    MoveDown(usize),
+    MoveLeft(usize),
+    MoveRight(usize),
 }
 
 /// Uses complete display units and copying row edits. A column one past the
@@ -127,6 +131,34 @@ impl ScreenModel {
                         style,
                     )?;
                     self.cancel_wrap();
+                }
+            }
+            Command::MoveUp(count)
+            | Command::MoveDown(count)
+            | Command::MoveLeft(count)
+            | Command::MoveRight(count) => {
+                if *count != 0 {
+                    self.cancel_wrap();
+                    // Walk individual cells until the directional barrier. The
+                    // screen dimensions bound the steps needed for any count.
+                    for _ in 0..(*count).min(self.storage.rows().max(self.storage.columns())) {
+                        match command {
+                            Command::MoveUp(_) if self.row > 0 && self.row != self.region.start => {
+                                self.row -= 1;
+                            }
+                            Command::MoveDown(_)
+                                if self.row + 1 < self.storage.rows()
+                                    && self.row + 1 != self.region.end =>
+                            {
+                                self.row += 1;
+                            }
+                            Command::MoveLeft(_) if self.column > 0 => self.column -= 1,
+                            Command::MoveRight(_) if self.column + 1 < self.storage.columns() => {
+                                self.column += 1;
+                            }
+                            _ => break,
+                        }
+                    }
                 }
             }
         }
