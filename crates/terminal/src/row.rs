@@ -73,6 +73,8 @@ impl Row {
         Ok(())
     }
 
+    // Keep allocation and sparse-index updates outside the scalar write path.
+    #[inline(never)]
     fn write_extended(
         &mut self,
         range: Range<usize>,

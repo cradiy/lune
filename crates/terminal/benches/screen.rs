@@ -42,22 +42,30 @@ fn measure_prepared(
 }
 
 fn main() {
-    let mut grid = Grid::new(240, 80).unwrap();
-    measure("grid scalar / cell", 240, || {
-        for column in 0..240 {
-            black_box(&mut grid)
-                .write(0, column, black_box("x"), CellWidth::Single, StyleId(1))
-                .unwrap();
-        }
-    });
-    let mut screen = Screen::new(240, 80).unwrap();
-    measure("screen scalar + wrap / cell", 240, || {
-        for _ in 0..240 {
-            black_box(&mut screen)
-                .write(black_box("x"), CellWidth::Single, StyleId(1))
-                .unwrap();
-        }
-    });
+    for (name, text, width, columns) in [
+        ("ASCII scalar", "x", CellWidth::Single, 1),
+        ("UTF-8 scalar", "é", CellWidth::Single, 1),
+        ("wide scalar", "水", CellWidth::Double, 2),
+        ("extended", "e\u{301}", CellWidth::Single, 1),
+    ] {
+        let units = 240 / columns;
+        let mut grid = Grid::new(240, 80).unwrap();
+        measure(&format!("grid {name} / unit"), units, || {
+            for column in (0..240).step_by(columns) {
+                black_box(&mut grid)
+                    .write(0, column, black_box(text), width, StyleId(1))
+                    .unwrap();
+            }
+        });
+        let mut screen = Screen::new(240, 80).unwrap();
+        measure(&format!("screen {name} + wrap / unit"), units, || {
+            for _ in 0..units {
+                black_box(&mut screen)
+                    .write(black_box(text), width, StyleId(1))
+                    .unwrap();
+            }
+        });
+    }
     for rows in [1, 24, 4096] {
         let mut screen = Screen::new(120, rows).unwrap();
         screen.set_cursor(rows - 1, 0).unwrap();
