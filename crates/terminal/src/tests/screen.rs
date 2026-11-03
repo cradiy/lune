@@ -2,6 +2,134 @@ use super::{assert_invariants, snapshot};
 use crate::{CellText, CellWidth, Cursor, EraseMode, Screen, StorageError, StyleId};
 
 #[test]
+fn saved_cursor_restores_modes_relative_rows_and_pending_writes_without_consuming_the_slot() {
+    let mut initial = Screen::new(4, 3).unwrap();
+    initial.set_scroll_region(1..3).unwrap();
+    initial.set_origin_mode(true);
+    initial.set_auto_wrap(false);
+    initial.set_cursor(usize::MAX, usize::MAX);
+    initial.restore_cursor();
+    assert_eq!(initial.cursor(), Cursor::default());
+    assert!(initial.auto_wrap());
+    assert!(!initial.origin_mode());
+    assert_eq!(initial.scroll_region(), 1..3);
+
+    for columns in [1, 4] {
+        for origin in [false, true] {
+            for (auto, pending) in [(false, false), (true, false), (true, true)] {
+                let mut screen = Screen::new(columns, 6).unwrap();
+                if columns > 1 {
+                    screen.set_cursor(2, 0);
+                    screen
+                        .write("水\u{301}", CellWidth::Double, StyleId(1))
+                        .unwrap();
+                }
+                screen.set_scroll_region(1..5).unwrap();
+                screen.set_origin_mode(origin);
+                screen.set_auto_wrap(auto);
+                screen.set_cursor(
+                    if origin { 1 } else { 2 },
+                    if pending { columns - 1 } else { 1 },
+                );
+                if pending {
+                    screen.write("!", CellWidth::Single, StyleId(2)).unwrap();
+                }
+                let saved = screen.cursor();
+                let contents = snapshot(screen.grid());
+                screen.save_cursor();
+                assert_eq!(screen.cursor(), saved);
+                screen.set_origin_mode(!origin);
+                screen.set_auto_wrap(!auto);
+                screen.set_scroll_region(2..6).unwrap();
+                screen.clear_tab_stops();
+                screen.set_tab_stop();
+                let tabs: Vec<_> = (0..columns)
+                    .map(|column| screen.is_tab_stop(column))
+                    .collect();
+                let expected = Cursor {
+                    row: if origin { 3 } else { 2 },
+                    ..saved
+                };
+                for _ in 0..2 {
+                    screen.restore_cursor();
+                    assert_eq!(screen.cursor(), expected);
+                    assert_eq!((screen.origin_mode(), screen.auto_wrap()), (origin, auto));
+                    assert_eq!(screen.scroll_region(), 2..6);
+                    assert_eq!(snapshot(screen.grid()), contents);
+                    assert_eq!(
+                        (0..columns)
+                            .map(|column| screen.is_tab_stop(column))
+                            .collect::<Vec<_>>(),
+                        tabs
+                    );
+                    screen.carriage_return();
+                    screen.set_origin_mode(!origin);
+                    screen.set_auto_wrap(!auto);
+                }
+                screen.restore_cursor();
+                screen.write("X", CellWidth::Single, StyleId(3)).unwrap();
+                assert_eq!(screen.cursor().row, expected.row + usize::from(pending));
+                let written = snapshot(screen.grid());
+                screen.restore_cursor();
+                assert_eq!(screen.cursor(), expected);
+                assert_eq!(snapshot(screen.grid()), written);
+
+                screen.set_cursor(0, 0);
+                screen.set_auto_wrap(false);
+                let replacement = screen.cursor();
+                screen.save_cursor();
+                screen.set_cursor(usize::MAX, usize::MAX);
+                screen.set_auto_wrap(true);
+                screen.restore_cursor();
+                assert_eq!(screen.cursor(), replacement);
+                assert!(!screen.auto_wrap());
+                assert_invariants(screen.grid());
+            }
+        }
+    }
+}
+
+#[test]
+fn saved_cursor_survives_resizing_and_cancels_pending_wrapping_when_clamped() {
+    for origin in [false, true] {
+        let mut screen = Screen::new(4, 6).unwrap();
+        screen.set_scroll_region(1..5).unwrap();
+        screen.set_origin_mode(origin);
+        screen.set_cursor(2, 3);
+        screen.write("!", CellWidth::Single, StyleId(1)).unwrap();
+        screen.save_cursor();
+        for (columns, rows, region) in [
+            (8, 6, 2..6),
+            (2, 6, 2..6),
+            (4, 2, 0..2),
+            (4, 6, 2..6),
+            (4, 6, 4..5),
+            (4, 6, 1..5),
+        ] {
+            screen.set_origin_mode(!origin);
+            screen.set_auto_wrap(false);
+            screen.resize(columns, rows, StyleId(2)).unwrap();
+            screen.set_scroll_region(region.clone()).unwrap();
+            let contents = snapshot(screen.grid());
+            screen.restore_cursor();
+            let height = if origin { region.len() } else { rows };
+            assert_eq!(
+                screen.cursor(),
+                Cursor {
+                    row: if origin { region.start } else { 0 } + 2.min(height - 1),
+                    column: 3.min(columns - 1),
+                    wrap_pending: columns == 4 && height > 2,
+                }
+            );
+            assert_eq!((screen.origin_mode(), screen.auto_wrap()), (origin, true));
+            assert_eq!(screen.scroll_region(), region);
+            assert_eq!(snapshot(screen.grid()), contents);
+            assert_invariants(screen.grid());
+        }
+    }
+}
+
+#[test]
 fn origin_addressing_clamps_and_homes_without_changing_storage_or_modes() {
     for columns in [1, 4] {
         for rows in 1..=5 {

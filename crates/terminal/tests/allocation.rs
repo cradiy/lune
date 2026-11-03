@@ -250,59 +250,45 @@ fn screen_failures_preserve_contents_cursor_and_pending_wrap() {
             |screen| screen.write("水\u{301}", CellWidth::Double, StyleId(3)),
         ),
     ];
+    let state = |screen: &Screen| {
+        (
+            snapshot(screen.grid()),
+            screen.cursor(),
+            screen.scroll_region(),
+            tab_stops(screen),
+            screen.auto_wrap(),
+            screen.origin_mode(),
+        )
+    };
     for (name, setup, mutate) in cases {
         let mut baseline = setup();
+        baseline.save_cursor();
         let (result, measured) = allocator::measure(None, || mutate(&mut baseline));
         result.unwrap();
         assert!(measured.attempts > 0, "{name}");
-        let expected = (
-            snapshot(baseline.grid()),
-            baseline.cursor(),
-            baseline.scroll_region(),
-            tab_stops(&baseline),
-            baseline.auto_wrap(),
-            baseline.origin_mode(),
-        );
+        let expected = state(&baseline);
+        baseline.restore_cursor();
+        let restored = state(&baseline);
         for point in 0..measured.attempts {
             let mut screen = setup();
-            let before = (
-                snapshot(screen.grid()),
-                screen.cursor(),
-                screen.scroll_region(),
-                tab_stops(&screen),
-                screen.auto_wrap(),
-                screen.origin_mode(),
-            );
+            screen.save_cursor();
+            let before = state(&screen);
             let (result, failed) = allocator::measure(Some(point), || mutate(&mut screen));
             assert!(
                 matches!(result, Err(StorageError::Allocation(_))),
                 "{name} at {point}: {result:?}"
             );
             assert_eq!(failed.failures, 1);
-            assert_eq!(
-                (
-                    snapshot(screen.grid()),
-                    screen.cursor(),
-                    screen.scroll_region(),
-                    tab_stops(&screen),
-                    screen.auto_wrap(),
-                    screen.origin_mode()
-                ),
-                before,
-                "{name} at {point}"
-            );
+            assert_eq!(state(&screen), before, "{name} at {point}");
+            screen.restore_cursor();
+            assert_eq!(state(&screen), before, "{name} saved state at {point}");
             mutate(&mut screen).unwrap();
+            assert_eq!(state(&screen), expected, "{name} retry at {point}");
+            screen.restore_cursor();
             assert_eq!(
-                (
-                    snapshot(screen.grid()),
-                    screen.cursor(),
-                    screen.scroll_region(),
-                    tab_stops(&screen),
-                    screen.auto_wrap(),
-                    screen.origin_mode()
-                ),
-                expected,
-                "{name} retry at {point}"
+                state(&screen),
+                restored,
+                "{name} saved state after retry at {point}"
             );
         }
         eprintln!("{name}: {} failure points covered", measured.attempts);
@@ -464,6 +450,7 @@ fn warm_writes_edits_scrolling_and_column_growth_make_no_allocation_requests() {
             screen.set_cursor(21, 119);
             screen.write("水\u{301}", CellWidth::Double, StyleId(2))?;
             screen.write_ascii(&[b'x'; 240], StyleId(1))?;
+            screen.save_cursor();
             screen.set_auto_wrap(true);
             screen.set_tab_stop();
             screen.clear_tab_stop();
@@ -489,6 +476,7 @@ fn warm_writes_edits_scrolling_and_column_growth_make_no_allocation_requests() {
             screen.resize(240, 24, StyleId(0))?;
             screen.resize(120, 24, StyleId(0))?;
             screen.set_origin_mode(false);
+            screen.restore_cursor();
         }
         Ok::<_, StorageError>(())
     });

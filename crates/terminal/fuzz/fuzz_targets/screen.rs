@@ -97,6 +97,8 @@ fn apply(screen: &mut Screen, command: &Command<'_>, style: StyleId) -> Result<(
         Command::ClearTabs => screen.clear_tab_stops(),
         Command::AutoWrap(enabled) => screen.set_auto_wrap(*enabled),
         Command::OriginMode(enabled) => screen.set_origin_mode(*enabled),
+        Command::SaveCursor => screen.save_cursor(),
+        Command::RestoreCursor => screen.restore_cursor(),
     }
     Ok(())
 }
@@ -122,7 +124,7 @@ fuzz_target!(|data: &[u8]| {
             1 => EraseMode::ToCursor,
             _ => EraseMode::All,
         };
-        let command = match bytes[0] % 30 {
+        let command = match bytes[0] % 32 {
             0 => {
                 let text = match bytes[4] % 10 {
                     8 => &long_text[..MAX_CELL_TEXT_BYTES],
@@ -164,7 +166,9 @@ fuzz_target!(|data: &[u8]| {
             26 => Command::ClearTab,
             27 => Command::ClearTabs,
             28 => Command::AutoWrap(bytes[3] & 1 != 0),
-            _ => Command::OriginMode(bytes[3] & 1 != 0),
+            29 => Command::OriginMode(bytes[3] & 1 != 0),
+            30 => Command::SaveCursor,
+            _ => Command::RestoreCursor,
         };
         match (
             apply(&mut screen, &command, style),
@@ -178,4 +182,7 @@ fuzz_target!(|data: &[u8]| {
         }
         model.check(&screen);
     }
+    screen.restore_cursor();
+    model.apply(&Command::RestoreCursor, StyleId(0)).unwrap();
+    model.check(&screen);
 });

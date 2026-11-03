@@ -52,6 +52,13 @@
 //! Setting origin mode or a valid scrolling region homes the cursor and clears
 //! pending wrapping. Resizing preserves origin mode and keeps the cursor in
 //! bounds; a height change resets the scrolling region to the full screen.
+//! [`Screen::save_cursor`] replaces a fixed save slot with the position, both
+//! modes, and pending wrapping. Saved rows follow the selected addressing origin.
+//! [`Screen::restore_cursor`] applies that state to the current region and size,
+//! clamping coordinates. Pending wrapping survives only at an unchanged valid
+//! position on the current right edge. The slot initially holds the initial
+//! cursor state and persists across resizing and repeated restores. Both
+//! operations preserve contents, scrolling boundaries, and tabs without allocating.
 
 mod cell;
 mod error;

@@ -30,10 +30,32 @@ pub struct Cursor {
 pub struct Screen {
     grid: Grid,
     cursor: Cursor,
+    saved_cursor: SavedCursor,
     scroll_region: Range<usize>,
     tabs: TabStops,
     auto_wrap: bool,
     origin_mode: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SavedCursor {
+    row: usize,
+    column: usize,
+    wrap_pending: bool,
+    auto_wrap: bool,
+    origin_mode: bool,
+}
+
+impl Default for SavedCursor {
+    fn default() -> Self {
+        Self {
+            row: 0,
+            column: 0,
+            wrap_pending: false,
+            auto_wrap: true,
+            origin_mode: false,
+        }
+    }
 }
 
 impl Screen {
@@ -41,6 +63,7 @@ impl Screen {
         Ok(Self {
             grid: Grid::new(columns, rows)?,
             cursor: Cursor::default(),
+            saved_cursor: SavedCursor::default(),
             scroll_region: 0..rows,
             tabs: TabStops::new(columns)?,
             auto_wrap: true,
@@ -54,6 +77,46 @@ impl Screen {
 
     pub fn cursor(&self) -> Cursor {
         self.cursor
+    }
+
+    /// Replaces the saved position, origin mode, automatic-wrap mode, and pending
+    /// wrapping. Rows are relative to the scrolling region when origin mode is
+    /// enabled. Active state, contents, region, and tabs are preserved.
+    /// The save slot initially holds the initial cursor state. This does not allocate.
+    pub fn save_cursor(&mut self) {
+        self.saved_cursor = SavedCursor {
+            row: if self.origin_mode {
+                self.cursor.row - self.scroll_region.start
+            } else {
+                self.cursor.row
+            },
+            column: self.cursor.column,
+            wrap_pending: self.cursor.wrap_pending,
+            auto_wrap: self.auto_wrap,
+            origin_mode: self.origin_mode,
+        };
+    }
+
+    /// Restores the save slot against the current dimensions and scrolling
+    /// region. Coordinates clamp as in [`Self::set_cursor`]. Pending wrapping
+    /// is restored only when saved coordinates fit unchanged in their addressing
+    /// scope, the saved column is the current right edge, and automatic wrapping
+    /// is enabled. Contents, region, tabs, and the saved slot are preserved.
+    /// Repeated restores reuse the same state. This does not allocate.
+    pub fn restore_cursor(&mut self) {
+        let saved = self.saved_cursor;
+        let height = if saved.origin_mode {
+            self.scroll_region.len()
+        } else {
+            self.grid.rows()
+        };
+        self.auto_wrap = saved.auto_wrap;
+        self.origin_mode = saved.origin_mode;
+        self.set_cursor(saved.row, saved.column);
+        self.cursor.wrap_pending = saved.wrap_pending
+            && saved.auto_wrap
+            && saved.row < height
+            && saved.column == self.grid.columns() - 1;
     }
 
     /// Whether cursor addressing uses the scrolling region as its origin.
@@ -555,6 +618,7 @@ impl Screen {
         Ok(())
     }
 
+    #[inline]
     fn advance(&mut self, row: usize, end: usize) {
         self.cursor = Cursor {
             row,

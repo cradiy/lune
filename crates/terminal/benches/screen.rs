@@ -293,6 +293,27 @@ fn main() {
         }
     }
     for origin in [false, true] {
+        let mut saved = Screen::new(120, 24).unwrap();
+        saved.set_scroll_region(3..21).unwrap();
+        saved.set_origin_mode(origin);
+        saved.set_cursor(if origin { 17 } else { 20 }, 119);
+        saved.write("!", CellWidth::Single, StyleId(1)).unwrap();
+        measure(&format!("save cursor / origin={origin}"), 1, || {
+            black_box(&mut saved).save_cursor();
+        });
+        for clamped in [false, true] {
+            if clamped {
+                saved.resize(80, 12, StyleId(0)).unwrap();
+                saved.set_scroll_region(2..10).unwrap();
+            }
+            measure(
+                &format!("restore / origin={origin}, clamped={clamped}"),
+                1,
+                || {
+                    black_box(&mut saved).restore_cursor();
+                },
+            );
+        }
         let mut screen = Screen::new(120, 24).unwrap();
         screen.set_scroll_region(3..21).unwrap();
         screen.set_origin_mode(origin);

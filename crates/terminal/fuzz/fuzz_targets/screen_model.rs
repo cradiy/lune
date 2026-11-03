@@ -34,6 +34,16 @@ pub enum Command<'a> {
     ClearTabs,
     AutoWrap(bool),
     OriginMode(bool),
+    SaveCursor,
+    RestoreCursor,
+}
+
+struct SavedCursor {
+    row: usize,
+    column: usize,
+    pending_width: Option<usize>,
+    auto_wrap: bool,
+    origin_mode: bool,
 }
 
 /// Uses complete display units and copying row edits. A column one past the
@@ -46,6 +56,7 @@ pub struct ScreenModel {
     tabs: BTreeSet<usize>,
     auto_wrap: bool,
     origin_mode: bool,
+    saved: SavedCursor,
 }
 
 impl ScreenModel {
@@ -58,6 +69,13 @@ impl ScreenModel {
             tabs: (0..columns).step_by(8).collect(),
             auto_wrap: true,
             origin_mode: false,
+            saved: SavedCursor {
+                row: 0,
+                column: 0,
+                pending_width: None,
+                auto_wrap: true,
+                origin_mode: false,
+            },
         }
     }
 
@@ -85,6 +103,40 @@ impl ScreenModel {
 
     pub fn apply(&mut self, command: &Command<'_>, style: StyleId) -> Result<(), StorageError> {
         match command {
+            Command::SaveCursor => {
+                self.saved = SavedCursor {
+                    row: if self.origin_mode {
+                        self.region.clone().position(|row| row == self.row).unwrap()
+                    } else {
+                        self.row
+                    },
+                    column: self.visible_column(),
+                    pending_width: (self.column == self.storage.columns()).then_some(self.column),
+                    auto_wrap: self.auto_wrap,
+                    origin_mode: self.origin_mode,
+                };
+            }
+            Command::RestoreCursor => {
+                self.auto_wrap = self.saved.auto_wrap;
+                self.origin_mode = self.saved.origin_mode;
+                let mut rows = if self.origin_mode {
+                    self.region.clone()
+                } else {
+                    0..self.storage.rows()
+                };
+                let last = rows.end - 1;
+                let destination = rows.nth(self.saved.row);
+                self.row = destination.unwrap_or(last);
+                self.column = (0..self.storage.columns())
+                    .nth(self.saved.column)
+                    .unwrap_or(self.storage.columns() - 1);
+                if self.auto_wrap
+                    && destination.is_some()
+                    && self.saved.pending_width == Some(self.storage.columns())
+                {
+                    self.column = self.storage.columns();
+                }
+            }
             Command::Write(text, width) => return self.write(text, *width, style),
             Command::Ascii(bytes) => {
                 if bytes.iter().any(|&byte| !(b' '..=b'~').contains(&byte)) {

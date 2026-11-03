@@ -40,6 +40,11 @@ Mode and region settings home the cursor and clear pending wrapping. Every
 command compares both mode flags and checks that origin-mode cursors remain
 within the scrolling region. Width changes retain the region; height changes
 reset it to the full screen while preserving origin mode.
+Save and restore commands retain modes and the position in its addressing scope.
+The saved oracle records pending wrapping as an optional original width. Restore
+selects a row in the current addressing range and restores pending wrapping only
+when that row fits and the width matches. The slot survives resizing and repeated
+restores. A final restore also checks saves at the end of each input.
 
 Every command checks cell text, width, continuation occupancy, styles, dimensions,
 cursor coordinates, pending wrapping, scrolling boundaries, and error categories.
@@ -58,14 +63,14 @@ columns to exercise bitmap word boundaries. Other valid widths and heights are
 limited to 16. Zero, overlarge, and invalid arguments are included.
 For screen coordinates, bytes `fc`, `fd`, `fe`, and `ff` select the last cell, the
 exclusive bound, zero, and `usize::MAX`; other bytes are reduced by the dimension
-plus two. Screen opcodes modulo 30 select: 0 unit write, 1 ASCII, 2 cursor, 3 region,
+plus two. Screen opcodes modulo 32 select: 0 unit write, 1 ASCII, 2 cursor, 3 region,
 4 resize, 5 carriage return, 6 backspace, 7 line feed, 8 reverse index, 9 line erasure,
 10 display erasure, 11 cell insertion, 12 cell deletion, 13 counted erasure,
 14 line insertion, 15 line deletion, 16 same-size resize, 17 move up, 18 move down,
 19 move left, 20 move right, 21 scroll up, 22 scroll down, 23 tab forward,
 24 tab backward, 25 set current tab, 26 clear current tab, 27 clear all tabs,
-28 set automatic wrapping, and 29 set origin mode. Both settings use the low bit
-of byte 3.
+28 set automatic wrapping, 29 set origin mode, 30 save cursor state, and 31 restore
+cursor state. Both mode settings use the low bit of byte 3.
 Byte 3 selects width, count (`ff` means `usize::MAX`), or erasure mode.
 Byte 4 selects synthetic text;
 bytes 4 through 7 also form the style key.
