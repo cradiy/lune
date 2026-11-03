@@ -52,8 +52,8 @@
 //! Setting origin mode or a valid scrolling region homes the cursor and clears
 //! pending wrapping. Resizing preserves origin mode and keeps the cursor in
 //! bounds; a height change resets the scrolling region to the full screen.
-//! [`Screen::save_cursor`] replaces a fixed save slot with the position, both
-//! modes, and pending wrapping. Saved rows follow the selected addressing origin.
+//! [`Screen::save_cursor`] replaces a fixed save slot with the position, origin
+//! and automatic-wrap modes, and pending wrapping. Saved rows follow the selected addressing origin.
 //! [`Screen::restore_cursor`] applies that state to the current region and size,
 //! clamping coordinates. Pending wrapping survives only at an unchanged valid
 //! position on the current right edge. The slot initially holds the initial
@@ -63,6 +63,12 @@
 //! the initial cursor, save slot, full-screen region, default tabs, and modes.
 //! Row buffers, the row queue, text indices, and the tab bitmap retain capacity;
 //! owned text is released. Repeated resets do not allocate.
+//! Insertion mode starts disabled. Enabling it shifts the row suffix right by
+//! each written unit's width, discards overflow, and repairs split wide units.
+//! ASCII batches shift once per row segment after validating the full input.
+//! Scalar insertion reserves owned text and index capacity before changing cells.
+//! Mode changes preserve pending wrapping; resizing and cursor restores preserve
+//! insertion mode. Resetting disables it.
 
 mod cell;
 mod error;

@@ -42,6 +42,33 @@ fn measure_prepared(
 }
 
 fn main() {
+    for columns in [120, 4096] {
+        for column in [0, columns / 2, columns - 1] {
+            for bulk in [false, true] {
+                let mut screen = Screen::new(columns, 24).unwrap();
+                screen.set_insert_mode(true);
+                screen.set_auto_wrap(false);
+                let bytes = [b'x'; 32];
+                measure(
+                    &format!("insert ASCII / {columns}/{column}, bulk={bulk}"),
+                    bytes.len(),
+                    || {
+                        let screen = black_box(&mut screen);
+                        screen.set_cursor(12, column);
+                        if bulk {
+                            screen.write_ascii(black_box(&bytes), StyleId(1)).unwrap();
+                        } else {
+                            for _ in 0..bytes.len() {
+                                screen
+                                    .write(black_box("x"), CellWidth::Single, StyleId(1))
+                                    .unwrap();
+                            }
+                        }
+                    },
+                );
+            }
+        }
+    }
     for (columns, rows) in [(120, 24), (240, 4096)] {
         let mut screen = Screen::new(columns, rows).unwrap();
         measure(

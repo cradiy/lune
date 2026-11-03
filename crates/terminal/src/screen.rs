@@ -35,6 +35,7 @@ pub struct Screen {
     tabs: TabStops,
     auto_wrap: bool,
     origin_mode: bool,
+    insert_mode: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -68,6 +69,7 @@ impl Screen {
             tabs: TabStops::new(columns)?,
             auto_wrap: true,
             origin_mode: false,
+            insert_mode: false,
         })
     }
 
@@ -92,6 +94,19 @@ impl Screen {
         self.tabs.reset(self.grid.columns());
         self.auto_wrap = true;
         self.origin_mode = false;
+        self.insert_mode = false;
+    }
+
+    /// Whether writes insert columns and shift the row suffix. Disabled initially.
+    pub fn insert_mode(&self) -> bool {
+        self.insert_mode
+    }
+
+    /// Changes insertion behavior while preserving all other state, including
+    /// pending wrapping and the save slot. Resizing and cursor restores preserve
+    /// this mode; resetting disables it. This does not allocate.
+    pub fn set_insert_mode(&mut self, enabled: bool) {
+        self.insert_mode = enabled;
     }
 
     /// Replaces the saved position, origin mode, automatic-wrap mode, and pending
@@ -312,11 +327,38 @@ impl Screen {
     /// using `style`.
     /// Wrapping at the region's bottom scrolls only that region. Outside the
     /// region, wrapping stops at the physical bottom and returns to column zero.
-    /// Units wider than the grid fail. Every error preserves contents and cursor.
+    /// Insertion mode shifts the destination row's suffix by the unit's width
+    /// and discards overflow, repairing split wide units. Text and index capacity
+    /// are reserved before mutation. Units wider than the grid fail.
+    /// Every error preserves contents and cursor.
     /// With automatic wrapping disabled, a unit that cannot fit the remaining
     /// columns is validated and ignored. Writes ending at the right edge keep
     /// the cursor in the last column with pending wrapping clear.
     pub fn write(
+        &mut self,
+        text: &str,
+        width: CellWidth,
+        style: StyleId,
+    ) -> Result<(), StorageError> {
+        if self.insert_mode {
+            self.write_inserted(text, width, style)
+        } else {
+            self.write_mode::<false>(text, width, style)
+        }
+    }
+
+    #[inline(never)]
+    fn write_inserted(
+        &mut self,
+        text: &str,
+        width: CellWidth,
+        style: StyleId,
+    ) -> Result<(), StorageError> {
+        self.write_mode::<true>(text, width, style)
+    }
+
+    #[inline]
+    fn write_mode<const INSERT: bool>(
         &mut self,
         text: &str,
         width: CellWidth,
@@ -345,8 +387,22 @@ impl Screen {
                 self.cursor.row
             } else {
                 let row = (self.cursor.row + 1).min(self.grid.rows() - 1);
-                self.grid.write(row, 0, text, width, style)?;
-                if gap && (row != self.cursor.row || width_columns < columns) {
+                if INSERT {
+                    self.grid.write_inserting(
+                        row,
+                        0,
+                        text,
+                        width,
+                        style,
+                        gap && row == self.cursor.row,
+                    )?;
+                } else {
+                    self.grid.write(row, 0, text, width, style)?;
+                }
+                if gap
+                    && (row != self.cursor.row || width_columns < columns)
+                    && !(INSERT && row == self.cursor.row)
+                {
                     self.grid
                         .clear_row(self.cursor.row, columns - 1..columns, style)
                         .expect("The last column is in bounds");
@@ -355,8 +411,19 @@ impl Screen {
             };
             (row, 0)
         } else {
-            self.grid
-                .write(self.cursor.row, self.cursor.column, text, width, style)?;
+            if INSERT {
+                self.grid.write_inserting(
+                    self.cursor.row,
+                    self.cursor.column,
+                    text,
+                    width,
+                    style,
+                    false,
+                )?;
+            } else {
+                self.grid
+                    .write(self.cursor.row, self.cursor.column, text, width, style)?;
+            }
             (self.cursor.row, self.cursor.column)
         };
         self.advance(row, column + width_columns);
@@ -367,15 +434,40 @@ impl Screen {
     /// before mutation. Empty input preserves pending wrapping. This does not allocate.
     /// With automatic wrapping disabled, excess bytes overwrite the last column;
     /// the final byte supplies that cell without writing intermediate values.
+    /// Insertion mode shifts the suffix once per row segment. This is equivalent
+    /// to individual unit writes, including wide-unit repair and edge overwrites.
     #[inline]
-    pub fn write_ascii(&mut self, mut bytes: &[u8], style: StyleId) -> Result<(), StorageError> {
+    pub fn write_ascii(&mut self, bytes: &[u8], style: StyleId) -> Result<(), StorageError> {
         if bytes.iter().any(|&byte| !(b' '..=b'~').contains(&byte)) {
             return Err(StorageError::InvalidAscii);
         }
+        if self.insert_mode {
+            self.write_ascii_inserting(bytes, style)
+        } else {
+            self.write_ascii_mode::<false>(bytes, style)
+        }
+    }
+
+    #[inline(never)]
+    fn write_ascii_inserting(&mut self, bytes: &[u8], style: StyleId) -> Result<(), StorageError> {
+        self.write_ascii_mode::<true>(bytes, style)
+    }
+
+    #[inline]
+    fn write_ascii_mode<const INSERT: bool>(
+        &mut self,
+        mut bytes: &[u8],
+        style: StyleId,
+    ) -> Result<(), StorageError> {
         if !self.auto_wrap && !bytes.is_empty() {
             let last = self.grid.columns() - 1;
             let prefix = bytes.len().min(last - self.cursor.column);
             if prefix != 0 {
+                if INSERT {
+                    self.grid
+                        .insert_cells(self.cursor.row, self.cursor.column, prefix, style)
+                        .expect("The ASCII prefix fits");
+                }
                 self.grid.write_ascii_validated(
                     self.cursor.row,
                     self.cursor.column,
@@ -385,6 +477,11 @@ impl Screen {
             }
             self.cursor.column += prefix;
             if prefix < bytes.len() {
+                if INSERT {
+                    self.grid
+                        .insert_cells(self.cursor.row, last, 1, style)
+                        .expect("The last column fits");
+                }
                 self.grid.write_ascii_validated(
                     self.cursor.row,
                     last,
@@ -402,6 +499,11 @@ impl Screen {
                 self.cursor.column = 0;
             }
             let length = bytes.len().min(self.grid.columns() - self.cursor.column);
+            if INSERT {
+                self.grid
+                    .insert_cells(self.cursor.row, self.cursor.column, length, style)
+                    .expect("The ASCII run fits");
+            }
             self.grid.write_ascii_validated(
                 self.cursor.row,
                 self.cursor.column,

@@ -2,6 +2,65 @@ use super::{assert_invariants, snapshot};
 use crate::{CellText, CellWidth, Cursor, EraseMode, Screen, StorageError, StyleId};
 
 #[test]
+fn insertion_writes_shift_complete_units_and_preserve_mode_boundaries() {
+    let mut screen = Screen::new(8, 3).unwrap();
+    screen.write_ascii(b"abcdefgh", StyleId(1)).unwrap();
+    let pending = screen.cursor();
+    screen.set_insert_mode(true);
+    assert_eq!(screen.cursor(), pending);
+    screen.set_cursor(0, 2);
+    screen.write_ascii(b"XY", StyleId(2)).unwrap();
+    for (column, byte) in b"abXYcdef".iter().enumerate() {
+        assert_eq!(
+            screen.grid().row(0).unwrap().text(column),
+            Some(CellText::Scalar(char::from(*byte)))
+        );
+    }
+    screen.set_cursor(0, 3);
+    screen
+        .write("水\u{301}", CellWidth::Double, StyleId(3))
+        .unwrap();
+    let row = screen.grid().row(0).unwrap();
+    assert_eq!(row.text(3), Some(CellText::Extended("水\u{301}")));
+    assert_eq!(row.text(4), Some(CellText::Continuation));
+    assert_eq!(row.text(5), Some(CellText::Scalar('Y')));
+    assert_eq!(row.text(7), Some(CellText::Scalar('d')));
+    let before = snapshot(screen.grid());
+    let cursor = screen.cursor();
+    assert!(screen.write_ascii(b"valid\n", StyleId(4)).is_err());
+    assert!(screen.write("", CellWidth::Single, StyleId(4)).is_err());
+    assert_eq!(snapshot(screen.grid()), before);
+    assert_eq!(screen.cursor(), cursor);
+    screen.save_cursor();
+    screen.set_insert_mode(false);
+    screen.restore_cursor();
+    assert!(!screen.insert_mode());
+    screen.set_insert_mode(true);
+    screen.resize(9, 3, StyleId(0)).unwrap();
+    assert!(screen.insert_mode());
+    screen.reset(StyleId(0));
+    assert!(!screen.insert_mode());
+
+    let mut bottom = Screen::new(4, 3).unwrap();
+    bottom.set_scroll_region(0..1).unwrap();
+    bottom.set_cursor(2, 0);
+    bottom.write_ascii(b"abcd", StyleId(1)).unwrap();
+    bottom.set_cursor(2, 3);
+    bottom.set_insert_mode(true);
+    bottom.write("水", CellWidth::Double, StyleId(2)).unwrap();
+    assert_eq!(
+        bottom.grid().row(2).unwrap().text(2),
+        Some(CellText::Scalar('a'))
+    );
+    assert_eq!(
+        bottom.grid().row(2).unwrap().text(3),
+        Some(CellText::Scalar('b'))
+    );
+    assert_invariants(bottom.grid());
+    assert_invariants(screen.grid());
+}
+
+#[test]
 fn reset_clears_owned_units_restores_state_and_reuses_wrapped_row_buffers() {
     for columns in [1, 8, 63, 64, 65, 129] {
         for rows in [1, 4] {
@@ -377,9 +436,11 @@ fn ascii_batches_match_unit_writes_across_wraps_and_scrolls() {
             for region in (0..rows).flat_map(|start| (start + 1..=rows).map(move |end| start..end))
             {
                 for row in 0..rows {
-                    for (column, auto_wrap) in (0..=columns)
-                        .flat_map(|column| [false, true].map(move |mode| (column, mode)))
-                    {
+                    for (column, auto_wrap, insert_mode) in (0..=columns).flat_map(|column| {
+                        [false, true].into_iter().flat_map(move |auto| {
+                            [false, true].map(move |insert| (column, auto, insert))
+                        })
+                    }) {
                         let mut bulk = Screen::new(columns, rows).unwrap();
                         let mut scalar = Screen::new(columns, rows).unwrap();
                         for screen in [&mut bulk, &mut scalar] {
@@ -396,6 +457,7 @@ fn ascii_batches_match_unit_writes_across_wraps_and_scrolls() {
                                 screen.write("!", CellWidth::Single, StyleId(3)).unwrap();
                             }
                             screen.set_auto_wrap(auto_wrap);
+                            screen.set_insert_mode(insert_mode);
                         }
                         for chunk in input.chunks(7) {
                             bulk.write_ascii(chunk, StyleId(4)).unwrap();

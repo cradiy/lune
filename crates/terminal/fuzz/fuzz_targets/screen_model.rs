@@ -37,6 +37,7 @@ pub enum Command<'a> {
     SaveCursor,
     RestoreCursor,
     Reset,
+    InsertMode(bool),
 }
 
 struct SavedCursor {
@@ -58,6 +59,7 @@ pub struct ScreenModel {
     auto_wrap: bool,
     origin_mode: bool,
     saved: SavedCursor,
+    insert_mode: bool,
 }
 
 impl ScreenModel {
@@ -70,6 +72,7 @@ impl ScreenModel {
             tabs: (0..columns).step_by(8).collect(),
             auto_wrap: true,
             origin_mode: false,
+            insert_mode: false,
             saved: SavedCursor {
                 row: 0,
                 column: 0,
@@ -89,6 +92,7 @@ impl ScreenModel {
         assert_eq!(screen.scroll_region(), self.region);
         assert_eq!(screen.auto_wrap(), self.auto_wrap);
         assert_eq!(screen.origin_mode(), self.origin_mode);
+        assert_eq!(screen.insert_mode(), self.insert_mode);
         assert!(!self.origin_mode || self.region.contains(&self.row));
         assert!(self.auto_wrap || self.column < self.storage.columns());
         for column in 0..self.storage.columns() {
@@ -104,6 +108,7 @@ impl ScreenModel {
 
     pub fn apply(&mut self, command: &Command<'_>, style: StyleId) -> Result<(), StorageError> {
         match command {
+            Command::InsertMode(enabled) => self.insert_mode = *enabled,
             Command::Reset => {
                 let columns = self.storage.columns();
                 let rows = self.storage.rows();
@@ -327,6 +332,10 @@ impl ScreenModel {
                 } else {
                     CellWidth::Double
                 };
+                if self.insert_mode {
+                    self.storage
+                        .edit(self.row, self.column, width, true, style)?;
+                }
                 self.storage
                     .write(self.row, self.column, text, cell_width, style)?;
                 self.column = (self.column + width).min(columns - 1);
@@ -346,6 +355,10 @@ impl ScreenModel {
         } else {
             CellWidth::Double
         };
+        if self.insert_mode {
+            self.storage
+                .edit(self.row, self.column, width, true, style)?;
+        }
         self.storage
             .write(self.row, self.column, text, cell_width, style)?;
         self.column += width;

@@ -73,6 +73,50 @@ impl Row {
         Ok(())
     }
 
+    pub(crate) fn write_inserting(
+        &mut self,
+        column: usize,
+        text: &str,
+        width: CellWidth,
+        style: StyleId,
+        clear_gap: bool,
+    ) -> Result<(), StorageError> {
+        self.end(column, width.columns())?;
+        let character = text.chars().next().ok_or(StorageError::EmptyText)?;
+        if text.len() > MAX_CELL_TEXT_BYTES {
+            return Err(StorageError::TextTooLong);
+        }
+        let owned = if text.len() > character.len_utf8() {
+            let mut owned = String::new();
+            owned.try_reserve_exact(text.len())?;
+            self.extended.try_reserve(1)?;
+            owned.push_str(text);
+            Some(owned)
+        } else {
+            None
+        };
+        if clear_gap {
+            let last = self.cells.len() - 1;
+            self.clear_range(last..last + 1, style)
+                .expect("The last column is in bounds");
+        }
+        self.insert_cells(column, width.columns(), style)
+            .expect("The destination fits");
+        let mut cell = Cell::scalar(character, width, style);
+        if let Some(text) = owned {
+            let index = self
+                .extended_index(column)
+                .expect_err("Inserted cells are blank");
+            self.extended.insert(index, ExtendedText { column, text });
+            cell.set_extended();
+        }
+        self.cells[column] = cell;
+        if width == CellWidth::Double {
+            self.cells[column + 1] = Cell::continuation(style);
+        }
+        Ok(())
+    }
+
     // Keep allocation and sparse-index updates outside the scalar write path.
     #[inline(never)]
     fn write_extended(

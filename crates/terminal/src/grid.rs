@@ -57,6 +57,19 @@ impl Grid {
         self.row_mut(row)?.write(column, text, width, style)
     }
 
+    pub(crate) fn write_inserting(
+        &mut self,
+        row: usize,
+        column: usize,
+        text: &str,
+        width: CellWidth,
+        style: StyleId,
+        clear_gap: bool,
+    ) -> Result<(), StorageError> {
+        self.row_mut(row)?
+            .write_inserting(column, text, width, style, clear_gap)
+    }
+
     /// Writes a printable ASCII run in one pass after validating the entire run.
     pub fn write_ascii(
         &mut self,

@@ -100,6 +100,7 @@ fn apply(screen: &mut Screen, command: &Command<'_>, style: StyleId) -> Result<(
         Command::SaveCursor => screen.save_cursor(),
         Command::RestoreCursor => screen.restore_cursor(),
         Command::Reset => screen.reset(style),
+        Command::InsertMode(enabled) => screen.set_insert_mode(*enabled),
     }
     Ok(())
 }
@@ -125,7 +126,7 @@ fuzz_target!(|data: &[u8]| {
             1 => EraseMode::ToCursor,
             _ => EraseMode::All,
         };
-        let command = match bytes[0] % 33 {
+        let command = match bytes[0] % 34 {
             0 => {
                 let text = match bytes[4] % 10 {
                     8 => &long_text[..MAX_CELL_TEXT_BYTES],
@@ -170,7 +171,8 @@ fuzz_target!(|data: &[u8]| {
             29 => Command::OriginMode(bytes[3] & 1 != 0),
             30 => Command::SaveCursor,
             31 => Command::RestoreCursor,
-            _ => Command::Reset,
+            32 => Command::Reset,
+            _ => Command::InsertMode(bytes[3] & 1 != 0),
         };
         match (
             apply(&mut screen, &command, style),

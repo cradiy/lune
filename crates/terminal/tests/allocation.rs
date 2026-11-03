@@ -134,7 +134,37 @@ fn screen_failures_preserve_contents_cursor_and_pending_wrap() {
         }
         screen
     }
-    let cases: [Case; 14] = [
+    let cases: [Case; 17] = [
+        (
+            "insert owned text into shifted suffix",
+            || {
+                let mut s = Screen::new(8, 2).unwrap();
+                s.write("水\u{301}", CellWidth::Double, StyleId(1)).unwrap();
+                s.set_cursor(0, 1);
+                s.set_insert_mode(true);
+                s
+            },
+            |s| s.write("e\u{301}", CellWidth::Single, StyleId(3)),
+        ),
+        (
+            "insert after wide gap on physical bottom",
+            || {
+                let mut s = regional(0..1, true);
+                s.set_cursor(3, 3);
+                s.set_insert_mode(true);
+                s
+            },
+            |s| s.write("水\u{301}", CellWidth::Double, StyleId(3)),
+        ),
+        (
+            "insert after regional scrolling",
+            || {
+                let mut s = regional(1..3, false);
+                s.set_insert_mode(true);
+                s
+            },
+            |s| s.write("水\u{301}", CellWidth::Double, StyleId(3)),
+        ),
         (
             "origin-mode wrap with owned text",
             || {
@@ -258,6 +288,7 @@ fn screen_failures_preserve_contents_cursor_and_pending_wrap() {
             tab_stops(screen),
             screen.auto_wrap(),
             screen.origin_mode(),
+            screen.insert_mode(),
         )
     };
     for (name, setup, mutate) in cases {
@@ -468,6 +499,7 @@ fn warm_writes_edits_scrolling_and_column_growth_make_no_allocation_requests() {
     screen.resize(120, 24, StyleId(0)).unwrap();
     let (result, stats) = allocator::measure(Some(0), || {
         for _ in 0..64 {
+            screen.set_insert_mode(true);
             screen.set_auto_wrap(false);
             screen.set_cursor(21, 119);
             screen.write("水\u{301}", CellWidth::Double, StyleId(2))?;
