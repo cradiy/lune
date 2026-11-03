@@ -61,6 +61,14 @@ impl Cell {
         self.text |= EXTENDED;
     }
 
+    pub(crate) fn is_inline_with_width(self, width: CellWidth) -> bool {
+        let occupancy = match width {
+            CellWidth::Single => 0,
+            CellWidth::Double => DOUBLE,
+        };
+        self.text & (DOUBLE | CONTINUATION | EXTENDED) == occupancy
+    }
+
     /// Returns the leading scalar of a display unit, or `None` for a continuation.
     pub fn character(self) -> Option<char> {
         if self.is_continuation() {

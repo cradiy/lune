@@ -426,6 +426,21 @@ fn allocation_failures_preserve_contents_and_allow_retry() {
 
 #[test]
 fn warm_writes_edits_scrolling_and_column_growth_make_no_allocation_requests() {
+    for width in [CellWidth::Single, CellWidth::Double] {
+        let mut grid = Grid::new(4, 1).unwrap();
+        let text = "e\u{301}".repeat(64);
+        grid.write(0, 0, &text, width, StyleId(1)).unwrap();
+        let (result, stats) =
+            allocator::measure(Some(0), || grid.write(0, 0, "x", width, StyleId(2)));
+        result.unwrap();
+        assert_eq!(stats.attempts, 0);
+        assert!(
+            stats.live_bytes < 0,
+            "Overwriting owned text releases its payload"
+        );
+        snapshot(&grid);
+    }
+
     let mut reset = Screen::new(130, 4).unwrap();
     reset.resize(65, 3, StyleId(0)).unwrap();
     for row in 0..3 {

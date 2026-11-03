@@ -53,6 +53,24 @@ impl Row {
         width: CellWidth,
         style: StyleId,
     ) -> Result<(), StorageError> {
+        match width {
+            CellWidth::Single => self.write_width::<false>(column, text, style),
+            CellWidth::Double => self.write_width::<true>(column, text, style),
+        }
+    }
+
+    #[inline]
+    fn write_width<const DOUBLE_WIDTH: bool>(
+        &mut self,
+        column: usize,
+        text: &str,
+        style: StyleId,
+    ) -> Result<(), StorageError> {
+        let width = if DOUBLE_WIDTH {
+            CellWidth::Double
+        } else {
+            CellWidth::Single
+        };
         let end = self.end(column, width.columns())?;
         let character = text.chars().next().ok_or(StorageError::EmptyText)?;
         if text.len() > MAX_CELL_TEXT_BYTES {
@@ -63,7 +81,7 @@ impl Row {
         if text.len() > character.len_utf8() {
             self.write_extended(column..end, text, style)?;
             cell.set_extended();
-        } else {
+        } else if !self.cells[column].is_inline_with_width(width) {
             self.prepare_overwrite(column..end, style, None);
         }
         self.cells[column] = cell;
