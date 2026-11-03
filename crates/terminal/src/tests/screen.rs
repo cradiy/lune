@@ -2,6 +2,86 @@ use super::{assert_invariants, snapshot};
 use crate::{CellText, CellWidth, Cursor, EraseMode, Screen, StorageError, StyleId};
 
 #[test]
+fn reset_clears_owned_units_restores_state_and_reuses_wrapped_row_buffers() {
+    for columns in [1, 8, 63, 64, 65, 129] {
+        for rows in [1, 4] {
+            let mut screen = Screen::new(columns + 8, rows).unwrap();
+            screen.resize(columns, rows, StyleId(0)).unwrap();
+            screen.set_cursor(rows - 1, 0);
+            screen.line_feed(StyleId(1));
+            for row in 0..rows {
+                screen.set_cursor(row, 0);
+                screen
+                    .write("e\u{301}", CellWidth::Single, StyleId(2))
+                    .unwrap();
+                if columns > 1 {
+                    screen.set_cursor(row, columns - 2);
+                    screen
+                        .write("水\u{301}", CellWidth::Double, StyleId(3))
+                        .unwrap();
+                }
+            }
+            screen.set_scroll_region(rows / 2..rows).unwrap();
+            screen.set_origin_mode(true);
+            screen.set_cursor(usize::MAX, usize::MAX);
+            screen.write("!", CellWidth::Single, StyleId(4)).unwrap();
+            screen.save_cursor();
+            screen.clear_tab_stops();
+            screen.set_tab_stop();
+            screen.set_auto_wrap(false);
+            let buffers: Vec<_> = screen
+                .grid()
+                .iter_rows()
+                .map(|row| row.cells().as_ptr())
+                .collect();
+            for style in [StyleId(7), StyleId(9)] {
+                screen.reset(style);
+                assert_eq!(
+                    (screen.grid().columns(), screen.grid().rows()),
+                    (columns, rows)
+                );
+                assert_eq!(screen.cursor(), Cursor::default());
+                assert_eq!(screen.scroll_region(), 0..rows);
+                assert_eq!((screen.auto_wrap(), screen.origin_mode()), (true, false));
+                for (row, buffer) in screen.grid().iter_rows().zip(&buffers) {
+                    assert_eq!(row.cells().as_ptr(), *buffer);
+                    for column in 0..columns {
+                        assert_eq!(row.text(column), Some(CellText::Scalar(' ')));
+                        assert_eq!(
+                            (row.cells()[column].width(), row.cells()[column].style()),
+                            (1, style)
+                        );
+                    }
+                }
+                for column in 0..columns {
+                    assert_eq!(screen.is_tab_stop(column), Some(column % 8 == 0));
+                }
+                screen.tab_forward(columns.div_ceil(8));
+                assert_eq!(screen.cursor().column, columns - 1);
+                screen.tab_backward(usize::MAX);
+                screen.tab_forward(usize::MAX);
+                assert_eq!(screen.cursor().column, columns - 1);
+                screen.tab_backward(usize::MAX);
+                assert_eq!(screen.cursor().column, 0);
+                screen.set_origin_mode(true);
+                screen.set_auto_wrap(false);
+                screen.set_cursor(usize::MAX, usize::MAX);
+                screen.restore_cursor();
+                assert_eq!(screen.cursor(), Cursor::default());
+                assert_eq!((screen.auto_wrap(), screen.origin_mode()), (true, false));
+                assert_invariants(screen.grid());
+            }
+            screen.resize(columns + 8, rows, StyleId(0)).unwrap();
+            screen.set_cursor(0, columns + 7);
+            screen.write("!", CellWidth::Single, StyleId(1)).unwrap();
+            screen.write("X", CellWidth::Single, StyleId(2)).unwrap();
+            assert_eq!(screen.cursor().row, usize::from(rows > 1));
+            assert_invariants(screen.grid());
+        }
+    }
+}
+
+#[test]
 fn saved_cursor_restores_modes_relative_rows_and_pending_writes_without_consuming_the_slot() {
     let mut initial = Screen::new(4, 3).unwrap();
     initial.set_scroll_region(1..3).unwrap();

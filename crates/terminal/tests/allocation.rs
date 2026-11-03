@@ -395,6 +395,28 @@ fn allocation_failures_preserve_contents_and_allow_retry() {
 
 #[test]
 fn warm_writes_edits_scrolling_and_column_growth_make_no_allocation_requests() {
+    let mut reset = Screen::new(130, 4).unwrap();
+    reset.resize(65, 3, StyleId(0)).unwrap();
+    for row in 0..3 {
+        for column in 0..65 {
+            reset.set_cursor(row, column);
+            reset
+                .write("e\u{301}", CellWidth::Single, StyleId(1))
+                .unwrap();
+        }
+    }
+    reset.set_origin_mode(true);
+    reset.save_cursor();
+    let ((), stats) = allocator::measure(Some(0), || {
+        reset.reset(StyleId(2));
+        reset.reset(StyleId(3));
+        reset.resize(130, 3, StyleId(0)).unwrap();
+        reset.reset(StyleId(4));
+        reset.resize(65, 3, StyleId(0)).unwrap();
+    });
+    assert_eq!(stats.attempts, 0);
+    snapshot(reset.grid());
+
     let mut grid = Grid::new(240, 80).unwrap();
     grid.resize(120, 80, StyleId(0)).unwrap();
     let ascii = [b'x'; 120];

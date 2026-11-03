@@ -79,6 +79,21 @@ impl Screen {
         self.cursor
     }
 
+    /// Clears all cells to spaces with `style`, preserving dimensions and row
+    /// buffers. Homes the cursor, clears pending wrapping, restores the full-screen
+    /// scrolling region and default tab stops, enables automatic wrapping, and
+    /// disables origin mode. The save slot returns to its initial state.
+    /// Row, queue, tab, and text-index capacities are retained. This does not allocate.
+    pub fn reset(&mut self, style: StyleId) {
+        self.grid.clear(style);
+        self.cursor = Cursor::default();
+        self.saved_cursor = SavedCursor::default();
+        self.scroll_region = 0..self.grid.rows();
+        self.tabs.reset(self.grid.columns());
+        self.auto_wrap = true;
+        self.origin_mode = false;
+    }
+
     /// Replaces the saved position, origin mode, automatic-wrap mode, and pending
     /// wrapping. Rows are relative to the scrolling region when origin mode is
     /// enabled. Active state, contents, region, and tabs are preserved.

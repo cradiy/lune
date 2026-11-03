@@ -59,6 +59,10 @@
 //! position on the current right edge. The slot initially holds the initial
 //! cursor state and persists across resizing and repeated restores. Both
 //! operations preserve contents, scrolling boundaries, and tabs without allocating.
+//! [`Screen::reset`] fills the current dimensions with styled spaces and restores
+//! the initial cursor, save slot, full-screen region, default tabs, and modes.
+//! Row buffers, the row queue, text indices, and the tab bitmap retain capacity;
+//! owned text is released. Repeated resets do not allocate.
 
 mod cell;
 mod error;

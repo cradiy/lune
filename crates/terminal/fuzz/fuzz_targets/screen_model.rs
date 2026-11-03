@@ -36,6 +36,7 @@ pub enum Command<'a> {
     OriginMode(bool),
     SaveCursor,
     RestoreCursor,
+    Reset,
 }
 
 struct SavedCursor {
@@ -103,6 +104,15 @@ impl ScreenModel {
 
     pub fn apply(&mut self, command: &Command<'_>, style: StyleId) -> Result<(), StorageError> {
         match command {
+            Command::Reset => {
+                let columns = self.storage.columns();
+                let rows = self.storage.rows();
+                let mut reset = Self::new(columns, rows);
+                for row in 0..rows {
+                    reset.storage.clear_row(row, 0..columns, style)?;
+                }
+                *self = reset;
+            }
             Command::SaveCursor => {
                 self.saved = SavedCursor {
                     row: if self.origin_mode {

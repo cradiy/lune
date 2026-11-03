@@ -42,6 +42,32 @@ fn measure_prepared(
 }
 
 fn main() {
+    for (columns, rows) in [(120, 24), (240, 4096)] {
+        let mut screen = Screen::new(columns, rows).unwrap();
+        measure(
+            &format!("reset blank / {columns}x{rows}, per cell"),
+            columns * rows,
+            || {
+                black_box(&mut screen).reset(black_box(StyleId(2)));
+            },
+        );
+    }
+    measure_prepared(
+        "reset owned text / 240x24",
+        || {
+            let mut screen = Screen::new(240, 24).unwrap();
+            for row in 0..24 {
+                screen.set_cursor(row, 0);
+                for _ in 0..240 {
+                    screen
+                        .write("e\u{301}", CellWidth::Single, StyleId(1))
+                        .unwrap();
+                }
+            }
+            screen
+        },
+        |screen| screen.reset(StyleId(2)),
+    );
     for (name, text, width, columns) in [
         ("ASCII scalar", "x", CellWidth::Single, 1),
         ("UTF-8 scalar", "é", CellWidth::Single, 1),
