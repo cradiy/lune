@@ -22,6 +22,7 @@ fn blank(style: StyleId) -> Unit {
 pub struct Model {
     columns: usize,
     rows: Vec<Vec<Unit>>,
+    wraps: Vec<Option<usize>>,
 }
 
 impl Model {
@@ -29,6 +30,7 @@ impl Model {
         Self {
             columns,
             rows: vec![vec![blank(StyleId(0)); columns]; rows],
+            wraps: vec![None; rows],
         }
     }
 
@@ -43,7 +45,8 @@ impl Model {
     pub fn check(&self, grid: &Grid) {
         assert_eq!(grid.columns(), self.columns);
         assert_eq!(grid.rows(), self.rows.len());
-        for (expected, actual) in self.rows.iter().zip(grid.iter_rows()) {
+        for (row, (expected, actual)) in self.rows.iter().zip(grid.iter_rows()).enumerate() {
+            assert_eq!(actual.wrap_end(), self.wraps[row]);
             assert_eq!(actual.cells().len(), self.columns);
             let mut column = 0;
             for unit in expected {
@@ -72,6 +75,11 @@ impl Model {
             }
             assert_eq!(column, self.columns);
         }
+    }
+
+    #[allow(dead_code, reason = "Only the screen oracle establishes soft wraps.")]
+    pub fn set_wrap(&mut self, row: usize, end: Option<usize>) {
+        self.wraps[row] = end;
     }
 
     pub fn write(
@@ -137,6 +145,9 @@ impl Model {
             return Err(StorageError::TextTooLong);
         }
         unit.text.push_str(text);
+        if !text.is_empty() && self.wraps[row].is_some_and(|end| column >= end) {
+            self.wraps[row] = None;
+        }
         Ok(())
     }
 
@@ -149,12 +160,16 @@ impl Model {
         if row >= self.rows.len() || range.start > range.end || range.end > self.columns {
             return Err(StorageError::OutOfBounds);
         }
+        if range == (0..self.columns) && row > 0 {
+            self.wraps[row - 1] = None;
+        }
         self.erase(row, range, style);
         Ok(())
     }
 
     pub fn clear(&mut self, style: StyleId) {
         self.rows.fill(vec![blank(style); self.columns]);
+        self.wraps.fill(None);
     }
 
     pub fn resize(
@@ -171,6 +186,11 @@ impl Model {
         if columns > 129 || rows > 16 {
             return Err(StorageError::CapacityExceeded);
         }
+        if columns != self.columns {
+            self.wraps.fill(None);
+        }
+        self.wraps.resize(rows, None);
+        self.wraps[rows - 1] = None;
         self.rows.truncate(rows);
         for row in &mut self.rows {
             remap(row, columns, style, |start, end| {
@@ -195,6 +215,19 @@ impl Model {
         let count = count.min(region.len());
         if count == 0 {
             return Ok(());
+        }
+        let previous = self.wraps.clone();
+        if region.start > 0 {
+            self.wraps[region.start - 1] = None;
+        }
+        for row in region.clone() {
+            self.wraps[row] = if up && row + count + 1 < region.end {
+                previous[row + count]
+            } else if !up && row >= region.start + count && row + 1 < region.end {
+                previous[row - count]
+            } else {
+                None
+            };
         }
         if up {
             for row in region.start..region.end - count {
@@ -227,6 +260,7 @@ impl Model {
         if count == 0 {
             return Ok(());
         }
+        self.wraps[row] = None;
         let columns = self.columns;
         remap(&mut self.rows[row], columns, style, |start, end| {
             if end <= column {
@@ -261,6 +295,17 @@ impl Model {
     fn erase(&mut self, row: usize, range: Range<usize>, style: StyleId) {
         if range.is_empty() {
             return;
+        }
+        let mut position = 0;
+        for unit in &self.rows[row] {
+            let end = position + unit.width;
+            if position < range.end
+                && end > range.start
+                && self.wraps[row].is_some_and(|boundary| end >= boundary)
+            {
+                self.wraps[row] = None;
+            }
+            position = end;
         }
         remap(&mut self.rows[row], self.columns, style, |start, end| {
             (end <= range.start || start >= range.end).then_some(start)

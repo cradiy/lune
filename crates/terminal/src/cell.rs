@@ -5,6 +5,11 @@ const SCALAR_MASK: u32 = (1 << 21) - 1;
 const DOUBLE: u32 = 1 << 21;
 const CONTINUATION: u32 = 1 << 22;
 const EXTENDED: u32 = 1 << 23;
+// The last cell carries the outgoing connection. An early wrap also marks the
+// preceding cell, so replacing either edge cell invalidates the connection.
+const ROW_WRAP: u32 = 1 << 24;
+const ROW_GAP: u32 = 1 << 25;
+const ROW_MASK: u32 = ROW_WRAP | ROW_GAP;
 
 /// An opaque style key supplied and interpreted by the caller. Zero is the default key.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -28,13 +33,43 @@ impl CellWidth {
 }
 
 /// An eight-byte cell header. Its row owns any extended text.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug)]
 pub struct Cell {
     text: u32,
     style: StyleId,
 }
 
+// Row metadata shares spare header bits without changing cell value semantics.
+impl PartialEq for Cell {
+    fn eq(&self, other: &Self) -> bool {
+        self.text & !ROW_MASK == other.text & !ROW_MASK && self.style == other.style
+    }
+}
+
+impl Eq for Cell {}
+
 impl Cell {
+    pub(crate) fn row_wrap(self) -> Option<bool> {
+        (self.text & ROW_WRAP != 0).then_some(self.text & ROW_GAP != 0)
+    }
+
+    pub(crate) fn is_row_gap(self) -> bool {
+        self.text & ROW_GAP != 0
+    }
+
+    pub(crate) fn set_row_gap(&mut self, gap: bool) {
+        self.text = (self.text & !ROW_GAP) | if gap { ROW_GAP } else { 0 };
+    }
+
+    pub(crate) fn set_row_wrap(&mut self, gap: Option<bool>) {
+        self.text = (self.text & !ROW_MASK)
+            | match gap {
+                None => 0,
+                Some(false) => ROW_WRAP,
+                Some(true) => ROW_WRAP | ROW_GAP,
+            };
+    }
+
     pub(crate) fn scalar(character: char, width: CellWidth, style: StyleId) -> Self {
         Self {
             text: character as u32

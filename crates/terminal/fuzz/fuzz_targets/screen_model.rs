@@ -200,7 +200,10 @@ impl ScreenModel {
             }
             Command::CarriageReturn => self.column = 0,
             Command::Backspace => self.column = self.visible_column().saturating_sub(1),
-            Command::LineFeed => self.index(true, style),
+            Command::LineFeed => {
+                self.storage.set_wrap(self.row, None);
+                self.index(true, style);
+            }
             Command::ReverseIndex => self.index(false, style),
             Command::EraseLine(mode) => self.erase(false, *mode, style),
             Command::EraseDisplay(mode) => self.erase(true, *mode, style),
@@ -342,12 +345,23 @@ impl ScreenModel {
             }
             return Ok(());
         }
+        let mut connection = None;
         if self.column + width > columns {
+            let source = self.row;
+            let end = self.column.min(columns);
+            let scrolling = self.row + 1 == self.region.end;
             if self.column < columns {
                 self.storage
                     .clear_row(self.row, self.column..columns, style)?;
             }
             self.index(true, style);
+            connection = if scrolling && self.region.len() > 1 {
+                Some((self.row - 1, end))
+            } else if source != self.row {
+                Some((source, end))
+            } else {
+                None
+            };
             self.column = 0;
         }
         let cell_width = if width == 1 {
@@ -361,6 +375,9 @@ impl ScreenModel {
         }
         self.storage
             .write(self.row, self.column, text, cell_width, style)?;
+        if let Some((row, end)) = connection {
+            self.storage.set_wrap(row, Some(end));
+        }
         self.column += width;
         Ok(())
     }

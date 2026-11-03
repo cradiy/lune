@@ -407,6 +407,10 @@ impl Screen {
                         .clear_row(self.cursor.row, columns - 1..columns, style)
                         .expect("The last column is in bounds");
                 }
+                if row != self.cursor.row {
+                    self.grid
+                        .set_wrap_end(self.cursor.row, Some(columns - usize::from(gap)));
+                }
                 row
             };
             (row, 0)
@@ -495,7 +499,21 @@ impl Screen {
         }
         while !bytes.is_empty() {
             if self.cursor.wrap_pending {
-                self.line_feed(style);
+                let source = self.cursor.row;
+                if source == self.scroll_region.end - 1 {
+                    self.grid
+                        .scroll_up(self.scroll_region.clone(), 1, style)
+                        .expect("The scrolling region is valid");
+                    if self.scroll_region.len() > 1 {
+                        self.grid
+                            .set_wrap_end(source - 1, Some(self.grid.columns()));
+                    }
+                } else {
+                    self.cursor.row = (source + 1).min(self.grid.rows() - 1);
+                    if self.cursor.row != source {
+                        self.grid.set_wrap_end(source, Some(self.grid.columns()));
+                    }
+                }
                 self.cursor.column = 0;
             }
             let length = bytes.len().min(self.grid.columns() - self.cursor.column);
@@ -675,8 +693,9 @@ impl Screen {
             self.grid
                 .scroll_up(self.scroll_region.clone(), 1, style)
                 .expect("The scrolling region is valid");
-        } else {
-            self.cursor.row = (self.cursor.row + 1).min(self.grid.rows() - 1);
+        } else if self.cursor.row + 1 < self.grid.rows() {
+            self.grid.set_wrap_end(self.cursor.row, None);
+            self.cursor.row += 1;
         }
         self.cursor.wrap_pending = false;
     }

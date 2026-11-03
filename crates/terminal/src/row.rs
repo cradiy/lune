@@ -30,6 +30,30 @@ impl Row {
         &self.cells
     }
 
+    /// Exclusive column where this row joins the next row through automatic
+    /// wrapping. A wide unit may leave one excluded column at the right edge.
+    /// The last physical row always returns `None`.
+    pub fn wrap_end(&self) -> Option<usize> {
+        let columns = self.cells.len();
+        // A gap join requires both edge markers. Replacing either cell leaves
+        // any remaining marker inactive until an explicit connection is set.
+        match self.cells[columns - 1].row_wrap() {
+            Some(false) => Some(columns),
+            Some(true) if columns > 1 && self.cells[columns - 2].is_row_gap() => Some(columns - 1),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn set_wrap_end(&mut self, end: Option<usize>) {
+        let columns = self.cells.len();
+        debug_assert!(end.is_none_or(|end| end > 0 && (end == columns || end + 1 == columns)));
+        let gap = end.is_some_and(|end| end != columns);
+        if columns > 1 {
+            self.cells[columns - 2].set_row_gap(gap);
+        }
+        self.cells[columns - 1].set_row_wrap(end.map(|_| gap));
+    }
+
     pub fn text(&self, column: usize) -> Option<CellText<'_>> {
         let cell = self.cells.get(column)?;
         if cell.is_continuation() {
@@ -242,6 +266,9 @@ impl Row {
                 self.cells[column].set_extended();
             }
         }
+        if self.wrap_end().is_some_and(|end| column >= end) {
+            self.set_wrap_end(None);
+        }
         Ok(())
     }
 
@@ -277,6 +304,8 @@ impl Row {
             return Ok(());
         }
 
+        self.set_wrap_end(None);
+
         if self.cells[column].is_continuation() {
             self.prepare_overwrite(column..column + 1, style, None);
             self.cells[column] = Cell::blank(style);
@@ -304,6 +333,8 @@ impl Row {
             return Ok(());
         }
 
+        self.set_wrap_end(None);
+
         let end = column + count;
         self.prepare_overwrite(column..end, style, None);
         self.cells.copy_within(end.., column);
@@ -323,6 +354,9 @@ impl Row {
     }
 
     pub(crate) fn resize_prepared(&mut self, columns: usize, style: StyleId) {
+        if columns != self.cells.len() {
+            self.set_wrap_end(None);
+        }
         if columns < self.cells.len() {
             self.cells.truncate(columns);
             let text_columns = if self.cells[columns - 1].width() == 2 {

@@ -44,6 +44,17 @@ impl Grid {
         self.rows.iter()
     }
 
+    pub(crate) fn set_wrap_end(&mut self, row: usize, end: Option<usize>) {
+        debug_assert!(end.is_none() || row + 1 < self.rows.len());
+        self.rows[row].set_wrap_end(end);
+    }
+
+    fn disconnect_before(&mut self, row: usize) {
+        if row != 0 {
+            self.rows[row - 1].set_wrap_end(None);
+        }
+    }
+
     /// Writes one caller-defined display unit. Overlapping wide units are cleared
     /// completely, using `style` for any cleared cell outside the write range.
     pub fn write(
@@ -109,7 +120,12 @@ impl Grid {
         range: Range<usize>,
         style: StyleId,
     ) -> Result<(), StorageError> {
-        self.row_mut(row)?.clear_range(range, style)
+        let full = range == (0..self.columns);
+        self.row_mut(row)?.clear_range(range, style)?;
+        if full {
+            self.disconnect_before(row);
+        }
+        Ok(())
     }
 
     /// Inserts blank cells at `column`, shifting the suffix right and discarding
@@ -170,7 +186,11 @@ impl Grid {
         if region.start == 0 && region.end == self.rows.len() {
             self.rows.rotate_left(1);
         } else if region.len() > 1 {
-            self.rotate_rows_left(region, 1);
+            self.rotate_rows_left(region.clone(), 1);
+        }
+        self.disconnect_before(region.start);
+        if region.len() > 1 {
+            self.rows[region.end - 2].set_wrap_end(Some(self.columns - usize::from(clear_gap)));
         }
         Ok(())
     }
@@ -187,6 +207,9 @@ impl Grid {
         style: StyleId,
     ) -> Result<(), StorageError> {
         if region.start == 0 && region.end == self.rows.len() && lines < region.end {
+            if lines == 0 {
+                return Ok(());
+            }
             self.rows.rotate_left(lines);
             if lines == 1 {
                 self.rows.back_mut().unwrap().clear(style);
@@ -202,6 +225,7 @@ impl Grid {
         if lines >= height {
             self.clear_rows(region, style);
         } else if lines != 0 {
+            self.disconnect_before(region.start);
             self.rotate_rows_left(region.clone(), lines);
             self.clear_rows(region.end - lines..region.end, style);
         }
@@ -218,7 +242,11 @@ impl Grid {
         style: StyleId,
     ) -> Result<(), StorageError> {
         if region.start == 0 && region.end == self.rows.len() && lines < region.end {
+            if lines == 0 {
+                return Ok(());
+            }
             self.rows.rotate_right(lines);
+            self.rows.back_mut().unwrap().set_wrap_end(None);
             if lines == 1 {
                 self.rows.front_mut().unwrap().clear(style);
             } else {
@@ -234,6 +262,7 @@ impl Grid {
             self.clear_rows(region, style);
         } else if lines != 0 {
             self.rotate_rows_left(region.clone(), height - lines);
+            self.rows[region.end - 1].set_wrap_end(None);
             self.clear_rows(region.start..region.start + lines, style);
         }
         Ok(())
@@ -248,6 +277,10 @@ impl Grid {
 
     /// The caller supplies a valid, possibly empty row range.
     pub(crate) fn clear_rows(&mut self, region: Range<usize>, style: StyleId) {
+        if region.is_empty() {
+            return;
+        }
+        self.disconnect_before(region.start);
         for row in self.rows.range_mut(region) {
             row.clear(style);
         }
@@ -345,6 +378,7 @@ impl Grid {
             row.resize_prepared(columns, style);
         }
         self.rows.extend(added);
+        self.rows.back_mut().unwrap().set_wrap_end(None);
         self.columns = columns;
         Ok(())
     }

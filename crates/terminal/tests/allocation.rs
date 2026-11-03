@@ -19,6 +19,7 @@ struct SnapshotCell {
 struct Snapshot {
     columns: usize,
     rows: Vec<Vec<SnapshotCell>>,
+    wraps: Vec<Option<usize>>,
 }
 
 fn snapshot(grid: &Grid) -> Snapshot {
@@ -55,6 +56,7 @@ fn snapshot(grid: &Grid) -> Snapshot {
     Snapshot {
         columns: grid.columns(),
         rows,
+        wraps: grid.iter_rows().map(|row| row.wrap_end()).collect(),
     }
 }
 
@@ -110,7 +112,7 @@ fn screen_failures_preserve_contents_cursor_and_pending_wrap() {
     }
     fn pending(rows: usize, gap: bool) -> Screen {
         let mut screen = Screen::new(4, rows).unwrap();
-        screen.write_ascii(b"top!", StyleId(1)).unwrap();
+        screen.write_ascii(b"top!next", StyleId(1)).unwrap();
         screen.set_cursor(rows - 1, 2);
         screen.write("旧", CellWidth::Double, StyleId(2)).unwrap();
         if gap {
@@ -134,7 +136,18 @@ fn screen_failures_preserve_contents_cursor_and_pending_wrap() {
         }
         screen
     }
-    let cases: [Case; 17] = [
+    let cases: [Case; 18] = [
+        (
+            "overwrite a soft-wrap gap boundary",
+            || {
+                let mut screen = Screen::new(4, 3).unwrap();
+                screen.write_ascii(b"abc", StyleId(1)).unwrap();
+                screen.write("水", CellWidth::Double, StyleId(2)).unwrap();
+                screen.set_cursor(0, 2);
+                screen
+            },
+            |screen| screen.write("e\u{301}", CellWidth::Single, StyleId(3)),
+        ),
         (
             "insert owned text into shifted suffix",
             || {

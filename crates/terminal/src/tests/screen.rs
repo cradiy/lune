@@ -2,6 +2,158 @@ use super::{assert_invariants, snapshot};
 use crate::{CellText, CellWidth, Cursor, EraseMode, Screen, StorageError, StyleId};
 
 #[test]
+fn soft_wraps_record_actual_joins_and_invalidate_edited_boundaries() {
+    let mut screen = Screen::new(4, 4).unwrap();
+    screen.write_ascii(b"abcd", StyleId(1)).unwrap();
+    assert_eq!(screen.grid().row(0).unwrap().wrap_end(), None);
+    let edge = screen.grid().row(0).unwrap().cells()[3];
+    let pending = screen.cursor();
+    screen.write_ascii(b"", StyleId(1)).unwrap();
+    assert_eq!(screen.cursor(), pending);
+    assert!(screen.write("", CellWidth::Single, StyleId(1)).is_err());
+    assert_eq!(screen.grid().row(0).unwrap().wrap_end(), None);
+    screen.write("x", CellWidth::Single, StyleId(1)).unwrap();
+    assert_eq!(screen.grid().row(0).unwrap().wrap_end(), Some(4));
+    assert_eq!(screen.grid().row(0).unwrap().cells()[3], edge);
+    screen.set_cursor(0, 1);
+    screen.write("y", CellWidth::Single, StyleId(2)).unwrap();
+    assert_eq!(screen.grid().row(0).unwrap().wrap_end(), Some(4));
+    screen.set_cursor(0, 3);
+    screen.write("z", CellWidth::Single, StyleId(2)).unwrap();
+    assert_eq!(screen.grid().row(0).unwrap().wrap_end(), None);
+    screen.write("x", CellWidth::Single, StyleId(2)).unwrap();
+    screen.set_cursor(0, 0);
+    screen.line_feed(StyleId(0));
+    assert_eq!(screen.grid().row(0).unwrap().wrap_end(), None);
+
+    let mut grid = crate::Grid::new(4, 2).unwrap();
+    grid.write(0, 2, "水", CellWidth::Double, StyleId(1))
+        .unwrap();
+    grid.set_wrap_end(0, Some(4));
+    grid.write(0, 2, "x", CellWidth::Single, StyleId(1))
+        .unwrap();
+    assert_eq!(grid.row(0).unwrap().wrap_end(), None);
+    grid.set_wrap_end(0, Some(3));
+    grid.append_text(0, 0, "\u{301}").unwrap();
+    assert_eq!(grid.row(0).unwrap().wrap_end(), Some(3));
+    grid.append_text(0, 3, "\u{301}").unwrap();
+    assert_eq!(grid.row(0).unwrap().wrap_end(), None);
+
+    for insert in [false, true] {
+        screen.reset(StyleId(0));
+        screen.set_insert_mode(insert);
+        screen.write_ascii(b"abc", StyleId(1)).unwrap();
+        screen.write("水", CellWidth::Double, StyleId(2)).unwrap();
+        assert_eq!(screen.grid().row(0).unwrap().wrap_end(), Some(3));
+        assert_eq!(
+            screen.grid().row(0).unwrap().text(3),
+            Some(CellText::Scalar(' '))
+        );
+        assert_invariants(screen.grid());
+        let before = snapshot(screen.grid());
+        assert!(screen.resize(0, 4, StyleId(0)).is_err());
+        assert!(screen.write_ascii(b"invalid\n", StyleId(0)).is_err());
+        assert_eq!(snapshot(screen.grid()), before);
+        screen.resize(4, 4, StyleId(0)).unwrap();
+        assert_eq!(snapshot(screen.grid()), before);
+        screen.resize(4, 2, StyleId(0)).unwrap();
+        assert_eq!(screen.grid().row(0).unwrap().wrap_end(), Some(3));
+        screen.resize(4, 1, StyleId(0)).unwrap();
+        screen.resize(4, 4, StyleId(0)).unwrap();
+        assert!(
+            screen
+                .grid()
+                .iter_rows()
+                .all(|row| row.wrap_end().is_none())
+        );
+    }
+
+    screen.reset(StyleId(0));
+    screen
+        .write_ascii(b"abcdefghijklmnopq", StyleId(1))
+        .unwrap();
+    screen.set_cursor(1, 0);
+    screen.erase_line(EraseMode::All, StyleId(0));
+    assert_eq!(screen.grid().row(0).unwrap().wrap_end(), None);
+    assert_eq!(screen.grid().row(1).unwrap().wrap_end(), None);
+    assert_eq!(screen.grid().row(2).unwrap().wrap_end(), Some(4));
+    screen.set_cursor(2, 0);
+    screen.insert_cells(0, StyleId(0));
+    assert_eq!(screen.grid().row(2).unwrap().wrap_end(), Some(4));
+    screen.delete_cells(1, StyleId(0));
+    assert_eq!(screen.grid().row(2).unwrap().wrap_end(), None);
+    screen.set_cursor(0, 3);
+    screen.write_ascii(b"xy", StyleId(1)).unwrap();
+    screen.resize(5, 4, StyleId(0)).unwrap();
+    assert!(
+        screen
+            .grid()
+            .iter_rows()
+            .all(|row| row.wrap_end().is_none())
+    );
+    screen
+        .write_ascii(b"abcdefghijklmnopqrst", StyleId(1))
+        .unwrap();
+    screen.reset(StyleId(0));
+    assert!(
+        screen
+            .grid()
+            .iter_rows()
+            .all(|row| row.wrap_end().is_none())
+    );
+}
+
+#[test]
+fn scrolling_preserves_only_connections_between_retained_adjacent_rows() {
+    for rows in 1..=8 {
+        for start in 0..=rows {
+            for end in start..=rows {
+                for count in [0, 1, 2, rows, usize::MAX] {
+                    for up in [false, true] {
+                        let mut grid = crate::Grid::new(4, rows).unwrap();
+                        for row in 0..rows - 1 {
+                            grid.set_wrap_end(row, Some(4 - row % 2));
+                        }
+                        let original: Vec<_> = grid.iter_rows().map(|row| row.wrap_end()).collect();
+                        if up {
+                            grid.scroll_up(start..end, count, StyleId(0)).unwrap();
+                        } else {
+                            grid.scroll_down(start..end, count, StyleId(0)).unwrap();
+                        }
+                        let count = count.min(end - start);
+                        let source = |row: usize| {
+                            if count == 0 || row < start || row >= end {
+                                Some(row)
+                            } else if up {
+                                (row + count < end).then_some(row + count)
+                            } else {
+                                row.checked_sub(count).filter(|&row| row >= start)
+                            }
+                        };
+                        for row in 0..rows {
+                            let expected = if row + 1 < rows {
+                                match (source(row), source(row + 1)) {
+                                    (Some(a), Some(b)) if a + 1 == b => original[a],
+                                    _ => None,
+                                }
+                            } else {
+                                None
+                            };
+                            assert_eq!(
+                                grid.row(row).unwrap().wrap_end(),
+                                expected,
+                                "rows={rows}, region={start}..{end}, count={count}, up={up}, row={row}"
+                            );
+                        }
+                        assert_invariants(&grid);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn insertion_writes_shift_complete_units_and_preserve_mode_boundaries() {
     let mut screen = Screen::new(8, 3).unwrap();
     screen.write_ascii(b"abcdefgh", StyleId(1)).unwrap();

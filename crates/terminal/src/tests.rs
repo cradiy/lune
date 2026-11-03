@@ -5,9 +5,23 @@ mod screen;
 use crate::{CellText, CellWidth, Grid, MAX_CELL_TEXT_BYTES, MAX_CELLS, StorageError, StyleId};
 
 fn assert_invariants(grid: &Grid) {
-    for row in grid.iter_rows() {
+    for (index, row) in grid.iter_rows().enumerate() {
+        if let Some(end) = row.wrap_end() {
+            assert!(index + 1 < grid.rows());
+            assert!(end > 0 && end <= grid.columns());
+            if end < grid.columns() {
+                assert_eq!(end, grid.columns() - 1);
+                assert_eq!(row.text(end), Some(CellText::Scalar(' ')));
+            }
+        }
         assert_eq!(row.cells().len(), grid.columns());
         for (column, cell) in row.cells().iter().enumerate() {
+            if column + 1 < grid.columns() {
+                assert_eq!(cell.row_wrap(), None);
+                if column + 2 < grid.columns() {
+                    assert!(!cell.is_row_gap());
+                }
+            }
             match cell.width() {
                 0 => {
                     assert!(column > 0);
@@ -52,6 +66,7 @@ struct SnapshotCell {
 struct Snapshot {
     columns: usize,
     rows: Vec<Vec<SnapshotCell>>,
+    wraps: Vec<Option<usize>>,
 }
 
 fn snapshot(grid: &Grid) -> Snapshot {
@@ -79,6 +94,7 @@ fn snapshot(grid: &Grid) -> Snapshot {
     Snapshot {
         columns: grid.columns(),
         rows,
+        wraps: grid.iter_rows().map(|row| row.wrap_end()).collect(),
     }
 }
 

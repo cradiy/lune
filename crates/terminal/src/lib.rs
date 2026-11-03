@@ -7,7 +7,7 @@
 //!
 //! Resizing preserves the upper-left intersection. A wide unit cut by the new
 //! right edge is cleared. Scrolling an exclusive row range recycles row buffers
-//! and clears exposed rows. Rows outside the range remain unchanged. Fallible
+//! and clears exposed rows. Cells outside the range remain unchanged. Fallible
 //! operations reserve storage before changing visible contents.
 //! In-row insertion and deletion shift cells and their owned text without
 //! allocating. Wide units split by an edit boundary are cleared completely.
@@ -69,6 +69,19 @@
 //! Scalar insertion reserves owned text and index capacity before changing cells.
 //! Mode changes preserve pending wrapping; resizing and cursor restores preserve
 //! insertion mode. Resetting disables it.
+//!
+//! [`Row::wrap_end`] records an actual automatic-wrap connection to the following
+//! row and its exclusive column boundary. A double-width unit that wraps early
+//! excludes its one-column gap. Pending wrapping alone leaves the row unjoined.
+//! Writes and erasure reaching the join boundary, including wide-unit repairs,
+//! cancel that row's outgoing connection. Earlier cell edits and width-preserving
+//! text appends retain it; appending into an excluded gap cancels it. Cell shifts
+//! cancel the edited row's outgoing connection. Clearing complete rows also
+//! disconnects the preceding row. Explicit line feed cancels the source join;
+//! other cursor movement preserves stored joins. Scrolling and whole-row edits
+//! retain connections only between surviving adjacent rows. Width changes clear
+//! all joins; height changes retain surviving adjacent joins. Reset clears them.
+//! Metadata updates do not allocate and fallible operations preserve it on error.
 
 mod cell;
 mod error;
