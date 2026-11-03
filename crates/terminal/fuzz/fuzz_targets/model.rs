@@ -1,6 +1,8 @@
 use std::ops::Range;
 
-use lune_terminal::{CellText, CellWidth, Grid, MAX_CELL_TEXT_BYTES, StorageError, StyleId};
+use lune_terminal::{
+    CellPosition, CellText, CellWidth, Grid, MAX_CELL_TEXT_BYTES, StorageError, StyleId,
+};
 
 #[derive(Clone, Debug)]
 struct Unit {
@@ -40,6 +42,47 @@ impl Model {
 
     pub fn rows(&self) -> usize {
         self.rows.len()
+    }
+
+    #[allow(dead_code, reason = "The screen target checks text extraction.")]
+    pub fn text(&self, range: Range<CellPosition>) -> Result<String, StorageError> {
+        for point in [range.start, range.end] {
+            if point.row >= self.rows.len() || point.column > self.columns {
+                return Err(StorageError::OutOfBounds);
+            }
+        }
+        if (range.start.row, range.start.column) > (range.end.row, range.end.column) {
+            return Err(StorageError::OutOfBounds);
+        }
+        let mut result = String::new();
+        for row in range.start.row..=range.end.row {
+            let start = if row == range.start.row {
+                range.start.column
+            } else {
+                0
+            };
+            let end = if row == range.end.row {
+                range.end.column
+            } else {
+                self.columns
+            };
+            let mut column = 0;
+            for unit in &self.rows[row] {
+                let next = column + unit.width;
+                if start < end
+                    && column < end
+                    && next > start
+                    && column < self.wraps[row].unwrap_or(self.columns)
+                {
+                    result.push_str(&unit.text);
+                }
+                column = next;
+            }
+            if row < range.end.row && self.wraps[row].is_none() {
+                result.push('\n');
+            }
+        }
+        Ok(result)
     }
 
     pub fn check(&self, grid: &Grid) {

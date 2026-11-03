@@ -1,4 +1,4 @@
-use std::ops::Range;
+use std::{fmt, ops::Range};
 
 use crate::{Cell, CellText, CellWidth, MAX_CELL_TEXT_BYTES, StorageError, StyleId};
 
@@ -68,6 +68,27 @@ impl Row {
                 cell.character().expect("A scalar is present"),
             ))
         }
+    }
+
+    pub(crate) fn write_text(
+        &self,
+        range: Range<usize>,
+        output: &mut impl fmt::Write,
+    ) -> fmt::Result {
+        if range.start >= range.end {
+            return Ok(());
+        }
+        let start = range.start - usize::from(self.cells[range.start].is_continuation());
+        let first = self.extended.partition_point(|entry| entry.column < start);
+        let mut extended = self.extended[first..].iter();
+        for cell in &self.cells[start..range.end] {
+            if cell.has_extended_text() {
+                output.write_str(&extended.next().expect("Extended text is present").text)?;
+            } else if let Some(character) = cell.character() {
+                output.write_char(character)?;
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn write(
@@ -218,6 +239,7 @@ impl Row {
     }
 
     /// The caller validates printable ASCII and the destination cell range.
+    #[inline]
     pub(crate) fn write_ascii_validated(&mut self, column: usize, bytes: &[u8], style: StyleId) {
         if !bytes.is_empty() {
             let end = column + bytes.len();

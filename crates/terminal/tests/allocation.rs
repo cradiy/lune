@@ -1,9 +1,14 @@
 #[path = "support/allocator.rs"]
 mod allocator;
 
-use std::hint::black_box;
+use std::{
+    fmt::{self, Write},
+    hint::black_box,
+};
 
-use lune_terminal::{CellText, CellWidth, EraseMode, Grid, Screen, StorageError, StyleId};
+use lune_terminal::{
+    CellPosition, CellText, CellWidth, EraseMode, Grid, Screen, StorageError, StyleId,
+};
 
 #[global_allocator]
 static ALLOCATOR: allocator::TestAllocator = allocator::TestAllocator;
@@ -700,4 +705,66 @@ fn resize_history_reaches_a_stable_requested_memory_high_water() {
         "Requested heap bytes: initial={initial}, retained={}, peak={}, after_drop={}",
         retained[0], released.peak_bytes, released.live_bytes
     );
+}
+
+#[test]
+fn text_views_stream_without_allocation_and_propagate_sink_failures() {
+    let mut screen = Screen::new(130, 4).unwrap();
+    let long = "e\u{301}".repeat(341);
+    for row in 0..4 {
+        for column in 0..130 {
+            screen
+                .write(
+                    if (row + column) % 3 == 0 { &long } else { "é" },
+                    CellWidth::Single,
+                    StyleId(1),
+                )
+                .unwrap();
+        }
+    }
+    screen.set_cursor(3, 0);
+    screen.line_feed(StyleId(0));
+    screen.set_cursor(3, 129);
+    screen
+        .write("水\u{301}", CellWidth::Double, StyleId(2))
+        .unwrap();
+    let before = snapshot(screen.grid());
+    let cursor = screen.cursor();
+    let range = CellPosition { row: 0, column: 1 }..CellPosition {
+        row: 3,
+        column: 130,
+    };
+    let expected = screen.grid().text(range.clone()).unwrap().to_string();
+    let mut output = String::with_capacity(expected.len());
+    let (result, stats) = allocator::measure(Some(0), || {
+        for _ in 0..3 {
+            let view = screen.grid().text(range.clone()).unwrap();
+            output.clear();
+            write!(&mut output, "{view}")?;
+        }
+        Ok::<_, fmt::Error>(())
+    });
+    result.unwrap();
+    assert_eq!(stats.attempts, 0);
+    assert_eq!(output, expected);
+
+    struct FailingSink {
+        remaining: usize,
+    }
+    impl Write for FailingSink {
+        fn write_str(&mut self, text: &str) -> fmt::Result {
+            self.remaining = self.remaining.checked_sub(text.len()).ok_or(fmt::Error)?;
+            Ok(())
+        }
+    }
+    for remaining in [0, 1, expected.len() / 2] {
+        let (result, stats) = allocator::measure(Some(0), || {
+            let view = screen.grid().text(range.clone()).unwrap();
+            write!(FailingSink { remaining }, "{view}")
+        });
+        assert!(result.is_err());
+        assert_eq!(stats.attempts, 0);
+    }
+    assert_eq!(snapshot(screen.grid()), before);
+    assert_eq!(screen.cursor(), cursor);
 }

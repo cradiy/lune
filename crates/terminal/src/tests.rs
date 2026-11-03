@@ -1,6 +1,7 @@
 use std::ops::Range;
 
 mod screen;
+mod text;
 
 use crate::{CellText, CellWidth, Grid, MAX_CELL_TEXT_BYTES, MAX_CELLS, StorageError, StyleId};
 

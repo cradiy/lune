@@ -11,7 +11,8 @@ use std::mem::discriminant;
 
 use libfuzzer_sys::fuzz_target;
 use lune_terminal::{
-    CellWidth, EraseMode, MAX_CELL_TEXT_BYTES, MAX_DIMENSION, Screen, StorageError, StyleId,
+    CellPosition, CellWidth, EraseMode, MAX_CELL_TEXT_BYTES, MAX_DIMENSION, Screen, StorageError,
+    StyleId,
 };
 use screen_model::{Command, ScreenModel};
 
@@ -126,7 +127,30 @@ fuzz_target!(|data: &[u8]| {
             1 => EraseMode::ToCursor,
             _ => EraseMode::All,
         };
-        let command = match bytes[0] % 34 {
+        let operation = bytes[0] % 35;
+        if operation == 34 {
+            let range = if bytes[7] & 1 != 0 {
+                CellPosition { row: 0, column: 0 }..CellPosition {
+                    row: rows - 1,
+                    column: columns,
+                }
+            } else {
+                CellPosition { row, column }..CellPosition {
+                    row: coordinate(bytes[5], rows),
+                    column: coordinate(bytes[6], columns),
+                }
+            };
+            match (screen.grid().text(range.clone()), model.text(range)) {
+                (Ok(actual), Ok(expected)) => assert_eq!(actual.to_string(), expected),
+                (Err(actual), Err(expected)) => {
+                    assert_eq!(discriminant(&actual), discriminant(&expected))
+                }
+                results => panic!("Text extraction differs from model: {results:?}"),
+            }
+            model.check(&screen);
+            continue;
+        }
+        let command = match operation {
             0 => {
                 let text = match bytes[4] % 10 {
                     8 => &long_text[..MAX_CELL_TEXT_BYTES],

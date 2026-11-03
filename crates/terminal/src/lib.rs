@@ -82,6 +82,12 @@
 //! retain connections only between surviving adjacent rows. Width changes clear
 //! all joins; height changes retain surviving adjacent joins. Reset clears them.
 //! Metadata updates do not allocate and fallible operations preserve it on error.
+//!
+//! [`Grid::text`] validates a half-open range of [`CellPosition`] boundaries and
+//! returns a borrowed [`GridText`] view. Formatting streams complete display units,
+//! preserves selected spaces, joins soft wraps, skips their edge gaps, and inserts
+//! newlines between hard rows. Reading uses fixed auxiliary space; the output sink
+//! owns its allocation and failure behavior.
 
 mod cell;
 mod error;
@@ -89,6 +95,7 @@ mod grid;
 mod row;
 mod screen;
 mod tabs;
+mod text;
 
 #[cfg(test)]
 mod tests;
@@ -98,3 +105,4 @@ pub use error::StorageError;
 pub use grid::{Grid, MAX_CELLS, MAX_DIMENSION};
 pub use row::Row;
 pub use screen::{Cursor, EraseMode, Screen};
+pub use text::{CellPosition, GridText};

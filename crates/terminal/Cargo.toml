@@ -12,6 +12,10 @@ harness = false
 name = "screen"
 harness = false
 
+[[bench]]
+name = "text"
+harness = false
+
 [dependencies]
 lune-vt = { path = "../vt" }
 

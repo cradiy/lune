@@ -1,6 +1,8 @@
 use std::{collections::BTreeSet, ops::Range};
 
-use lune_terminal::{CellWidth, EraseMode, MAX_CELL_TEXT_BYTES, Screen, StorageError, StyleId};
+use lune_terminal::{
+    CellPosition, CellWidth, EraseMode, MAX_CELL_TEXT_BYTES, Screen, StorageError, StyleId,
+};
 
 use crate::model::Model;
 
@@ -63,6 +65,10 @@ pub struct ScreenModel {
 }
 
 impl ScreenModel {
+    pub fn text(&self, range: Range<CellPosition>) -> Result<String, StorageError> {
+        self.storage.text(range)
+    }
+
     pub fn new(columns: usize, rows: usize) -> Self {
         Self {
             storage: Model::new(columns, rows),

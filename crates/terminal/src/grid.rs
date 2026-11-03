@@ -1,6 +1,6 @@
 use std::{collections::VecDeque, ops::Range};
 
-use crate::{CellWidth, Row, StorageError, StyleId};
+use crate::{CellPosition, CellWidth, GridText, Row, StorageError, StyleId};
 
 /// Maximum rows or columns in a grid.
 pub const MAX_DIMENSION: usize = u16::MAX as usize;
@@ -42,6 +42,17 @@ impl Grid {
 
     pub fn iter_rows(&self) -> impl ExactSizeIterator<Item = &Row> + DoubleEndedIterator {
         self.rows.iter()
+    }
+
+    /// Borrows a row-major, half-open text range. Endpoint rows must be in bounds;
+    /// endpoint columns may equal the grid width. Reversed ranges fail.
+    /// Formatting preserves selected spaces, joins soft-wrapped rows, and emits
+    /// newlines at hard row boundaries. Intersected wide units are included whole,
+    /// and automatic-wrap gaps are omitted. Empty ranges produce empty text.
+    /// Creation and traversal use fixed auxiliary space and preserve the grid.
+    /// The output sink controls allocation and may fail after receiving a prefix.
+    pub fn text(&self, range: Range<CellPosition>) -> Result<GridText<'_>, StorageError> {
+        GridText::new(self, range)
     }
 
     pub(crate) fn set_wrap_end(&mut self, row: usize, end: Option<usize>) {
@@ -92,6 +103,7 @@ impl Grid {
         self.row_mut(row)?.write_ascii(column, bytes, style)
     }
 
+    #[inline]
     pub(crate) fn write_ascii_validated(
         &mut self,
         row: usize,
