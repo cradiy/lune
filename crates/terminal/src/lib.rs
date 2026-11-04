@@ -1,4 +1,4 @@
-//! Screen storage for terminal state.
+//! Terminal screen storage and incremental protocol execution.
 //!
 //! [`Grid`] stores explicit-width display units in rows of compact [`Cell`] values.
 //! Single scalars are inline; multi-scalar text is owned by its row. Mutations
@@ -88,10 +88,19 @@
 //! preserves selected spaces, joins soft wraps, skips their edge gaps, and inserts
 //! newlines between hard rows. Reading uses fixed auxiliary space; the output sink
 //! owns its allocation and failure behavior.
+//!
+//! [`Processor`] executes byte streams through the parser and existing screen
+//! operations. Text layout is supplied by an atomic callback. [`ProcessError`]
+//! reports the consumed input prefix; failed decoded text is retained in fixed
+//! storage for retry before further input. ASCII runs and complete UTF-8 scalars
+//! are dispatched directly in the parser's ground state. Lexical errors recover
+//! through the parser and are counted, while unsupported ESC/CSI forms are counted
+//! and ignored. Finishing flushes incomplete lexical input exactly once.
 
 mod cell;
 mod error;
 mod grid;
+mod processor;
 mod row;
 mod screen;
 mod tabs;
@@ -103,6 +112,7 @@ mod tests;
 pub use cell::{Cell, CellText, CellWidth, MAX_CELL_TEXT_BYTES, StyleId};
 pub use error::StorageError;
 pub use grid::{Grid, MAX_CELLS, MAX_DIMENSION};
+pub use processor::{ProcessError, Processor};
 pub use row::Row;
 pub use screen::{Cursor, EraseMode, Screen};
 pub use text::{CellPosition, GridText};

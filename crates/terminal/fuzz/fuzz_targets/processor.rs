@@ -1,0 +1,251 @@
+#![no_main]
+
+#[allow(
+    dead_code,
+    reason = "Shared oracle operations serve different fuzz targets."
+)]
+mod model;
+#[allow(
+    dead_code,
+    reason = "Shared oracle operations serve different fuzz targets."
+)]
+mod screen_model;
+
+use std::io::Write;
+
+use libfuzzer_sys::fuzz_target;
+use lune_terminal::{CellWidth, EraseMode, Processor, Screen, StyleId};
+use screen_model::{Command, ScreenModel};
+
+fn count(wire: &mut Vec<u8>, final_byte: u8, bytes: &[u8; 8]) -> usize {
+    if bytes[4] & 1 == 0 {
+        wire.extend([0x1b, b'[', final_byte]);
+        1
+    } else {
+        let value = bytes[3] as usize % 17;
+        write!(wire, "\x1b[{value}{}", char::from(final_byte)).unwrap();
+        value.max(1)
+    }
+}
+
+fn drive(
+    wire: &[u8],
+    chunk: usize,
+    fail_at: usize,
+    expected: &ScreenModel,
+    diagnostics: (u64, u64),
+) {
+    let mut screen = Screen::new(8, 4).unwrap();
+    let mut processor = Processor::new(StyleId(3));
+    let mut calls = 0;
+    let mut available = false;
+    let mut text = |screen: &mut Screen, value: &str, style| {
+        if !available && calls == fail_at {
+            available = true;
+            return Err(());
+        }
+        calls += 1;
+        if value.is_ascii() {
+            screen.write_ascii(value.as_bytes(), style).unwrap();
+        } else {
+            assert_eq!(value.chars().count(), 1);
+            if value == "水" {
+                screen.write("水\u{301}", CellWidth::Double, style).unwrap();
+            } else {
+                screen.write(value, CellWidth::Single, style).unwrap();
+            }
+        }
+        Ok(())
+    };
+    for mut input in wire.chunks(chunk) {
+        loop {
+            match processor.advance(input, &mut screen, &mut text) {
+                Ok(consumed) => {
+                    assert_eq!(consumed, input.len());
+                    break;
+                }
+                Err(error) => {
+                    assert!(error.consumed <= input.len());
+                    input = &input[error.consumed..];
+                }
+            }
+        }
+    }
+    while processor.finish(&mut screen, &mut text).is_err() {}
+    expected.check(&screen);
+    assert_eq!(
+        (processor.parse_errors(), processor.ignored_sequences()),
+        diagnostics
+    );
+}
+
+fuzz_target!(|data: &[u8]| {
+    let mut wire = Vec::new();
+    let mut expected = ScreenModel::new(8, 4);
+    let mut diagnostics = (0_u64, 0_u64);
+    for bytes in data.as_chunks::<8>().0.iter().take(512) {
+        let command = match bytes[0] % 38 {
+            0 => {
+                wire.extend(b"abc");
+                Some(Command::Ascii(b"abc"))
+            }
+            1 => {
+                wire.extend("水".as_bytes());
+                Some(Command::Write("水\u{301}", CellWidth::Double))
+            }
+            2 => {
+                let row = bytes[1] as usize % 7;
+                let column = bytes[2] as usize % 12;
+                write!(&mut wire, "\x1b[{};{}H", row + 1, column + 1).unwrap();
+                Some(Command::Cursor(row, column))
+            }
+            3 => {
+                let top = bytes[1] as usize % 4;
+                let bottom = bytes[2] as usize % 4 + 1;
+                write!(&mut wire, "\x1b[{};{bottom}r", top + 1).unwrap();
+                Some(Command::Region(top..bottom))
+            }
+            4 => {
+                wire.extend(b"\xf0\x9fx");
+                expected
+                    .apply(&Command::Write("�", CellWidth::Single), StyleId(3))
+                    .unwrap();
+                Some(Command::Ascii(b"x"))
+            }
+            5 => {
+                wire.push(b'\r');
+                Some(Command::CarriageReturn)
+            }
+            6 => {
+                wire.push(0x08);
+                Some(Command::Backspace)
+            }
+            7 => {
+                wire.push(b'\n');
+                Some(Command::LineFeed)
+            }
+            8 => {
+                wire.extend(b"\x1bM");
+                Some(Command::ReverseIndex)
+            }
+            9 | 10 => {
+                let n = bytes[3] % 4;
+                let final_byte = if bytes[0] % 38 == 9 { 'K' } else { 'J' };
+                write!(&mut wire, "\x1b[{n}{final_byte}").unwrap();
+                let mode = match n {
+                    0 => Some(EraseMode::FromCursor),
+                    1 => Some(EraseMode::ToCursor),
+                    2 => Some(EraseMode::All),
+                    _ => None,
+                };
+                if let Some(mode) = mode {
+                    Some(if final_byte == 'K' {
+                        Command::EraseLine(mode)
+                    } else {
+                        Command::EraseDisplay(mode)
+                    })
+                } else {
+                    diagnostics.1 += 1;
+                    None
+                }
+            }
+            11 => Some(Command::InsertCells(count(&mut wire, b'@', bytes))),
+            12 => Some(Command::DeleteCells(count(&mut wire, b'P', bytes))),
+            13 => Some(Command::EraseCells(count(&mut wire, b'X', bytes))),
+            14 => Some(Command::InsertLines(count(&mut wire, b'L', bytes))),
+            15 => Some(Command::DeleteLines(count(&mut wire, b'M', bytes))),
+            16 => {
+                wire.extend(b"\x1bE");
+                expected
+                    .apply(&Command::CarriageReturn, StyleId(3))
+                    .unwrap();
+                Some(Command::LineFeed)
+            }
+            17 => Some(Command::MoveUp(count(&mut wire, b'A', bytes))),
+            18 => Some(Command::MoveDown(count(&mut wire, b'B', bytes))),
+            19 => Some(Command::MoveLeft(count(&mut wire, b'D', bytes))),
+            20 => Some(Command::MoveRight(count(&mut wire, b'C', bytes))),
+            21 => Some(Command::ScrollUp(count(&mut wire, b'S', bytes))),
+            22 => Some(Command::ScrollDown(count(&mut wire, b'T', bytes))),
+            23 => Some(Command::TabForward(count(&mut wire, b'I', bytes))),
+            24 => Some(Command::TabBackward(count(&mut wire, b'Z', bytes))),
+            25 => {
+                wire.extend(b"\x1bH");
+                Some(Command::SetTab)
+            }
+            26 => {
+                wire.extend(b"\x1b[g");
+                Some(Command::ClearTab)
+            }
+            27 => {
+                wire.extend(b"\x1b[3g");
+                Some(Command::ClearTabs)
+            }
+            28 | 29 | 33 => {
+                let enabled = bytes[3] & 1 != 0;
+                let final_byte = if enabled { 'h' } else { 'l' };
+                let command = match bytes[0] % 38 {
+                    28 => {
+                        write!(&mut wire, "\x1b[?7{final_byte}").unwrap();
+                        Command::AutoWrap(enabled)
+                    }
+                    29 => {
+                        write!(&mut wire, "\x1b[?6{final_byte}").unwrap();
+                        Command::OriginMode(enabled)
+                    }
+                    _ => {
+                        write!(&mut wire, "\x1b[4{final_byte}").unwrap();
+                        Command::InsertMode(enabled)
+                    }
+                };
+                Some(command)
+            }
+            30 => {
+                wire.extend(b"\x1b7");
+                Some(Command::SaveCursor)
+            }
+            31 => {
+                wire.extend(b"\x1b8");
+                Some(Command::RestoreCursor)
+            }
+            32 => {
+                wire.extend(b"\x1bc");
+                Some(Command::Reset)
+            }
+            34 => {
+                wire.extend(b"\x1b[?6;25h");
+                diagnostics.1 += 1;
+                None
+            }
+            35 => {
+                wire.extend(b"\x1b[65536A");
+                diagnostics.0 += 1;
+                None
+            }
+            36 => {
+                wire.extend(b"\x1b[1:2A");
+                diagnostics.1 += 1;
+                None
+            }
+            _ => {
+                wire.extend(b"\x1b]0;synthetic title\x07");
+                None
+            }
+        };
+        if let Some(command) = command
+            && expected.apply(&command, StyleId(3)).is_err()
+        {
+            diagnostics.1 += 1;
+        }
+    }
+    wire.extend(b"\x1b8");
+    expected.apply(&Command::RestoreCursor, StyleId(3)).unwrap();
+    drive(&wire, wire.len(), usize::MAX, &expected, diagnostics);
+    drive(
+        &wire,
+        data.first().copied().unwrap_or(0) as usize % 17 + 1,
+        data.get(4).copied().unwrap_or(0) as usize % 32,
+        &expected,
+        diagnostics,
+    );
+});

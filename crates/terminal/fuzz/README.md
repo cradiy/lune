@@ -1,7 +1,8 @@
 # Terminal State Fuzzing
 
 This standalone workspace uses cargo-fuzz and nightly Rust to compare terminal
-storage and cursor-driven screen mutations with independent models.
+storage, cursor-driven screen mutations, and byte-stream execution with independent
+models.
 
 ## Storage Target
 
@@ -60,6 +61,21 @@ multi-scalar units, and lengths at and above the per-cell byte limit. The dictio
 also includes sequences for zero-count edits, rejected writes, width-only resizing,
 and wide wrapping inside and outside the scrolling region.
 
+## Processor Target
+
+The `processor` target serializes commands into VT bytes and compares execution
+with the complete-unit Screen model. It exercises cursor addressing, scrolling,
+cell and line edits, erasure, tabs, mode changes, saved cursors, and reset, together
+with malformed UTF-8, discarded strings, rejected parameter forms, and diagnostics.
+Unsupported mode lists preserve all screen state.
+
+Each input runs as one chunk and in chunks of one through seventeen bytes. A text
+callback can fail before mutation; execution retries the reported input suffix.
+Both runs must produce the same modeled screen, saved cursor, and diagnostics.
+The fixed-width fixture maps one synthetic scalar to an owned multi-scalar display
+unit, exercising text storage through the execution boundary. Inputs contain at
+most 512 eight-byte commands and use an eight-column, four-row screen.
+
 ## Input Bounds and Replay
 
 Each eight-byte command selects an operation, coordinates, a count, and synthetic
@@ -90,6 +106,7 @@ Run from `crates/terminal` after installing cargo-fuzz:
 ```sh
 cargo +nightly fuzz run storage -- -dict=fuzz/storage.dict -max_len=4096 -timeout=2 -rss_limit_mb=1024 -max_total_time=60
 cargo +nightly fuzz run screen -- -dict=fuzz/screen.dict -max_len=4096 -timeout=2 -rss_limit_mb=1024 -max_total_time=60
+cargo +nightly fuzz run processor -- -max_len=4096 -timeout=2 -rss_limit_mb=1024 -max_total_time=60
 ```
 
 Pass a finding's artifact file as the corpus argument to replay it. The command

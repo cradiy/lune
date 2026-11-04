@@ -92,6 +92,24 @@ pub struct Parser {
 }
 
 impl Parser {
+    /// Whether the parser is in ground state with no incomplete UTF-8 scalar.
+    /// Complete valid text can then be consumed without changing parser state.
+    #[inline]
+    pub fn is_ground(&self) -> bool {
+        self.state == State::Ground && !self.utf8.is_pending()
+    }
+
+    /// Consumes a discarded string payload prefix, stopping before a control or
+    /// DEL. Returns zero outside a string payload. This emits no events.
+    #[inline]
+    pub fn discard_string_payload(&mut self, bytes: &[u8]) -> usize {
+        if matches!(self.state, State::String { .. }) {
+            text_end(bytes)
+        } else {
+            0
+        }
+    }
+
     /// Consumes a chunk and invokes `emit` synchronously for each lexical event.
     ///
     /// Invalid UTF-8 uses the Unicode replacement character. Raw eight-bit C1

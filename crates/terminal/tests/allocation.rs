@@ -7,7 +7,7 @@ use std::{
 };
 
 use lune_terminal::{
-    CellPosition, CellText, CellWidth, EraseMode, Grid, Screen, StorageError, StyleId,
+    CellPosition, CellText, CellWidth, EraseMode, Grid, Processor, Screen, StorageError, StyleId,
 };
 
 #[global_allocator]
@@ -813,4 +813,69 @@ fn text_views_stream_without_allocation_and_propagate_sink_failures() {
     }
     assert_eq!(snapshot(screen.grid()), before);
     assert_eq!(screen.cursor(), cursor);
+}
+
+#[test]
+fn processor_retries_allocation_failures_from_owned_input_positions() {
+    fn text(screen: &mut Screen, value: &str, style: StyleId) -> Result<(), StorageError> {
+        if value.is_ascii() {
+            screen.write_ascii(value.as_bytes(), style)
+        } else {
+            screen.write("水\u{301}", CellWidth::Double, style)
+        }
+    }
+    let input = "AB\x1b[2;2H水\nZ".as_bytes();
+    let mut expected_screen = Screen::new(8, 4).unwrap();
+    let mut expected_processor = Processor::new(StyleId(3));
+    let (result, stats) = allocator::measure(None, || {
+        expected_processor.advance(input, &mut expected_screen, text)
+    });
+    assert_eq!(result.unwrap(), input.len());
+    assert!(stats.attempts > 0);
+    let expected = snapshot(expected_screen.grid());
+    for split in [0, input.iter().position(|&byte| byte == 0xb0).unwrap() + 1] {
+        for point in 0..stats.attempts {
+            let mut screen = Screen::new(8, 4).unwrap();
+            let mut processor = Processor::new(StyleId(3));
+            processor
+                .advance(&input[..split], &mut screen, text)
+                .unwrap();
+            let (result, failed) = allocator::measure(Some(point), || {
+                processor.advance(&input[split..], &mut screen, text)
+            });
+            let error = result.unwrap_err();
+            assert!(matches!(error.error, StorageError::Allocation(_)));
+            assert_eq!(failed.failures, 1);
+            let suffix = &input[split + error.consumed..];
+            let checkpoint = snapshot(screen.grid());
+            let cursor = screen.cursor();
+            let (result, _) =
+                allocator::measure(Some(0), || processor.advance(&[], &mut screen, text));
+            let again = result.unwrap_err();
+            assert_eq!(again.consumed, 0);
+            assert_eq!(snapshot(screen.grid()), checkpoint);
+            assert_eq!(screen.cursor(), cursor);
+            assert_eq!(
+                processor.advance(suffix, &mut screen, text).unwrap(),
+                suffix.len()
+            );
+            processor.finish(&mut screen, text).unwrap();
+            assert_eq!(snapshot(screen.grid()), expected);
+            assert_eq!(screen.cursor(), expected_screen.cursor());
+        }
+    }
+    let mut processor = Processor::default();
+    let mut screen = Screen::new(8, 4).unwrap();
+    let (result, stats) = allocator::measure(Some(0), || {
+        for _ in 0..32 {
+            processor.advance(
+                b"abc\r\n\x1b[2;3H!\x1b[0K",
+                &mut screen,
+                |s, value, style| s.write_ascii(value.as_bytes(), style),
+            )?;
+        }
+        Ok::<_, lune_terminal::ProcessError<StorageError>>(())
+    });
+    result.unwrap();
+    assert_eq!(stats.attempts, 0);
 }

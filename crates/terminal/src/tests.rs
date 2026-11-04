@@ -1,5 +1,6 @@
 use std::ops::Range;
 
+mod processor;
 mod screen;
 mod text;
 
