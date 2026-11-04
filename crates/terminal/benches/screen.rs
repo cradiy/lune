@@ -43,6 +43,25 @@ fn measure_prepared(
 
 fn main() {
     for columns in [120, 4096] {
+        for length in [1, 7, 31, 4096] {
+            for insert in [false, true] {
+                let mut screen = Screen::new(columns, 24).unwrap();
+                screen.set_insert_mode(insert);
+                screen.set_cursor(23, 0);
+                let bytes = vec![b'x'; length];
+                measure(
+                    &format!("ASCII scroll / {columns}, len={length}, insert={insert}"),
+                    length,
+                    || {
+                        black_box(&mut screen)
+                            .write_ascii(black_box(&bytes), StyleId(1))
+                            .unwrap();
+                    },
+                );
+            }
+        }
+    }
+    for columns in [120, 4096] {
         for column in [0, columns / 2, columns - 1] {
             for bulk in [false, true] {
                 let mut screen = Screen::new(columns, 24).unwrap();

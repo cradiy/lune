@@ -176,6 +176,7 @@ impl Grid {
         }
     }
 
+    #[inline]
     pub(crate) fn write_scrolling(
         &mut self,
         region: Range<usize>,
@@ -205,6 +206,26 @@ impl Grid {
             self.rows[region.end - 2].set_wrap_end(Some(self.columns - usize::from(clear_gap)));
         }
         Ok(())
+    }
+
+    /// The region is valid and nonempty; the validated ASCII fills one row.
+    #[inline]
+    pub(crate) fn write_ascii_scrolling(
+        &mut self,
+        region: Range<usize>,
+        bytes: &[u8],
+        style: StyleId,
+    ) {
+        self.rows[region.start].reset_ascii(bytes, style);
+        if region.start == 0 && region.end == self.rows.len() {
+            self.rows.rotate_left(1);
+        } else if region.len() > 1 {
+            self.rotate_rows_left(region.clone(), 1);
+        }
+        self.disconnect_before(region.start);
+        if region.len() > 1 {
+            self.rows[region.end - 2].set_wrap_end(Some(self.columns));
+        }
     }
 
     /// Scrolls an exclusive row range upward, clearing exposed rows with `style`.
@@ -288,11 +309,16 @@ impl Grid {
     }
 
     /// The caller supplies a valid, possibly empty row range.
+    #[inline]
     pub(crate) fn clear_rows(&mut self, region: Range<usize>, style: StyleId) {
         if region.is_empty() {
             return;
         }
         self.disconnect_before(region.start);
+        if region.len() == 1 {
+            self.rows[region.start].clear(style);
+            return;
+        }
         for row in self.rows.range_mut(region) {
             row.clear(style);
         }

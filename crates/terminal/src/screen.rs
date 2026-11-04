@@ -440,6 +440,8 @@ impl Screen {
     /// the final byte supplies that cell without writing intermediate values.
     /// Insertion mode shifts the suffix once per row segment. This is equivalent
     /// to individual unit writes, including wide-unit repair and edge overwrites.
+    /// Complete incoming rows replace recycled buffers directly when scrolling,
+    /// releasing their owned text in one pass.
     #[inline]
     pub fn write_ascii(&mut self, bytes: &[u8], style: StyleId) -> Result<(), StorageError> {
         if bytes.iter().any(|&byte| !(b' '..=b'~').contains(&byte)) {
@@ -459,6 +461,28 @@ impl Screen {
 
     #[inline]
     fn write_ascii_mode<const INSERT: bool>(
+        &mut self,
+        bytes: &[u8],
+        style: StyleId,
+    ) -> Result<(), StorageError> {
+        let available = self.grid.columns() - self.cursor.column;
+        if !self.cursor.wrap_pending && bytes.len() <= available {
+            if INSERT {
+                self.grid
+                    .insert_cells(self.cursor.row, self.cursor.column, bytes.len(), style)
+                    .expect("The ASCII run fits");
+            }
+            self.grid
+                .write_ascii_validated(self.cursor.row, self.cursor.column, bytes, style);
+            self.advance(self.cursor.row, self.cursor.column + bytes.len());
+            return Ok(());
+        }
+        self.write_ascii_at_boundary::<INSERT>(bytes, style)
+    }
+
+    // Share boundary handling while keeping fitting writes inline.
+    #[inline(never)]
+    fn write_ascii_at_boundary<const INSERT: bool>(
         &mut self,
         mut bytes: &[u8],
         style: StyleId,
@@ -501,12 +525,22 @@ impl Screen {
             if self.cursor.wrap_pending {
                 let source = self.cursor.row;
                 if source == self.scroll_region.end - 1 {
+                    let columns = self.grid.columns();
+                    if bytes.len() >= columns {
+                        self.grid.write_ascii_scrolling(
+                            self.scroll_region.clone(),
+                            &bytes[..columns],
+                            style,
+                        );
+                        self.advance(source, columns);
+                        bytes = &bytes[columns..];
+                        continue;
+                    }
                     self.grid
                         .scroll_up(self.scroll_region.clone(), 1, style)
                         .expect("The scrolling region is valid");
                     if self.scroll_region.len() > 1 {
-                        self.grid
-                            .set_wrap_end(source - 1, Some(self.grid.columns()));
+                        self.grid.set_wrap_end(source - 1, Some(columns));
                     }
                 } else {
                     self.cursor.row = (source + 1).min(self.grid.rows() - 1);

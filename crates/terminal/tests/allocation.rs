@@ -459,6 +459,52 @@ fn warm_writes_edits_scrolling_and_column_growth_make_no_allocation_requests() {
         snapshot(&grid);
     }
 
+    fn owned_rows(region: std::ops::Range<usize>, insert: bool) -> Screen {
+        let mut screen = Screen::new(8, 3).unwrap();
+        let text = "水\u{301}".repeat(32);
+        for row in 0..3 {
+            screen.set_cursor(row, 0);
+            for _ in 0..4 {
+                screen
+                    .write(&text, CellWidth::Double, StyleId(row as u32))
+                    .unwrap();
+            }
+        }
+        screen.set_scroll_region(region.clone()).unwrap();
+        screen.set_cursor(region.end - 1, 7);
+        screen.write("!", CellWidth::Single, StyleId(4)).unwrap();
+        screen.set_insert_mode(insert);
+        screen
+    }
+    for region in [0..1, 0..3, 1..3] {
+        for insert in [false, true] {
+            for count in [1, 8, 17] {
+                let mut bulk = owned_rows(region.clone(), insert);
+                let mut scalar = owned_rows(region.clone(), insert);
+                let bytes = [b'x'; 17];
+                let (result, stats) =
+                    allocator::measure(Some(0), || bulk.write_ascii(&bytes[..count], StyleId(9)));
+                result.unwrap();
+                assert_eq!(stats.attempts, 0);
+                assert!(
+                    stats.live_bytes < 0,
+                    "Recycled rows release their owned text"
+                );
+                let (result, scalar_stats) = allocator::measure(Some(0), || {
+                    for _ in 0..count {
+                        scalar.write("x", CellWidth::Single, StyleId(9))?;
+                    }
+                    Ok::<_, StorageError>(())
+                });
+                result.unwrap();
+                assert_eq!(scalar_stats.attempts, 0);
+                assert_eq!(stats.live_bytes, scalar_stats.live_bytes);
+                assert_eq!(bulk.cursor(), scalar.cursor());
+                assert_eq!(snapshot(bulk.grid()), snapshot(scalar.grid()));
+            }
+        }
+    }
+
     let mut reset = Screen::new(130, 4).unwrap();
     reset.resize(65, 3, StyleId(0)).unwrap();
     for row in 0..3 {

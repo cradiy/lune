@@ -309,9 +309,20 @@ impl Row {
         Ok(())
     }
 
+    #[inline]
     pub(crate) fn clear(&mut self, style: StyleId) {
         self.extended.clear();
         self.cells.fill(Cell::blank(style));
+    }
+
+    /// Replaces a recycled row with validated ASCII of exactly the row width.
+    #[inline]
+    pub(crate) fn reset_ascii(&mut self, bytes: &[u8], style: StyleId) {
+        debug_assert_eq!(bytes.len(), self.cells.len());
+        self.extended.clear();
+        for (cell, &byte) in self.cells.iter_mut().zip(bytes) {
+            *cell = Cell::scalar(char::from(byte), CellWidth::Single, style);
+        }
     }
 
     pub(crate) fn insert_cells(
