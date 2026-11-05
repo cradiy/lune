@@ -50,6 +50,7 @@ fn main() {
     let rendition = b"\x1b[1;31mred\x1b[38;2;0;128;255;48:5:17mblue\x1b[0mplain\r\n".repeat(1024);
     let graphics =
         b"\x1b)0\x0elqqqqqqqqqqqqk\r\nx            x\r\nmqqqqqqqqqqqqj\x0f plain\r\n".repeat(1024);
+    let cursor = b"\x1b[?25l\x1b[6 q\x1b[?12htext\x1b[?25h\x1b[ q\r\n".repeat(1024);
     let mut newlines = Vec::from(&b"\x1b[20h"[..]);
     newlines
         .extend(b"abcdefghijklmnopqrstuvwxyz 0123456789 ABCDEFGHIJKLMNOPQRSTUVWXYZ\n".repeat(1024));
@@ -67,4 +68,6 @@ fn main() {
     measure("DEC graphics / 1-byte", &graphics, 1);
     measure("new-line mode / bulk", &newlines, newlines.len());
     measure("new-line mode / 1-byte", &newlines, 1);
+    measure("cursor state / bulk", &cursor, cursor.len());
+    measure("cursor state / 1-byte", &cursor, 1);
 }

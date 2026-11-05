@@ -1,5 +1,44 @@
 use super::{assert_invariants, snapshot};
-use crate::{CellText, CellWidth, Cursor, EraseMode, Screen, StorageError, StyleId};
+use crate::{
+    CellText, CellWidth, Cursor, CursorAppearance, CursorShape, EraseMode, Screen, StorageError,
+    StyleId,
+};
+
+#[test]
+fn cursor_appearance_preserves_placement_saved_state_and_resizing_until_reset() {
+    let mut screen = Screen::new(4, 4).unwrap();
+    let initial = CursorAppearance {
+        visible: true,
+        blinking: true,
+        shape: CursorShape::Block,
+    };
+    assert_eq!(screen.cursor_appearance(), initial);
+    screen.write_ascii(b"abcd", StyleId(1)).unwrap();
+    screen.save_cursor();
+    let cursor = screen.cursor();
+    let contents = snapshot(screen.grid());
+    let hidden = CursorAppearance {
+        visible: false,
+        blinking: false,
+        shape: CursorShape::Bar,
+    };
+    screen.set_cursor_appearance(hidden);
+    assert_eq!(screen.cursor(), cursor);
+    assert_eq!(snapshot(screen.grid()), contents);
+    screen.carriage_return();
+    screen.restore_cursor();
+    assert_eq!(screen.cursor(), cursor);
+    assert_eq!(screen.cursor_appearance(), hidden);
+    screen.resize(3, 2, StyleId(0)).unwrap();
+    screen.restore_cursor();
+    assert_eq!(screen.cursor_appearance(), hidden);
+    let checkpoint = snapshot(screen.grid());
+    assert!(screen.resize(0, 2, StyleId(0)).is_err());
+    assert_eq!(snapshot(screen.grid()), checkpoint);
+    assert_eq!(screen.cursor_appearance(), hidden);
+    screen.reset(StyleId(0));
+    assert_eq!(screen.cursor_appearance(), initial);
+}
 
 #[test]
 fn soft_wraps_record_actual_joins_and_invalidate_edited_boundaries() {

@@ -15,7 +15,8 @@ use std::io::Write;
 
 use libfuzzer_sys::fuzz_target;
 use lune_terminal::{
-    CellWidth, Color, EraseMode, InputModes, Processor, Screen, Style, StyleId, Underline,
+    CellWidth, Color, CursorShape, EraseMode, InputModes, Processor, Screen, Style, StyleId,
+    Underline,
 };
 use screen_model::{Command, ScreenModel};
 
@@ -142,7 +143,7 @@ fuzz_target!(|data: &[u8]| {
     let mut saved_charsets = (charsets, selected);
     let mut input = InputModes::default();
     for bytes in data.as_chunks::<8>().0.iter().take(512) {
-        let command = match bytes[0] % 52 {
+        let command = match bytes[0] % 55 {
             0 => {
                 wire.extend(b"abc");
                 ascii(
@@ -208,7 +209,7 @@ fuzz_target!(|data: &[u8]| {
             }
             9 | 10 => {
                 let n = bytes[3] % 4;
-                let final_byte = if bytes[0] % 52 == 9 { 'K' } else { 'J' };
+                let final_byte = if bytes[0] % 55 == 9 { 'K' } else { 'J' };
                 write!(&mut wire, "\x1b[{n}{final_byte}").unwrap();
                 let mode = match n {
                     0 => Some(EraseMode::FromCursor),
@@ -262,7 +263,7 @@ fuzz_target!(|data: &[u8]| {
             28 | 29 | 33 => {
                 let enabled = bytes[3] & 1 != 0;
                 let final_byte = if enabled { 'h' } else { 'l' };
-                let command = match bytes[0] % 52 {
+                let command = match bytes[0] % 55 {
                     28 => {
                         write!(&mut wire, "\x1b[?7{final_byte}").unwrap();
                         Command::AutoWrap(enabled)
@@ -301,7 +302,7 @@ fuzz_target!(|data: &[u8]| {
                 Some(Command::Reset)
             }
             34 => {
-                wire.extend(b"\x1b[?6;25h");
+                wire.extend(b"\x1b[?6;999h");
                 diagnostics.1 += 1;
                 None
             }
@@ -456,7 +457,7 @@ fuzz_target!(|data: &[u8]| {
                 });
                 None
             }
-            _ => {
+            51 => {
                 input.application_keypad = bytes[1] & 1 != 0;
                 wire.extend(if input.application_keypad {
                     b"\x1b="
@@ -464,6 +465,35 @@ fuzz_target!(|data: &[u8]| {
                     b"\x1b>"
                 });
                 None
+            }
+            52 | 53 => {
+                let enabled = bytes[1] & 1 != 0;
+                let mode = if bytes[0] % 55 == 52 { 25 } else { 12 };
+                write!(&mut wire, "\x1b[?{mode}{}", if enabled { 'h' } else { 'l' }).unwrap();
+                Some(if mode == 25 {
+                    Command::CursorVisible(enabled)
+                } else {
+                    Command::CursorBlink(enabled)
+                })
+            }
+            _ => {
+                let selector = bytes[1] % 9;
+                write!(&mut wire, "\x1b[{selector} q").unwrap();
+                let style = match selector {
+                    0 | 1 => Some((CursorShape::Block, true)),
+                    2 => Some((CursorShape::Block, false)),
+                    3 => Some((CursorShape::Underline, true)),
+                    4 => Some((CursorShape::Underline, false)),
+                    5 => Some((CursorShape::Bar, true)),
+                    6 => Some((CursorShape::Bar, false)),
+                    _ => None,
+                };
+                if let Some((shape, blinking)) = style {
+                    Some(Command::CursorShape(shape, blinking))
+                } else {
+                    diagnostics.1 += 1;
+                    None
+                }
             }
         };
         if let Some(command) = command

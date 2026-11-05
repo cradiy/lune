@@ -24,6 +24,32 @@ pub struct Cursor {
     pub wrap_pending: bool,
 }
 
+/// Geometry requested for the cursor at its current cell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CursorShape {
+    Block,
+    Underline,
+    Bar,
+}
+
+/// Cursor presentation metadata. Timing and painting belong to the consumer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CursorAppearance {
+    pub visible: bool,
+    pub blinking: bool,
+    pub shape: CursorShape,
+}
+
+impl Default for CursorAppearance {
+    fn default() -> Self {
+        Self {
+            visible: true,
+            blinking: true,
+            shape: CursorShape::Block,
+        }
+    }
+}
+
 /// Screen storage with cursor placement and delayed automatic wrapping.
 /// Callers supply complete display units, their widths, and style keys.
 #[derive(Debug)]
@@ -36,6 +62,7 @@ pub struct Screen {
     auto_wrap: bool,
     origin_mode: bool,
     insert_mode: bool,
+    cursor_appearance: CursorAppearance,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -70,6 +97,7 @@ impl Screen {
             auto_wrap: true,
             origin_mode: false,
             insert_mode: false,
+            cursor_appearance: CursorAppearance::default(),
         })
     }
 
@@ -81,10 +109,22 @@ impl Screen {
         self.cursor
     }
 
+    /// A copyable presentation snapshot. Initially a visible blinking block.
+    pub fn cursor_appearance(&self) -> CursorAppearance {
+        self.cursor_appearance
+    }
+
+    /// Replaces presentation metadata while preserving contents, cursor placement,
+    /// pending wrapping, modes, and the save slot. Resizing and cursor restores
+    /// preserve this state; reset restores the default. This does not allocate.
+    pub fn set_cursor_appearance(&mut self, appearance: CursorAppearance) {
+        self.cursor_appearance = appearance;
+    }
+
     /// Clears all cells to spaces with `style`, preserving dimensions and row
     /// buffers. Homes the cursor, clears pending wrapping, restores the full-screen
     /// scrolling region and default tab stops, enables automatic wrapping, and
-    /// disables origin mode. The save slot returns to its initial state.
+    /// disables origin mode. Cursor appearance and the save slot return to defaults.
     /// Row, queue, tab, and text-index capacities are retained. This does not allocate.
     pub fn reset(&mut self, style: StyleId) {
         self.grid.clear(style);
@@ -95,6 +135,7 @@ impl Screen {
         self.auto_wrap = true;
         self.origin_mode = false;
         self.insert_mode = false;
+        self.cursor_appearance = CursorAppearance::default();
     }
 
     /// Whether writes insert columns and shift the row suffix. Disabled initially.

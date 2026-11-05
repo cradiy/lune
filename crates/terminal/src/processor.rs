@@ -3,7 +3,9 @@ use std::{error::Error, fmt};
 use lune_vt::{CsiSequence, EscapeSequence, Event, Parameter, Parser};
 
 use crate::charsets::Charsets;
-use crate::{EraseMode, InputModes, MAX_STYLES, Screen, Style, StyleError, StyleId, StyleTable};
+use crate::{
+    CursorShape, EraseMode, InputModes, MAX_STYLES, Screen, Style, StyleError, StyleId, StyleTable,
+};
 
 /// A failure while applying a completed text or rendition event.
 #[derive(Debug)]
@@ -470,8 +472,31 @@ fn erase_mode(value: usize) -> Option<EraseMode> {
 fn csi(screen: &mut Screen, sequence: CsiSequence<'_>, state: &mut State) -> bool {
     let style = state.style;
     let p = sequence.parameters;
-    if !sequence.intermediates.is_empty() || p.iter().any(|p| p.is_subparameter) {
+    if p.iter().any(|p| p.is_subparameter) {
         return false;
+    }
+    if !sequence.intermediates.is_empty() {
+        if sequence.intermediates != b" "
+            || sequence.final_byte != b'q'
+            || !sequence.private_markers.is_empty()
+            || p.len() > 1
+        {
+            return false;
+        }
+        let (shape, blinking) = match value(p, 0, 0) {
+            0 | 1 => (CursorShape::Block, true),
+            2 => (CursorShape::Block, false),
+            3 => (CursorShape::Underline, true),
+            4 => (CursorShape::Underline, false),
+            5 => (CursorShape::Bar, true),
+            6 => (CursorShape::Bar, false),
+            _ => return false,
+        };
+        let mut appearance = screen.cursor_appearance();
+        appearance.shape = shape;
+        appearance.blinking = blinking;
+        screen.set_cursor_appearance(appearance);
+        return true;
     }
     if matches!(sequence.final_byte, b'h' | b'l') {
         let private = match sequence.private_markers {
@@ -483,7 +508,7 @@ fn csi(screen: &mut Screen, sequence: CsiSequence<'_>, state: &mut State) -> boo
             || !p.iter().all(|p| {
                 matches!(
                     (private, p.value),
-                    (false, Some(4 | 20)) | (true, Some(1 | 6 | 7))
+                    (false, Some(4 | 20)) | (true, Some(1 | 6 | 7 | 12 | 25))
                 )
             })
         {
@@ -497,6 +522,15 @@ fn csi(screen: &mut Screen, sequence: CsiSequence<'_>, state: &mut State) -> boo
                 (true, Some(1)) => state.input.application_cursor = enabled,
                 (true, Some(6)) => screen.set_origin_mode(enabled),
                 (true, Some(7)) => screen.set_auto_wrap(enabled),
+                (true, Some(12 | 25)) => {
+                    let mut appearance = screen.cursor_appearance();
+                    if parameter.value == Some(12) {
+                        appearance.blinking = enabled;
+                    } else {
+                        appearance.visible = enabled;
+                    }
+                    screen.set_cursor_appearance(appearance);
+                }
                 _ => unreachable!("Mode parameters were validated"),
             }
         }

@@ -73,6 +73,11 @@
 //! Scalar insertion reserves owned text and index capacity before changing cells.
 //! Mode changes preserve pending wrapping; resizing and cursor restores preserve
 //! insertion mode. Resetting disables it.
+//! [`CursorAppearance`] records visibility, blinking, and [`CursorShape`] separately
+//! from placement. Presentation changes preserve contents and pending wrapping;
+//! resizing and cursor restores preserve appearance. Reset restores a visible
+//! blinking block. [`Processor`] executes DEC modes 12/25 and DECSCUSR values 0–6.
+//! Consumers own cursor timing and painting.
 //!
 //! [`Row::wrap_end`] records an actual automatic-wrap connection to the following
 //! row and its exclusive column boundary. A double-width unit that wraps early
@@ -147,7 +152,7 @@ pub use grid::{Grid, MAX_CELLS, MAX_DIMENSION};
 pub use input::{InputModes, Key};
 pub use processor::{ProcessError, ProcessFailure, Processor};
 pub use row::Row;
-pub use screen::{Cursor, EraseMode, Screen};
+pub use screen::{Cursor, CursorAppearance, CursorShape, EraseMode, Screen};
 pub use style::{Color, Style, Underline};
 pub use styles::{MAX_STYLES, StyleError, StyleTable};
 pub use text::{CellPosition, GridText};

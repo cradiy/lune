@@ -1,7 +1,8 @@
 use std::{collections::BTreeSet, ops::Range};
 
 use lune_terminal::{
-    CellPosition, CellWidth, EraseMode, MAX_CELL_TEXT_BYTES, Screen, StorageError, StyleId,
+    CellPosition, CellWidth, CursorAppearance, CursorShape, EraseMode, MAX_CELL_TEXT_BYTES, Screen,
+    StorageError, StyleId,
 };
 
 use crate::model::Model;
@@ -40,6 +41,9 @@ pub enum Command<'a> {
     RestoreCursor,
     Reset,
     InsertMode(bool),
+    CursorVisible(bool),
+    CursorBlink(bool),
+    CursorShape(CursorShape, bool),
 }
 
 struct SavedCursor {
@@ -62,6 +66,7 @@ pub struct ScreenModel {
     origin_mode: bool,
     saved: SavedCursor,
     insert_mode: bool,
+    cursor_appearance: CursorAppearance,
 }
 
 impl ScreenModel {
@@ -79,6 +84,11 @@ impl ScreenModel {
             auto_wrap: true,
             origin_mode: false,
             insert_mode: false,
+            cursor_appearance: CursorAppearance {
+                visible: true,
+                blinking: true,
+                shape: CursorShape::Block,
+            },
             saved: SavedCursor {
                 row: 0,
                 column: 0,
@@ -103,6 +113,7 @@ impl ScreenModel {
         assert_eq!(screen.auto_wrap(), self.auto_wrap);
         assert_eq!(screen.origin_mode(), self.origin_mode);
         assert_eq!(screen.insert_mode(), self.insert_mode);
+        assert_eq!(screen.cursor_appearance(), self.cursor_appearance);
         assert!(!self.origin_mode || self.region.contains(&self.row));
         assert!(self.auto_wrap || self.column < self.storage.columns());
         for column in 0..self.storage.columns() {
@@ -118,6 +129,12 @@ impl ScreenModel {
 
     pub fn apply(&mut self, command: &Command<'_>, style: StyleId) -> Result<(), StorageError> {
         match command {
+            Command::CursorVisible(visible) => self.cursor_appearance.visible = *visible,
+            Command::CursorBlink(blinking) => self.cursor_appearance.blinking = *blinking,
+            Command::CursorShape(shape, blinking) => {
+                self.cursor_appearance.shape = *shape;
+                self.cursor_appearance.blinking = *blinking;
+            }
             Command::InsertMode(enabled) => self.insert_mode = *enabled,
             Command::Reset => {
                 let columns = self.storage.columns();

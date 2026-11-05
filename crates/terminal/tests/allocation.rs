@@ -1034,7 +1034,8 @@ fn processor_retries_style_and_text_allocations_without_replaying_accepted_input
     let (processor, stats) = allocator::measure(Some(0), Processor::default);
     assert_eq!(stats.attempts, 0);
     let mut processor = processor;
-    let warm = b"\x1b[1;31mabc\x1b[0m\x1b[K\r\n\x1b7\x1b[34m\x1b8";
+    let warm =
+        b"\x1b[1;31mabc\x1b[0m\x1b[K\r\n\x1b7\x1b[34m\x1b8\x1b[?12;25l\x1b[6 q\x1b[?12;25h\x1b[ q";
     processor.advance(warm, &mut screen, text).unwrap();
     let ((), stats) = allocator::measure(Some(0), || {
         for _ in 0..32 {

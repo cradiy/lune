@@ -54,6 +54,8 @@ Insertion-mode writes first edit complete display units in the reference row,
 then write one unit. The ASCII oracle repeats that operation per input byte,
 checking the batched implementation. Reset disables insertion mode; resize and
 cursor restores preserve it.
+Cursor appearance has independent visibility, blinking, and shape. Mode changes,
+resizing, saved cursors, and reset compare these values along with placement.
 Reset rebuilds the oracle at the current dimensions with styled blanks and
 initial cursor state, modes, region, tabs, and save slot. Mixed sequences also
 check subsequent restore, writing, tabulation, and resizing after reset.
@@ -88,6 +90,8 @@ The reference also tracks application cursor/keypad and ANSI new-line modes
 independently of cursor saves. Mode changes and resets compare complete snapshots.
 LF, VT, and FF select either vertical movement or carriage return plus line feed;
 explicit IND/NEL and reset commands check the distinct mode boundaries.
+DEC cursor visibility/blinking modes and DECSCUSR commands update reference
+appearance; unsupported style selectors preserve it and count as ignored sequences.
 The fixed-width fixture maps one synthetic scalar to an owned multi-scalar display
 unit, exercising text storage through the execution boundary. Inputs contain at
 most 512 eight-byte commands and use an eight-column, four-row screen.
@@ -122,14 +126,16 @@ columns to exercise bitmap word boundaries. Other valid widths and heights are
 limited to 16. Zero, overlarge, and invalid arguments are included.
 For screen coordinates, bytes `fc`, `fd`, `fe`, and `ff` select the last cell, the
 exclusive bound, zero, and `usize::MAX`; other bytes are reduced by the dimension
-plus two. Screen opcodes modulo 34 select: 0 unit write, 1 ASCII, 2 cursor, 3 region,
+plus two. Screen opcodes modulo 38 select: 0 unit write, 1 ASCII, 2 cursor, 3 region,
 4 resize, 5 carriage return, 6 backspace, 7 line feed, 8 reverse index, 9 line erasure,
 10 display erasure, 11 cell insertion, 12 cell deletion, 13 counted erasure,
 14 line insertion, 15 line deletion, 16 same-size resize, 17 move up, 18 move down,
 19 move left, 20 move right, 21 scroll up, 22 scroll down, 23 tab forward,
 24 tab backward, 25 set current tab, 26 clear current tab, 27 clear all tabs,
 28 set automatic wrapping, 29 set origin mode, 30 save cursor state, 31 restore
-cursor state, 32 reset the screen with the style key, and 33 set insertion mode.
+cursor state, 32 reset the screen with the style key, 33 set insertion mode,
+34 extract a text range, 35 set cursor visibility, 36 set blinking, and 37 set
+shape (byte 1 modulo three selects block, underline, or bar) and blinking.
 Mode settings use the low bit of byte 3.
 Byte 3 selects width, count (`ff` means `usize::MAX`), or erasure mode.
 Byte 4 selects synthetic text;

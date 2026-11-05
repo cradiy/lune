@@ -1,8 +1,101 @@
 use super::{Snapshot, snapshot};
 use crate::{
-    CellPosition, CellWidth, Color, Cursor, ProcessFailure, Processor, Screen, StorageError, Style,
-    StyleError, StyleId,
+    CellPosition, CellWidth, Color, Cursor, CursorAppearance, CursorShape, ProcessFailure,
+    Processor, Screen, StorageError, Style, StyleError, StyleId,
 };
+
+#[test]
+fn cursor_presentation_controls_compose_across_chunks_reject_headers_and_reset() {
+    use CursorShape::{Bar, Block, Underline};
+    for (wire, shape, blinking) in [
+        (&b"\x1b[ q"[..], Block, true),
+        (&b"\x1b[0 q"[..], Block, true),
+        (&b"\x1b[1 q"[..], Block, true),
+        (&b"\x1b[2 q"[..], Block, false),
+        (&b"\x1b[3 q"[..], Underline, true),
+        (&b"\x1b[4 q"[..], Underline, false),
+        (&b"\x1b[5 q"[..], Bar, true),
+        (&b"\x1b[6 q"[..], Bar, false),
+    ] {
+        let mut input = Vec::from(&b"abcd\x1b7\x1b[?12;25l"[..]);
+        input.extend(wire);
+        input.extend(b"\x1b8");
+        for split in 0..=input.len() {
+            let mut screen = Screen::new(4, 4).unwrap();
+            let mut processor = Processor::default();
+            processor
+                .advance(&input[..split], &mut screen, write_text)
+                .unwrap();
+            processor
+                .advance(&input[split..], &mut screen, write_text)
+                .unwrap();
+            let appearance = CursorAppearance {
+                visible: false,
+                blinking,
+                shape,
+            };
+            assert_eq!(screen.cursor_appearance(), appearance);
+            assert_eq!(
+                screen.cursor(),
+                Cursor {
+                    row: 0,
+                    column: 3,
+                    wrap_pending: true
+                }
+            );
+            assert_eq!(row_text(&screen, 0), "abcd");
+            processor
+                .advance(b"\x1b[?25h\x1b[?12l\x1b8", &mut screen, write_text)
+                .unwrap();
+            assert_eq!(
+                screen.cursor_appearance(),
+                CursorAppearance {
+                    visible: true,
+                    blinking: false,
+                    shape
+                }
+            );
+            for rejected in [
+                &b"\x1b[7 q"[..],
+                b"\x1b[?2 q",
+                b"\x1b[2;4 q",
+                b"\x1b[2:4 q",
+                b"\x1b[2q",
+                b"\x1b[2!q",
+                b"\x1b[?25;12;999h",
+                b"\x1b[25l",
+            ] {
+                let before = screen.cursor_appearance();
+                processor
+                    .advance(rejected, &mut screen, write_text)
+                    .unwrap();
+                assert_eq!(screen.cursor_appearance(), before);
+                assert!(screen.cursor().wrap_pending);
+            }
+            assert_eq!(processor.ignored_sequences(), 8);
+            processor
+                .advance(b"\x1b[?12h", &mut screen, write_text)
+                .unwrap();
+            assert_eq!(
+                screen.cursor_appearance(),
+                CursorAppearance {
+                    visible: true,
+                    blinking: true,
+                    shape
+                }
+            );
+            processor
+                .advance(b"\x1b[?25l\x1b[6 q\x1bc", &mut screen, write_text)
+                .unwrap();
+            assert_eq!(screen.cursor_appearance(), CursorAppearance::default());
+            processor
+                .advance(b"\x1b[?25l\x1b[4 q", &mut screen, write_text)
+                .unwrap();
+            processor.reset(&mut screen);
+            assert_eq!(screen.cursor_appearance(), CursorAppearance::default());
+        }
+    }
+}
 
 fn write_text(screen: &mut Screen, text: &str, style: StyleId) -> Result<(), StorageError> {
     if text.is_ascii() {
