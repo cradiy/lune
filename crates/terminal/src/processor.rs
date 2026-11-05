@@ -3,7 +3,7 @@ use std::{error::Error, fmt};
 use lune_vt::{CsiSequence, EscapeSequence, Event, Parameter, Parser};
 
 use crate::charsets::Charsets;
-use crate::{EraseMode, MAX_STYLES, Screen, Style, StyleError, StyleId, StyleTable};
+use crate::{EraseMode, InputModes, MAX_STYLES, Screen, Style, StyleError, StyleId, StyleTable};
 
 /// A failure while applying a completed text or rendition event.
 #[derive(Debug)]
@@ -67,7 +67,7 @@ struct State {
     saved_style: StyleId,
     charsets: Charsets,
     saved_charsets: Charsets,
-    new_line_mode: bool,
+    input: InputModes,
 }
 
 /// Incremental execution of screen controls with caller-owned text layout.
@@ -124,10 +124,9 @@ impl Processor {
         self.state.style
     }
 
-    /// Whether LF moves to column zero on the following line. Input encoders can
-    /// use this state to select CR versus CR/LF for the Return key.
-    pub fn new_line_mode(&self) -> bool {
-        self.state.new_line_mode
+    /// Keyboard modes in effect at the end of the accepted input prefix.
+    pub fn input_modes(&self) -> InputModes {
+        self.state.input
     }
 
     /// Resolves keys issued for this processor's screen and retained snapshots.
@@ -357,7 +356,7 @@ impl Processor {
                 Pending::Execute(0x0e) => self.state.charsets.shift(true),
                 Pending::Execute(0x0f) => self.state.charsets.shift(false),
                 Pending::Execute(control) => {
-                    execute(screen, control, self.state.style, self.state.new_line_mode)
+                    execute(screen, control, self.state.style, self.state.input.new_line)
                 }
                 Pending::Rendition(style) => {
                     self.state.style = self.styles.intern(style).map_err(ProcessFailure::Style)?;
@@ -435,6 +434,8 @@ fn escape(screen: &mut Screen, sequence: EscapeSequence<'_>, state: &mut State) 
             screen.line_feed(state.style);
         }
         b'H' => screen.set_tab_stop(),
+        b'=' => state.input.application_keypad = true,
+        b'>' => state.input.application_keypad = false,
         b'M' => screen.reverse_index(state.style),
         b'c' => {
             *state = State::default();
@@ -482,7 +483,7 @@ fn csi(screen: &mut Screen, sequence: CsiSequence<'_>, state: &mut State) -> boo
             || !p.iter().all(|p| {
                 matches!(
                     (private, p.value),
-                    (false, Some(4 | 20)) | (true, Some(6 | 7))
+                    (false, Some(4 | 20)) | (true, Some(1 | 6 | 7))
                 )
             })
         {
@@ -492,7 +493,8 @@ fn csi(screen: &mut Screen, sequence: CsiSequence<'_>, state: &mut State) -> boo
         for parameter in p {
             match (private, parameter.value) {
                 (false, Some(4)) => screen.set_insert_mode(enabled),
-                (false, Some(20)) => state.new_line_mode = enabled,
+                (false, Some(20)) => state.input.new_line = enabled,
+                (true, Some(1)) => state.input.application_cursor = enabled,
                 (true, Some(6)) => screen.set_origin_mode(enabled),
                 (true, Some(7)) => screen.set_auto_wrap(enabled),
                 _ => unreachable!("Mode parameters were validated"),

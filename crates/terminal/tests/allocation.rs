@@ -1056,6 +1056,20 @@ fn processor_retries_style_and_text_allocations_without_replaying_accepted_input
         }
         processor.reset(&mut screen);
         processor.collect_styles(&screen, []).unwrap();
+        processor
+            .advance(b"\x1b[?1h\x1b=\x1b[20h", &mut screen, text)
+            .unwrap();
+        let modes = processor.input_modes();
+        for digit in 0..=255 {
+            black_box(modes.encode_key(lune_terminal::Key::KeypadDigit(digit)));
+        }
+        for key in [
+            lune_terminal::Key::Up,
+            lune_terminal::Key::Enter,
+            lune_terminal::Key::KeypadEnter,
+        ] {
+            black_box(modes.encode_key(key));
+        }
     });
     assert_eq!(stats.attempts, 0);
 }

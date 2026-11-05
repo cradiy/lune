@@ -105,6 +105,10 @@
 //! Mapped scalar failures retain the mapped value and own its source byte.
 //! ANSI new-line mode selects vertical-only or column-zero movement for LF and
 //! its VT/FF aliases. Explicit IND/NEL retain their own movement semantics.
+//! [`Processor::input_modes`] captures application cursor/keypad and new-line
+//! modes. [`InputModes::encode_key`] encodes unmodified cursor, Return, and
+//! numeric-keypad keys into static byte slices without allocating. Snapshots and
+//! encoded bytes remain valid across later mode changes and partial writes.
 //!
 //! [`Style`] represents unresolved colors and character rendition independently
 //! of [`StyleId`] storage. [`Style::apply_sgr`] interprets a parameter list
@@ -125,6 +129,7 @@ mod cell;
 mod charsets;
 mod error;
 mod grid;
+mod input;
 mod processor;
 mod row;
 mod screen;
@@ -139,6 +144,7 @@ mod tests;
 pub use cell::{Cell, CellText, CellWidth, MAX_CELL_TEXT_BYTES, StyleId};
 pub use error::StorageError;
 pub use grid::{Grid, MAX_CELLS, MAX_DIMENSION};
+pub use input::{InputModes, Key};
 pub use processor::{ProcessError, ProcessFailure, Processor};
 pub use row::Row;
 pub use screen::{Cursor, EraseMode, Screen};

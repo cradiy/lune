@@ -461,17 +461,17 @@ fn new_line_mode_composes_with_mode_lists_saved_cursors_and_explicit_indexing() 
                 wrap_pending: false
             }
         );
-        assert!(!processor.new_line_mode() && !screen.insert_mode());
+        assert!(!processor.input_modes().new_line && !screen.insert_mode());
         assert_eq!(processor.ignored_sequences(), 1);
         processor
             .advance(b"\x1b[20h\x1bc", &mut screen, write_text)
             .unwrap();
-        assert!(!processor.new_line_mode());
+        assert!(!processor.input_modes().new_line);
         processor
             .advance(b"\x1b[20h", &mut screen, write_text)
             .unwrap();
         processor.reset(&mut screen);
-        assert!(!processor.new_line_mode());
+        assert!(!processor.input_modes().new_line);
     }
 }
 
@@ -487,7 +487,7 @@ fn new_line_mode_applies_after_a_failed_replacement_before_following_text() {
         .unwrap_err();
     assert_eq!(error.consumed, 1);
     assert_eq!(screen.cursor().column, 2);
-    assert!(processor.new_line_mode());
+    assert!(processor.input_modes().new_line);
     processor.advance(b"X", &mut screen, write_text).unwrap();
     assert_eq!(row_text(&screen, 0), "ab�     ");
     assert_eq!(row_text(&screen, 1), "X       ");
