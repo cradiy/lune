@@ -11,7 +11,8 @@ const ROW_WRAP: u32 = 1 << 24;
 const ROW_GAP: u32 = 1 << 25;
 const ROW_MASK: u32 = ROW_WRAP | ROW_GAP;
 
-/// An opaque style key supplied and interpreted by the caller. Zero is the default key.
+/// An opaque style key supplied and interpreted by the caller. Zero is the default
+/// key. Keys issued by [`crate::StyleTable`] belong to that table's lifetime.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[repr(transparent)]
 pub struct StyleId(pub u32);

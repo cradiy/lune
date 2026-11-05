@@ -42,3 +42,10 @@ path = "fuzz_targets/style.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "styles"
+path = "fuzz_targets/styles.rs"
+test = false
+doc = false
+bench = false

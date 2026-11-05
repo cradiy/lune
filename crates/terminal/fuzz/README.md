@@ -86,6 +86,16 @@ Arbitrary parameter lists additionally check rejection atomicity, idempotence,
 and an explicit final reset. The target retains at most 32 generated parameters;
 its wire encoder uses a fixed-size synthetic seed.
 
+## Style Table Target
+
+The `styles` target compares a bounded table with a map of live IDs and a history
+of every issued ID. Commands interleave interning, duplicate lookup, valid and
+invalid root sets, collection, and stale-ID queries. Reclaimed IDs must stay
+invalid through slot reuse, retained values keep their IDs, and rejected root
+sets preserve all mappings. Inputs contain at most 128 four-byte commands and a
+capacity of one through sixteen styles. Generation retirement and allocation
+failures are covered by the terminal tests.
+
 ## Input Bounds and Replay
 
 Each eight-byte command selects an operation, coordinates, a count, and synthetic
@@ -118,6 +128,7 @@ cargo +nightly fuzz run storage -- -dict=fuzz/storage.dict -max_len=4096 -timeou
 cargo +nightly fuzz run screen -- -dict=fuzz/screen.dict -max_len=4096 -timeout=2 -rss_limit_mb=1024 -max_total_time=60
 cargo +nightly fuzz run processor -- -max_len=4096 -timeout=2 -rss_limit_mb=1024 -max_total_time=60
 cargo +nightly fuzz run style -- -max_len=128 -timeout=2 -rss_limit_mb=1024 -max_total_time=60
+cargo +nightly fuzz run styles -- -max_len=512 -timeout=2 -rss_limit_mb=1024 -max_total_time=60
 ```
 
 Pass a finding's artifact file as the corpus argument to replay it. The command

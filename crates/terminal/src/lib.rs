@@ -102,6 +102,11 @@
 //! atomically with fixed auxiliary space. [`Color`] preserves default and indexed
 //! colors for later theme/palette resolution. Cell style keys and the processor's
 //! text callback retain caller-owned style storage.
+//! [`StyleTable`] interns values behind bounded, table-local IDs. Explicit
+//! collection traces caller-owned roots, preserves retained IDs, and invalidates
+//! reclaimed IDs through slot generations. Default rendition permanently uses
+//! key zero; exhausted generations retire their slots. Lookup, repeated interning
+//! hits, and collection make no allocation requests.
 
 mod cell;
 mod error;
@@ -110,6 +115,7 @@ mod processor;
 mod row;
 mod screen;
 mod style;
+mod styles;
 mod tabs;
 mod text;
 
@@ -123,4 +129,5 @@ pub use processor::{ProcessError, Processor};
 pub use row::Row;
 pub use screen::{Cursor, EraseMode, Screen};
 pub use style::{Color, Style, Underline};
+pub use styles::{MAX_STYLES, StyleError, StyleTable};
 pub use text::{CellPosition, GridText};

@@ -8,7 +8,7 @@ use std::{
 
 use lune_terminal::{
     CellPosition, CellText, CellWidth, EraseMode, Grid, Processor, Screen, StorageError, Style,
-    StyleId,
+    StyleError, StyleId, StyleTable,
 };
 
 #[global_allocator]
@@ -900,6 +900,59 @@ fn sgr_interpretation_preserves_zero_allocation_for_accepted_and_rejected_groups
             assert_eq!(style, before);
             assert!(style.apply_sgr(&[]));
         }
+    });
+    assert_eq!(stats.attempts, 0);
+}
+
+#[test]
+fn style_table_failures_preserve_ids_and_collection_and_hits_do_not_allocate() {
+    fn value(index: u8) -> Style {
+        Style {
+            foreground: lune_terminal::Color::Indexed(index),
+            ..Style::default()
+        }
+    }
+    fn populated(count: u8) -> (StyleTable, Vec<StyleId>) {
+        let mut table = StyleTable::new(128).unwrap();
+        let ids = (0..count)
+            .map(|n| table.intern(value(n)).unwrap())
+            .collect();
+        (table, ids)
+    }
+    for count in 0..=32 {
+        let (mut table, _) = populated(count);
+        let (result, stats) = allocator::measure(None, || table.intern(value(127)));
+        result.unwrap();
+        for point in 0..stats.attempts {
+            let (mut table, ids) = populated(count);
+            let (result, failed) = allocator::measure(Some(point), || table.intern(value(127)));
+            assert!(matches!(result, Err(StyleError::Allocation(_))));
+            assert_eq!(failed.failures, 1);
+            assert_eq!(table.style_count(), count as usize + 1);
+            for (n, id) in ids.iter().copied().enumerate() {
+                assert_eq!(table.get(id), Some(&value(n as u8)));
+            }
+            let new = table.intern(value(127)).unwrap();
+            assert_eq!(table.get(new), Some(&value(127)));
+            assert_eq!(table.style_count(), count as usize + 2);
+        }
+    }
+    let (created, stats) = allocator::measure(Some(0), || StyleTable::new(64));
+    let mut table = created.unwrap();
+    assert_eq!(stats.attempts, 0);
+    let ids: Vec<_> = (0..32).map(|n| table.intern(value(n)).unwrap()).collect();
+    let ((), stats) = allocator::measure(Some(0), || {
+        for (n, &id) in ids.iter().enumerate() {
+            assert_eq!(table.intern(value(n as u8)).unwrap(), id);
+            assert_eq!(table.get(id), Some(&value(n as u8)));
+        }
+        assert!(matches!(
+            table.collect([ids[0], StyleId(u32::MAX)]),
+            Err(StyleError::InvalidId(_))
+        ));
+        assert_eq!(table.collect(ids.iter().copied().skip(16)).unwrap(), 16);
+        assert_eq!(table.collect([]).unwrap(), 16);
+        assert_eq!(table.style_count(), 1);
     });
     assert_eq!(stats.attempts, 0);
 }

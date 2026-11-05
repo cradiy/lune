@@ -3,6 +3,7 @@ use std::ops::Range;
 mod processor;
 mod screen;
 mod style;
+mod styles;
 mod text;
 
 use crate::{CellText, CellWidth, Grid, MAX_CELL_TEXT_BYTES, MAX_CELLS, StorageError, StyleId};
