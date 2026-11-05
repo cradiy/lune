@@ -100,6 +100,30 @@ fn reference_id(values: &mut Vec<Style>, style: Style) -> StyleId {
     StyleId(index as u32)
 }
 
+fn ascii(expected: &mut ScreenModel, bytes: &[u8], style: StyleId, graphics: bool) {
+    for &byte in bytes {
+        let character = if graphics {
+            match byte {
+                b'a' => '▒',
+                b'b' => '␉',
+                b'c' => '␌',
+                b'q' => '─',
+                b'x' => '│',
+                b'_' => '\u{a0}',
+                _ => char::from(byte),
+            }
+        } else {
+            char::from(byte)
+        };
+        expected
+            .apply(
+                &Command::Write(character.encode_utf8(&mut [0; 4]), CellWidth::Single),
+                style,
+            )
+            .unwrap();
+    }
+}
+
 fuzz_target!(|data: &[u8]| {
     let mut wire = Vec::new();
     let mut expected = ScreenModel::new(8, 4);
@@ -107,11 +131,20 @@ fuzz_target!(|data: &[u8]| {
     let mut values = vec![Style::default()];
     let mut current = Style::default();
     let mut saved = Style::default();
+    let mut charsets = [false; 2];
+    let mut selected = 0;
+    let mut saved_charsets = (charsets, selected);
     for bytes in data.as_chunks::<8>().0.iter().take(512) {
-        let command = match bytes[0] % 43 {
+        let command = match bytes[0] % 48 {
             0 => {
                 wire.extend(b"abc");
-                Some(Command::Ascii(b"abc"))
+                ascii(
+                    &mut expected,
+                    b"abc",
+                    reference_id(&mut values, current),
+                    charsets[selected],
+                );
+                None
             }
             1 => {
                 wire.extend("水".as_bytes());
@@ -137,7 +170,13 @@ fuzz_target!(|data: &[u8]| {
                         reference_id(&mut values, current),
                     )
                     .unwrap();
-                Some(Command::Ascii(b"x"))
+                ascii(
+                    &mut expected,
+                    b"x",
+                    reference_id(&mut values, current),
+                    charsets[selected],
+                );
+                None
             }
             5 => {
                 wire.push(b'\r');
@@ -157,7 +196,7 @@ fuzz_target!(|data: &[u8]| {
             }
             9 | 10 => {
                 let n = bytes[3] % 4;
-                let final_byte = if bytes[0] % 43 == 9 { 'K' } else { 'J' };
+                let final_byte = if bytes[0] % 48 == 9 { 'K' } else { 'J' };
                 write!(&mut wire, "\x1b[{n}{final_byte}").unwrap();
                 let mode = match n {
                     0 => Some(EraseMode::FromCursor),
@@ -211,7 +250,7 @@ fuzz_target!(|data: &[u8]| {
             28 | 29 | 33 => {
                 let enabled = bytes[3] & 1 != 0;
                 let final_byte = if enabled { 'h' } else { 'l' };
-                let command = match bytes[0] % 43 {
+                let command = match bytes[0] % 48 {
                     28 => {
                         write!(&mut wire, "\x1b[?7{final_byte}").unwrap();
                         Command::AutoWrap(enabled)
@@ -230,17 +269,22 @@ fuzz_target!(|data: &[u8]| {
             30 => {
                 wire.extend(b"\x1b7");
                 saved = current;
+                saved_charsets = (charsets, selected);
                 Some(Command::SaveCursor)
             }
             31 => {
                 wire.extend(b"\x1b8");
                 current = saved;
+                (charsets, selected) = saved_charsets;
                 Some(Command::RestoreCursor)
             }
             32 => {
                 wire.extend(b"\x1bc");
                 current = Style::default();
                 saved = current;
+                charsets = [false; 2];
+                selected = 0;
+                saved_charsets = (charsets, selected);
                 Some(Command::Reset)
             }
             34 => {
@@ -301,7 +345,7 @@ fuzz_target!(|data: &[u8]| {
                 diagnostics.1 += 1;
                 None
             }
-            _ => {
+            42 => {
                 let enabled = bytes[1] & 1 != 0;
                 if enabled {
                     wire.extend(b"\x1b[1;2;3;4;5;7;8;9m");
@@ -322,6 +366,55 @@ fuzz_target!(|data: &[u8]| {
                 };
                 None
             }
+            43 => {
+                let slot = bytes[1] as usize & 1;
+                let graphics = bytes[2] & 1 != 0;
+                wire.extend([
+                    0x1b,
+                    if slot == 0 { b'(' } else { b')' },
+                    if graphics { b'0' } else { b'B' },
+                ]);
+                charsets[slot] = graphics;
+                None
+            }
+            44 => {
+                selected = bytes[1] as usize & 1;
+                wire.push(if selected == 0 { 0x0f } else { 0x0e });
+                None
+            }
+            45 => {
+                let byte = b"qx_abcA^"[bytes[1] as usize % 8];
+                wire.push(byte);
+                ascii(
+                    &mut expected,
+                    &[byte],
+                    reference_id(&mut values, current),
+                    charsets[selected],
+                );
+                None
+            }
+            46 => {
+                wire.extend(b"\x1b(A");
+                diagnostics.1 += 1;
+                None
+            }
+            _ => {
+                wire.extend(b"\xf0\x9f\x0eq");
+                expected
+                    .apply(
+                        &Command::Write("�", CellWidth::Single),
+                        reference_id(&mut values, current),
+                    )
+                    .unwrap();
+                selected = 1;
+                ascii(
+                    &mut expected,
+                    b"q",
+                    reference_id(&mut values, current),
+                    charsets[selected],
+                );
+                None
+            }
         };
         if let Some(command) = command
             && expected
@@ -331,11 +424,18 @@ fuzz_target!(|data: &[u8]| {
             diagnostics.1 += 1;
         }
     }
-    wire.extend(b"\x1b8");
+    wire.extend(b"\x1b8qx");
     current = saved;
+    (charsets, selected) = saved_charsets;
     expected
         .apply(&Command::RestoreCursor, reference_id(&mut values, current))
         .unwrap();
+    ascii(
+        &mut expected,
+        b"qx",
+        reference_id(&mut values, current),
+        charsets[selected],
+    );
     drive(
         &wire,
         wire.len(),

@@ -48,6 +48,8 @@ fn main() {
     let controls = b"\x1b[2;4Hword\x1b[0K\x1b[2A\x1b7\x1b[4hXX\x1b[4l\x1b8\r\n".repeat(1024);
     let strings = b"\x1b]0;synthetic title\x07\x1bPsynthetic payload\x1b\\".repeat(2048);
     let rendition = b"\x1b[1;31mred\x1b[38;2;0;128;255;48:5:17mblue\x1b[0mplain\r\n".repeat(1024);
+    let graphics =
+        b"\x1b)0\x0elqqqqqqqqqqqqk\r\nx            x\r\nmqqqqqqqqqqqqj\x0f plain\r\n".repeat(1024);
     measure("ASCII bulk", &ascii, ascii.len());
     measure("ASCII / 17-byte", &ascii, 17);
     measure("ASCII / 1-byte", &ascii, 1);
@@ -57,4 +59,6 @@ fn main() {
     measure("SGR / bulk", &rendition, rendition.len());
     measure("SGR / 17-byte", &rendition, 17);
     measure("SGR / 1-byte", &rendition, 1);
+    measure("DEC graphics / bulk", &graphics, graphics.len());
+    measure("DEC graphics / 1-byte", &graphics, 1);
 }

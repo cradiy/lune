@@ -100,6 +100,9 @@
 //! are dispatched directly in the parser's ground state. Lexical errors recover
 //! through the parser and are counted, while unsupported ESC/CSI forms are counted
 //! and ignored. Finishing flushes incomplete lexical input exactly once.
+//! G0/G1 ASCII and DEC Special Graphics designation, SI/SO selection, and cursor
+//! save/restore determine how printable ASCII maps to Unicode text callbacks.
+//! Mapped scalar failures retain the mapped value and own its source byte.
 //!
 //! [`Style`] represents unresolved colors and character rendition independently
 //! of [`StyleId`] storage. [`Style::apply_sgr`] interprets a parameter list
@@ -117,6 +120,7 @@
 //! hits, and collection make no allocation requests.
 
 mod cell;
+mod charsets;
 mod error;
 mod grid;
 mod processor;

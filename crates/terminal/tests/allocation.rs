@@ -1039,6 +1039,19 @@ fn processor_retries_style_and_text_allocations_without_replaying_accepted_input
     let ((), stats) = allocator::measure(Some(0), || {
         for _ in 0..32 {
             processor.advance(warm, &mut screen, text).unwrap();
+            processor
+                .advance(
+                    b"\x1b(0lqqk\r\nx  x\r\nmqqj\x1b(B",
+                    &mut screen,
+                    |s, value, style| {
+                        if value.is_ascii() {
+                            s.write_ascii(value.as_bytes(), style)
+                        } else {
+                            s.write(value, CellWidth::Single, style)
+                        }
+                    },
+                )
+                .unwrap();
             processor.collect_styles(&screen, []).unwrap();
         }
         processor.reset(&mut screen);

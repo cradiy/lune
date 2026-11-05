@@ -356,3 +356,80 @@ fn full_style_storage_retries_after_tracing_current_saved_and_external_owners() 
     assert_eq!(row_text(&screen, 0), "D       ");
     assert_eq!(limited.style_id(), StyleId(0));
 }
+
+#[test]
+fn designated_charsets_shift_save_restore_and_preserve_unicode_across_chunks() {
+    let input = "A^\x1b(0_`abcdefghijklmnopqrstuvwxyz{|}~\r\n\x1b(B\x1b)0\x0elqqk\x0fq\x0e\x1b[31m\x1b7\x1b)B\x1b(0\x0f\x1b[3;1Hq水\x1b[34m\x1b8x\x0fx\x0e\x1b)Aq".as_bytes();
+    let expected = "A^\u{a0}◆▒␉␌␍␊°±␤␋┘┐┌└┼⎺⎻─⎼⎽├┤┴┬│≤≥π≠£·";
+    for split in 0..=input.len() {
+        let mut screen = Screen::new(64, 4).unwrap();
+        let mut processor = Processor::default();
+        processor
+            .advance(&input[..split], &mut screen, write_text)
+            .unwrap();
+        processor
+            .advance(&input[split..], &mut screen, write_text)
+            .unwrap();
+        processor.finish(&mut screen, write_text).unwrap();
+        assert_eq!(row_text(&screen, 0).trim_end(), expected);
+        assert_eq!(row_text(&screen, 1).trim_end(), "┌──┐q│x─");
+        assert_eq!(row_text(&screen, 2).trim_end(), "─水");
+        assert_eq!(processor.ignored_sequences(), 1);
+        assert_eq!(
+            processor.styles().get(processor.style_id()),
+            Some(&Style {
+                foreground: Color::Indexed(1),
+                ..Style::default()
+            })
+        );
+        processor
+            .advance(b"\x1bcq\x1b8x", &mut screen, write_text)
+            .unwrap();
+        assert_eq!(row_text(&screen, 0).trim_end(), "x");
+        assert_eq!(processor.style_id(), StyleId(0));
+        processor.reset(&mut screen);
+        processor
+            .advance(b"q\x0ex", &mut screen, write_text)
+            .unwrap();
+        assert_eq!(row_text(&screen, 0).trim_end(), "qx");
+    }
+}
+
+#[test]
+fn mapped_text_retries_once_after_ground_and_reprocessed_utf8_input() {
+    let mut screen = Screen::new(8, 4).unwrap();
+    let mut processor = Processor::default();
+    let input = b"\x1b(0q\x1b(BX";
+    let error = processor
+        .advance(input, &mut screen, |_, _, _| Err("blocked"))
+        .unwrap_err();
+    assert_eq!(error.consumed, 4);
+    assert_eq!(screen.cursor(), Cursor::default());
+    let again = processor
+        .advance(&input[4..], &mut screen, |_, _, _| Err("blocked"))
+        .unwrap_err();
+    assert_eq!(again.consumed, 0);
+    processor
+        .advance(&input[4..], &mut screen, write_text)
+        .unwrap();
+    assert_eq!(row_text(&screen, 0), "─X      ");
+    processor.reset(&mut screen);
+    processor
+        .advance(b"\x1b)0\x0e\xf0\x9f", &mut screen, write_text)
+        .unwrap();
+    let error = processor
+        .advance(b"q\x0fq", &mut screen, |s, value, style| {
+            if value == "─" {
+                return Err("blocked");
+            }
+            write_text(s, value, style).unwrap();
+            Ok(())
+        })
+        .unwrap_err();
+    assert_eq!(error.consumed, 1);
+    assert_eq!(row_text(&screen, 0), "�       ");
+    processor
+        .advance(b"\x0fq", &mut screen, write_text)
+        .unwrap();
+    assert_eq!(row_text(&screen, 0), "�─q     ");
+}

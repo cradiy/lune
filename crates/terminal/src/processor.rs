@@ -2,6 +2,7 @@ use std::{error::Error, fmt};
 
 use lune_vt::{CsiSequence, EscapeSequence, Event, Parameter, Parser};
 
+use crate::charsets::Charsets;
 use crate::{EraseMode, MAX_STYLES, Screen, Style, StyleError, StyleId, StyleTable};
 
 /// A failure while applying a completed text or rendition event.
@@ -73,11 +74,17 @@ enum Pending {
 /// Include retained screen/rendering snapshots when collecting style storage.
 /// Screen edits use keys from this processor's table; callbacks receive the
 /// current key. Default construction permits up to [`MAX_STYLES`] entries.
+/// G0/G1 designation supports ASCII (`B`) and DEC Special Graphics (`0`), selected
+/// by SI/SO. Graphics bytes map to Unicode scalars before text callbacks; literal
+/// non-ASCII Unicode retains its identity. Cursor saves include both designated
+/// sets and their selection. Reset restores both sets to ASCII and selects G0.
 pub struct Processor {
     parser: Parser,
     styles: StyleTable,
     style: StyleId,
     saved_style: StyleId,
+    charsets: Charsets,
+    saved_charsets: Charsets,
     pending: [Option<Pending>; 2],
     head: usize,
     end: usize,
@@ -100,6 +107,8 @@ impl Processor {
             styles: StyleTable::new(style_limit)?,
             style: StyleId(0),
             saved_style: StyleId(0),
+            charsets: Charsets::default(),
+            saved_charsets: Charsets::default(),
             pending: [None; 2],
             head: 0,
             end: 0,
@@ -167,11 +176,28 @@ impl Processor {
         let mut consumed = 0;
         while consumed < input.len() {
             if self.parser.is_ground() {
-                let length = input[consumed..]
-                    .iter()
-                    .position(|byte| !(b' '..=b'~').contains(byte))
-                    .unwrap_or(input.len() - consumed);
-                if length != 0 {
+                let first = input[consumed];
+                if (b' '..=b'~').contains(&first) {
+                    let length = if self.charsets.is_graphics() {
+                        if first >= b'_' {
+                            let character = self.charsets.map(char::from(first));
+                            consumed += 1;
+                            if let Err(error) =
+                                text(screen, character.encode_utf8(&mut [0; 4]), self.style)
+                            {
+                                self.pending[0] = Some(Pending::Text(character));
+                                self.end = 1;
+                                return Err(ProcessError {
+                                    consumed,
+                                    error: ProcessFailure::Text(error),
+                                });
+                            }
+                            continue;
+                        }
+                        ascii_prefix::<b'^'>(&input[consumed..])
+                    } else {
+                        ascii_prefix::<b'~'>(&input[consumed..])
+                    };
                     let run = std::str::from_utf8(&input[consumed..consumed + length])
                         .expect("The run is printable ASCII");
                     text(screen, run, self.style).map_err(|error| ProcessError {
@@ -181,7 +207,7 @@ impl Processor {
                     consumed += length;
                     continue;
                 }
-                let scalar_bytes = match input[consumed] {
+                let scalar_bytes = match first {
                     0xc2..=0xdf => 2,
                     0xe0..=0xef => 3,
                     0xf0..=0xf4 => 4,
@@ -217,6 +243,8 @@ impl Processor {
                 style,
                 saved_style,
                 styles,
+                charsets,
+                saved_charsets,
                 ..
             } = self;
             parser.advance(&input[consumed..consumed + 1], |event| match event {
@@ -224,7 +252,7 @@ impl Processor {
                     let mut characters = value.chars();
                     let character = characters.next().expect("A decoded scalar is present");
                     debug_assert!(characters.next().is_none());
-                    pending[*end] = Some(Pending::Text(character));
+                    pending[*end] = Some(Pending::Text(charsets.map(character)));
                     *end += 1;
                 }
                 Event::Execute(control) => {
@@ -233,7 +261,14 @@ impl Processor {
                 }
                 Event::Escape(sequence) => {
                     debug_assert_eq!(*end, 0);
-                    if !escape(screen, sequence, style, saved_style) {
+                    if !escape(
+                        screen,
+                        sequence,
+                        style,
+                        saved_style,
+                        charsets,
+                        saved_charsets,
+                    ) {
                         *ignored_sequences = ignored_sequences.saturating_add(1);
                     }
                 }
@@ -305,6 +340,8 @@ impl Processor {
         self.ignored_sequences = 0;
         self.style = StyleId(0);
         self.saved_style = StyleId(0);
+        self.charsets = Charsets::default();
+        self.saved_charsets = Charsets::default();
         screen.reset(StyleId(0));
     }
 
@@ -319,6 +356,8 @@ impl Processor {
                     text(screen, character.encode_utf8(&mut [0; 4]), self.style)
                         .map_err(ProcessFailure::Text)?
                 }
+                Pending::Execute(0x0e) => self.charsets.shift(true),
+                Pending::Execute(0x0f) => self.charsets.shift(false),
                 Pending::Execute(control) => execute(screen, control, self.style),
                 Pending::Rendition(style) => {
                     self.style = self.styles.intern(style).map_err(ProcessFailure::Style)?;
@@ -331,6 +370,28 @@ impl Processor {
         self.end = 0;
         Ok(())
     }
+}
+
+#[inline]
+fn ascii_prefix<const LAST: u8>(input: &[u8]) -> usize {
+    const ONES: u64 = u64::MAX / 255;
+    const HIGH: u64 = ONES * 128;
+    let mut offset = 0;
+    while input.len() - offset >= 8 {
+        let word = u64::from_ne_bytes(input[offset..offset + 8].try_into().unwrap());
+        // Out-of-range bytes set a high bit; the scalar tail locates the boundary.
+        let below = word.wrapping_sub(ONES * 32) & !word;
+        let above = word.wrapping_add(ONES * u64::from(127 - LAST)) | word;
+        if (below | above) & HIGH != 0 {
+            break;
+        }
+        offset += 8;
+    }
+    offset
+        + input[offset..]
+            .iter()
+            .position(|byte| !(b' '..=LAST).contains(byte))
+            .unwrap_or(input.len() - offset)
 }
 
 fn execute(screen: &mut Screen, control: u8, style: StyleId) {
@@ -348,7 +409,12 @@ fn escape(
     sequence: EscapeSequence<'_>,
     style: &mut StyleId,
     saved_style: &mut StyleId,
+    charsets: &mut Charsets,
+    saved_charsets: &mut Charsets,
 ) -> bool {
+    if let [designation @ (b'(' | b')')] = sequence.intermediates {
+        return charsets.designate(*designation == b')', sequence.final_byte);
+    }
     if !sequence.intermediates.is_empty() {
         return false;
     }
@@ -356,10 +422,12 @@ fn escape(
         b'7' => {
             screen.save_cursor();
             *saved_style = *style;
+            *saved_charsets = *charsets;
         }
         b'8' => {
             screen.restore_cursor();
             *style = *saved_style;
+            *charsets = *saved_charsets;
         }
         b'D' => screen.line_feed(*style),
         b'E' => {
@@ -371,6 +439,8 @@ fn escape(
         b'c' => {
             *style = StyleId(0);
             *saved_style = StyleId(0);
+            *charsets = Charsets::default();
+            *saved_charsets = Charsets::default();
             screen.reset(*style);
         }
         _ => return false,
@@ -501,4 +571,36 @@ fn csi(screen: &mut Screen, sequence: CsiSequence<'_>, style: StyleId) -> bool {
         _ => return false,
     }
     true
+}
+
+#[cfg(test)]
+mod scan_tests {
+    use super::ascii_prefix;
+
+    #[test]
+    fn word_scans_match_scalar_bounds_for_every_byte_and_alignment() {
+        for (last, scan) in [
+            (b'^', ascii_prefix::<b'^'> as fn(&[u8]) -> usize),
+            (b'~', ascii_prefix::<b'~'>),
+        ] {
+            for alignment in 0..8 {
+                let mut bytes = [b'A'; 48];
+                for length in [0, 1, 7, 8, 9, 15, 16, 17, 31, 32, 33] {
+                    assert_eq!(scan(&bytes[alignment..alignment + length]), length);
+                    for position in 0..length {
+                        for value in 0..=255 {
+                            bytes[alignment + position] = value;
+                            let input = &bytes[alignment..alignment + length];
+                            let expected = input
+                                .iter()
+                                .position(|byte| !(b' '..=last).contains(byte))
+                                .unwrap_or(length);
+                            assert_eq!(scan(input), expected);
+                        }
+                        bytes[alignment + position] = b'A';
+                    }
+                }
+            }
+        }
+    }
 }

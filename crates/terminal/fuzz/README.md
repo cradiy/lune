@@ -80,6 +80,10 @@ SGR commands update an independent rendition value and a vector of reference
 styles. Cell styles are compared by resolved value, allowing actual IDs to change
 as collection runs between chunks and retries. Collection must retain current
 and saved rendition even when they are absent from screen cells.
+The reference state also tracks G0/G1 designation, SI/SO selection, and saved
+character sets. ASCII fixtures map through an independent set of expected glyphs;
+malformed UTF-8 followed by text or a shift exercises reprocessed bytes and
+pending-event order. A final restore and text write exposes saved character sets.
 The fixed-width fixture maps one synthetic scalar to an owned multi-scalar display
 unit, exercising text storage through the execution boundary. Inputs contain at
 most 512 eight-byte commands and use an eight-column, four-row screen.
