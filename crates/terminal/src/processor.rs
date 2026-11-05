@@ -61,6 +61,15 @@ enum Pending {
     Rendition(Style),
 }
 
+#[derive(Default)]
+struct State {
+    style: StyleId,
+    saved_style: StyleId,
+    charsets: Charsets,
+    saved_charsets: Charsets,
+    new_line_mode: bool,
+}
+
 /// Incremental execution of screen controls with caller-owned text layout.
 /// Pair a processor with one screen and text writer across calls. Text callbacks
 /// receive a printable ASCII run or one Unicode scalar, including replacements
@@ -81,11 +90,7 @@ enum Pending {
 pub struct Processor {
     parser: Parser,
     styles: StyleTable,
-    style: StyleId,
-    saved_style: StyleId,
-    charsets: Charsets,
-    saved_charsets: Charsets,
-    new_line_mode: bool,
+    state: State,
     pending: [Option<Pending>; 2],
     head: usize,
     end: usize,
@@ -106,11 +111,7 @@ impl Processor {
         Ok(Self {
             parser: Parser::default(),
             styles: StyleTable::new(style_limit)?,
-            style: StyleId(0),
-            saved_style: StyleId(0),
-            charsets: Charsets::default(),
-            saved_charsets: Charsets::default(),
-            new_line_mode: false,
+            state: State::default(),
             pending: [None; 2],
             head: 0,
             end: 0,
@@ -120,13 +121,13 @@ impl Processor {
     }
 
     pub fn style_id(&self) -> StyleId {
-        self.style
+        self.state.style
     }
 
     /// Whether LF moves to column zero on the following line. Input encoders can
     /// use this state to select CR versus CR/LF for the Return key.
     pub fn new_line_mode(&self) -> bool {
-        self.new_line_mode
+        self.state.new_line_mode
     }
 
     /// Resolves keys issued for this processor's screen and retained snapshots.
@@ -143,7 +144,7 @@ impl Processor {
         external: impl IntoIterator<Item = StyleId>,
     ) -> Result<usize, StyleError> {
         self.styles.collect(
-            [self.style, self.saved_style]
+            [self.state.style, self.state.saved_style]
                 .into_iter()
                 .chain(
                     screen
@@ -186,12 +187,12 @@ impl Processor {
             if self.parser.is_ground() {
                 let first = input[consumed];
                 if (b' '..=b'~').contains(&first) {
-                    let length = if self.charsets.is_graphics() {
+                    let length = if self.state.charsets.is_graphics() {
                         if first >= b'_' {
-                            let character = self.charsets.map(char::from(first));
+                            let character = self.state.charsets.map(char::from(first));
                             consumed += 1;
                             if let Err(error) =
-                                text(screen, character.encode_utf8(&mut [0; 4]), self.style)
+                                text(screen, character.encode_utf8(&mut [0; 4]), self.state.style)
                             {
                                 self.pending[0] = Some(Pending::Text(character));
                                 self.end = 1;
@@ -208,7 +209,7 @@ impl Processor {
                     };
                     let run = std::str::from_utf8(&input[consumed..consumed + length])
                         .expect("The run is printable ASCII");
-                    text(screen, run, self.style).map_err(|error| ProcessError {
+                    text(screen, run, self.state.style).map_err(|error| ProcessError {
                         consumed,
                         error: ProcessFailure::Text(error),
                     })?;
@@ -226,7 +227,7 @@ impl Processor {
                     && let Ok(value) = std::str::from_utf8(bytes)
                 {
                     consumed += scalar_bytes;
-                    if let Err(error) = text(screen, value, self.style) {
+                    if let Err(error) = text(screen, value, self.state.style) {
                         self.pending[0] = Some(Pending::Text(value.chars().next().unwrap()));
                         self.end = 1;
                         return Err(ProcessError {
@@ -248,12 +249,8 @@ impl Processor {
                 end,
                 parse_errors,
                 ignored_sequences,
-                style,
-                saved_style,
                 styles,
-                charsets,
-                saved_charsets,
-                new_line_mode,
+                state,
                 ..
             } = self;
             parser.advance(&input[consumed..consumed + 1], |event| match event {
@@ -261,7 +258,7 @@ impl Processor {
                     let mut characters = value.chars();
                     let character = characters.next().expect("A decoded scalar is present");
                     debug_assert!(characters.next().is_none());
-                    pending[*end] = Some(Pending::Text(charsets.map(character)));
+                    pending[*end] = Some(Pending::Text(state.charsets.map(character)));
                     *end += 1;
                 }
                 Event::Execute(control) => {
@@ -270,15 +267,7 @@ impl Processor {
                 }
                 Event::Escape(sequence) => {
                     debug_assert_eq!(*end, 0);
-                    if !escape(
-                        screen,
-                        sequence,
-                        style,
-                        saved_style,
-                        charsets,
-                        saved_charsets,
-                        new_line_mode,
-                    ) {
+                    if !escape(screen, sequence, state) {
                         *ignored_sequences = ignored_sequences.saturating_add(1);
                     }
                 }
@@ -288,7 +277,9 @@ impl Processor {
                         && sequence.private_markers.is_empty()
                         && sequence.intermediates.is_empty()
                     {
-                        let mut next = *styles.get(*style).expect("Current rendition is rooted");
+                        let mut next = *styles
+                            .get(state.style)
+                            .expect("Current rendition is rooted");
                         if next.apply_sgr(sequence.parameters) {
                             pending[*end] = Some(Pending::Rendition(next));
                             *end += 1;
@@ -297,7 +288,7 @@ impl Processor {
                             false
                         }
                     } else {
-                        csi(screen, sequence, *style, new_line_mode)
+                        csi(screen, sequence, state)
                     };
                     if !accepted {
                         *ignored_sequences = ignored_sequences.saturating_add(1);
@@ -348,11 +339,7 @@ impl Processor {
         self.end = 0;
         self.parse_errors = 0;
         self.ignored_sequences = 0;
-        self.style = StyleId(0);
-        self.saved_style = StyleId(0);
-        self.charsets = Charsets::default();
-        self.saved_charsets = Charsets::default();
-        self.new_line_mode = false;
+        self.state = State::default();
         screen.reset(StyleId(0));
     }
 
@@ -364,16 +351,16 @@ impl Processor {
         while self.head < self.end {
             match self.pending[self.head].expect("A pending action is present") {
                 Pending::Text(character) => {
-                    text(screen, character.encode_utf8(&mut [0; 4]), self.style)
+                    text(screen, character.encode_utf8(&mut [0; 4]), self.state.style)
                         .map_err(ProcessFailure::Text)?
                 }
-                Pending::Execute(0x0e) => self.charsets.shift(true),
-                Pending::Execute(0x0f) => self.charsets.shift(false),
+                Pending::Execute(0x0e) => self.state.charsets.shift(true),
+                Pending::Execute(0x0f) => self.state.charsets.shift(false),
                 Pending::Execute(control) => {
-                    execute(screen, control, self.style, self.new_line_mode)
+                    execute(screen, control, self.state.style, self.state.new_line_mode)
                 }
                 Pending::Rendition(style) => {
-                    self.style = self.styles.intern(style).map_err(ProcessFailure::Style)?;
+                    self.state.style = self.styles.intern(style).map_err(ProcessFailure::Style)?;
                 }
             }
             self.pending[self.head] = None;
@@ -422,17 +409,11 @@ fn execute(screen: &mut Screen, control: u8, style: StyleId, new_line_mode: bool
     }
 }
 
-fn escape(
-    screen: &mut Screen,
-    sequence: EscapeSequence<'_>,
-    style: &mut StyleId,
-    saved_style: &mut StyleId,
-    charsets: &mut Charsets,
-    saved_charsets: &mut Charsets,
-    new_line_mode: &mut bool,
-) -> bool {
+fn escape(screen: &mut Screen, sequence: EscapeSequence<'_>, state: &mut State) -> bool {
     if let [designation @ (b'(' | b')')] = sequence.intermediates {
-        return charsets.designate(*designation == b')', sequence.final_byte);
+        return state
+            .charsets
+            .designate(*designation == b')', sequence.final_byte);
     }
     if !sequence.intermediates.is_empty() {
         return false;
@@ -440,28 +421,24 @@ fn escape(
     match sequence.final_byte {
         b'7' => {
             screen.save_cursor();
-            *saved_style = *style;
-            *saved_charsets = *charsets;
+            state.saved_style = state.style;
+            state.saved_charsets = state.charsets;
         }
         b'8' => {
             screen.restore_cursor();
-            *style = *saved_style;
-            *charsets = *saved_charsets;
+            state.style = state.saved_style;
+            state.charsets = state.saved_charsets;
         }
-        b'D' => screen.line_feed(*style),
+        b'D' => screen.line_feed(state.style),
         b'E' => {
             screen.carriage_return();
-            screen.line_feed(*style);
+            screen.line_feed(state.style);
         }
         b'H' => screen.set_tab_stop(),
-        b'M' => screen.reverse_index(*style),
+        b'M' => screen.reverse_index(state.style),
         b'c' => {
-            *style = StyleId(0);
-            *saved_style = StyleId(0);
-            *charsets = Charsets::default();
-            *saved_charsets = Charsets::default();
-            *new_line_mode = false;
-            screen.reset(*style);
+            *state = State::default();
+            screen.reset(state.style);
         }
         _ => return false,
     }
@@ -489,12 +466,8 @@ fn erase_mode(value: usize) -> Option<EraseMode> {
     }
 }
 
-fn csi(
-    screen: &mut Screen,
-    sequence: CsiSequence<'_>,
-    style: StyleId,
-    new_line_mode: &mut bool,
-) -> bool {
+fn csi(screen: &mut Screen, sequence: CsiSequence<'_>, state: &mut State) -> bool {
+    let style = state.style;
     let p = sequence.parameters;
     if !sequence.intermediates.is_empty() || p.iter().any(|p| p.is_subparameter) {
         return false;
@@ -519,7 +492,7 @@ fn csi(
         for parameter in p {
             match (private, parameter.value) {
                 (false, Some(4)) => screen.set_insert_mode(enabled),
-                (false, Some(20)) => *new_line_mode = enabled,
+                (false, Some(20)) => state.new_line_mode = enabled,
                 (true, Some(6)) => screen.set_origin_mode(enabled),
                 (true, Some(7)) => screen.set_auto_wrap(enabled),
                 _ => unreachable!("Mode parameters were validated"),
