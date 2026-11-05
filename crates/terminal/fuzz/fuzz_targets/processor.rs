@@ -14,7 +14,7 @@ mod screen_model;
 use std::io::Write;
 
 use libfuzzer_sys::fuzz_target;
-use lune_terminal::{CellWidth, EraseMode, Processor, Screen, StyleId};
+use lune_terminal::{CellWidth, Color, EraseMode, Processor, Screen, Style, StyleId, Underline};
 use screen_model::{Command, ScreenModel};
 
 fn count(wire: &mut Vec<u8>, final_byte: u8, bytes: &[u8; 8]) -> usize {
@@ -34,9 +34,11 @@ fn drive(
     fail_at: usize,
     expected: &ScreenModel,
     diagnostics: (u64, u64),
+    values: &[Style],
+    current: Style,
 ) {
     let mut screen = Screen::new(8, 4).unwrap();
-    let mut processor = Processor::new(StyleId(3));
+    let mut processor = Processor::default();
     let mut calls = 0;
     let mut available = false;
     let mut text = |screen: &mut Screen, value: &str, style| {
@@ -67,24 +69,46 @@ fn drive(
                 Err(error) => {
                     assert!(error.consumed <= input.len());
                     input = &input[error.consumed..];
+                    processor.collect_styles(&screen, []).unwrap();
                 }
             }
         }
+        processor.collect_styles(&screen, []).unwrap();
     }
     while processor.finish(&mut screen, &mut text).is_err() {}
-    expected.check(&screen);
+    expected.check_styles(&screen, |actual, reference| {
+        assert_eq!(
+            processor.styles().get(actual),
+            Some(&values[reference.0 as usize])
+        );
+    });
+    assert_eq!(processor.styles().get(processor.style_id()), Some(&current));
     assert_eq!(
         (processor.parse_errors(), processor.ignored_sequences()),
         diagnostics
     );
 }
 
+fn reference_id(values: &mut Vec<Style>, style: Style) -> StyleId {
+    let index = values
+        .iter()
+        .position(|&value| value == style)
+        .unwrap_or_else(|| {
+            values.push(style);
+            values.len() - 1
+        });
+    StyleId(index as u32)
+}
+
 fuzz_target!(|data: &[u8]| {
     let mut wire = Vec::new();
     let mut expected = ScreenModel::new(8, 4);
     let mut diagnostics = (0_u64, 0_u64);
+    let mut values = vec![Style::default()];
+    let mut current = Style::default();
+    let mut saved = Style::default();
     for bytes in data.as_chunks::<8>().0.iter().take(512) {
-        let command = match bytes[0] % 38 {
+        let command = match bytes[0] % 43 {
             0 => {
                 wire.extend(b"abc");
                 Some(Command::Ascii(b"abc"))
@@ -108,7 +132,10 @@ fuzz_target!(|data: &[u8]| {
             4 => {
                 wire.extend(b"\xf0\x9fx");
                 expected
-                    .apply(&Command::Write("�", CellWidth::Single), StyleId(3))
+                    .apply(
+                        &Command::Write("�", CellWidth::Single),
+                        reference_id(&mut values, current),
+                    )
                     .unwrap();
                 Some(Command::Ascii(b"x"))
             }
@@ -130,7 +157,7 @@ fuzz_target!(|data: &[u8]| {
             }
             9 | 10 => {
                 let n = bytes[3] % 4;
-                let final_byte = if bytes[0] % 38 == 9 { 'K' } else { 'J' };
+                let final_byte = if bytes[0] % 43 == 9 { 'K' } else { 'J' };
                 write!(&mut wire, "\x1b[{n}{final_byte}").unwrap();
                 let mode = match n {
                     0 => Some(EraseMode::FromCursor),
@@ -157,7 +184,7 @@ fuzz_target!(|data: &[u8]| {
             16 => {
                 wire.extend(b"\x1bE");
                 expected
-                    .apply(&Command::CarriageReturn, StyleId(3))
+                    .apply(&Command::CarriageReturn, reference_id(&mut values, current))
                     .unwrap();
                 Some(Command::LineFeed)
             }
@@ -184,7 +211,7 @@ fuzz_target!(|data: &[u8]| {
             28 | 29 | 33 => {
                 let enabled = bytes[3] & 1 != 0;
                 let final_byte = if enabled { 'h' } else { 'l' };
-                let command = match bytes[0] % 38 {
+                let command = match bytes[0] % 43 {
                     28 => {
                         write!(&mut wire, "\x1b[?7{final_byte}").unwrap();
                         Command::AutoWrap(enabled)
@@ -202,14 +229,18 @@ fuzz_target!(|data: &[u8]| {
             }
             30 => {
                 wire.extend(b"\x1b7");
+                saved = current;
                 Some(Command::SaveCursor)
             }
             31 => {
                 wire.extend(b"\x1b8");
+                current = saved;
                 Some(Command::RestoreCursor)
             }
             32 => {
                 wire.extend(b"\x1bc");
+                current = Style::default();
+                saved = current;
                 Some(Command::Reset)
             }
             34 => {
@@ -227,25 +258,100 @@ fuzz_target!(|data: &[u8]| {
                 diagnostics.1 += 1;
                 None
             }
-            _ => {
+            37 => {
                 wire.extend(b"\x1b]0;synthetic title\x07");
+                None
+            }
+            38 => {
+                let index = bytes[1] % 16;
+                let color_code = if index < 8 {
+                    30 + index
+                } else {
+                    90 + index - 8
+                };
+                let bold = bytes[2] & 1 != 0;
+                let intensity = if bold { 1 } else { 22 };
+                write!(&mut wire, "\x1b[{color_code};{intensity}m").unwrap();
+                current.foreground = Color::Indexed(index);
+                current.bold = bold;
+                if !bold {
+                    current.faint = false;
+                }
+                None
+            }
+            39 => {
+                let [red, green, blue] = [bytes[1], bytes[2], bytes[3]];
+                let index = bytes[4];
+                if bytes[5] & 1 == 0 {
+                    write!(&mut wire, "\x1b[38;2;{red};{green};{blue};48:5:{index}m").unwrap();
+                } else {
+                    write!(&mut wire, "\x1b[38:2::{red}:{green}:{blue};48;5;{index}m").unwrap();
+                }
+                current.foreground = Color::Rgb { red, green, blue };
+                current.background = Color::Indexed(index);
+                None
+            }
+            40 => {
+                wire.extend(b"\x1b[0m");
+                current = Style::default();
+                None
+            }
+            41 => {
+                wire.extend(b"\x1b[1;38;5;256m");
+                diagnostics.1 += 1;
+                None
+            }
+            _ => {
+                let enabled = bytes[1] & 1 != 0;
+                if enabled {
+                    wire.extend(b"\x1b[1;2;3;4;5;7;8;9m");
+                } else {
+                    wire.extend(b"\x1b[22;23;24;25;27;28;29m");
+                }
+                current.bold = enabled;
+                current.faint = enabled;
+                current.italic = enabled;
+                current.blink = enabled;
+                current.inverse = enabled;
+                current.hidden = enabled;
+                current.strikethrough = enabled;
+                current.underline = if enabled {
+                    Underline::Single
+                } else {
+                    Underline::None
+                };
                 None
             }
         };
         if let Some(command) = command
-            && expected.apply(&command, StyleId(3)).is_err()
+            && expected
+                .apply(&command, reference_id(&mut values, current))
+                .is_err()
         {
             diagnostics.1 += 1;
         }
     }
     wire.extend(b"\x1b8");
-    expected.apply(&Command::RestoreCursor, StyleId(3)).unwrap();
-    drive(&wire, wire.len(), usize::MAX, &expected, diagnostics);
+    current = saved;
+    expected
+        .apply(&Command::RestoreCursor, reference_id(&mut values, current))
+        .unwrap();
+    drive(
+        &wire,
+        wire.len(),
+        usize::MAX,
+        &expected,
+        diagnostics,
+        &values,
+        current,
+    );
     drive(
         &wire,
         data.first().copied().unwrap_or(0) as usize % 17 + 1,
         data.get(4).copied().unwrap_or(0) as usize % 32,
         &expected,
         diagnostics,
+        &values,
+        current,
     );
 });

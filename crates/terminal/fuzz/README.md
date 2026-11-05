@@ -72,6 +72,10 @@ Unsupported mode lists preserve all screen state.
 Each input runs as one chunk and in chunks of one through seventeen bytes. A text
 callback can fail before mutation; execution retries the reported input suffix.
 Both runs must produce the same modeled screen, saved cursor, and diagnostics.
+SGR commands update an independent rendition value and a vector of reference
+styles. Cell styles are compared by resolved value, allowing actual IDs to change
+as collection runs between chunks and retries. Collection must retain current
+and saved rendition even when they are absent from screen cells.
 The fixed-width fixture maps one synthetic scalar to an owned multi-scalar display
 unit, exercising text storage through the execution boundary. Inputs contain at
 most 512 eight-byte commands and use an eight-column, four-row screen.

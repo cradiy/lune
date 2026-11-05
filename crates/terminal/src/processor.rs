@@ -2,21 +2,46 @@ use std::{error::Error, fmt};
 
 use lune_vt::{CsiSequence, EscapeSequence, Event, Parameter, Parser};
 
-use crate::{EraseMode, Screen, StyleId};
+use crate::{EraseMode, MAX_STYLES, Screen, Style, StyleError, StyleId, StyleTable};
 
-/// A text callback failure and the input prefix already owned by the processor.
+/// A failure while applying a completed text or rendition event.
+#[derive(Debug)]
+pub enum ProcessFailure<E> {
+    Text(E),
+    Style(StyleError),
+}
+
+impl<E: fmt::Display> fmt::Display for ProcessFailure<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Text(error) => write!(f, "Text processing failed: {error}"),
+            Self::Style(error) => error.fmt(f),
+        }
+    }
+}
+
+impl<E: Error + 'static> Error for ProcessFailure<E> {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(match self {
+            Self::Text(error) => error,
+            Self::Style(error) => error,
+        })
+    }
+}
+
+/// An execution failure and the input prefix already owned by the processor.
 /// Retry with `input[consumed..]`; retained events are applied before new input.
 #[derive(Debug)]
 pub struct ProcessError<E> {
     pub consumed: usize,
-    pub error: E,
+    pub error: ProcessFailure<E>,
 }
 
 impl<E: fmt::Display> fmt::Display for ProcessError<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "Text processing failed after consuming {} bytes: {}",
+            "Processing failed after consuming {} bytes: {}",
             self.consumed, self.error
         )
     }
@@ -32,6 +57,7 @@ impl<E: Error + 'static> Error for ProcessError<E> {
 enum Pending {
     Text(char),
     Execute(u8),
+    Rendition(Style),
 }
 
 /// Incremental execution of screen controls with caller-owned text layout.
@@ -43,11 +69,15 @@ enum Pending {
 ///
 /// A byte can complete a replacement and a second text/control event. Two fixed
 /// slots retain these events across writer failures; sequence headers remain in
-/// the fixed-capacity parser. Execution and buffering make no allocation requests.
-#[derive(Default)]
+/// the fixed-capacity parser. Rendition changes use a bounded, owned style table.
+/// Include retained screen/rendering snapshots when collecting style storage.
+/// Screen edits use keys from this processor's table; callbacks receive the
+/// current key. Default construction permits up to [`MAX_STYLES`] entries.
 pub struct Processor {
     parser: Parser,
+    styles: StyleTable,
     style: StyleId,
+    saved_style: StyleId,
     pending: [Option<Pending>; 2],
     head: usize,
     end: usize,
@@ -55,13 +85,57 @@ pub struct Processor {
     ignored_sequences: u64,
 }
 
+impl Default for Processor {
+    fn default() -> Self {
+        Self::new(MAX_STYLES).expect("The default style limit is valid")
+    }
+}
+
 impl Processor {
-    /// Sets the style key used for text and clearing operations.
-    pub fn new(style: StyleId) -> Self {
-        Self {
-            style,
-            ..Self::default()
-        }
+    /// Starts with default rendition and a bounded style table. Construction
+    /// makes no allocation requests; the limit includes permanent default.
+    pub fn new(style_limit: usize) -> Result<Self, StyleError> {
+        Ok(Self {
+            parser: Parser::default(),
+            styles: StyleTable::new(style_limit)?,
+            style: StyleId(0),
+            saved_style: StyleId(0),
+            pending: [None; 2],
+            head: 0,
+            end: 0,
+            parse_errors: 0,
+            ignored_sequences: 0,
+        })
+    }
+
+    pub fn style_id(&self) -> StyleId {
+        self.style
+    }
+
+    /// Resolves keys issued for this processor's screen and retained snapshots.
+    pub fn styles(&self) -> &StyleTable {
+        &self.styles
+    }
+
+    /// Traces current/saved rendition and the paired screen automatically.
+    /// Supply every externally retained ID as an additional root. Reclaimed
+    /// history can make room for a pending rendition change before retrying it.
+    pub fn collect_styles(
+        &mut self,
+        screen: &Screen,
+        external: impl IntoIterator<Item = StyleId>,
+    ) -> Result<usize, StyleError> {
+        self.styles.collect(
+            [self.style, self.saved_style]
+                .into_iter()
+                .chain(
+                    screen
+                        .grid()
+                        .iter_rows()
+                        .flat_map(|row| row.cells().iter().map(|c| c.style())),
+                )
+                .chain(external),
+        )
     }
 
     pub fn parse_errors(&self) -> u64 {
@@ -79,6 +153,8 @@ impl Processor {
     /// On error, `consumed` includes bytes buffered in the parser or retained as
     /// events. An ASCII run rejected by the writer remains unconsumed. A failed
     /// decoded scalar is retained, including any following event from its byte.
+    /// A rendition storage failure retains the complete candidate style and
+    /// consumes its sequence, leaving current rendition unchanged until retry.
     /// Retry the suffix even when empty. Repeated failures consume zero new bytes.
     pub fn advance<E>(
         &mut self,
@@ -98,8 +174,10 @@ impl Processor {
                 if length != 0 {
                     let run = std::str::from_utf8(&input[consumed..consumed + length])
                         .expect("The run is printable ASCII");
-                    text(screen, run, self.style)
-                        .map_err(|error| ProcessError { consumed, error })?;
+                    text(screen, run, self.style).map_err(|error| ProcessError {
+                        consumed,
+                        error: ProcessFailure::Text(error),
+                    })?;
                     consumed += length;
                     continue;
                 }
@@ -117,7 +195,10 @@ impl Processor {
                     if let Err(error) = text(screen, value, self.style) {
                         self.pending[0] = Some(Pending::Text(value.chars().next().unwrap()));
                         self.end = 1;
-                        return Err(ProcessError { consumed, error });
+                        return Err(ProcessError {
+                            consumed,
+                            error: ProcessFailure::Text(error),
+                        });
                     }
                     continue;
                 }
@@ -134,6 +215,8 @@ impl Processor {
                 parse_errors,
                 ignored_sequences,
                 style,
+                saved_style,
+                styles,
                 ..
             } = self;
             parser.advance(&input[consumed..consumed + 1], |event| match event {
@@ -150,13 +233,28 @@ impl Processor {
                 }
                 Event::Escape(sequence) => {
                     debug_assert_eq!(*end, 0);
-                    if !escape(screen, sequence, *style) {
+                    if !escape(screen, sequence, style, saved_style) {
                         *ignored_sequences = ignored_sequences.saturating_add(1);
                     }
                 }
                 Event::Csi(sequence) => {
                     debug_assert_eq!(*end, 0);
-                    if !csi(screen, sequence, *style) {
+                    let accepted = if sequence.final_byte == b'm'
+                        && sequence.private_markers.is_empty()
+                        && sequence.intermediates.is_empty()
+                    {
+                        let mut next = *styles.get(*style).expect("Current rendition is rooted");
+                        if next.apply_sgr(sequence.parameters) {
+                            pending[*end] = Some(Pending::Rendition(next));
+                            *end += 1;
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        csi(screen, sequence, *style)
+                    };
+                    if !accepted {
                         *ignored_sequences = ignored_sequences.saturating_add(1);
                     }
                 }
@@ -169,13 +267,13 @@ impl Processor {
         Ok(consumed)
     }
 
-    /// Ends the lexical stream. Failed final text remains retained for retry;
+    /// Ends the lexical stream. Failed text or rendition remains retained for retry;
     /// repeated successful calls emit no further replacements or diagnostics.
     pub fn finish<E>(
         &mut self,
         screen: &mut Screen,
         mut text: impl FnMut(&mut Screen, &str, StyleId) -> Result<(), E>,
-    ) -> Result<(), E> {
+    ) -> Result<(), ProcessFailure<E>> {
         self.drain(screen, &mut text)?;
         let Self {
             parser,
@@ -196,24 +294,35 @@ impl Processor {
     }
 
     /// Discards buffered input and events, clears diagnostics, and resets the screen.
-    /// Reset caller-owned text state at the same stream boundary.
+    /// Reset caller-owned text state at the same stream boundary. Style storage
+    /// remains available for retained snapshots until explicit collection.
     pub fn reset(&mut self, screen: &mut Screen) {
-        let style = self.style;
-        *self = Self::new(style);
-        screen.reset(style);
+        self.parser.reset();
+        self.pending = [None; 2];
+        self.head = 0;
+        self.end = 0;
+        self.parse_errors = 0;
+        self.ignored_sequences = 0;
+        self.style = StyleId(0);
+        self.saved_style = StyleId(0);
+        screen.reset(StyleId(0));
     }
 
     fn drain<E>(
         &mut self,
         screen: &mut Screen,
         text: &mut impl FnMut(&mut Screen, &str, StyleId) -> Result<(), E>,
-    ) -> Result<(), E> {
+    ) -> Result<(), ProcessFailure<E>> {
         while self.head < self.end {
             match self.pending[self.head].expect("A pending action is present") {
                 Pending::Text(character) => {
-                    text(screen, character.encode_utf8(&mut [0; 4]), self.style)?
+                    text(screen, character.encode_utf8(&mut [0; 4]), self.style)
+                        .map_err(ProcessFailure::Text)?
                 }
                 Pending::Execute(control) => execute(screen, control, self.style),
+                Pending::Rendition(style) => {
+                    self.style = self.styles.intern(style).map_err(ProcessFailure::Style)?;
+                }
             }
             self.pending[self.head] = None;
             self.head += 1;
@@ -234,21 +343,36 @@ fn execute(screen: &mut Screen, control: u8, style: StyleId) {
     }
 }
 
-fn escape(screen: &mut Screen, sequence: EscapeSequence<'_>, style: StyleId) -> bool {
+fn escape(
+    screen: &mut Screen,
+    sequence: EscapeSequence<'_>,
+    style: &mut StyleId,
+    saved_style: &mut StyleId,
+) -> bool {
     if !sequence.intermediates.is_empty() {
         return false;
     }
     match sequence.final_byte {
-        b'7' => screen.save_cursor(),
-        b'8' => screen.restore_cursor(),
-        b'D' => screen.line_feed(style),
+        b'7' => {
+            screen.save_cursor();
+            *saved_style = *style;
+        }
+        b'8' => {
+            screen.restore_cursor();
+            *style = *saved_style;
+        }
+        b'D' => screen.line_feed(*style),
         b'E' => {
             screen.carriage_return();
-            screen.line_feed(style);
+            screen.line_feed(*style);
         }
         b'H' => screen.set_tab_stop(),
-        b'M' => screen.reverse_index(style),
-        b'c' => screen.reset(style),
+        b'M' => screen.reverse_index(*style),
+        b'c' => {
+            *style = StyleId(0);
+            *saved_style = StyleId(0);
+            screen.reset(*style);
+        }
         _ => return false,
     }
     true

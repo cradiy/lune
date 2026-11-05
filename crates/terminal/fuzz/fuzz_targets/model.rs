@@ -86,6 +86,10 @@ impl Model {
     }
 
     pub fn check(&self, grid: &Grid) {
+        self.check_styles(grid, |actual, expected| assert_eq!(actual, expected));
+    }
+
+    pub fn check_styles(&self, grid: &Grid, mut check: impl FnMut(StyleId, StyleId)) {
         assert_eq!(grid.columns(), self.columns);
         assert_eq!(grid.rows(), self.rows.len());
         for (row, (expected, actual)) in self.rows.iter().zip(grid.iter_rows()).enumerate() {
@@ -97,7 +101,7 @@ impl Model {
                 let first = unit.text.chars().next().unwrap();
                 let extended = first.len_utf8() != unit.text.len();
                 assert_eq!(cell.width(), unit.width);
-                assert_eq!(cell.style(), unit.style);
+                check(cell.style(), unit.style);
                 assert_eq!(cell.character(), Some(first));
                 assert_eq!(cell.has_extended_text(), extended);
                 let text = if extended {
@@ -109,7 +113,7 @@ impl Model {
                 if unit.width == 2 {
                     let tail = actual.cells()[column + 1];
                     assert_eq!(tail.width(), 0);
-                    assert_eq!(tail.style(), unit.style);
+                    check(tail.style(), unit.style);
                     assert_eq!(tail.character(), None);
                     assert!(!tail.has_extended_text());
                     assert_eq!(actual.text(column + 1), Some(CellText::Continuation));

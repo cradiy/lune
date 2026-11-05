@@ -1,5 +1,8 @@
 use super::{Snapshot, snapshot};
-use crate::{CellPosition, CellWidth, Cursor, Processor, Screen, StorageError, StyleId};
+use crate::{
+    CellPosition, CellWidth, Color, Cursor, ProcessFailure, Processor, Screen, StorageError, Style,
+    StyleError, StyleId,
+};
 
 fn write_text(screen: &mut Screen, text: &str, style: StyleId) -> Result<(), StorageError> {
     if text.is_ascii() {
@@ -19,7 +22,7 @@ fn write_text(screen: &mut Screen, text: &str, style: StyleId) -> Result<(), Sto
 
 fn run(input: &[u8], cuts: &[usize]) -> (Screen, Processor) {
     let mut screen = Screen::new(8, 4).unwrap();
-    let mut processor = Processor::new(StyleId(3));
+    let mut processor = Processor::default();
     let mut start = 0;
     for end in cuts.iter().copied().chain([input.len()]) {
         assert_eq!(
@@ -124,7 +127,8 @@ fn failures_preserve_ascii_runs_and_both_events_of_a_reprocessed_byte() {
     let error = processor
         .advance(b"abc", &mut screen, |_, _, _| Err("blocked"))
         .unwrap_err();
-    assert_eq!((error.consumed, error.error), (0, "blocked"));
+    assert_eq!(error.consumed, 0);
+    assert!(matches!(error.error, ProcessFailure::Text("blocked")));
     assert_eq!(snapshot(screen.grid()), before);
     processor.advance(b"abc", &mut screen, write_text).unwrap();
     processor.reset(&mut screen);
@@ -214,4 +218,141 @@ fn finishing_and_resetting_own_pending_input_without_duplicate_effects() {
     assert_eq!(screen.cursor(), Cursor::default());
     assert_eq!(processor.parse_errors(), 0);
     assert_eq!(row_text(&screen, 0), "        ");
+}
+
+#[test]
+fn sgr_styles_follow_saved_cursors_wide_text_erasure_and_input_boundaries() {
+    let input = "\x1b[31mR\x1b7\x1b[1;48;5;17m\x1b[1;5HB\x1b8S\x1b[0mN\x1b[48:2::1:2:3m\x1b[3;1H\x1b[K\x1b[4;1H\x1b[38;2;0;255;1m水\x1b[38;5;256m!\x1b[?31m\x1b[1 m".as_bytes();
+    let (screen, processor) = run(input, &[]);
+    let red = Style {
+        foreground: Color::Indexed(1),
+        ..Style::default()
+    };
+    let background = Color::Rgb {
+        red: 1,
+        green: 2,
+        blue: 3,
+    };
+    let green = Style {
+        foreground: Color::Rgb {
+            red: 0,
+            green: 255,
+            blue: 1,
+        },
+        background,
+        ..Style::default()
+    };
+    let style_at = |row: usize, column: usize| {
+        let id = screen.grid().row(row).unwrap().cells()[column].style();
+        *processor.styles().get(id).unwrap()
+    };
+    assert_eq!(row_text(&screen, 0), "RSN B   ");
+    assert_eq!(style_at(0, 0), red);
+    assert_eq!(style_at(0, 1), red);
+    assert_eq!(style_at(0, 2), Style::default());
+    assert_eq!(
+        style_at(0, 4),
+        Style {
+            bold: true,
+            background: Color::Indexed(17),
+            ..red
+        }
+    );
+    for column in 0..8 {
+        assert_eq!(
+            style_at(2, column),
+            Style {
+                background,
+                ..Style::default()
+            }
+        );
+    }
+    for column in 0..3 {
+        assert_eq!(style_at(3, column), green);
+    }
+    assert_eq!(processor.styles().get(processor.style_id()), Some(&green));
+    assert_eq!(processor.ignored_sequences(), 3);
+    let expected = snapshot(screen.grid());
+    for split in 0..=input.len() {
+        let (split_screen, split_processor) = run(input, &[split]);
+        assert_eq!(snapshot(split_screen.grid()), expected);
+        assert_eq!(split_screen.cursor(), screen.cursor());
+        assert_eq!(split_processor.ignored_sequences(), 3);
+        assert_eq!(
+            split_processor.styles().get(split_processor.style_id()),
+            Some(&green)
+        );
+    }
+}
+
+#[test]
+fn full_style_storage_retries_after_tracing_current_saved_and_external_owners() {
+    let mut screen = Screen::new(8, 4).unwrap();
+    let mut processor = Processor::new(4).unwrap();
+    processor
+        .advance(b"\x1b[31m\x1b7\x1b[34m", &mut screen, write_text)
+        .unwrap();
+    let blue = processor.style_id();
+    processor
+        .advance(b"\x1b[32m", &mut screen, write_text)
+        .unwrap();
+    let green = processor.style_id();
+    let input = b"\x1b[35mX";
+    let error = processor
+        .advance(input, &mut screen, write_text)
+        .unwrap_err();
+    assert_eq!(error.consumed, 5);
+    assert!(matches!(
+        error.error,
+        ProcessFailure::Style(StyleError::CapacityExceeded)
+    ));
+    assert_eq!(processor.style_id(), green);
+    assert_eq!(screen.cursor(), Cursor::default());
+    assert_eq!(processor.collect_styles(&screen, [blue]).unwrap(), 0);
+    let error = processor
+        .advance(&input[5..], &mut screen, write_text)
+        .unwrap_err();
+    assert_eq!(error.consumed, 0);
+    assert!(matches!(
+        processor.finish(&mut screen, write_text),
+        Err(ProcessFailure::Style(StyleError::CapacityExceeded))
+    ));
+    assert_eq!(processor.collect_styles(&screen, []).unwrap(), 1);
+    processor
+        .advance(&input[5..], &mut screen, write_text)
+        .unwrap();
+    let magenta = processor.style_id();
+    assert_ne!(magenta, blue);
+    assert_eq!(processor.styles().get(blue), None);
+    assert_eq!(row_text(&screen, 0), "X       ");
+    processor
+        .advance(b"\x1b8R", &mut screen, write_text)
+        .unwrap();
+    let red = processor.style_id();
+    assert_eq!(
+        processor.styles().get(red),
+        Some(&Style {
+            foreground: Color::Indexed(1),
+            ..Style::default()
+        })
+    );
+    assert_eq!(row_text(&screen, 0), "R       ");
+    processor.reset(&mut screen);
+    assert_eq!(processor.style_id(), StyleId(0));
+    assert_eq!(processor.collect_styles(&screen, [red]).unwrap(), 2);
+    assert!(processor.styles().get(red).is_some());
+    assert_eq!(processor.collect_styles(&screen, []).unwrap(), 1);
+    assert_eq!(processor.styles().get(red), None);
+    assert_eq!(processor.styles().style_count(), 1);
+    let mut limited = Processor::new(1).unwrap();
+    assert!(
+        limited
+            .advance(b"\x1b[31mR", &mut screen, write_text)
+            .is_err()
+    );
+    limited.reset(&mut screen);
+    limited.finish(&mut screen, write_text).unwrap();
+    limited.advance(b"D", &mut screen, write_text).unwrap();
+    assert_eq!(row_text(&screen, 0), "D       ");
+    assert_eq!(limited.style_id(), StyleId(0));
 }

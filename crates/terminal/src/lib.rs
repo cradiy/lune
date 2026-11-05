@@ -100,8 +100,12 @@
 //! [`Style`] represents unresolved colors and character rendition independently
 //! of [`StyleId`] storage. [`Style::apply_sgr`] interprets a parameter list
 //! atomically with fixed auxiliary space. [`Color`] preserves default and indexed
-//! colors for later theme/palette resolution. Cell style keys and the processor's
-//! text callback retain caller-owned style storage.
+//! colors for later theme/palette resolution. Screen callers can own style storage.
+//! [`Processor`] owns its [`StyleTable`] and supplies its current key to the text
+//! callback and screen operations. [`Processor::collect_styles`] traces the paired
+//! screen and current/saved rendition, together with caller-supplied snapshot roots.
+//! [`ProcessFailure`] distinguishes text errors from rendition storage errors;
+//! failed style changes remain buffered for retry before further input.
 //! [`StyleTable`] interns values behind bounded, table-local IDs. Explicit
 //! collection traces caller-owned roots, preserves retained IDs, and invalidates
 //! reclaimed IDs through slot generations. Default rendition permanently uses
@@ -125,7 +129,7 @@ mod tests;
 pub use cell::{Cell, CellText, CellWidth, MAX_CELL_TEXT_BYTES, StyleId};
 pub use error::StorageError;
 pub use grid::{Grid, MAX_CELLS, MAX_DIMENSION};
-pub use processor::{ProcessError, Processor};
+pub use processor::{ProcessError, ProcessFailure, Processor};
 pub use row::Row;
 pub use screen::{Cursor, EraseMode, Screen};
 pub use style::{Color, Style, Underline};

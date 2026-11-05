@@ -90,7 +90,11 @@ impl ScreenModel {
     }
 
     pub fn check(&self, screen: &Screen) {
-        self.storage.check(screen.grid());
+        self.check_styles(screen, |actual, expected| assert_eq!(actual, expected));
+    }
+
+    pub fn check_styles(&self, screen: &Screen, check: impl FnMut(StyleId, StyleId)) {
+        self.storage.check_styles(screen.grid(), check);
         let cursor = screen.cursor();
         assert_eq!(cursor.row, self.row);
         assert_eq!(cursor.column, self.visible_column());
