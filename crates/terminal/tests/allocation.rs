@@ -19,6 +19,7 @@ struct SnapshotCell {
     text: String,
     width: usize,
     style: StyleId,
+    erased: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -54,6 +55,7 @@ fn snapshot(grid: &Grid) -> Snapshot {
                         text,
                         width: cell.width(),
                         style: cell.style(),
+                        erased: cell.is_erased(),
                     }
                 })
                 .collect()
@@ -380,6 +382,11 @@ fn allocation_failures_preserve_contents_and_allow_retry() {
             name: "grow appended text",
             setup: extended,
             mutate: |grid| grid.append_text(0, 0, "\u{301}\u{302}\u{303}\u{304}"),
+        },
+        Scenario {
+            name: "append a display unit to erased storage",
+            setup: || Grid::new(4, 2).unwrap(),
+            mutate: |grid| grid.append_text(0, 0, "\u{301}"),
         },
         Scenario {
             name: "grow rows and columns",

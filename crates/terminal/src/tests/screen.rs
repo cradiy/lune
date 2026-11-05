@@ -1069,6 +1069,7 @@ fn erasure_clears_intersecting_units_and_preserves_screen_state_and_buffers() {
                                                     blank.text = " ".into();
                                                     blank.width = 1;
                                                     blank.style = style;
+                                                    blank.erased = true;
                                                 }
                                             }
                                         }
@@ -1203,6 +1204,7 @@ fn cursor_cell_edits_preserve_units_buffers_and_zero_count_state() {
                                     cell.text = " ".into();
                                     cell.width = 1;
                                     cell.style = style;
+                                    cell.erased = true;
                                 }
                                 let mut retained = Vec::new();
                                 for (source, cell) in before.rows[row]

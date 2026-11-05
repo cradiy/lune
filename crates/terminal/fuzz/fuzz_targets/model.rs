@@ -9,6 +9,7 @@ struct Unit {
     text: String,
     width: usize,
     style: StyleId,
+    erased: bool,
 }
 
 fn blank(style: StyleId) -> Unit {
@@ -16,6 +17,7 @@ fn blank(style: StyleId) -> Unit {
         text: " ".into(),
         width: 1,
         style,
+        erased: true,
     }
 }
 
@@ -101,6 +103,7 @@ impl Model {
                 let first = unit.text.chars().next().unwrap();
                 let extended = first.len_utf8() != unit.text.len();
                 assert_eq!(cell.width(), unit.width);
+                assert_eq!(cell.is_erased(), unit.erased);
                 check(cell.style(), unit.style);
                 assert_eq!(cell.character(), Some(first));
                 assert_eq!(cell.has_extended_text(), extended);
@@ -113,6 +116,7 @@ impl Model {
                 if unit.width == 2 {
                     let tail = actual.cells()[column + 1];
                     assert_eq!(tail.width(), 0);
+                    assert!(!tail.is_erased());
                     check(tail.style(), unit.style);
                     assert_eq!(tail.character(), None);
                     assert!(!tail.has_extended_text());
@@ -153,6 +157,7 @@ impl Model {
                 text: text.into(),
                 width,
                 style,
+                erased: false,
             }],
         );
         Ok(())
@@ -178,6 +183,7 @@ impl Model {
                     text: char::from(byte).to_string(),
                     width: 1,
                     style,
+                    erased: false,
                 }),
             );
         }
@@ -192,6 +198,9 @@ impl Model {
             return Err(StorageError::TextTooLong);
         }
         unit.text.push_str(text);
+        if !text.is_empty() {
+            unit.erased = false;
+        }
         if !text.is_empty() && self.wraps[row].is_some_and(|end| column >= end) {
             self.wraps[row] = None;
         }

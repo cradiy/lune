@@ -12,6 +12,10 @@ units in vectors. The model rebuilds rows after edits and copies rows during scr
 The target mixes writes, appends, erasure, insertion, deletion, region and full-grid
 scrolling, and resizing. After every operation it checks text, styles, occupancy,
 dimensions, and error categories. Rejected operations must preserve model contents.
+Complete units also record erased state. Printed spaces and nonempty appends are
+text; blank filling, erased ranges, cropped wide fragments, and exposed cells are
+erased. Copying or remapping a retained unit preserves this distinction. All
+targets sharing this model compare erased state independently of text and style.
 
 ## Screen Target
 

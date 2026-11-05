@@ -4,6 +4,10 @@
 //! Single scalars are inline; multi-scalar text is owned by its row. Mutations
 //! preserve paired wide cells. Callers provide display widths and opaque style
 //! keys; terminal interpretation owns their meaning.
+//! [`Cell::is_erased`] distinguishes initialized/erased positions from printed
+//! spaces. Erasure, exposed rows/columns, and repaired wide fragments establish
+//! erased single-width spaces. Cell edits retain the state of moved units;
+//! nonempty text appends establish text. Extraction emits spaces for both states.
 //!
 //! Resizing preserves the upper-left intersection. A wide unit cut by the new
 //! right edge is cleared. Scrolling an exclusive row range recycles row buffers

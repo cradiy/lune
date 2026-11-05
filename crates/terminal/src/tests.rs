@@ -1,5 +1,6 @@
 use std::ops::Range;
 
+mod erased;
 mod processor;
 mod screen;
 mod style;
@@ -20,6 +21,11 @@ fn assert_invariants(grid: &Grid) {
         }
         assert_eq!(row.cells().len(), grid.columns());
         for (column, cell) in row.cells().iter().enumerate() {
+            if cell.is_erased() {
+                assert_eq!(cell.width(), 1);
+                assert_eq!(cell.character(), Some(' '));
+                assert!(!cell.has_extended_text());
+            }
             if column + 1 < grid.columns() {
                 assert_eq!(cell.row_wrap(), None);
                 if column + 2 < grid.columns() {
@@ -64,6 +70,7 @@ struct SnapshotCell {
     text: String,
     width: usize,
     style: StyleId,
+    erased: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -90,6 +97,7 @@ fn snapshot(grid: &Grid) -> Snapshot {
                         text,
                         width: cell.width(),
                         style: cell.style(),
+                        erased: cell.is_erased(),
                     }
                 })
                 .collect()
@@ -305,6 +313,7 @@ fn cell_edits_move_complete_units_and_retain_text_buffers() {
                         text: " ".into(),
                         width: 1,
                         style,
+                        erased: true,
                     };
                     let mut expected = vec![blank; columns];
                     let requested = count;

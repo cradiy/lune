@@ -10,6 +10,7 @@ const EXTENDED: u32 = 1 << 23;
 const ROW_WRAP: u32 = 1 << 24;
 const ROW_GAP: u32 = 1 << 25;
 const ROW_MASK: u32 = ROW_WRAP | ROW_GAP;
+const ERASED: u32 = 1 << 26;
 
 /// An opaque style key supplied and interpreted by the caller. Zero is the default
 /// key. Keys issued by [`crate::StyleTable`] belong to that table's lifetime.
@@ -39,6 +40,8 @@ pub struct Cell {
     text: u32,
     style: StyleId,
 }
+
+const _: () = assert!(size_of::<Cell>() == 8);
 
 // Row metadata shares spare header bits without changing cell value semantics.
 impl PartialEq for Cell {
@@ -83,7 +86,10 @@ impl Cell {
     }
 
     pub(crate) fn blank(style: StyleId) -> Self {
-        Self::scalar(' ', CellWidth::Single, style)
+        Self {
+            text: ' ' as u32 | ERASED,
+            style,
+        }
     }
 
     pub(crate) fn continuation(style: StyleId) -> Self {
@@ -94,7 +100,7 @@ impl Cell {
     }
 
     pub(crate) fn set_extended(&mut self) {
-        self.text |= EXTENDED;
+        self.text = (self.text & !ERASED) | EXTENDED;
     }
 
     pub(crate) fn is_inline_with_width(self, width: CellWidth) -> bool {
@@ -131,6 +137,13 @@ impl Cell {
 
     pub fn has_extended_text(self) -> bool {
         self.text & EXTENDED != 0
+    }
+
+    /// Whether initialization, erasure, or blank filling created this cell.
+    /// Printed spaces are text and return false. Erased cells have single width
+    /// and expose a space through [`Self::character`] and text extraction.
+    pub fn is_erased(self) -> bool {
+        self.text & ERASED != 0
     }
 
     pub fn style(self) -> StyleId {
