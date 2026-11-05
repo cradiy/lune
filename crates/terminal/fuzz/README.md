@@ -1,8 +1,8 @@
 # Terminal State Fuzzing
 
 This standalone workspace uses cargo-fuzz and nightly Rust to compare terminal
-storage, cursor-driven screen mutations, and byte-stream execution with independent
-models.
+storage, cursor-driven screen mutations, byte-stream execution, and SGR rendition
+with independent expectations.
 
 ## Storage Target
 
@@ -76,6 +76,16 @@ The fixed-width fixture maps one synthetic scalar to an owned multi-scalar displ
 unit, exercising text storage through the execution boundary. Inputs contain at
 most 512 eight-byte commands and use an eight-column, four-row screen.
 
+## Style Target
+
+The `style` target creates a rendition value from synthetic input and independently
+encodes it as one SGR sequence. Whole-input and fragmented parsing must recover
+that value, including default, indexed, and RGB colors in semicolon and colon
+forms. Attributes include selective intensity flags and both underline variants.
+Arbitrary parameter lists additionally check rejection atomicity, idempotence,
+and an explicit final reset. The target retains at most 32 generated parameters;
+its wire encoder uses a fixed-size synthetic seed.
+
 ## Input Bounds and Replay
 
 Each eight-byte command selects an operation, coordinates, a count, and synthetic
@@ -107,6 +117,7 @@ Run from `crates/terminal` after installing cargo-fuzz:
 cargo +nightly fuzz run storage -- -dict=fuzz/storage.dict -max_len=4096 -timeout=2 -rss_limit_mb=1024 -max_total_time=60
 cargo +nightly fuzz run screen -- -dict=fuzz/screen.dict -max_len=4096 -timeout=2 -rss_limit_mb=1024 -max_total_time=60
 cargo +nightly fuzz run processor -- -max_len=4096 -timeout=2 -rss_limit_mb=1024 -max_total_time=60
+cargo +nightly fuzz run style -- -max_len=128 -timeout=2 -rss_limit_mb=1024 -max_total_time=60
 ```
 
 Pass a finding's artifact file as the corpus argument to replay it. The command

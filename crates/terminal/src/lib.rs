@@ -96,6 +96,12 @@
 //! are dispatched directly in the parser's ground state. Lexical errors recover
 //! through the parser and are counted, while unsupported ESC/CSI forms are counted
 //! and ignored. Finishing flushes incomplete lexical input exactly once.
+//!
+//! [`Style`] represents unresolved colors and character rendition independently
+//! of [`StyleId`] storage. [`Style::apply_sgr`] interprets a parameter list
+//! atomically with fixed auxiliary space. [`Color`] preserves default and indexed
+//! colors for later theme/palette resolution. Cell style keys and the processor's
+//! text callback retain caller-owned style storage.
 
 mod cell;
 mod error;
@@ -103,6 +109,7 @@ mod grid;
 mod processor;
 mod row;
 mod screen;
+mod style;
 mod tabs;
 mod text;
 
@@ -115,4 +122,5 @@ pub use grid::{Grid, MAX_CELLS, MAX_DIMENSION};
 pub use processor::{ProcessError, Processor};
 pub use row::Row;
 pub use screen::{Cursor, EraseMode, Screen};
+pub use style::{Color, Style, Underline};
 pub use text::{CellPosition, GridText};

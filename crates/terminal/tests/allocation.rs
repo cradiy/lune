@@ -7,7 +7,8 @@ use std::{
 };
 
 use lune_terminal::{
-    CellPosition, CellText, CellWidth, EraseMode, Grid, Processor, Screen, StorageError, StyleId,
+    CellPosition, CellText, CellWidth, EraseMode, Grid, Processor, Screen, StorageError, Style,
+    StyleId,
 };
 
 #[global_allocator]
@@ -877,5 +878,28 @@ fn processor_retries_allocation_failures_from_owned_input_positions() {
         Ok::<_, lune_terminal::ProcessError<StorageError>>(())
     });
     result.unwrap();
+    assert_eq!(stats.attempts, 0);
+}
+
+#[test]
+fn sgr_interpretation_preserves_zero_allocation_for_accepted_and_rejected_groups() {
+    let mut parameters = [lune_vt::Parameter::default(); 32];
+    let mut length = 0;
+    lune_vt::Parser::default().advance(b"\x1b[1;38;2;0;128;255;48:5:255;21m", |event| {
+        if let lune_vt::Event::Csi(sequence) = event {
+            length = sequence.parameters.len();
+            parameters[..length].copy_from_slice(sequence.parameters);
+        }
+    });
+    let mut style = Style::default();
+    let ((), stats) = allocator::measure(Some(0), || {
+        for _ in 0..1024 {
+            assert!(style.apply_sgr(&parameters[..length]));
+            let before = style;
+            assert!(!style.apply_sgr(&parameters[..5]));
+            assert_eq!(style, before);
+            assert!(style.apply_sgr(&[]));
+        }
+    });
     assert_eq!(stats.attempts, 0);
 }

@@ -10,6 +10,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 lune-terminal = { path = ".." }
+lune-vt = { path = "../../vt" }
 
 [workspace]
 members = ["."]
@@ -31,6 +32,13 @@ bench = false
 [[bin]]
 name = "processor"
 path = "fuzz_targets/processor.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "style"
+path = "fuzz_targets/style.rs"
 test = false
 doc = false
 bench = false

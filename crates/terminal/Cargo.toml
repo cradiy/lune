@@ -20,6 +20,10 @@ harness = false
 name = "processor"
 harness = false
 
+[[bench]]
+name = "style"
+harness = false
+
 [dependencies]
 lune-vt = { path = "../vt" }
 

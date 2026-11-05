@@ -82,6 +82,7 @@ version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
  "lune-terminal",
+ "lune-vt",
 ]
 
 [[package]]
