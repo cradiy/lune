@@ -85,6 +85,7 @@ pub struct Processor {
     saved_style: StyleId,
     charsets: Charsets,
     saved_charsets: Charsets,
+    new_line_mode: bool,
     pending: [Option<Pending>; 2],
     head: usize,
     end: usize,
@@ -109,6 +110,7 @@ impl Processor {
             saved_style: StyleId(0),
             charsets: Charsets::default(),
             saved_charsets: Charsets::default(),
+            new_line_mode: false,
             pending: [None; 2],
             head: 0,
             end: 0,
@@ -119,6 +121,12 @@ impl Processor {
 
     pub fn style_id(&self) -> StyleId {
         self.style
+    }
+
+    /// Whether LF moves to column zero on the following line. Input encoders can
+    /// use this state to select CR versus CR/LF for the Return key.
+    pub fn new_line_mode(&self) -> bool {
+        self.new_line_mode
     }
 
     /// Resolves keys issued for this processor's screen and retained snapshots.
@@ -245,6 +253,7 @@ impl Processor {
                 styles,
                 charsets,
                 saved_charsets,
+                new_line_mode,
                 ..
             } = self;
             parser.advance(&input[consumed..consumed + 1], |event| match event {
@@ -268,6 +277,7 @@ impl Processor {
                         saved_style,
                         charsets,
                         saved_charsets,
+                        new_line_mode,
                     ) {
                         *ignored_sequences = ignored_sequences.saturating_add(1);
                     }
@@ -287,7 +297,7 @@ impl Processor {
                             false
                         }
                     } else {
-                        csi(screen, sequence, *style)
+                        csi(screen, sequence, *style, new_line_mode)
                     };
                     if !accepted {
                         *ignored_sequences = ignored_sequences.saturating_add(1);
@@ -342,6 +352,7 @@ impl Processor {
         self.saved_style = StyleId(0);
         self.charsets = Charsets::default();
         self.saved_charsets = Charsets::default();
+        self.new_line_mode = false;
         screen.reset(StyleId(0));
     }
 
@@ -358,7 +369,9 @@ impl Processor {
                 }
                 Pending::Execute(0x0e) => self.charsets.shift(true),
                 Pending::Execute(0x0f) => self.charsets.shift(false),
-                Pending::Execute(control) => execute(screen, control, self.style),
+                Pending::Execute(control) => {
+                    execute(screen, control, self.style, self.new_line_mode)
+                }
                 Pending::Rendition(style) => {
                     self.style = self.styles.intern(style).map_err(ProcessFailure::Style)?;
                 }
@@ -394,11 +407,16 @@ fn ascii_prefix<const LAST: u8>(input: &[u8]) -> usize {
             .unwrap_or(input.len() - offset)
 }
 
-fn execute(screen: &mut Screen, control: u8, style: StyleId) {
+fn execute(screen: &mut Screen, control: u8, style: StyleId, new_line_mode: bool) {
     match control {
         0x08 => screen.backspace(),
         0x09 => screen.tab_forward(1),
-        0x0a..=0x0c => screen.line_feed(style),
+        0x0a..=0x0c => {
+            if new_line_mode {
+                screen.carriage_return();
+            }
+            screen.line_feed(style);
+        }
         0x0d => screen.carriage_return(),
         _ => {}
     }
@@ -411,6 +429,7 @@ fn escape(
     saved_style: &mut StyleId,
     charsets: &mut Charsets,
     saved_charsets: &mut Charsets,
+    new_line_mode: &mut bool,
 ) -> bool {
     if let [designation @ (b'(' | b')')] = sequence.intermediates {
         return charsets.designate(*designation == b')', sequence.final_byte);
@@ -441,6 +460,7 @@ fn escape(
             *saved_style = StyleId(0);
             *charsets = Charsets::default();
             *saved_charsets = Charsets::default();
+            *new_line_mode = false;
             screen.reset(*style);
         }
         _ => return false,
@@ -469,7 +489,12 @@ fn erase_mode(value: usize) -> Option<EraseMode> {
     }
 }
 
-fn csi(screen: &mut Screen, sequence: CsiSequence<'_>, style: StyleId) -> bool {
+fn csi(
+    screen: &mut Screen,
+    sequence: CsiSequence<'_>,
+    style: StyleId,
+    new_line_mode: &mut bool,
+) -> bool {
     let p = sequence.parameters;
     if !sequence.intermediates.is_empty() || p.iter().any(|p| p.is_subparameter) {
         return false;
@@ -481,9 +506,12 @@ fn csi(screen: &mut Screen, sequence: CsiSequence<'_>, style: StyleId) -> bool {
             _ => return false,
         };
         if p.is_empty()
-            || !p
-                .iter()
-                .all(|p| matches!((private, p.value), (false, Some(4)) | (true, Some(6 | 7))))
+            || !p.iter().all(|p| {
+                matches!(
+                    (private, p.value),
+                    (false, Some(4 | 20)) | (true, Some(6 | 7))
+                )
+            })
         {
             return false;
         }
@@ -491,6 +519,7 @@ fn csi(screen: &mut Screen, sequence: CsiSequence<'_>, style: StyleId) -> bool {
         for parameter in p {
             match (private, parameter.value) {
                 (false, Some(4)) => screen.set_insert_mode(enabled),
+                (false, Some(20)) => *new_line_mode = enabled,
                 (true, Some(6)) => screen.set_origin_mode(enabled),
                 (true, Some(7)) => screen.set_auto_wrap(enabled),
                 _ => unreachable!("Mode parameters were validated"),

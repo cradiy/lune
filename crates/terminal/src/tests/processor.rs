@@ -433,3 +433,70 @@ fn mapped_text_retries_once_after_ground_and_reprocessed_utf8_input() {
         .unwrap();
     assert_eq!(row_text(&screen, 0), "�─q     ");
 }
+
+#[test]
+fn new_line_mode_composes_with_mode_lists_saved_cursors_and_explicit_indexing() {
+    let input = b"ab\nC\x1b[4;20h\nD\x1b7\x1b[20l\x1b8\nE\x1b[20h\x1bDI\x1bEN\x0bV\x1b[20;999l\x0cF\x1b[4;20l";
+    for split in 0..=input.len() {
+        let mut screen = Screen::new(8, 8).unwrap();
+        let mut processor = Processor::default();
+        processor
+            .advance(&input[..split], &mut screen, write_text)
+            .unwrap();
+        processor
+            .advance(&input[split..], &mut screen, write_text)
+            .unwrap();
+        assert_eq!(
+            (0..8).map(|row| row_text(&screen, row)).collect::<Vec<_>>(),
+            [
+                "ab      ", "  C     ", "D       ", " E      ", "  I     ", "N       ", "V       ",
+                "F       ",
+            ]
+        );
+        assert_eq!(
+            screen.cursor(),
+            Cursor {
+                row: 7,
+                column: 1,
+                wrap_pending: false
+            }
+        );
+        assert!(!processor.new_line_mode() && !screen.insert_mode());
+        assert_eq!(processor.ignored_sequences(), 1);
+        processor
+            .advance(b"\x1b[20h\x1bc", &mut screen, write_text)
+            .unwrap();
+        assert!(!processor.new_line_mode());
+        processor
+            .advance(b"\x1b[20h", &mut screen, write_text)
+            .unwrap();
+        processor.reset(&mut screen);
+        assert!(!processor.new_line_mode());
+    }
+}
+
+#[test]
+fn new_line_mode_applies_after_a_failed_replacement_before_following_text() {
+    let mut screen = Screen::new(8, 4).unwrap();
+    let mut processor = Processor::default();
+    processor
+        .advance(b"ab\x1b[20h\xf0\x9f", &mut screen, write_text)
+        .unwrap();
+    let error = processor
+        .advance(b"\nX", &mut screen, |_, _, _| Err("blocked"))
+        .unwrap_err();
+    assert_eq!(error.consumed, 1);
+    assert_eq!(screen.cursor().column, 2);
+    assert!(processor.new_line_mode());
+    processor.advance(b"X", &mut screen, write_text).unwrap();
+    assert_eq!(row_text(&screen, 0), "ab�     ");
+    assert_eq!(row_text(&screen, 1), "X       ");
+    assert_eq!(
+        screen.cursor(),
+        Cursor {
+            row: 1,
+            column: 1,
+            wrap_pending: false
+        }
+    );
+}

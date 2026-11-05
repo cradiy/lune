@@ -28,15 +28,15 @@ fn count(wire: &mut Vec<u8>, final_byte: u8, bytes: &[u8; 8]) -> usize {
     }
 }
 
-fn drive(
-    wire: &[u8],
-    chunk: usize,
-    fail_at: usize,
-    expected: &ScreenModel,
+struct Expected<'a> {
+    screen: &'a ScreenModel,
     diagnostics: (u64, u64),
-    values: &[Style],
-    current: Style,
-) {
+    values: &'a [Style],
+    style: Style,
+    new_line_mode: bool,
+}
+
+fn drive(wire: &[u8], chunk: usize, fail_at: usize, expected: &Expected<'_>) {
     let mut screen = Screen::new(8, 4).unwrap();
     let mut processor = Processor::default();
     let mut calls = 0;
@@ -76,16 +76,20 @@ fn drive(
         processor.collect_styles(&screen, []).unwrap();
     }
     while processor.finish(&mut screen, &mut text).is_err() {}
-    expected.check_styles(&screen, |actual, reference| {
+    expected.screen.check_styles(&screen, |actual, reference| {
         assert_eq!(
             processor.styles().get(actual),
-            Some(&values[reference.0 as usize])
+            Some(&expected.values[reference.0 as usize])
         );
     });
-    assert_eq!(processor.styles().get(processor.style_id()), Some(&current));
+    assert_eq!(
+        processor.styles().get(processor.style_id()),
+        Some(&expected.style)
+    );
+    assert_eq!(processor.new_line_mode(), expected.new_line_mode);
     assert_eq!(
         (processor.parse_errors(), processor.ignored_sequences()),
-        diagnostics
+        expected.diagnostics
     );
 }
 
@@ -134,8 +138,9 @@ fuzz_target!(|data: &[u8]| {
     let mut charsets = [false; 2];
     let mut selected = 0;
     let mut saved_charsets = (charsets, selected);
+    let mut new_line_mode = false;
     for bytes in data.as_chunks::<8>().0.iter().take(512) {
-        let command = match bytes[0] % 48 {
+        let command = match bytes[0] % 50 {
             0 => {
                 wire.extend(b"abc");
                 ascii(
@@ -188,6 +193,11 @@ fuzz_target!(|data: &[u8]| {
             }
             7 => {
                 wire.push(b'\n');
+                if new_line_mode {
+                    expected
+                        .apply(&Command::CarriageReturn, reference_id(&mut values, current))
+                        .unwrap();
+                }
                 Some(Command::LineFeed)
             }
             8 => {
@@ -196,7 +206,7 @@ fuzz_target!(|data: &[u8]| {
             }
             9 | 10 => {
                 let n = bytes[3] % 4;
-                let final_byte = if bytes[0] % 48 == 9 { 'K' } else { 'J' };
+                let final_byte = if bytes[0] % 50 == 9 { 'K' } else { 'J' };
                 write!(&mut wire, "\x1b[{n}{final_byte}").unwrap();
                 let mode = match n {
                     0 => Some(EraseMode::FromCursor),
@@ -250,7 +260,7 @@ fuzz_target!(|data: &[u8]| {
             28 | 29 | 33 => {
                 let enabled = bytes[3] & 1 != 0;
                 let final_byte = if enabled { 'h' } else { 'l' };
-                let command = match bytes[0] % 48 {
+                let command = match bytes[0] % 50 {
                     28 => {
                         write!(&mut wire, "\x1b[?7{final_byte}").unwrap();
                         Command::AutoWrap(enabled)
@@ -285,6 +295,7 @@ fuzz_target!(|data: &[u8]| {
                 charsets = [false; 2];
                 selected = 0;
                 saved_charsets = (charsets, selected);
+                new_line_mode = false;
                 Some(Command::Reset)
             }
             34 => {
@@ -398,7 +409,7 @@ fuzz_target!(|data: &[u8]| {
                 diagnostics.1 += 1;
                 None
             }
-            _ => {
+            47 => {
                 wire.extend(b"\xf0\x9f\x0eq");
                 expected
                     .apply(
@@ -414,6 +425,25 @@ fuzz_target!(|data: &[u8]| {
                     charsets[selected],
                 );
                 None
+            }
+            48 => {
+                let enabled = bytes[1] & 1 != 0;
+                wire.extend(if enabled {
+                    b"\x1b[4;20h"
+                } else {
+                    b"\x1b[4;20l"
+                });
+                new_line_mode = enabled;
+                Some(Command::InsertMode(enabled))
+            }
+            _ => {
+                wire.push([b'\n', 0x0b, 0x0c][bytes[1] as usize % 3]);
+                if new_line_mode {
+                    expected
+                        .apply(&Command::CarriageReturn, reference_id(&mut values, current))
+                        .unwrap();
+                }
+                Some(Command::LineFeed)
             }
         };
         if let Some(command) = command
@@ -436,22 +466,18 @@ fuzz_target!(|data: &[u8]| {
         reference_id(&mut values, current),
         charsets[selected],
     );
-    drive(
-        &wire,
-        wire.len(),
-        usize::MAX,
-        &expected,
+    let oracle = Expected {
+        screen: &expected,
         diagnostics,
-        &values,
-        current,
-    );
+        values: &values,
+        style: current,
+        new_line_mode,
+    };
+    drive(&wire, wire.len(), usize::MAX, &oracle);
     drive(
         &wire,
         data.first().copied().unwrap_or(0) as usize % 17 + 1,
         data.get(4).copied().unwrap_or(0) as usize % 32,
-        &expected,
-        diagnostics,
-        &values,
-        current,
+        &oracle,
     );
 });

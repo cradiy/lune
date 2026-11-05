@@ -103,6 +103,8 @@
 //! G0/G1 ASCII and DEC Special Graphics designation, SI/SO selection, and cursor
 //! save/restore determine how printable ASCII maps to Unicode text callbacks.
 //! Mapped scalar failures retain the mapped value and own its source byte.
+//! ANSI new-line mode selects vertical-only or column-zero movement for LF and
+//! its VT/FF aliases. Explicit IND/NEL retain their own movement semantics.
 //!
 //! [`Style`] represents unresolved colors and character rendition independently
 //! of [`StyleId`] storage. [`Style::apply_sgr`] interprets a parameter list
