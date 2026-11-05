@@ -106,9 +106,9 @@
 //! ANSI new-line mode selects vertical-only or column-zero movement for LF and
 //! its VT/FF aliases. Explicit IND/NEL retain their own movement semantics.
 //! [`Processor::input_modes`] captures application cursor/keypad and new-line
-//! modes. [`InputModes::encode_key`] encodes unmodified cursor, Return, and
-//! numeric-keypad keys into static byte slices without allocating. Snapshots and
-//! encoded bytes remain valid across later mode changes and partial writes.
+//! modes. [`InputModes::encode_key`] encodes unmodified cursor, editing, F1–F12,
+//! Return, and numeric-keypad keys into static byte slices without allocating.
+//! Snapshots and encoded bytes remain valid across later mode changes and partial writes.
 //!
 //! [`Style`] represents unresolved colors and character rendition independently
 //! of [`StyleId`] storage. [`Style::apply_sgr`] interprets a parameter list

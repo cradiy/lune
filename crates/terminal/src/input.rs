@@ -1,10 +1,17 @@
-/// Unmodified ANSI cursor, Return, and numeric-keypad keys.
+/// Unmodified ANSI cursor, editing, function, Return, and numeric-keypad keys.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Key {
     Up,
     Down,
     Right,
     Left,
+    Home,
+    End,
+    Insert,
+    Delete,
+    PageUp,
+    PageDown,
+    Function(u8),
     Enter,
     KeypadDigit(u8),
     KeypadDecimal,
@@ -26,8 +33,10 @@ pub struct InputModes {
 impl InputModes {
     /// Encodes a key without allocating. Returned bytes have static storage and
     /// can be retained across mode changes or partial transport writes.
-    /// Returns `None` for keypad digit values above nine. In application keypad
-    /// mode, keypad Enter sends SS3 M; the main Return key follows new-line mode.
+    /// Returns `None` for keypad digits above nine or function keys outside 1–12.
+    /// In application keypad mode, keypad Enter sends SS3 M; the main Return key
+    /// follows new-line mode.
+    #[inline]
     pub fn encode_key(self, key: Key) -> Option<&'static [u8]> {
         Some(match key {
             Key::Up => {
@@ -57,6 +66,41 @@ impl InputModes {
                 } else {
                     b"\x1b[D"
                 }
+            }
+            Key::Home => {
+                if self.application_cursor {
+                    b"\x1bOH"
+                } else {
+                    b"\x1b[H"
+                }
+            }
+            Key::End => {
+                if self.application_cursor {
+                    b"\x1bOF"
+                } else {
+                    b"\x1b[F"
+                }
+            }
+            Key::Insert => b"\x1b[2~",
+            Key::Delete => b"\x1b[3~",
+            Key::PageUp => b"\x1b[5~",
+            Key::PageDown => b"\x1b[6~",
+            Key::Function(number) => {
+                const FUNCTIONS: [&[u8]; 12] = [
+                    b"\x1bOP",
+                    b"\x1bOQ",
+                    b"\x1bOR",
+                    b"\x1bOS",
+                    b"\x1b[15~",
+                    b"\x1b[17~",
+                    b"\x1b[18~",
+                    b"\x1b[19~",
+                    b"\x1b[20~",
+                    b"\x1b[21~",
+                    b"\x1b[23~",
+                    b"\x1b[24~",
+                ];
+                return FUNCTIONS.get(usize::from(number.checked_sub(1)?)).copied();
             }
             Key::Enter => {
                 if self.new_line {

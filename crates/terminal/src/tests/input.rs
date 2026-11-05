@@ -83,3 +83,39 @@ fn cursor_keypad_and_new_line_modes_encode_independently_and_reject_invalid_digi
         assert_eq!(keypad.encode_key(Key::KeypadDigit(digit)), None);
     }
 }
+
+#[test]
+fn editing_and_function_keys_preserve_distinct_sequences_across_all_mode_combinations() {
+    for flags in 0..8 {
+        let modes = InputModes {
+            application_cursor: flags & 1 != 0,
+            application_keypad: flags & 2 != 0,
+            new_line: flags & 4 != 0,
+        };
+        let mut actual = Vec::<u8>::new();
+        for key in [
+            Key::Home,
+            Key::End,
+            Key::Insert,
+            Key::Delete,
+            Key::PageUp,
+            Key::PageDown,
+        ] {
+            actual.extend(modes.encode_key(key).unwrap());
+        }
+        for number in 1..=12 {
+            actual.extend(modes.encode_key(Key::Function(number)).unwrap());
+        }
+        let mut expected = Vec::from(if modes.application_cursor {
+            &b"\x1bOH\x1bOF"[..]
+        } else {
+            &b"\x1b[H\x1b[F"[..]
+        });
+        expected.extend(b"\x1b[2~\x1b[3~\x1b[5~\x1b[6~\x1bOP\x1bOQ\x1bOR\x1bOS\x1b[15~\x1b[17~\x1b[18~\x1b[19~\x1b[20~\x1b[21~\x1b[23~\x1b[24~");
+        assert_eq!(actual, expected);
+        assert_eq!(modes.encode_key(Key::Function(0)), None);
+        for number in 13..=255 {
+            assert_eq!(modes.encode_key(Key::Function(number)), None);
+        }
+    }
+}

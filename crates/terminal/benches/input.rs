@@ -26,6 +26,15 @@ fn measure(name: &str, modes: InputModes, keys: &[Key]) {
 
 fn main() {
     let cursor = [Key::Up, Key::Down, Key::Right, Key::Left, Key::Enter];
+    let editing = [
+        Key::Home,
+        Key::End,
+        Key::Insert,
+        Key::Delete,
+        Key::PageUp,
+        Key::PageDown,
+    ];
+    let functions = std::array::from_fn::<_, 12, _>(|n| Key::Function(n as u8 + 1));
     let keypad = [
         Key::KeypadDigit(0),
         Key::KeypadDigit(5),
@@ -54,6 +63,8 @@ fn main() {
         ),
     ] {
         measure(&format!("{name} cursor"), modes, &cursor);
+        measure(&format!("{name} editing"), modes, &editing);
+        measure(&format!("{name} functions"), modes, &functions);
         measure(&format!("{name} keypad"), modes, &keypad);
     }
 }
