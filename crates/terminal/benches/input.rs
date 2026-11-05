@@ -26,6 +26,7 @@ fn measure(name: &str, modes: InputModes, keys: &[Key]) {
 
 fn main() {
     let cursor = [Key::Up, Key::Down, Key::Right, Key::Left, Key::Enter];
+    let controls = [Key::Tab, Key::Escape, Key::Backspace, Key::Enter];
     let editing = [
         Key::Home,
         Key::End,
@@ -42,6 +43,10 @@ fn main() {
         Key::KeypadDecimal,
         Key::KeypadComma,
         Key::KeypadMinus,
+        Key::KeypadMultiply,
+        Key::KeypadAdd,
+        Key::KeypadDivide,
+        Key::KeypadEqual,
         Key::KeypadEnter,
     ];
     for (name, modes) in [
@@ -52,6 +57,7 @@ fn main() {
                 application_cursor: true,
                 application_keypad: true,
                 new_line: false,
+                backarrow: true,
             },
         ),
         (
@@ -63,6 +69,7 @@ fn main() {
         ),
     ] {
         measure(&format!("{name} cursor"), modes, &cursor);
+        measure(&format!("{name} controls"), modes, &controls);
         measure(&format!("{name} editing"), modes, &editing);
         measure(&format!("{name} functions"), modes, &functions);
         measure(&format!("{name} keypad"), modes, &keypad);

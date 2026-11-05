@@ -1,4 +1,4 @@
-/// Unmodified ANSI cursor, editing, function, Return, and numeric-keypad keys.
+/// Unmodified ANSI control, cursor, editing, function, and numeric-keypad keys.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Key {
     Up,
@@ -13,21 +13,30 @@ pub enum Key {
     PageDown,
     Function(u8),
     Enter,
+    Tab,
+    Escape,
+    Backspace,
     KeypadDigit(u8),
     KeypadDecimal,
     KeypadComma,
     KeypadMinus,
+    KeypadMultiply,
+    KeypadAdd,
+    KeypadDivide,
+    KeypadEqual,
     KeypadEnter,
 }
 
 /// A copyable snapshot of keyboard modes selected by the output stream.
 /// Cursor-key and keypad application modes are independent. Default modes use
-/// CSI cursor sequences, numeric keypad characters, and CR for Return.
+/// CSI cursor sequences, numeric keypad characters, CR for Return, and DEL for Backspace.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct InputModes {
     pub application_cursor: bool,
     pub application_keypad: bool,
     pub new_line: bool,
+    /// DECBKM: Backspace sends BS when enabled and DEL when disabled.
+    pub backarrow: bool,
 }
 
 impl InputModes {
@@ -109,6 +118,15 @@ impl InputModes {
                     b"\r"
                 }
             }
+            Key::Tab => b"\t",
+            Key::Escape => b"\x1b",
+            Key::Backspace => {
+                if self.backarrow {
+                    b"\x08"
+                } else {
+                    b"\x7f"
+                }
+            }
             Key::KeypadEnter if self.application_keypad => b"\x1bOM",
             Key::KeypadEnter => {
                 if self.new_line {
@@ -136,6 +154,34 @@ impl InputModes {
                     b"\x1bOm"
                 } else {
                     b"-"
+                }
+            }
+            Key::KeypadMultiply => {
+                if self.application_keypad {
+                    b"\x1bOj"
+                } else {
+                    b"*"
+                }
+            }
+            Key::KeypadAdd => {
+                if self.application_keypad {
+                    b"\x1bOk"
+                } else {
+                    b"+"
+                }
+            }
+            Key::KeypadDivide => {
+                if self.application_keypad {
+                    b"\x1bOo"
+                } else {
+                    b"/"
+                }
+            }
+            Key::KeypadEqual => {
+                if self.application_keypad {
+                    b"\x1bOX"
+                } else {
+                    b"="
                 }
             }
             Key::KeypadDigit(digit) => {

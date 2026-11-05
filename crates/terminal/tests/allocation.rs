@@ -1058,7 +1058,7 @@ fn processor_retries_style_and_text_allocations_without_replaying_accepted_input
         processor.reset(&mut screen);
         processor.collect_styles(&screen, []).unwrap();
         processor
-            .advance(b"\x1b[?1h\x1b=\x1b[20h", &mut screen, text)
+            .advance(b"\x1b[?1;66;67h\x1b[20h", &mut screen, text)
             .unwrap();
         let modes = processor.input_modes();
         for digit in 0..=255 {
@@ -1075,6 +1075,13 @@ fn processor_retries_style_and_text_allocations_without_replaying_accepted_input
             lune_terminal::Key::Delete,
             lune_terminal::Key::PageUp,
             lune_terminal::Key::PageDown,
+            lune_terminal::Key::Tab,
+            lune_terminal::Key::Escape,
+            lune_terminal::Key::Backspace,
+            lune_terminal::Key::KeypadMultiply,
+            lune_terminal::Key::KeypadAdd,
+            lune_terminal::Key::KeypadDivide,
+            lune_terminal::Key::KeypadEqual,
         ] {
             black_box(modes.encode_key(key));
         }

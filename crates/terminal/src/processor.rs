@@ -175,6 +175,7 @@ impl Processor {
     /// A rendition storage failure retains the complete candidate style and
     /// consumes its sequence, leaving current rendition unchanged until retry.
     /// Retry the suffix even when empty. Repeated failures consume zero new bytes.
+    #[inline]
     pub fn advance<E>(
         &mut self,
         input: &[u8],
@@ -208,8 +209,11 @@ impl Processor {
                     } else {
                         ascii_prefix::<b'~'>(&input[consumed..])
                     };
-                    let run = std::str::from_utf8(&input[consumed..consumed + length])
-                        .expect("The run is printable ASCII");
+                    // SAFETY: the word scan rejects every high-bit byte, and its
+                    // scalar tail accepts only ASCII. The immutable run is valid UTF-8.
+                    let run = unsafe {
+                        std::str::from_utf8_unchecked(&input[consumed..consumed + length])
+                    };
                     text(screen, run, self.state.style).map_err(|error| ProcessError {
                         consumed,
                         error: ProcessFailure::Text(error),
@@ -508,7 +512,7 @@ fn csi(screen: &mut Screen, sequence: CsiSequence<'_>, state: &mut State) -> boo
             || !p.iter().all(|p| {
                 matches!(
                     (private, p.value),
-                    (false, Some(4 | 20)) | (true, Some(1 | 6 | 7 | 12 | 25))
+                    (false, Some(4 | 20)) | (true, Some(1 | 6 | 7 | 12 | 25 | 66 | 67))
                 )
             })
         {
@@ -520,6 +524,8 @@ fn csi(screen: &mut Screen, sequence: CsiSequence<'_>, state: &mut State) -> boo
                 (false, Some(4)) => screen.set_insert_mode(enabled),
                 (false, Some(20)) => state.input.new_line = enabled,
                 (true, Some(1)) => state.input.application_cursor = enabled,
+                (true, Some(66)) => state.input.application_keypad = enabled,
+                (true, Some(67)) => state.input.backarrow = enabled,
                 (true, Some(6)) => screen.set_origin_mode(enabled),
                 (true, Some(7)) => screen.set_auto_wrap(enabled),
                 (true, Some(12 | 25)) => {
@@ -636,6 +642,20 @@ mod scan_tests {
                             assert_eq!(scan(input), expected);
                         }
                         bytes[alignment + position] = b'A';
+                    }
+                }
+            }
+            for fill in [b' ', last] {
+                let mut bytes = [fill; 17];
+                for position in [6, 7] {
+                    bytes.fill(fill);
+                    for pair in 0..=u16::MAX {
+                        bytes[position..position + 2].copy_from_slice(&pair.to_le_bytes());
+                        let expected = bytes
+                            .iter()
+                            .position(|byte| !(b' '..=last).contains(byte))
+                            .unwrap_or(bytes.len());
+                        assert_eq!(scan(&bytes), expected);
                     }
                 }
             }

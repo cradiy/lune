@@ -143,7 +143,7 @@ fuzz_target!(|data: &[u8]| {
     let mut saved_charsets = (charsets, selected);
     let mut input = InputModes::default();
     for bytes in data.as_chunks::<8>().0.iter().take(512) {
-        let command = match bytes[0] % 55 {
+        let command = match bytes[0] % 57 {
             0 => {
                 wire.extend(b"abc");
                 ascii(
@@ -209,7 +209,7 @@ fuzz_target!(|data: &[u8]| {
             }
             9 | 10 => {
                 let n = bytes[3] % 4;
-                let final_byte = if bytes[0] % 55 == 9 { 'K' } else { 'J' };
+                let final_byte = if bytes[0] % 57 == 9 { 'K' } else { 'J' };
                 write!(&mut wire, "\x1b[{n}{final_byte}").unwrap();
                 let mode = match n {
                     0 => Some(EraseMode::FromCursor),
@@ -263,7 +263,7 @@ fuzz_target!(|data: &[u8]| {
             28 | 29 | 33 => {
                 let enabled = bytes[3] & 1 != 0;
                 let final_byte = if enabled { 'h' } else { 'l' };
-                let command = match bytes[0] % 55 {
+                let command = match bytes[0] % 57 {
                     28 => {
                         write!(&mut wire, "\x1b[?7{final_byte}").unwrap();
                         Command::AutoWrap(enabled)
@@ -468,7 +468,7 @@ fuzz_target!(|data: &[u8]| {
             }
             52 | 53 => {
                 let enabled = bytes[1] & 1 != 0;
-                let mode = if bytes[0] % 55 == 52 { 25 } else { 12 };
+                let mode = if bytes[0] % 57 == 52 { 25 } else { 12 };
                 write!(&mut wire, "\x1b[?{mode}{}", if enabled { 'h' } else { 'l' }).unwrap();
                 Some(if mode == 25 {
                     Command::CursorVisible(enabled)
@@ -476,7 +476,7 @@ fuzz_target!(|data: &[u8]| {
                     Command::CursorBlink(enabled)
                 })
             }
-            _ => {
+            54 => {
                 let selector = bytes[1] % 9;
                 write!(&mut wire, "\x1b[{selector} q").unwrap();
                 let style = match selector {
@@ -494,6 +494,18 @@ fuzz_target!(|data: &[u8]| {
                     diagnostics.1 += 1;
                     None
                 }
+            }
+            _ => {
+                let enabled = bytes[1] & 1 != 0;
+                let mode = if bytes[0] % 57 == 55 {
+                    input.application_keypad = enabled;
+                    66
+                } else {
+                    input.backarrow = enabled;
+                    67
+                };
+                write!(&mut wire, "\x1b[?{mode}{}", if enabled { 'h' } else { 'l' }).unwrap();
+                None
             }
         };
         if let Some(command) = command

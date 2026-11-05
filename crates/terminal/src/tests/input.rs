@@ -13,6 +13,13 @@ fn encoded(modes: InputModes) -> Vec<u8> {
         Key::KeypadComma,
         Key::KeypadMinus,
         Key::KeypadEnter,
+        Key::Tab,
+        Key::Escape,
+        Key::Backspace,
+        Key::KeypadMultiply,
+        Key::KeypadAdd,
+        Key::KeypadDivide,
+        Key::KeypadEqual,
     ] {
         result.extend(modes.encode_key(key).unwrap());
     }
@@ -21,9 +28,9 @@ fn encoded(modes: InputModes) -> Vec<u8> {
 
 #[test]
 fn output_selected_input_modes_encode_keys_and_survive_as_independent_snapshots() {
-    let program = b"\x1b[?1h\x1b=\x1b[20h\x1b7\x1b[?1;999l";
-    let normal = b"\x1b[A\x1b[B\x1b[C\x1b[D\r0123456789.,-\r";
-    let application = b"\x1bOA\x1bOB\x1bOC\x1bOD\r\n\x1bOp\x1bOq\x1bOr\x1bOs\x1bOt\x1bOu\x1bOv\x1bOw\x1bOx\x1bOy\x1bOn\x1bOl\x1bOm\x1bOM";
+    let program = b"\x1b[?1;66;67h\x1b[20h\x1b7\x1b[?1;999l";
+    let normal = b"\x1b[A\x1b[B\x1b[C\x1b[D\r0123456789.,-\r\t\x1b\x7f*+/=";
+    let application = b"\x1bOA\x1bOB\x1bOC\x1bOD\r\n\x1bOp\x1bOq\x1bOr\x1bOs\x1bOt\x1bOu\x1bOv\x1bOw\x1bOx\x1bOy\x1bOn\x1bOl\x1bOm\x1bOM\t\x1b\x08\x1bOj\x1bOk\x1bOo\x1bOX";
     let text = |_: &mut Screen, _: &str, _| Ok::<_, StorageError>(());
     for split in 0..=program.len() {
         let mut screen = Screen::new(8, 4).unwrap();
@@ -44,16 +51,16 @@ fn output_selected_input_modes_encode_keys_and_survive_as_independent_snapshots(
         assert_eq!(screen.cursor(), cursor);
         assert_eq!(processor.ignored_sequences(), 1);
         processor
-            .advance(b"\x1b[?1l\x1b>\x1b[20l\x1b8", &mut screen, text)
+            .advance(b"\x1b[?1;66;67l\x1b[20l\x1b8", &mut screen, text)
             .unwrap();
         assert_eq!(encoded(processor.input_modes()), normal);
         assert_eq!(encoded(snapshot), application);
         processor
-            .advance(b"\x1b[?1h\x1b=\x1b[20h\x1bc", &mut screen, text)
+            .advance(b"\x1b[?1;66;67h\x1b[20h\x1bc", &mut screen, text)
             .unwrap();
         assert_eq!(processor.input_modes(), InputModes::default());
         processor
-            .advance(b"\x1b[?1h\x1b=\x1b[20h", &mut screen, text)
+            .advance(b"\x1b[?1;66;67h\x1b[20h", &mut screen, text)
             .unwrap();
         processor.reset(&mut screen);
         assert_eq!(processor.input_modes(), InputModes::default());
@@ -78,6 +85,18 @@ fn cursor_keypad_and_new_line_modes_encode_independently_and_reject_invalid_digi
     assert_eq!(keypad.encode_key(Key::KeypadDigit(3)), Some(&b"\x1bOs"[..]));
     assert_eq!(keypad.encode_key(Key::KeypadEnter), Some(&b"\x1bOM"[..]));
     assert_eq!(keypad.encode_key(Key::Enter), Some(&b"\r\n"[..]));
+    assert_eq!(keypad.encode_key(Key::Backspace), Some(&b"\x7f"[..]));
+    processor
+        .advance(b"\x1b[?67h\x1b>", &mut screen, text)
+        .unwrap();
+    let numeric = processor.input_modes();
+    assert_eq!(numeric.encode_key(Key::Backspace), Some(&b"\x08"[..]));
+    assert_eq!(numeric.encode_key(Key::KeypadMultiply), Some(&b"*"[..]));
+    assert_eq!(numeric.encode_key(Key::Enter), Some(&b"\r\n"[..]));
+    processor
+        .advance(b"\x1b[?66;67;999l", &mut screen, text)
+        .unwrap();
+    assert_eq!(processor.input_modes(), numeric);
     for digit in 10..=255 {
         assert_eq!(cursor.encode_key(Key::KeypadDigit(digit)), None);
         assert_eq!(keypad.encode_key(Key::KeypadDigit(digit)), None);
@@ -86,11 +105,12 @@ fn cursor_keypad_and_new_line_modes_encode_independently_and_reject_invalid_digi
 
 #[test]
 fn editing_and_function_keys_preserve_distinct_sequences_across_all_mode_combinations() {
-    for flags in 0..8 {
+    for flags in 0..16 {
         let modes = InputModes {
             application_cursor: flags & 1 != 0,
             application_keypad: flags & 2 != 0,
             new_line: flags & 4 != 0,
+            backarrow: flags & 8 != 0,
         };
         let mut actual = Vec::<u8>::new();
         for key in [
