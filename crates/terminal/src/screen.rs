@@ -50,11 +50,21 @@ impl Default for CursorAppearance {
     }
 }
 
-/// Screen storage with cursor placement and delayed automatic wrapping.
+/// The two display buffers owned by a screen.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ScreenBuffer {
+    #[default]
+    Primary,
+    Alternate,
+}
+
+/// Primary/alternate storage with live cursor placement and delayed wrapping.
 /// Callers supply complete display units, their widths, and style keys.
 #[derive(Debug)]
 pub struct Screen {
     grid: Grid,
+    inactive: InactiveBuffer,
+    active_buffer: ScreenBuffer,
     cursor: Cursor,
     saved_cursor: SavedCursor,
     scroll_region: Range<usize>,
@@ -63,6 +73,12 @@ pub struct Screen {
     origin_mode: bool,
     insert_mode: bool,
     cursor_appearance: CursorAppearance,
+}
+
+#[derive(Debug)]
+struct InactiveBuffer {
+    grid: Grid,
+    saved_cursor: SavedCursor,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -87,9 +103,16 @@ impl Default for SavedCursor {
 }
 
 impl Screen {
+    /// Allocates two equal grids, each bounded by `MAX_CELLS`, and shared tabs.
+    /// Both buffers start erased with default style; the primary starts active.
     pub fn new(columns: usize, rows: usize) -> Result<Self, StorageError> {
         Ok(Self {
             grid: Grid::new(columns, rows)?,
+            inactive: InactiveBuffer {
+                grid: Grid::new(columns, rows)?,
+                saved_cursor: SavedCursor::default(),
+            },
+            active_buffer: ScreenBuffer::Primary,
             cursor: Cursor::default(),
             saved_cursor: SavedCursor::default(),
             scroll_region: 0..rows,
@@ -103,6 +126,40 @@ impl Screen {
 
     pub fn grid(&self) -> &Grid {
         &self.grid
+    }
+
+    pub fn active_buffer(&self) -> ScreenBuffer {
+        self.active_buffer
+    }
+
+    /// Read-only storage for either buffer, including its soft-wrap connections.
+    pub fn buffer(&self, buffer: ScreenBuffer) -> &Grid {
+        if buffer == self.active_buffer {
+            &self.grid
+        } else {
+            &self.inactive.grid
+        }
+    }
+
+    /// Selects storage and its cursor save slot. Live cursor placement, pending
+    /// wrapping, scrolling region, tabs, modes, and appearance are shared and
+    /// preserved. Both buffers are allocated by `new`; switching does not allocate.
+    pub fn select_buffer(&mut self, buffer: ScreenBuffer) {
+        if buffer == self.active_buffer {
+            return;
+        }
+        std::mem::swap(&mut self.grid, &mut self.inactive.grid);
+        std::mem::swap(&mut self.saved_cursor, &mut self.inactive.saved_cursor);
+        self.active_buffer = buffer;
+    }
+
+    pub(crate) fn style_ids(&self) -> impl Iterator<Item = StyleId> + '_ {
+        [&self.grid, &self.inactive.grid]
+            .into_iter()
+            .flat_map(|grid| {
+                grid.iter_rows()
+                    .flat_map(|row| row.cells().iter().map(|cell| cell.style()))
+            })
     }
 
     pub fn cursor(&self) -> Cursor {
@@ -121,13 +178,17 @@ impl Screen {
         self.cursor_appearance = appearance;
     }
 
-    /// Clears all cells to spaces with `style`, preserving dimensions and row
-    /// buffers. Homes the cursor, clears pending wrapping, restores the full-screen
-    /// scrolling region and default tab stops, enables automatic wrapping, and
-    /// disables origin mode. Cursor appearance and the save slot return to defaults.
+    /// Clears both buffers to spaces with `style`, selects the primary, and
+    /// preserves dimensions and row buffers. Homes the cursor, clears pending
+    /// wrapping, restores the full-screen scrolling region and default tab stops,
+    /// enables automatic wrapping, and disables origin mode. Cursor appearance and
+    /// both save slots return to defaults.
     /// Row, queue, tab, and text-index capacities are retained. This does not allocate.
     pub fn reset(&mut self, style: StyleId) {
+        self.select_buffer(ScreenBuffer::Primary);
         self.grid.clear(style);
+        self.inactive.grid.clear(style);
+        self.inactive.saved_cursor = SavedCursor::default();
         self.cursor = Cursor::default();
         self.saved_cursor = SavedCursor::default();
         self.scroll_region = 0..self.grid.rows();
@@ -150,10 +211,10 @@ impl Screen {
         self.insert_mode = enabled;
     }
 
-    /// Replaces the saved position, origin mode, automatic-wrap mode, and pending
-    /// wrapping. Rows are relative to the scrolling region when origin mode is
+    /// Replaces the active buffer's saved position, origin/automatic-wrap modes,
+    /// and pending wrapping. Rows are relative to the region when origin mode is
     /// enabled. Active state, contents, region, and tabs are preserved.
-    /// The save slot initially holds the initial cursor state. This does not allocate.
+    /// Each save slot initially holds the initial cursor state. This does not allocate.
     pub fn save_cursor(&mut self) {
         self.saved_cursor = SavedCursor {
             row: if self.origin_mode {
@@ -168,8 +229,8 @@ impl Screen {
         };
     }
 
-    /// Restores the save slot against the current dimensions and scrolling
-    /// region. Coordinates clamp as in [`Self::set_cursor`]. Pending wrapping
+    /// Restores the active buffer's save slot against the current dimensions and
+    /// scrolling region. Coordinates clamp as in [`Self::set_cursor`]. Pending wrapping
     /// is restored only when saved coordinates fit unchanged in their addressing
     /// scope, the saved column is the current right edge, and automatic wrapping
     /// is enabled. Contents, region, tabs, and the saved slot are preserved.
@@ -796,13 +857,13 @@ impl Screen {
         self.cursor.wrap_pending = false;
     }
 
-    /// Preserves the upper-left grid intersection and clamps cursor coordinates.
+    /// Preserves both upper-left grid intersections and clamps cursor coordinates.
     /// A size change cancels pending wrapping; an unchanged size preserves it.
     /// Height changes reset the scrolling region to the full grid; width-only
     /// changes preserve it. Tab stops in the width intersection are preserved;
     /// cropped stops are discarded and added columns receive default stops.
-    /// Height-only changes preserve stops. Every error preserves contents, cursor,
-    /// region, and stops. Automatic wrapping and origin modes are preserved.
+    /// Height-only changes preserve stops. Every error preserves both buffers,
+    /// cursor, region, and stops. Automatic wrapping and origin modes are preserved.
     /// The cursor remains in the active region while origin mode is enabled.
     /// Reserved tab capacity survives shrinking.
     pub fn resize(
@@ -818,7 +879,10 @@ impl Screen {
         self.tabs.reserve_columns(columns)?;
         let old_columns = self.grid.columns();
         let height_changed = rows != self.grid.rows();
-        self.grid.resize(columns, rows, style)?;
+        let active = self.grid.prepare_resize(columns, rows, style)?;
+        let inactive = self.inactive.grid.prepare_resize(columns, rows, style)?;
+        self.grid.resize_prepared(active, style);
+        self.inactive.grid.resize_prepared(inactive, style);
         self.tabs.resize_prepared(old_columns, columns);
         if height_changed {
             self.scroll_region = 0..rows;

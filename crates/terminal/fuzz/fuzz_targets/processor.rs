@@ -167,14 +167,15 @@ fuzz_target!(|data: &[u8]| {
     let mut diagnostics = (0_u64, 0_u64);
     let mut values = vec![Style::default()];
     let mut current = Style::default();
-    let mut saved = Style::default();
+    let mut saved = [Style::default(); 2];
     let mut charsets = [false; 2];
     let mut selected = 0;
-    let mut saved_charsets = (charsets, selected);
+    let mut saved_charsets = [(charsets, selected); 2];
     let mut input = InputModes::default();
     let mut replies = Vec::new();
     for bytes in data.as_chunks::<8>().0.iter().take(512) {
-        let command = match bytes[0] % 60 {
+        let index = usize::from(expected.is_alternate());
+        let command = match bytes[0] % 64 {
             0 => {
                 const ASCII: &[u8; 65] =
                     b"abcA^qx_abcA^qx_abcA^qx_abcA^qx_abcA^qx_abcA^qx_abcA^qx_abcA^qx_A";
@@ -245,7 +246,7 @@ fuzz_target!(|data: &[u8]| {
             }
             9 | 10 => {
                 let n = bytes[3] % 4;
-                let final_byte = if bytes[0] % 60 == 9 { 'K' } else { 'J' };
+                let final_byte = if bytes[0] % 64 == 9 { 'K' } else { 'J' };
                 write!(&mut wire, "\x1b[{n}{final_byte}").unwrap();
                 let mode = match n {
                     0 => Some(EraseMode::FromCursor),
@@ -299,7 +300,7 @@ fuzz_target!(|data: &[u8]| {
             28 | 29 | 33 => {
                 let enabled = bytes[3] & 1 != 0;
                 let final_byte = if enabled { 'h' } else { 'l' };
-                let command = match bytes[0] % 60 {
+                let command = match bytes[0] % 64 {
                     28 => {
                         write!(&mut wire, "\x1b[?7{final_byte}").unwrap();
                         Command::AutoWrap(enabled)
@@ -317,23 +318,23 @@ fuzz_target!(|data: &[u8]| {
             }
             30 => {
                 wire.extend(b"\x1b7");
-                saved = current;
-                saved_charsets = (charsets, selected);
+                saved[index] = current;
+                saved_charsets[index] = (charsets, selected);
                 Some(Command::SaveCursor)
             }
             31 => {
                 wire.extend(b"\x1b8");
-                current = saved;
-                (charsets, selected) = saved_charsets;
+                current = saved[index];
+                (charsets, selected) = saved_charsets[index];
                 Some(Command::RestoreCursor)
             }
             32 => {
                 wire.extend(b"\x1bc");
                 current = Style::default();
-                saved = current;
+                saved = [current; 2];
                 charsets = [false; 2];
                 selected = 0;
-                saved_charsets = (charsets, selected);
+                saved_charsets = [(charsets, selected); 2];
                 input = InputModes::default();
                 Some(Command::Reset)
             }
@@ -504,7 +505,7 @@ fuzz_target!(|data: &[u8]| {
             }
             52 | 53 => {
                 let enabled = bytes[1] & 1 != 0;
-                let mode = if bytes[0] % 60 == 52 { 25 } else { 12 };
+                let mode = if bytes[0] % 64 == 52 { 25 } else { 12 };
                 write!(&mut wire, "\x1b[?{mode}{}", if enabled { 'h' } else { 'l' }).unwrap();
                 Some(if mode == 25 {
                     Command::CursorVisible(enabled)
@@ -533,7 +534,7 @@ fuzz_target!(|data: &[u8]| {
             }
             55 | 56 => {
                 let enabled = bytes[1] & 1 != 0;
-                let mode = if bytes[0] % 60 == 55 {
+                let mode = if bytes[0] % 64 == 55 {
                     input.application_keypad = enabled;
                     66
                 } else {
@@ -554,7 +555,7 @@ fuzz_target!(|data: &[u8]| {
                 write!(&mut replies, "\x1b[{row};{column}R").unwrap();
                 None
             }
-            _ => {
+            59 => {
                 let invalid: [&[u8]; 8] = [
                     b"\x1b[n",
                     b"\x1b[0n",
@@ -569,6 +570,77 @@ fuzz_target!(|data: &[u8]| {
                 diagnostics.1 += 1;
                 None
             }
+            60 => {
+                let enabled = bytes[1] & 1 != 0;
+                wire.extend(if enabled { b"\x1b[?47h" } else { b"\x1b[?47l" });
+                Some(Command::SelectBuffer(enabled))
+            }
+            61 => {
+                let enabled = bytes[1] & 1 != 0;
+                wire.extend(if enabled {
+                    b"\x1b[?1047h"
+                } else {
+                    b"\x1b[?1047l"
+                });
+                if !enabled && expected.is_alternate() {
+                    expected
+                        .apply(
+                            &Command::EraseDisplay(EraseMode::All),
+                            reference_id(&mut values, current),
+                        )
+                        .unwrap();
+                }
+                Some(Command::SelectBuffer(enabled))
+            }
+            62 => {
+                let enabled = bytes[1] & 1 != 0;
+                wire.extend(if enabled {
+                    b"\x1b[?1048h"
+                } else {
+                    b"\x1b[?1048l"
+                });
+                if enabled {
+                    saved[index] = current;
+                    saved_charsets[index] = (charsets, selected);
+                    Some(Command::SaveCursor)
+                } else {
+                    current = saved[index];
+                    (charsets, selected) = saved_charsets[index];
+                    Some(Command::RestoreCursor)
+                }
+            }
+            _ => {
+                let enabled = bytes[1] & 1 != 0;
+                wire.extend(if enabled {
+                    b"\x1b[?1049h"
+                } else {
+                    b"\x1b[?1049l"
+                });
+                if enabled {
+                    saved[index] = current;
+                    saved_charsets[index] = (charsets, selected);
+                    expected
+                        .apply(&Command::SaveCursor, reference_id(&mut values, current))
+                        .unwrap();
+                    expected
+                        .apply(
+                            &Command::SelectBuffer(true),
+                            reference_id(&mut values, current),
+                        )
+                        .unwrap();
+                    Some(Command::EraseDisplay(EraseMode::All))
+                } else {
+                    expected
+                        .apply(
+                            &Command::SelectBuffer(false),
+                            reference_id(&mut values, current),
+                        )
+                        .unwrap();
+                    current = saved[0];
+                    (charsets, selected) = saved_charsets[0];
+                    Some(Command::RestoreCursor)
+                }
+            }
         };
         if let Some(command) = command
             && expected
@@ -578,18 +650,35 @@ fuzz_target!(|data: &[u8]| {
             diagnostics.1 += 1;
         }
     }
-    wire.extend(b"\x1b8qx");
-    current = saved;
-    (charsets, selected) = saved_charsets;
-    expected
-        .apply(&Command::RestoreCursor, reference_id(&mut values, current))
-        .unwrap();
-    ascii(
-        &mut expected,
-        b"qx",
-        reference_id(&mut values, current),
-        charsets[selected],
-    );
+    for pass in 0..2 {
+        let index = usize::from(expected.is_alternate());
+        wire.extend(b"\x1b8qx");
+        current = saved[index];
+        (charsets, selected) = saved_charsets[index];
+        expected
+            .apply(&Command::RestoreCursor, reference_id(&mut values, current))
+            .unwrap();
+        ascii(
+            &mut expected,
+            b"qx",
+            reference_id(&mut values, current),
+            charsets[selected],
+        );
+        if pass == 0 {
+            let alternate = !expected.is_alternate();
+            wire.extend(if alternate {
+                b"\x1b[?47h"
+            } else {
+                b"\x1b[?47l"
+            });
+            expected
+                .apply(
+                    &Command::SelectBuffer(alternate),
+                    reference_id(&mut values, current),
+                )
+                .unwrap();
+        }
+    }
     let oracle = Expected {
         screen: &expected,
         diagnostics,

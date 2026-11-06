@@ -90,6 +90,7 @@ fn main() {
         b"\x1b)0\x0elqqqqqqqqqqqqk\r\nx            x\r\nmqqqqqqqqqqqqj\x0f plain\r\n".repeat(1024);
     let cursor = b"\x1b[?25l\x1b[6 q\x1b[?12htext\x1b[?25h\x1b[ q\r\n".repeat(1024);
     let queries = b"row\r\n\x1b[5n\x1b[6n\x1b[2;8H\x1b[6n\x1b[?6h\x1b[6n\x1b[?6l".repeat(1024);
+    let alternate = b"\x1b[31mprimary\r\n\x1b[?1049h\x1b[34m\x1b[2;3Halternate\r\n\x1b[?1048h\x1b[?47l\x1b[?47h\x1b[?1048l\x1b[?1049l\x1b[0m".repeat(512);
     let mut newlines = Vec::from(&b"\x1b[20h"[..]);
     newlines
         .extend(b"abcdefghijklmnopqrstuvwxyz 0123456789 ABCDEFGHIJKLMNOPQRSTUVWXYZ\n".repeat(1024));
@@ -112,4 +113,7 @@ fn main() {
     measure_replies("queries / bulk", &queries, queries.len(), 14);
     measure_replies("queries / 17-byte", &queries, 17, 3);
     measure_replies("queries / 1-byte", &queries, 1, 1);
+    measure("alternate / bulk", &alternate, alternate.len());
+    measure("alternate / 17-byte", &alternate, 17);
+    measure("alternate / 1-byte", &alternate, 1);
 }

@@ -5,7 +5,8 @@ use lune_vt::{CsiSequence, EscapeSequence, Event, Parameter, Parser};
 use crate::charsets::Charsets;
 use crate::reply::{self, Reply, Report};
 use crate::{
-    CursorShape, EraseMode, InputModes, MAX_STYLES, Screen, Style, StyleError, StyleId, StyleTable,
+    CursorShape, EraseMode, InputModes, MAX_STYLES, Screen, ScreenBuffer, Style, StyleError,
+    StyleId, StyleTable,
 };
 
 /// A failure while applying a completed text, rendition, or reply event.
@@ -73,9 +74,9 @@ enum Pending {
 #[derive(Default)]
 struct State {
     style: StyleId,
-    saved_style: StyleId,
+    saved_style: [StyleId; 2],
     charsets: Charsets,
-    saved_charsets: Charsets,
+    saved_charsets: [Charsets; 2],
     input: InputModes,
 }
 
@@ -162,7 +163,7 @@ impl Processor {
         &self.styles
     }
 
-    /// Traces current/saved rendition and the paired screen automatically.
+    /// Traces current rendition, both saved renditions, and both display buffers.
     /// Supply every externally retained ID as an additional root. Reclaimed
     /// history can make room for a pending rendition change before retrying it.
     pub fn collect_styles(
@@ -171,15 +172,14 @@ impl Processor {
         external: impl IntoIterator<Item = StyleId>,
     ) -> Result<usize, StyleError> {
         self.styles.collect(
-            [self.state.style, self.state.saved_style]
-                .into_iter()
-                .chain(
-                    screen
-                        .grid()
-                        .iter_rows()
-                        .flat_map(|row| row.cells().iter().map(|c| c.style())),
-                )
-                .chain(external),
+            [
+                self.state.style,
+                self.state.saved_style[0],
+                self.state.saved_style[1],
+            ]
+            .into_iter()
+            .chain(screen.style_ids())
+            .chain(external),
         )
     }
 
@@ -503,14 +503,10 @@ fn escape(screen: &mut Screen, sequence: EscapeSequence<'_>, state: &mut State) 
     }
     match sequence.final_byte {
         b'7' => {
-            screen.save_cursor();
-            state.saved_style = state.style;
-            state.saved_charsets = state.charsets;
+            save_cursor(screen, state);
         }
         b'8' => {
-            screen.restore_cursor();
-            state.style = state.saved_style;
-            state.charsets = state.saved_charsets;
+            restore_cursor(screen, state);
         }
         b'D' => screen.line_feed(state.style),
         b'E' => {
@@ -528,6 +524,20 @@ fn escape(screen: &mut Screen, sequence: EscapeSequence<'_>, state: &mut State) 
         _ => return false,
     }
     true
+}
+
+fn save_cursor(screen: &mut Screen, state: &mut State) {
+    screen.save_cursor();
+    let index = screen.active_buffer() as usize;
+    state.saved_style[index] = state.style;
+    state.saved_charsets[index] = state.charsets;
+}
+
+fn restore_cursor(screen: &mut Screen, state: &mut State) {
+    screen.restore_cursor();
+    let index = screen.active_buffer() as usize;
+    state.style = state.saved_style[index];
+    state.charsets = state.saved_charsets[index];
 }
 
 fn value(parameters: &[Parameter], index: usize, default: usize) -> usize {
@@ -590,7 +600,11 @@ fn csi(screen: &mut Screen, sequence: CsiSequence<'_>, state: &mut State) -> boo
             || !p.iter().all(|p| {
                 matches!(
                     (private, p.value),
-                    (false, Some(4 | 20)) | (true, Some(1 | 6 | 7 | 12 | 25 | 66 | 67))
+                    (false, Some(4 | 20))
+                        | (
+                            true,
+                            Some(1 | 6 | 7 | 12 | 25 | 47 | 66 | 67 | 1047 | 1048 | 1049)
+                        )
                 )
             })
         {
@@ -606,6 +620,36 @@ fn csi(screen: &mut Screen, sequence: CsiSequence<'_>, state: &mut State) -> boo
                 (true, Some(67)) => state.input.backarrow = enabled,
                 (true, Some(6)) => screen.set_origin_mode(enabled),
                 (true, Some(7)) => screen.set_auto_wrap(enabled),
+                (true, Some(47 | 1047 | 1049)) => {
+                    if parameter.value == Some(1049) && enabled {
+                        save_cursor(screen, state);
+                    }
+                    if parameter.value == Some(1047)
+                        && !enabled
+                        && screen.active_buffer() == ScreenBuffer::Alternate
+                    {
+                        screen.erase_display(EraseMode::All, state.style);
+                    }
+                    screen.select_buffer(if enabled {
+                        ScreenBuffer::Alternate
+                    } else {
+                        ScreenBuffer::Primary
+                    });
+                    if parameter.value == Some(1049) {
+                        if enabled {
+                            screen.erase_display(EraseMode::All, state.style);
+                        } else {
+                            restore_cursor(screen, state);
+                        }
+                    }
+                }
+                (true, Some(1048)) => {
+                    if enabled {
+                        save_cursor(screen, state);
+                    } else {
+                        restore_cursor(screen, state);
+                    }
+                }
                 (true, Some(12 | 25)) => {
                     let mut appearance = screen.cursor_appearance();
                     if parameter.value == Some(12) {

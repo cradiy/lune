@@ -2,7 +2,7 @@ use std::{collections::BTreeSet, ops::Range};
 
 use lune_terminal::{
     CellPosition, CellWidth, CursorAppearance, CursorShape, EraseMode, MAX_CELL_TEXT_BYTES, Screen,
-    StorageError, StyleId,
+    ScreenBuffer, StorageError, StyleId,
 };
 
 use crate::model::Model;
@@ -44,8 +44,10 @@ pub enum Command<'a> {
     CursorVisible(bool),
     CursorBlink(bool),
     CursorShape(CursorShape, bool),
+    SelectBuffer(bool),
 }
 
+#[derive(Clone, Copy)]
 struct SavedCursor {
     row: usize,
     column: usize,
@@ -57,14 +59,15 @@ struct SavedCursor {
 /// Uses complete display units and copying row edits. A column one past the
 /// right edge represents delayed wrapping; the visible cursor is derived from it.
 pub struct ScreenModel {
-    storage: Model,
+    storage: [Model; 2],
+    active: usize,
     row: usize,
     column: usize,
     region: Range<usize>,
     tabs: BTreeSet<usize>,
     auto_wrap: bool,
     origin_mode: bool,
-    saved: SavedCursor,
+    saved: [SavedCursor; 2],
     insert_mode: bool,
     cursor_appearance: CursorAppearance,
 }
@@ -83,13 +86,18 @@ impl ScreenModel {
         (row + 1, self.visible_column() + 1)
     }
 
+    pub fn is_alternate(&self) -> bool {
+        self.active == 1
+    }
+
     pub fn text(&self, range: Range<CellPosition>) -> Result<String, StorageError> {
-        self.storage.text(range)
+        self.storage[self.active].text(range)
     }
 
     pub fn new(columns: usize, rows: usize) -> Self {
         Self {
-            storage: Model::new(columns, rows),
+            storage: [Model::new(columns, rows), Model::new(columns, rows)],
+            active: 0,
             row: 0,
             column: 0,
             region: 0..rows,
@@ -102,13 +110,13 @@ impl ScreenModel {
                 blinking: true,
                 shape: CursorShape::Block,
             },
-            saved: SavedCursor {
+            saved: [SavedCursor {
                 row: 0,
                 column: 0,
                 pending_width: None,
                 auto_wrap: true,
                 origin_mode: false,
-            },
+            }; 2],
         }
     }
 
@@ -116,32 +124,44 @@ impl ScreenModel {
         self.check_styles(screen, |actual, expected| assert_eq!(actual, expected));
     }
 
-    pub fn check_styles(&self, screen: &Screen, check: impl FnMut(StyleId, StyleId)) {
-        self.storage.check_styles(screen.grid(), check);
+    pub fn check_styles(&self, screen: &Screen, mut check: impl FnMut(StyleId, StyleId)) {
+        self.storage[0].check_styles(screen.buffer(ScreenBuffer::Primary), &mut check);
+        self.storage[1].check_styles(screen.buffer(ScreenBuffer::Alternate), &mut check);
+        assert_eq!(
+            screen.active_buffer() == ScreenBuffer::Alternate,
+            self.is_alternate()
+        );
         let cursor = screen.cursor();
         assert_eq!(cursor.row, self.row);
         assert_eq!(cursor.column, self.visible_column());
-        assert_eq!(cursor.wrap_pending, self.column == self.storage.columns());
+        assert_eq!(
+            cursor.wrap_pending,
+            self.column == self.storage[self.active].columns()
+        );
         assert_eq!(screen.scroll_region(), self.region);
         assert_eq!(screen.auto_wrap(), self.auto_wrap);
         assert_eq!(screen.origin_mode(), self.origin_mode);
         assert_eq!(screen.insert_mode(), self.insert_mode);
         assert_eq!(screen.cursor_appearance(), self.cursor_appearance);
         assert!(!self.origin_mode || self.region.contains(&self.row));
-        assert!(self.auto_wrap || self.column < self.storage.columns());
-        for column in 0..self.storage.columns() {
+        assert!(self.auto_wrap || self.column < self.storage[self.active].columns());
+        for column in 0..self.storage[self.active].columns() {
             assert_eq!(
                 screen.is_tab_stop(column),
                 Some(self.tabs.contains(&column))
             );
         }
-        assert!(self.row < self.storage.rows());
-        assert!(self.column <= self.storage.columns());
-        assert!(self.region.start < self.region.end && self.region.end <= self.storage.rows());
+        assert!(self.row < self.storage[self.active].rows());
+        assert!(self.column <= self.storage[self.active].columns());
+        assert!(
+            self.region.start < self.region.end
+                && self.region.end <= self.storage[self.active].rows()
+        );
     }
 
     pub fn apply(&mut self, command: &Command<'_>, style: StyleId) -> Result<(), StorageError> {
         match command {
+            Command::SelectBuffer(alternate) => self.active = usize::from(*alternate),
             Command::CursorVisible(visible) => self.cursor_appearance.visible = *visible,
             Command::CursorBlink(blinking) => self.cursor_appearance.blinking = *blinking,
             Command::CursorShape(shape, blinking) => {
@@ -150,46 +170,50 @@ impl ScreenModel {
             }
             Command::InsertMode(enabled) => self.insert_mode = *enabled,
             Command::Reset => {
-                let columns = self.storage.columns();
-                let rows = self.storage.rows();
+                let columns = self.storage[self.active].columns();
+                let rows = self.storage[self.active].rows();
                 let mut reset = Self::new(columns, rows);
-                for row in 0..rows {
-                    reset.storage.clear_row(row, 0..columns, style)?;
+                for buffer in &mut reset.storage {
+                    for row in 0..rows {
+                        buffer.clear_row(row, 0..columns, style)?;
+                    }
                 }
                 *self = reset;
             }
             Command::SaveCursor => {
-                self.saved = SavedCursor {
+                self.saved[self.active] = SavedCursor {
                     row: if self.origin_mode {
                         self.region.clone().position(|row| row == self.row).unwrap()
                     } else {
                         self.row
                     },
                     column: self.visible_column(),
-                    pending_width: (self.column == self.storage.columns()).then_some(self.column),
+                    pending_width: (self.column == self.storage[self.active].columns())
+                        .then_some(self.column),
                     auto_wrap: self.auto_wrap,
                     origin_mode: self.origin_mode,
                 };
             }
             Command::RestoreCursor => {
-                self.auto_wrap = self.saved.auto_wrap;
-                self.origin_mode = self.saved.origin_mode;
+                self.auto_wrap = self.saved[self.active].auto_wrap;
+                self.origin_mode = self.saved[self.active].origin_mode;
                 let mut rows = if self.origin_mode {
                     self.region.clone()
                 } else {
-                    0..self.storage.rows()
+                    0..self.storage[self.active].rows()
                 };
                 let last = rows.end - 1;
-                let destination = rows.nth(self.saved.row);
+                let destination = rows.nth(self.saved[self.active].row);
                 self.row = destination.unwrap_or(last);
-                self.column = (0..self.storage.columns())
-                    .nth(self.saved.column)
-                    .unwrap_or(self.storage.columns() - 1);
+                self.column = (0..self.storage[self.active].columns())
+                    .nth(self.saved[self.active].column)
+                    .unwrap_or(self.storage[self.active].columns() - 1);
                 if self.auto_wrap
                     && destination.is_some()
-                    && self.saved.pending_width == Some(self.storage.columns())
+                    && self.saved[self.active].pending_width
+                        == Some(self.storage[self.active].columns())
                 {
-                    self.column = self.storage.columns();
+                    self.column = self.storage[self.active].columns();
                 }
             }
             Command::Write(text, width) => return self.write(text, *width, style),
@@ -205,14 +229,14 @@ impl ScreenModel {
                 let mut rows = if self.origin_mode {
                     self.region.clone()
                 } else {
-                    0..self.storage.rows()
+                    0..self.storage[self.active].rows()
                 };
                 let last = rows.end - 1;
                 self.row = rows.nth(*row).unwrap_or(last);
-                self.column = (*column).min(self.storage.columns() - 1);
+                self.column = (*column).min(self.storage[self.active].columns() - 1);
             }
             Command::Region(region) => {
-                if region.start >= region.end || region.end > self.storage.rows() {
+                if region.start >= region.end || region.end > self.storage[self.active].rows() {
                     return Err(StorageError::OutOfBounds);
                 }
                 self.region = region.clone();
@@ -220,13 +244,16 @@ impl ScreenModel {
                 self.column = 0;
             }
             Command::Resize(columns, rows) => {
-                if *columns == self.storage.columns() && *rows == self.storage.rows() {
+                if *columns == self.storage[self.active].columns()
+                    && *rows == self.storage[self.active].rows()
+                {
                     return Ok(());
                 }
-                let old_rows = self.storage.rows();
-                let old_columns = self.storage.columns();
+                let old_rows = self.storage[self.active].rows();
+                let old_columns = self.storage[self.active].columns();
                 let column = self.visible_column();
-                self.storage.resize(*columns, *rows, style)?;
+                self.storage[0].resize(*columns, *rows, style)?;
+                self.storage[1].resize(*columns, *rows, style)?;
                 self.tabs.retain(|column| column < columns);
                 if *columns > old_columns {
                     self.tabs
@@ -241,7 +268,7 @@ impl ScreenModel {
             Command::CarriageReturn => self.column = 0,
             Command::Backspace => self.column = self.visible_column().saturating_sub(1),
             Command::LineFeed => {
-                self.storage.set_wrap(self.row, None);
+                self.storage[self.active].set_wrap(self.row, None);
                 self.index(true, style);
             }
             Command::ReverseIndex => self.index(false, style),
@@ -249,7 +276,7 @@ impl ScreenModel {
             Command::EraseDisplay(mode) => self.erase(true, *mode, style),
             Command::InsertCells(count) | Command::DeleteCells(count) => {
                 if *count != 0 {
-                    self.storage.edit(
+                    self.storage[self.active].edit(
                         self.row,
                         self.visible_column(),
                         *count,
@@ -262,14 +289,14 @@ impl ScreenModel {
             Command::EraseCells(count) => {
                 if *count != 0 {
                     let column = self.visible_column();
-                    let end = column + (*count).min(self.storage.columns() - column);
-                    self.storage.clear_row(self.row, column..end, style)?;
+                    let end = column + (*count).min(self.storage[self.active].columns() - column);
+                    self.storage[self.active].clear_row(self.row, column..end, style)?;
                     self.cancel_wrap();
                 }
             }
             Command::InsertLines(count) | Command::DeleteLines(count) => {
                 if *count != 0 && self.region.contains(&self.row) {
-                    self.storage.scroll(
+                    self.storage[self.active].scroll(
                         self.row..self.region.end,
                         *count,
                         matches!(command, Command::DeleteLines(_)),
@@ -299,13 +326,13 @@ impl ScreenModel {
             Command::TabForward(count) | Command::TabBackward(count) => {
                 if *count != 0 {
                     let column = self.visible_column();
-                    let rank = (*count).min(self.storage.columns()) - 1;
+                    let rank = (*count).min(self.storage[self.active].columns()) - 1;
                     self.column = if matches!(command, Command::TabForward(_)) {
                         self.tabs
                             .range(column + 1..)
                             .nth(rank)
                             .copied()
-                            .unwrap_or(self.storage.columns() - 1)
+                            .unwrap_or(self.storage[self.active].columns() - 1)
                     } else {
                         self.tabs
                             .range(..column)
@@ -317,7 +344,7 @@ impl ScreenModel {
                 }
             }
             Command::ScrollUp(count) | Command::ScrollDown(count) => {
-                self.storage.scroll(
+                self.storage[self.active].scroll(
                     self.region.clone(),
                     *count,
                     matches!(command, Command::ScrollUp(_)),
@@ -332,19 +359,25 @@ impl ScreenModel {
                     self.cancel_wrap();
                     // Walk individual cells until the directional barrier. The
                     // screen dimensions bound the steps needed for any count.
-                    for _ in 0..(*count).min(self.storage.rows().max(self.storage.columns())) {
+                    for _ in 0..(*count).min(
+                        self.storage[self.active]
+                            .rows()
+                            .max(self.storage[self.active].columns()),
+                    ) {
                         match command {
                             Command::MoveUp(_) if self.row > 0 && self.row != self.region.start => {
                                 self.row -= 1;
                             }
                             Command::MoveDown(_)
-                                if self.row + 1 < self.storage.rows()
+                                if self.row + 1 < self.storage[self.active].rows()
                                     && self.row + 1 != self.region.end =>
                             {
                                 self.row += 1;
                             }
                             Command::MoveLeft(_) if self.column > 0 => self.column -= 1,
-                            Command::MoveRight(_) if self.column + 1 < self.storage.columns() => {
+                            Command::MoveRight(_)
+                                if self.column + 1 < self.storage[self.active].columns() =>
+                            {
                                 self.column += 1;
                             }
                             _ => break,
@@ -358,7 +391,7 @@ impl ScreenModel {
 
     fn write(&mut self, text: &str, width: CellWidth, style: StyleId) -> Result<(), StorageError> {
         let width = if width == CellWidth::Single { 1 } else { 2 };
-        let columns = self.storage.columns();
+        let columns = self.storage[self.active].columns();
         if width > columns {
             return Err(StorageError::OutOfBounds);
         }
@@ -376,11 +409,9 @@ impl ScreenModel {
                     CellWidth::Double
                 };
                 if self.insert_mode {
-                    self.storage
-                        .edit(self.row, self.column, width, true, style)?;
+                    self.storage[self.active].edit(self.row, self.column, width, true, style)?;
                 }
-                self.storage
-                    .write(self.row, self.column, text, cell_width, style)?;
+                self.storage[self.active].write(self.row, self.column, text, cell_width, style)?;
                 self.column = (self.column + width).min(columns - 1);
             }
             return Ok(());
@@ -391,8 +422,7 @@ impl ScreenModel {
             let end = self.column.min(columns);
             let scrolling = self.row + 1 == self.region.end;
             if self.column < columns {
-                self.storage
-                    .clear_row(self.row, self.column..columns, style)?;
+                self.storage[self.active].clear_row(self.row, self.column..columns, style)?;
             }
             self.index(true, style);
             connection = if scrolling && self.region.len() > 1 {
@@ -410,13 +440,11 @@ impl ScreenModel {
             CellWidth::Double
         };
         if self.insert_mode {
-            self.storage
-                .edit(self.row, self.column, width, true, style)?;
+            self.storage[self.active].edit(self.row, self.column, width, true, style)?;
         }
-        self.storage
-            .write(self.row, self.column, text, cell_width, style)?;
+        self.storage[self.active].write(self.row, self.column, text, cell_width, style)?;
         if let Some((row, end)) = connection {
-            self.storage.set_wrap(row, Some(end));
+            self.storage[self.active].set_wrap(row, Some(end));
         }
         self.column += width;
         Ok(())
@@ -424,11 +452,11 @@ impl ScreenModel {
 
     fn index(&mut self, down: bool, style: StyleId) {
         if (down && self.row + 1 == self.region.end) || (!down && self.row == self.region.start) {
-            self.storage
+            self.storage[self.active]
                 .scroll(self.region.clone(), 1, down, style)
                 .unwrap();
         } else if down {
-            self.row = (self.row + 1).min(self.storage.rows() - 1);
+            self.row = (self.row + 1).min(self.storage[self.active].rows() - 1);
         } else {
             self.row = self.row.saturating_sub(1);
         }
@@ -436,10 +464,10 @@ impl ScreenModel {
     }
 
     fn erase(&mut self, display: bool, mode: EraseMode, style: StyleId) {
-        let columns = self.storage.columns();
+        let columns = self.storage[self.active].columns();
         let cursor = self.row * columns + self.visible_column();
         let scope = if display {
-            0..self.storage.rows() * columns
+            0..self.storage[self.active].rows() * columns
         } else {
             self.row * columns..(self.row + 1) * columns
         };
@@ -448,16 +476,18 @@ impl ScreenModel {
             EraseMode::ToCursor => scope.start..cursor + 1,
             EraseMode::All => scope,
         };
-        for row in 0..self.storage.rows() {
+        for row in 0..self.storage[self.active].rows() {
             let start = range.start.saturating_sub(row * columns).min(columns);
             let end = range.end.saturating_sub(row * columns).min(columns);
-            self.storage.clear_row(row, start..end, style).unwrap();
+            self.storage[self.active]
+                .clear_row(row, start..end, style)
+                .unwrap();
         }
         self.cancel_wrap();
     }
 
     fn visible_column(&self) -> usize {
-        self.column.min(self.storage.columns() - 1)
+        self.column.min(self.storage[self.active].columns() - 1)
     }
 
     fn cancel_wrap(&mut self) {

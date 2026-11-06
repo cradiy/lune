@@ -8,11 +8,76 @@ use std::{
 
 use lune_terminal::{
     CellPosition, CellText, CellWidth, EraseMode, Grid, ProcessFailure, Processor, Screen,
-    StorageError, Style, StyleError, StyleId, StyleTable,
+    ScreenBuffer, StorageError, Style, StyleError, StyleId, StyleTable,
 };
 
 #[global_allocator]
 static ALLOCATOR: allocator::TestAllocator = allocator::TestAllocator;
+
+#[test]
+fn paired_resize_failures_preserve_both_buffers_and_saved_cursors() {
+    use ScreenBuffer::{Alternate, Primary};
+    fn prepared() -> Screen {
+        let mut screen = Screen::new(3, 3).unwrap();
+        screen.set_cursor(1, 1);
+        screen
+            .write("水\u{301}", CellWidth::Double, StyleId(1))
+            .unwrap();
+        screen.save_cursor();
+        screen.select_buffer(Alternate);
+        screen.set_cursor(2, 0);
+        screen
+            .write("e\u{301}", CellWidth::Single, StyleId(2))
+            .unwrap();
+        screen.save_cursor();
+        screen.set_scroll_region(1..3).unwrap();
+        screen.set_origin_mode(true);
+        screen.clear_tab_stops();
+        screen.set_tab_stop();
+        screen.set_insert_mode(true);
+        screen
+    }
+    let mut expected = prepared();
+    let (result, stats) = allocator::measure(None, || expected.resize(130, 6, StyleId(7)));
+    result.unwrap();
+    let expected_primary = snapshot(expected.buffer(Primary));
+    let expected_alternate = snapshot(expected.buffer(Alternate));
+    for point in 0..stats.attempts {
+        let mut screen = prepared();
+        let primary = snapshot(screen.buffer(Primary));
+        let alternate = snapshot(screen.buffer(Alternate));
+        let cursor = screen.cursor();
+        let (result, failed) =
+            allocator::measure(Some(point), || screen.resize(130, 6, StyleId(7)));
+        assert!(matches!(result, Err(StorageError::Allocation(_))));
+        assert_eq!(failed.failures, 1);
+        assert_eq!(screen.active_buffer(), Alternate);
+        assert_eq!(snapshot(screen.buffer(Primary)), primary);
+        assert_eq!(snapshot(screen.buffer(Alternate)), alternate);
+        assert_eq!(screen.cursor(), cursor);
+        assert_eq!(screen.scroll_region(), 1..3);
+        assert!(screen.origin_mode() && screen.insert_mode());
+        assert_eq!(screen.is_tab_stop(0), Some(true));
+        assert_eq!(screen.is_tab_stop(1), Some(false));
+        screen.resize(130, 6, StyleId(7)).unwrap();
+        assert_eq!(snapshot(screen.buffer(Primary)), expected_primary);
+        assert_eq!(snapshot(screen.buffer(Alternate)), expected_alternate);
+        assert_eq!(screen.cursor(), expected.cursor());
+        screen.select_buffer(Primary);
+        screen.restore_cursor();
+        assert_eq!(
+            (
+                screen.cursor().row,
+                screen.cursor().column,
+                screen.cursor().wrap_pending
+            ),
+            (1, 2, false)
+        );
+        screen.select_buffer(Alternate);
+        screen.restore_cursor();
+        assert_eq!((screen.cursor().row, screen.cursor().column), (2, 1));
+    }
+}
 
 #[derive(Debug, PartialEq, Eq)]
 struct SnapshotCell {
@@ -1040,6 +1105,13 @@ fn processor_retries_style_and_text_allocations_without_replaying_accepted_input
     let ((), stats) = allocator::measure(Some(0), || {
         for _ in 0..32 {
             processor.advance(warm, &mut screen, text).unwrap();
+            processor
+                .advance(
+                    b"\x1b[?1049hALT\x1b[?1048h\x1b[?47l\x1b[?47h\x1b[?1048l\x1b[?1047l",
+                    &mut screen,
+                    text,
+                )
+                .unwrap();
             processor
                 .advance(
                     b"\x1b(0lqqk\r\nx  x\r\nmqqj\x1b(B",

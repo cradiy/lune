@@ -16,7 +16,7 @@
 //! In-row insertion and deletion shift cells and their owned text without
 //! allocating. Wide units split by an edit boundary are cleared completely.
 //!
-//! [`MAX_CELLS`] bounds the logical cell count. Cell buffers and the row queue
+//! [`MAX_CELLS`] bounds the logical cell count per grid. Cell buffers and the row queue
 //! retain capacity after shrinking. [`MAX_CELL_TEXT_BYTES`] bounds the UTF-8
 //! payload of each display unit. Protocol interpretation consumes [`lune_vt::Event`].
 //!
@@ -25,6 +25,14 @@
 //! backspace. ASCII runs are written in batches;
 //! other display units use caller-supplied widths. Writes and resizing preserve
 //! grid contents, cursor state, and the scrolling region on error.
+//! Each screen allocates primary and alternate grids, each bounded by [`MAX_CELLS`].
+//! [`Screen::select_buffer`] swaps storage and the buffer's cursor save slot while
+//! preserving live cursor placement, region, tabs, modes, and appearance.
+//! [`Screen::buffer`] reads either grid. Resize reserves both grids before committing;
+//! failure preserves both logical states. Reset selects the primary and clears both.
+//! [`Processor`] executes private modes 47, 1047, 1048, and 1049. Current rendition
+//! and character sets remain live across switches; each buffer saves them separately.
+//! Style collection traces both grids and save slots. Switching does not allocate.
 //! [`EraseMode`] selects cursor-inclusive line or display erasure. Erasure
 //! preserves cursor coordinates and region boundaries, cancels pending wrapping,
 //! and fills complete affected display units with styled spaces without allocating.
@@ -163,7 +171,7 @@ pub use grid::{Grid, MAX_CELLS, MAX_DIMENSION};
 pub use input::{InputModes, Key};
 pub use processor::{ProcessError, ProcessFailure, Processor};
 pub use row::Row;
-pub use screen::{Cursor, CursorAppearance, CursorShape, EraseMode, Screen};
+pub use screen::{Cursor, CursorAppearance, CursorShape, EraseMode, Screen, ScreenBuffer};
 pub use style::{Color, Style, Underline};
 pub use styles::{MAX_STYLES, StyleError, StyleTable};
 pub use text::{CellPosition, GridText};

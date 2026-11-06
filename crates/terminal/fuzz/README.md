@@ -59,6 +59,9 @@ resizing, saved cursors, and reset compare these values along with placement.
 Reset rebuilds the oracle at the current dimensions with styled blanks and
 initial cursor state, modes, region, tabs, and save slot. Mixed sequences also
 check subsequent restore, writing, tabulation, and resizing after reset.
+The screen oracle owns two complete-unit models and two saved cursors, selected
+by an index. Live cursor, region, tabs, and modes are shared. Checks compare both
+grids; resize updates both and reset rebuilds both with primary selection.
 
 Every command checks cell text, width, continuation occupancy, styles, dimensions,
 cursor coordinates, pending wrapping, scrolling boundaries, and error categories.
@@ -88,6 +91,10 @@ malformed UTF-8 followed by text or a shift exercises reprocessed bytes and
 pending-event order. A final restore and text write exposes saved character sets.
 ASCII runs extend through 65 bytes to exercise word and block boundaries under
 both character-set selections, including row wrapping and insertion mode.
+Private modes 47/1047/1048/1049 switch reference buffers, clear at the specified
+boundaries, and save or restore buffer-local rendition and character sets.
+Final probes restore and write through each buffer's save slot. Style collection
+between chunks must retain inactive cells and both saved renditions.
 The reference also tracks application cursor/keypad, ANSI new-line, and backarrow modes
 independently of cursor saves. Mode changes and resets compare complete snapshots.
 Both ESC keypad selection and DEC mode 66 update the same reference keypad flag;
@@ -104,7 +111,7 @@ retry blocked execution without replaying accepted input. Text failures, style
 collection, queries, and screen edits share the same mixed command stream.
 The fixed-width fixture maps one synthetic scalar to an owned multi-scalar display
 unit, exercising text storage through the execution boundary. Inputs contain at
-most 512 eight-byte commands and use an eight-column, four-row screen.
+most 512 eight-byte commands and use two eight-column, four-row buffers.
 
 ## Style Target
 
@@ -130,13 +137,14 @@ failures are covered by the terminal tests.
 
 Each eight-byte command selects an operation, coordinates, a count, and synthetic
 text and style values. Executions process at most 512 commands and retain at most
-16 by 16 logical cells in the storage target, or 129 by 16 in the screen target.
+16 by 16 logical cells in the storage target, or two grids of up to 129 by 16
+cells in the screen target.
 Screen resize width bytes `f9` through `fe` select 63, 64, 65, 127, 128, and 129
 columns to exercise bitmap word boundaries. Other valid widths and heights are
 limited to 16. Zero, overlarge, and invalid arguments are included.
 For screen coordinates, bytes `fc`, `fd`, `fe`, and `ff` select the last cell, the
 exclusive bound, zero, and `usize::MAX`; other bytes are reduced by the dimension
-plus two. Screen opcodes modulo 38 select: 0 unit write, 1 ASCII, 2 cursor, 3 region,
+plus two. Screen opcodes modulo 39 select: 0 unit write, 1 ASCII, 2 cursor, 3 region,
 4 resize, 5 carriage return, 6 backspace, 7 line feed, 8 reverse index, 9 line erasure,
 10 display erasure, 11 cell insertion, 12 cell deletion, 13 counted erasure,
 14 line insertion, 15 line deletion, 16 same-size resize, 17 move up, 18 move down,
@@ -145,7 +153,8 @@ plus two. Screen opcodes modulo 38 select: 0 unit write, 1 ASCII, 2 cursor, 3 re
 28 set automatic wrapping, 29 set origin mode, 30 save cursor state, 31 restore
 cursor state, 32 reset the screen with the style key, 33 set insertion mode,
 34 extract a text range, 35 set cursor visibility, 36 set blinking, and 37 set
-shape (byte 1 modulo three selects block, underline, or bar) and blinking.
+shape (byte 1 modulo three selects block, underline, or bar) and blinking,
+38 select primary/alternate storage using the low bit of byte 3.
 Mode settings use the low bit of byte 3.
 Byte 3 selects width, count (`ff` means `usize::MAX`), or erasure mode.
 Byte 4 selects synthetic text;

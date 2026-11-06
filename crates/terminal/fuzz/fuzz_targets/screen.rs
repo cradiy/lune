@@ -12,7 +12,7 @@ use std::mem::discriminant;
 use libfuzzer_sys::fuzz_target;
 use lune_terminal::{
     CellPosition, CellWidth, CursorShape, EraseMode, MAX_CELL_TEXT_BYTES, MAX_DIMENSION, Screen,
-    StorageError, StyleId,
+    ScreenBuffer, StorageError, StyleId,
 };
 use screen_model::{Command, ScreenModel};
 
@@ -102,6 +102,11 @@ fn apply(screen: &mut Screen, command: &Command<'_>, style: StyleId) -> Result<(
         Command::RestoreCursor => screen.restore_cursor(),
         Command::Reset => screen.reset(style),
         Command::InsertMode(enabled) => screen.set_insert_mode(*enabled),
+        Command::SelectBuffer(alternate) => screen.select_buffer(if *alternate {
+            ScreenBuffer::Alternate
+        } else {
+            ScreenBuffer::Primary
+        }),
         Command::CursorVisible(visible) => {
             let mut appearance = screen.cursor_appearance();
             appearance.visible = *visible;
@@ -143,7 +148,7 @@ fuzz_target!(|data: &[u8]| {
             1 => EraseMode::ToCursor,
             _ => EraseMode::All,
         };
-        let operation = bytes[0] % 38;
+        let operation = bytes[0] % 39;
         if operation == 34 {
             let range = if bytes[7] & 1 != 0 {
                 CellPosition { row: 0, column: 0 }..CellPosition {
@@ -215,11 +220,12 @@ fuzz_target!(|data: &[u8]| {
             33 => Command::InsertMode(bytes[3] & 1 != 0),
             35 => Command::CursorVisible(bytes[3] & 1 != 0),
             36 => Command::CursorBlink(bytes[3] & 1 != 0),
-            _ => Command::CursorShape(
+            37 => Command::CursorShape(
                 [CursorShape::Block, CursorShape::Underline, CursorShape::Bar]
                     [bytes[1] as usize % 3],
                 bytes[3] & 1 != 0,
             ),
+            _ => Command::SelectBuffer(bytes[3] & 1 != 0),
         };
         match (
             apply(&mut screen, &command, style),

@@ -14,6 +14,12 @@ pub struct Grid {
     rows: VecDeque<Row>,
 }
 
+pub(crate) struct GridResize {
+    columns: usize,
+    rows: usize,
+    added: Vec<Row>,
+}
+
 impl Grid {
     pub fn new(columns: usize, rows: usize) -> Result<Self, StorageError> {
         validate_dimensions(columns, rows)?;
@@ -397,7 +403,18 @@ impl Grid {
         if columns == self.columns && rows == self.rows.len() {
             return Ok(());
         }
+        let prepared = self.prepare_resize(columns, rows, style)?;
+        self.resize_prepared(prepared, style);
+        Ok(())
+    }
 
+    /// Reserves a validated resize without changing logical contents.
+    pub(crate) fn prepare_resize(
+        &mut self,
+        columns: usize,
+        rows: usize,
+        style: StyleId,
+    ) -> Result<GridResize, StorageError> {
         let additional = rows.saturating_sub(self.rows.len());
         let mut added = Vec::new();
         added.try_reserve_exact(additional)?;
@@ -410,7 +427,19 @@ impl Grid {
                 row.reserve_columns(columns)?;
             }
         }
+        Ok(GridResize {
+            columns,
+            rows,
+            added,
+        })
+    }
 
+    pub(crate) fn resize_prepared(&mut self, prepared: GridResize, style: StyleId) {
+        let GridResize {
+            columns,
+            rows,
+            added,
+        } = prepared;
         self.rows.truncate(rows);
         for row in &mut self.rows {
             row.resize_prepared(columns, style);
@@ -418,7 +447,6 @@ impl Grid {
         self.rows.extend(added);
         self.rows.back_mut().unwrap().set_wrap_end(None);
         self.columns = columns;
-        Ok(())
     }
 
     fn row_mut(&mut self, row: usize) -> Result<&mut Row, StorageError> {
