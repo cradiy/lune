@@ -1,0 +1,13 @@
+[package]
+name = "lune-text"
+version = "0.1.0"
+edition = "2024"
+description = "Bounded incremental grapheme updates and Unicode column widths"
+
+[dependencies]
+unicode-segmentation = "=1.13.3"
+unicode-width = "=0.2.2"
+
+[[bench]]
+name = "graphemes"
+harness = false
