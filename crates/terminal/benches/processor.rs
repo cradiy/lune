@@ -3,7 +3,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use lune_terminal::{CellWidth, Processor, Screen, StorageError, StyleId};
+use lune_terminal::{CellWidth, ProcessFailure, Processor, Screen, StorageError, StyleId};
 
 fn text(screen: &mut Screen, value: &str, style: StyleId) -> Result<(), StorageError> {
     if value.is_ascii() {
@@ -41,6 +41,44 @@ fn measure(name: &str, input: &[u8], chunk: usize) {
     println!("{name:<26} {:>8.3} ns/input byte", samples[1]);
 }
 
+fn measure_replies(name: &str, input: &[u8], chunk: usize, write_chunk: usize) {
+    let mut screen = Screen::new(120, 24).unwrap();
+    let mut processor = Processor::default();
+    let mut samples = [0.0_f64; 3];
+    for sample in &mut samples {
+        let start = Instant::now();
+        let mut iterations = 0_u64;
+        while start.elapsed() < Duration::from_millis(150) {
+            for mut bytes in input.chunks(chunk) {
+                loop {
+                    let result = processor.advance(black_box(bytes), black_box(&mut screen), text);
+                    while !processor.reply_bytes().is_empty() {
+                        let count = processor.reply_bytes().len().min(write_chunk);
+                        black_box(&processor.reply_bytes()[..count]);
+                        assert!(processor.consume_reply(count));
+                    }
+                    match result {
+                        Ok(consumed) => {
+                            assert_eq!(consumed, bytes.len());
+                            break;
+                        }
+                        Err(error) => {
+                            assert!(matches!(error.error, ProcessFailure::ReplyPending));
+                            bytes = &bytes[error.consumed..];
+                        }
+                    }
+                }
+            }
+            processor.finish(black_box(&mut screen), text).unwrap();
+            black_box(screen.cursor());
+            iterations += 1;
+        }
+        *sample = start.elapsed().as_nanos() as f64 / (iterations as f64 * input.len() as f64);
+    }
+    samples.sort_by(f64::total_cmp);
+    println!("{name:<26} {:>8.3} ns/input byte", samples[1]);
+}
+
 fn main() {
     let ascii =
         b"abcdefghijklmnopqrstuvwxyz 0123456789 ABCDEFGHIJKLMNOPQRSTUVWXYZ\r\n".repeat(1024);
@@ -51,6 +89,7 @@ fn main() {
     let graphics =
         b"\x1b)0\x0elqqqqqqqqqqqqk\r\nx            x\r\nmqqqqqqqqqqqqj\x0f plain\r\n".repeat(1024);
     let cursor = b"\x1b[?25l\x1b[6 q\x1b[?12htext\x1b[?25h\x1b[ q\r\n".repeat(1024);
+    let queries = b"row\r\n\x1b[5n\x1b[6n\x1b[2;8H\x1b[6n\x1b[?6h\x1b[6n\x1b[?6l".repeat(1024);
     let mut newlines = Vec::from(&b"\x1b[20h"[..]);
     newlines
         .extend(b"abcdefghijklmnopqrstuvwxyz 0123456789 ABCDEFGHIJKLMNOPQRSTUVWXYZ\n".repeat(1024));
@@ -70,4 +109,7 @@ fn main() {
     measure("new-line mode / 1-byte", &newlines, 1);
     measure("cursor state / bulk", &cursor, cursor.len());
     measure("cursor state / 1-byte", &cursor, 1);
+    measure_replies("queries / bulk", &queries, queries.len(), 14);
+    measure_replies("queries / 17-byte", &queries, 17, 3);
+    measure_replies("queries / 1-byte", &queries, 1, 1);
 }

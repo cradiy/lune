@@ -70,6 +70,19 @@ pub struct ScreenModel {
 }
 
 impl ScreenModel {
+    #[allow(
+        dead_code,
+        reason = "Cursor reports are checked by the processor target."
+    )]
+    pub fn report_position(&self) -> (usize, usize) {
+        let row = if self.origin_mode {
+            self.region.clone().position(|row| row == self.row).unwrap()
+        } else {
+            self.row
+        };
+        (row + 1, self.visible_column() + 1)
+    }
+
     pub fn text(&self, range: Range<CellPosition>) -> Result<String, StorageError> {
         self.storage.text(range)
     }

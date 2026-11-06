@@ -105,6 +105,15 @@
 //! are dispatched directly in the parser's ground state. Lexical errors recover
 //! through the parser and are counted, while unsupported ESC/CSI forms are counted
 //! and ignored. Finishing flushes incomplete lexical input exactly once.
+//! DSR status (`CSI 5 n`) and cursor-position (`CSI 6 n`) queries publish replies
+//! through [`Processor::reply_bytes`]. Coordinates are one-based and relative to
+//! the scrolling region under origin mode; pending wrapping reports the last
+//! physical column. One fixed slot holds at most 14 output bytes. Another complete
+//! reply can wait in pending-event storage. [`ProcessFailure::ReplyPending`]
+//! pauses execution until output is acknowledged with [`Processor::consume_reply`].
+//! Partial acknowledgement preserves the unsent suffix, and retry uses the same
+//! consumed-prefix rules as text failures. Replies retain query-time coordinates.
+//! Finishing and RIS preserve issued replies; explicit reset discards all output.
 //! G0/G1 ASCII and DEC Special Graphics designation, SI/SO selection, and cursor
 //! save/restore determine how printable ASCII maps to Unicode text callbacks.
 //! Mapped scalar failures retain the mapped value and own its source byte.
@@ -137,6 +146,7 @@ mod error;
 mod grid;
 mod input;
 mod processor;
+mod reply;
 mod row;
 mod screen;
 mod style;

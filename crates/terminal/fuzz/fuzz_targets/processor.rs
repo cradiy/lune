@@ -15,8 +15,8 @@ use std::io::Write;
 
 use libfuzzer_sys::fuzz_target;
 use lune_terminal::{
-    CellWidth, Color, CursorShape, EraseMode, InputModes, Processor, Screen, Style, StyleId,
-    Underline,
+    CellWidth, Color, CursorShape, EraseMode, InputModes, ProcessFailure, Processor, Screen, Style,
+    StyleId, Underline,
 };
 use screen_model::{Command, ScreenModel};
 
@@ -37,6 +37,13 @@ struct Expected<'a> {
     values: &'a [Style],
     style: Style,
     input: InputModes,
+    replies: &'a [u8],
+}
+
+fn drain_reply(processor: &mut Processor, output: &mut Vec<u8>, count: usize) {
+    let count = count.min(processor.reply_bytes().len());
+    output.extend_from_slice(&processor.reply_bytes()[..count]);
+    assert!(processor.consume_reply(count));
 }
 
 fn drive(wire: &[u8], chunk: usize, fail_at: usize, expected: &Expected<'_>) {
@@ -44,6 +51,7 @@ fn drive(wire: &[u8], chunk: usize, fail_at: usize, expected: &Expected<'_>) {
     let mut processor = Processor::default();
     let mut calls = 0;
     let mut available = false;
+    let mut replies = Vec::new();
     let mut text = |screen: &mut Screen, value: &str, style| {
         if !available && calls == fail_at {
             available = true;
@@ -72,13 +80,35 @@ fn drive(wire: &[u8], chunk: usize, fail_at: usize, expected: &Expected<'_>) {
                 Err(error) => {
                     assert!(error.consumed <= input.len());
                     input = &input[error.consumed..];
+                    match error.error {
+                        ProcessFailure::ReplyPending => {
+                            assert!(!processor.reply_bytes().is_empty());
+                            let again = processor.advance(&[], &mut screen, &mut text).unwrap_err();
+                            assert_eq!(again.consumed, 0);
+                            assert!(matches!(again.error, ProcessFailure::ReplyPending));
+                            drain_reply(&mut processor, &mut replies, chunk % 3 + 1);
+                        }
+                        ProcessFailure::Text(()) => {}
+                        ProcessFailure::Style(error) => panic!("Unexpected style failure: {error}"),
+                    }
                     processor.collect_styles(&screen, []).unwrap();
                 }
             }
         }
         processor.collect_styles(&screen, []).unwrap();
     }
-    while processor.finish(&mut screen, &mut text).is_err() {}
+    loop {
+        match processor.finish(&mut screen, &mut text) {
+            Ok(()) => break,
+            Err(ProcessFailure::ReplyPending) => drain_reply(&mut processor, &mut replies, 1),
+            Err(ProcessFailure::Text(())) => {}
+            Err(ProcessFailure::Style(error)) => panic!("Unexpected style failure: {error}"),
+        }
+    }
+    while !processor.reply_bytes().is_empty() {
+        drain_reply(&mut processor, &mut replies, chunk % 3 + 1);
+    }
+    assert_eq!(replies, expected.replies);
     expected.screen.check_styles(&screen, |actual, reference| {
         assert_eq!(
             processor.styles().get(actual),
@@ -142,8 +172,9 @@ fuzz_target!(|data: &[u8]| {
     let mut selected = 0;
     let mut saved_charsets = (charsets, selected);
     let mut input = InputModes::default();
+    let mut replies = Vec::new();
     for bytes in data.as_chunks::<8>().0.iter().take(512) {
-        let command = match bytes[0] % 57 {
+        let command = match bytes[0] % 60 {
             0 => {
                 wire.extend(b"abc");
                 ascii(
@@ -209,7 +240,7 @@ fuzz_target!(|data: &[u8]| {
             }
             9 | 10 => {
                 let n = bytes[3] % 4;
-                let final_byte = if bytes[0] % 57 == 9 { 'K' } else { 'J' };
+                let final_byte = if bytes[0] % 60 == 9 { 'K' } else { 'J' };
                 write!(&mut wire, "\x1b[{n}{final_byte}").unwrap();
                 let mode = match n {
                     0 => Some(EraseMode::FromCursor),
@@ -263,7 +294,7 @@ fuzz_target!(|data: &[u8]| {
             28 | 29 | 33 => {
                 let enabled = bytes[3] & 1 != 0;
                 let final_byte = if enabled { 'h' } else { 'l' };
-                let command = match bytes[0] % 57 {
+                let command = match bytes[0] % 60 {
                     28 => {
                         write!(&mut wire, "\x1b[?7{final_byte}").unwrap();
                         Command::AutoWrap(enabled)
@@ -468,7 +499,7 @@ fuzz_target!(|data: &[u8]| {
             }
             52 | 53 => {
                 let enabled = bytes[1] & 1 != 0;
-                let mode = if bytes[0] % 57 == 52 { 25 } else { 12 };
+                let mode = if bytes[0] % 60 == 52 { 25 } else { 12 };
                 write!(&mut wire, "\x1b[?{mode}{}", if enabled { 'h' } else { 'l' }).unwrap();
                 Some(if mode == 25 {
                     Command::CursorVisible(enabled)
@@ -495,9 +526,9 @@ fuzz_target!(|data: &[u8]| {
                     None
                 }
             }
-            _ => {
+            55 | 56 => {
                 let enabled = bytes[1] & 1 != 0;
-                let mode = if bytes[0] % 57 == 55 {
+                let mode = if bytes[0] % 60 == 55 {
                     input.application_keypad = enabled;
                     66
                 } else {
@@ -505,6 +536,32 @@ fuzz_target!(|data: &[u8]| {
                     67
                 };
                 write!(&mut wire, "\x1b[?{mode}{}", if enabled { 'h' } else { 'l' }).unwrap();
+                None
+            }
+            57 => {
+                wire.extend(b"\x1b[5n");
+                replies.extend(b"\x1b[0n");
+                None
+            }
+            58 => {
+                wire.extend(b"\x1b[6n");
+                let (row, column) = expected.report_position();
+                write!(&mut replies, "\x1b[{row};{column}R").unwrap();
+                None
+            }
+            _ => {
+                let invalid: [&[u8]; 8] = [
+                    b"\x1b[n",
+                    b"\x1b[0n",
+                    b"\x1b[?5n",
+                    b"\x1b[?6n",
+                    b"\x1b[6;5n",
+                    b"\x1b[6:0n",
+                    b"\x1b[6!n",
+                    b"\x1b[>6n",
+                ];
+                wire.extend(invalid[bytes[1] as usize % invalid.len()]);
+                diagnostics.1 += 1;
                 None
             }
         };
@@ -534,6 +591,7 @@ fuzz_target!(|data: &[u8]| {
         values: &values,
         style: current,
         input,
+        replies: &replies,
     };
     drive(&wire, wire.len(), usize::MAX, &oracle);
     drive(

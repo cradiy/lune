@@ -3,15 +3,19 @@ use std::{error::Error, fmt};
 use lune_vt::{CsiSequence, EscapeSequence, Event, Parameter, Parser};
 
 use crate::charsets::Charsets;
+use crate::reply::{self, Reply, Report};
 use crate::{
     CursorShape, EraseMode, InputModes, MAX_STYLES, Screen, Style, StyleError, StyleId, StyleTable,
 };
 
-/// A failure while applying a completed text or rendition event.
+/// A failure while applying a completed text, rendition, or reply event.
 #[derive(Debug)]
 pub enum ProcessFailure<E> {
     Text(E),
     Style(StyleError),
+    /// A completed reply is waiting for the occupied output slot. Drain
+    /// [`Processor::reply_bytes`] and confirm delivery with [`Processor::consume_reply`].
+    ReplyPending,
 }
 
 impl<E: fmt::Display> fmt::Display for ProcessFailure<E> {
@@ -19,16 +23,18 @@ impl<E: fmt::Display> fmt::Display for ProcessFailure<E> {
         match self {
             Self::Text(error) => write!(f, "Text processing failed: {error}"),
             Self::Style(error) => error.fmt(f),
+            Self::ReplyPending => f.write_str("Reply output requires draining"),
         }
     }
 }
 
 impl<E: Error + 'static> Error for ProcessFailure<E> {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
-        Some(match self {
-            Self::Text(error) => error,
-            Self::Style(error) => error,
-        })
+        match self {
+            Self::Text(error) => Some(error),
+            Self::Style(error) => Some(error),
+            Self::ReplyPending => None,
+        }
     }
 }
 
@@ -61,6 +67,7 @@ enum Pending {
     Text(char),
     Execute(u8),
     Rendition(Style),
+    Reply(Report),
 }
 
 #[derive(Default)]
@@ -93,6 +100,7 @@ pub struct Processor {
     parser: Parser,
     styles: StyleTable,
     state: State,
+    reply: Reply,
     pending: [Option<Pending>; 2],
     head: usize,
     end: usize,
@@ -114,6 +122,7 @@ impl Processor {
             parser: Parser::default(),
             styles: StyleTable::new(style_limit)?,
             state: State::default(),
+            reply: Reply::default(),
             pending: [None; 2],
             head: 0,
             end: 0,
@@ -129,6 +138,23 @@ impl Processor {
     /// Keyboard modes in effect at the end of the accepted input prefix.
     pub fn input_modes(&self) -> InputModes {
         self.state.input
+    }
+
+    /// Unsent bytes from the active reply, in wire order. The fixed output slot
+    /// holds one reply of at most 14 bytes. Bytes remain stable until acknowledged
+    /// or explicitly reset. RIS preserves replies issued before it.
+    #[inline]
+    pub fn reply_bytes(&self) -> &[u8] {
+        self.reply.bytes()
+    }
+
+    /// Acknowledges exactly the prefix accepted by the transport. Partial writes
+    /// retain the remaining suffix. Returns false without changing state if
+    /// `count` exceeds the unsent length; zero is accepted. After clearing a slot,
+    /// retry processing, including an empty suffix, to publish a blocked reply.
+    #[inline]
+    pub fn consume_reply(&mut self, count: usize) -> bool {
+        self.reply.consume(count)
     }
 
     /// Resolves keys issued for this processor's screen and retained snapshots.
@@ -175,7 +201,9 @@ impl Processor {
     /// A rendition storage failure retains the complete candidate style and
     /// consumes its sequence, leaving current rendition unchanged until retry.
     /// Retry the suffix even when empty. Repeated failures consume zero new bytes.
-    #[inline]
+    /// Reply backpressure retains a complete reply captured at query execution;
+    /// drain and acknowledge active output before retrying the unconsumed input.
+    #[inline(always)]
     pub fn advance<E>(
         &mut self,
         input: &[u8],
@@ -292,6 +320,14 @@ impl Processor {
                         } else {
                             false
                         }
+                    } else if sequence.final_byte == b'n' {
+                        if let Some(reply) = reply::query(screen, sequence) {
+                            pending[*end] = Some(Pending::Reply(reply));
+                            *end += 1;
+                            true
+                        } else {
+                            false
+                        }
                     } else {
                         csi(screen, sequence, state)
                     };
@@ -308,8 +344,9 @@ impl Processor {
         Ok(consumed)
     }
 
-    /// Ends the lexical stream. Failed text or rendition remains retained for retry;
+    /// Ends the lexical stream. Failed text, rendition, or replies remain for retry;
     /// repeated successful calls emit no further replacements or diagnostics.
+    /// Active reply bytes remain available after a successful finish.
     pub fn finish<E>(
         &mut self,
         screen: &mut Screen,
@@ -334,9 +371,9 @@ impl Processor {
         self.drain(screen, &mut text)
     }
 
-    /// Discards buffered input and events, clears diagnostics, and resets the screen.
-    /// Reset caller-owned text state at the same stream boundary. Style storage
-    /// remains available for retained snapshots until explicit collection.
+    /// Discards buffered input, replies, and events; clears diagnostics and resets
+    /// the screen. Synchronize caller-owned text and transport state at this stream
+    /// boundary. Style storage remains available for retained snapshots until collection.
     pub fn reset(&mut self, screen: &mut Screen) {
         self.parser.reset();
         self.pending = [None; 2];
@@ -345,10 +382,24 @@ impl Processor {
         self.parse_errors = 0;
         self.ignored_sequences = 0;
         self.state = State::default();
+        self.reply = Reply::default();
         screen.reset(StyleId(0));
     }
 
+    #[inline]
     fn drain<E>(
+        &mut self,
+        screen: &mut Screen,
+        text: &mut impl FnMut(&mut Screen, &str, StyleId) -> Result<(), E>,
+    ) -> Result<(), ProcessFailure<E>> {
+        if self.head == self.end {
+            return Ok(());
+        }
+        self.drain_pending(screen, text)
+    }
+
+    #[inline(never)]
+    fn drain_pending<E>(
         &mut self,
         screen: &mut Screen,
         text: &mut impl FnMut(&mut Screen, &str, StyleId) -> Result<(), E>,
@@ -366,6 +417,12 @@ impl Processor {
                 }
                 Pending::Rendition(style) => {
                     self.state.style = self.styles.intern(style).map_err(ProcessFailure::Style)?;
+                }
+                Pending::Reply(reply) => {
+                    if !self.reply.is_empty() {
+                        return Err(ProcessFailure::ReplyPending);
+                    }
+                    self.reply = reply.encode();
                 }
             }
             self.pending[self.head] = None;

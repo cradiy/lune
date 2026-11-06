@@ -1057,6 +1057,22 @@ fn processor_retries_style_and_text_allocations_without_replaying_accepted_input
         }
         processor.reset(&mut screen);
         processor.collect_styles(&screen, []).unwrap();
+        for _ in 0..32 {
+            let error = processor
+                .advance(b"\x1b[5n\x1b[6n", &mut screen, text)
+                .unwrap_err();
+            assert!(matches!(error.error, ProcessFailure::ReplyPending));
+            assert_eq!(error.consumed, 8);
+            while !processor.reply_bytes().is_empty() {
+                black_box(processor.reply_bytes());
+                assert!(processor.consume_reply(1));
+            }
+            processor.advance(&[], &mut screen, text).unwrap();
+            while !processor.reply_bytes().is_empty() {
+                black_box(processor.reply_bytes());
+                assert!(processor.consume_reply(1));
+            }
+        }
         processor
             .advance(b"\x1b[?1;66;67h\x1b[20h", &mut screen, text)
             .unwrap();

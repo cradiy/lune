@@ -3,6 +3,7 @@ use std::ops::Range;
 mod erased;
 mod input;
 mod processor;
+mod replies;
 mod screen;
 mod style;
 mod styles;

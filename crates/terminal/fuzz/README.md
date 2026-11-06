@@ -94,6 +94,12 @@ LF, VT, and FF select either vertical movement or carriage return plus line feed
 explicit IND/NEL and reset commands check the distinct mode boundaries.
 DEC cursor visibility/blinking modes and DECSCUSR commands update reference
 appearance; unsupported style selectors preserve it and count as ignored sequences.
+Status and cursor-position queries append expected reply bytes independently of
+execution. Position reports use the oracle's visible column and regional row
+iterator. Replies issued before RIS remain in wire order. Runs retain active
+output across input chunks, acknowledge partial prefixes under backpressure, and
+retry blocked execution without replaying accepted input. Text failures, style
+collection, queries, and screen edits share the same mixed command stream.
 The fixed-width fixture maps one synthetic scalar to an owned multi-scalar display
 unit, exercising text storage through the execution boundary. Inputs contain at
 most 512 eight-byte commands and use an eight-column, four-row screen.
