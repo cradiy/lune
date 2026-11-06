@@ -435,16 +435,37 @@ impl Processor {
 }
 
 #[inline]
-fn ascii_prefix<const LAST: u8>(input: &[u8]) -> usize {
+fn ascii_range_mask<const LAST: u8>(word: u64) -> u64 {
     const ONES: u64 = u64::MAX / 255;
     const HIGH: u64 = ONES * 128;
+    let below = word.wrapping_sub(ONES * 32) & !word;
+    let above = word.wrapping_add(ONES * u64::from(127 - LAST)) | word;
+    (below | above) & HIGH
+}
+
+#[inline]
+fn ascii_prefix<const LAST: u8>(input: &[u8]) -> usize {
     let mut offset = 0;
+    while input.len() - offset >= 32 {
+        // Check four words together, then locate the first failing word.
+        let invalid = [0, 8, 16, 24].map(|index| {
+            let word = u64::from_ne_bytes(
+                input[offset + index..offset + index + 8]
+                    .try_into()
+                    .unwrap(),
+            );
+            ascii_range_mask::<LAST>(word)
+        });
+        if invalid.into_iter().fold(0, |all, word| all | word) != 0 {
+            offset += invalid.iter().take_while(|&&mask| mask == 0).count() * 8;
+            break;
+        }
+        offset += 32;
+    }
     while input.len() - offset >= 8 {
         let word = u64::from_ne_bytes(input[offset..offset + 8].try_into().unwrap());
         // Out-of-range bytes set a high bit; the scalar tail locates the boundary.
-        let below = word.wrapping_sub(ONES * 32) & !word;
-        let above = word.wrapping_add(ONES * u64::from(127 - LAST)) | word;
-        if (below | above) & HIGH != 0 {
+        if ascii_range_mask::<LAST>(word) != 0 {
             break;
         }
         offset += 8;
@@ -685,8 +706,8 @@ mod scan_tests {
             (b'~', ascii_prefix::<b'~'>),
         ] {
             for alignment in 0..8 {
-                let mut bytes = [b'A'; 48];
-                for length in [0, 1, 7, 8, 9, 15, 16, 17, 31, 32, 33] {
+                let mut bytes = [b'A'; 80];
+                for length in [0, 1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65] {
                     assert_eq!(scan(&bytes[alignment..alignment + length]), length);
                     for position in 0..length {
                         for value in 0..=255 {
@@ -703,8 +724,8 @@ mod scan_tests {
                 }
             }
             for fill in [b' ', last] {
-                let mut bytes = [fill; 17];
-                for position in [6, 7] {
+                let mut bytes = [fill; 65];
+                for position in [6, 7, 14, 15, 22, 23, 30, 31, 62, 63] {
                     bytes.fill(fill);
                     for pair in 0..=u16::MAX {
                         bytes[position..position + 2].copy_from_slice(&pair.to_le_bytes());

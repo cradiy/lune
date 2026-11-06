@@ -176,10 +176,15 @@ fuzz_target!(|data: &[u8]| {
     for bytes in data.as_chunks::<8>().0.iter().take(512) {
         let command = match bytes[0] % 60 {
             0 => {
-                wire.extend(b"abc");
+                const ASCII: &[u8; 65] =
+                    b"abcA^qx_abcA^qx_abcA^qx_abcA^qx_abcA^qx_abcA^qx_abcA^qx_abcA^qx_A";
+                let length =
+                    [3, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65][bytes[1] as usize % 13];
+                let run = &ASCII[..length];
+                wire.extend(run);
                 ascii(
                     &mut expected,
-                    b"abc",
+                    run,
                     reference_id(&mut values, current),
                     charsets[selected],
                 );
