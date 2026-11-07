@@ -138,6 +138,11 @@ impl Screen {
     }
 
     #[inline]
+    pub(crate) fn history_capture_enabled(&self) -> bool {
+        self.history_capture
+    }
+
+    #[inline]
     pub(crate) fn prepare_ascii_text(
         &mut self,
         length: usize,

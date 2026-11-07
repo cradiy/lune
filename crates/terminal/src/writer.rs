@@ -113,11 +113,31 @@ impl TextSink for UnicodeWriter {
             self.position = Some(position);
             return Ok(());
         }
-        self.write_clusters(screen, text, style, ascii)
+        if ascii && screen.history_capture_enabled() {
+            self.write_ascii_clusters(screen, text, style)
+        } else {
+            self.write_clusters(screen, text, style, ascii)
+        }
     }
 }
 
 impl UnicodeWriter {
+    #[inline(never)]
+    fn write_ascii_clusters(
+        &mut self,
+        screen: &mut Screen,
+        text: &str,
+        style: StyleId,
+    ) -> Result<(), StorageError> {
+        // A Prepend extension can consume one extra column before the ASCII suffix.
+        let prepared = screen.prepare_ascii_text(text.len().saturating_add(1), style)?;
+        let result = self.write_clusters(screen, text, style, true);
+        if prepared {
+            screen.finish_text_reservation();
+        }
+        result
+    }
+
     #[inline(never)]
     fn write_clusters(
         &mut self,
@@ -137,11 +157,8 @@ impl UnicodeWriter {
                 return Ok(());
             }
         }
-        // A Prepend extension can consume one extra column before the ASCII suffix.
-        let prepared = ascii && screen.prepare_ascii_text(text.len().saturating_add(1), style)?;
         let position = &mut self.position;
-        let result = self
-            .grapheme
+        self.grapheme
             .advance(text, |update| {
                 match update {
                     TextUpdate::Ascii(run) => {
@@ -195,11 +212,7 @@ impl UnicodeWriter {
                 TextFailure::Rejected(error) => error,
                 TextFailure::TooLong => StorageError::TextTooLong,
                 TextFailure::Control(_) => StorageError::InvalidText,
-            });
-        if prepared {
-            screen.finish_text_reservation();
-        }
-        result
+            })
     }
 }
 
