@@ -1,6 +1,6 @@
 use std::{iter::FusedIterator, ops::Range};
 
-use crate::{CellPosition, Row, ScreenView, TextRange};
+use crate::{CellPosition, ReflowRows, Row, ScreenView, StorageError, TextRange};
 
 impl<'a> ScreenView<'a> {
     /// Groups retained rows connected by automatic wrapping. Hard row breaks
@@ -39,6 +39,17 @@ pub struct LogicalLine<'a> {
 }
 
 impl<'a> LogicalLine<'a> {
+    /// Lays out retained units at a target width from 1 through [`crate::MAX_DIMENSION`].
+    /// All spaces and cell metadata are retained; source soft-wrap gaps are omitted.
+    /// A one-column target containing a double-width unit fails before traversal.
+    /// Validation is constant-time for widths of at least two, and scans source
+    /// cells for a one-column target. Layout work is proportional to source rows
+    /// and output rows, with constant auxiliary space and no allocation requests.
+    /// The immutable borrow fixes the source.
+    pub fn reflow(&self, columns: usize) -> Result<ReflowRows<'a>, StorageError> {
+        ReflowRows::new(self.view, self.range(), columns)
+    }
+
     /// Exclusive physical row range in the source view.
     #[inline]
     pub fn range(&self) -> Range<usize> {

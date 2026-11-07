@@ -127,6 +127,12 @@
 //! view row. [`LogicalLine`] borrows its row range, rows, and text. History eviction
 //! may leave the oldest group as a fragment. Double-ended traversal takes linear
 //! time in physical rows and constant auxiliary space without allocating.
+//! [`LogicalLine::reflow`] lays out retained units at a new column width through
+//! borrowed [`ReflowRow`] values. Each row exposes source coordinates, occupied
+//! columns, a soft-wrap boundary, and streamed text. Layout retains all spaces
+//! and cell metadata while skipping source wrap gaps. A one-column target rejects
+//! double-width units before traversal. Planning uses constant auxiliary space
+//! without allocating; consumers own destination storage and padding.
 //! [`Screen::viewport`] borrows a screen-height [`Viewport`] using window-local
 //! row coordinates. Its offset is bounded by retained primary history. Zero
 //! follows output; scrolling upward anchors the top retained row as captures
@@ -212,6 +218,7 @@ mod history;
 mod input;
 mod lines;
 mod processor;
+mod reflow;
 mod reply;
 mod row;
 mod screen;
@@ -233,6 +240,7 @@ pub use input::{InputModes, Key};
 pub use lines::{LogicalLine, LogicalLines};
 pub use lune_text::WidthPolicy;
 pub use processor::{ProcessError, ProcessFailure, Processor};
+pub use reflow::{ReflowRow, ReflowRows};
 pub use row::Row;
 pub use screen::{Cursor, CursorAppearance, CursorShape, EraseMode, Screen, ScreenBuffer};
 pub use style::{Color, Style, Underline};

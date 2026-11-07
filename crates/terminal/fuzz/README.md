@@ -200,6 +200,9 @@ gaps, and inserts hard newlines. Probes compare full and arbitrary ranges,
 including mixed historical widths and alternate-buffer selection.
 Logical-line probes partition those snapshots at hard breaks, compare forward
 and reverse row ranges, and check containing-line lookup and complete text.
+Reflow probes flatten complete retained units, pack them at a chosen width,
+and compare output source ranges, occupied columns, soft wraps and text.
+One-column layouts reject wide units before traversal.
 
 Viewport probes track retained cell-buffer identity across individual captures,
 clamp removed anchors to the oldest retained row, and walk navigation counts in

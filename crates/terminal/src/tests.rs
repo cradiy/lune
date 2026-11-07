@@ -6,6 +6,7 @@ mod history;
 mod input;
 mod lines;
 mod processor;
+mod reflow;
 mod replies;
 mod revision;
 mod screen;

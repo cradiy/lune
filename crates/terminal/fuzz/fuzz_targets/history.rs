@@ -4,8 +4,9 @@ use std::ops::Range;
 
 use libfuzzer_sys::fuzz_target;
 use lune_terminal::{
-    Cell, CellPosition, CellText, CellWidth, EraseMode, HistoryLimits, MAX_HISTORY_BYTES,
-    MAX_HISTORY_ROWS, Row, Screen, ScreenBuffer, StorageError, StyleId, TextRange,
+    Cell, CellPosition, CellText, CellWidth, EraseMode, HistoryLimits, LogicalLine,
+    MAX_HISTORY_BYTES, MAX_HISTORY_ROWS, Row, Screen, ScreenBuffer, StorageError, StyleId,
+    TextRange,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -99,11 +100,64 @@ fn check_text(screen: &Screen, bytes: [u8; 4]) {
         }
     }
     assert_eq!(line.text().to_string(), expected_text);
+    check_reflow(line, &rows, usize::from(bytes[1] % 17) + 1);
     check_ranges(&rows, |range| view.text(range), bytes);
     let viewport = screen.viewport();
     let selected = &rows[viewport.range()];
     assert_eq!(viewport.iter_rows().map(row).collect::<Vec<_>>(), selected);
     check_ranges(selected, |range| viewport.text(range), bytes);
+}
+
+fn check_reflow(line: LogicalLine<'_>, rows: &[SavedRow], columns: usize) {
+    let mut units = Vec::new();
+    for index in line.range() {
+        let row = &rows[index];
+        for (column, cell) in row.cells.iter().enumerate() {
+            if column < row.wrap.unwrap_or(row.cells.len()) && cell.width() != 0 {
+                units.push((
+                    CellPosition { row: index, column },
+                    cell.width(),
+                    row.text[column].as_str(),
+                ));
+            }
+        }
+    }
+    if columns == 1 && units.iter().any(|unit| unit.1 == 2) {
+        assert!(matches!(
+            line.reflow(columns),
+            Err(StorageError::OutOfBounds)
+        ));
+        return;
+    }
+    let mut groups = Vec::new();
+    let mut first = 0;
+    let mut used = 0;
+    for (index, unit) in units.iter().enumerate() {
+        if used + unit.1 > columns {
+            groups.push((first, index, used));
+            first = index;
+            used = 0;
+        }
+        used += unit.1;
+    }
+    groups.push((first, units.len(), used));
+    let last = line.range().end - 1;
+    let end = CellPosition {
+        row: last,
+        column: rows[last].cells.len(),
+    };
+    let actual = line.reflow(columns).unwrap().collect::<Vec<_>>();
+    assert_eq!(actual.len(), groups.len());
+    for (index, (row, &(start, finish, used))) in actual.iter().zip(&groups).enumerate() {
+        assert_eq!(
+            row.source_range(),
+            units[start].0..units.get(finish).map_or(end, |unit| unit.0)
+        );
+        assert_eq!(row.used_columns(), used);
+        assert_eq!(row.wrap_end(), (index + 1 < groups.len()).then_some(used));
+        let expected: String = units[start..finish].iter().map(|unit| unit.2).collect();
+        assert_eq!(row.text().to_string(), expected);
+    }
 }
 
 fn check_ranges<'a>(

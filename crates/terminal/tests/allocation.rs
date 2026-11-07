@@ -1472,6 +1472,22 @@ fn text_views_stream_without_allocation_and_propagate_sink_failures() {
         result.unwrap();
         assert_eq!(stats.attempts, 0);
         assert_eq!(output, expected_lines);
+        for columns in [2, 7, 129] {
+            output.clear();
+            let (result, stats) = allocator::measure(Some(0), || {
+                for line in screen.view().logical_lines() {
+                    let _ = black_box(line.reflow(1));
+                    for row in line.reflow(columns).unwrap() {
+                        black_box((row.source_range(), row.used_columns(), row.wrap_end()));
+                        write!(&mut output, "{}", row.text())?;
+                    }
+                }
+                Ok::<_, fmt::Error>(())
+            });
+            result.unwrap();
+            assert_eq!(stats.attempts, 0);
+            assert_eq!(output, expected_lines);
+        }
     }
 }
 
