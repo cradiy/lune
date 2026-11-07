@@ -2,8 +2,8 @@
 
 use libfuzzer_sys::fuzz_target;
 use lune_terminal::{
-    Cell, CellText, CellWidth, EraseMode, HistoryLimits, MAX_HISTORY_BYTES, MAX_HISTORY_ROWS, Row,
-    Screen, ScreenBuffer, StyleId,
+    Cell, CellPosition, CellText, CellWidth, EraseMode, HistoryLimits, MAX_HISTORY_BYTES,
+    MAX_HISTORY_ROWS, Row, Screen, ScreenBuffer, StorageError, StyleId,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -43,6 +43,75 @@ fn check(left: &Screen, right: &Screen) {
                 .map(row)
                 .collect::<Vec<_>>()
         );
+    }
+}
+
+fn check_text(screen: &Screen, bytes: [u8; 4]) {
+    let rows = if screen.active_buffer() == ScreenBuffer::Primary {
+        screen
+            .history()
+            .iter_rows()
+            .chain(screen.grid().iter_rows())
+            .map(row)
+            .collect::<Vec<_>>()
+    } else {
+        screen.grid().iter_rows().map(row).collect::<Vec<_>>()
+    };
+    let view = screen.view();
+    assert_eq!(view.rows(), rows.len());
+    assert_eq!(view.iter_rows().map(row).collect::<Vec<_>>(), rows);
+    for range in [
+        CellPosition { row: 0, column: 0 }..CellPosition {
+            row: rows.len() - 1,
+            column: rows.last().unwrap().cells.len(),
+        },
+        CellPosition {
+            row: usize::from(bytes[1]) % (rows.len() + 1),
+            column: usize::from(bytes[2] % 14),
+        }..CellPosition {
+            row: usize::from(bytes[3]) % (rows.len() + 1),
+            column: usize::from(bytes[0] % 14),
+        },
+    ] {
+        let valid = range.start <= range.end
+            && [&range.start, &range.end].into_iter().all(|p| {
+                rows.get(p.row)
+                    .is_some_and(|row| p.column <= row.cells.len())
+            });
+        if !valid {
+            assert!(matches!(view.text(range), Err(StorageError::OutOfBounds)));
+            continue;
+        }
+        let mut expected = String::new();
+        for (index, row) in rows
+            .iter()
+            .enumerate()
+            .take(range.end.row + 1)
+            .skip(range.start.row)
+        {
+            let start = if index == range.start.row {
+                range.start.column
+            } else {
+                0
+            };
+            let end = if index == range.end.row {
+                range.end.column
+            } else {
+                row.cells.len()
+            }
+            .min(row.wrap.unwrap_or(row.cells.len()));
+            if start < end {
+                for (column, cell) in row.cells.iter().enumerate() {
+                    if cell.width() != 0 && column < end && column + cell.width() > start {
+                        expected.push_str(&row.text[column]);
+                    }
+                }
+            }
+            if index < range.end.row && row.wrap.is_none() {
+                expected.push('\n');
+            }
+        }
+        assert_eq!(view.text(range).unwrap().to_string(), expected);
     }
 }
 
@@ -144,6 +213,9 @@ fuzz_target!(|data: &[u8]| {
                 18 => screen.carriage_return(),
                 _ => {}
             }
+        }
+        if bytes[0] & 3 == 0 {
+            check_text(&bulk, *bytes);
         }
         check(&bulk, &ordinary);
         check(&bulk, &fragmented);

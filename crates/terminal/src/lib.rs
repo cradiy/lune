@@ -111,10 +111,17 @@
 //! Metadata updates do not allocate and fallible operations preserve it on error.
 //!
 //! [`Grid::text`] validates a half-open range of [`CellPosition`] boundaries and
-//! returns a borrowed [`GridText`] view. Formatting streams complete display units,
+//! returns a borrowed [`TextRange`] view. Formatting streams complete display units,
 //! preserves selected spaces, joins soft wraps, skips their edge gaps, and inserts
 //! newlines between hard rows. Reading uses fixed auxiliary space; the output sink
 //! owns its allocation and failure behavior.
+//! [`Screen::view`] borrows chronological primary history and visible rows, or
+//! just visible alternate rows. [`ScreenView::text`] uses the same range rules,
+//! validating endpoint columns against their own rows' captured widths. View
+//! indices start at the oldest retained row and are fixed by the source borrow.
+//! [`ScreenView::history_rows`] translates a physical cursor row into view space.
+//! Construction, row lookup, and validation take constant time. Formatting visits
+//! only selected rows, including soft-wrap connections across history and screen.
 //!
 //! [`Processor`] executes byte streams through the parser and existing screen
 //! operations. Text layout is supplied by an atomic [`TextSink`]. [`ProcessError`]
@@ -210,5 +217,5 @@ pub use row::Row;
 pub use screen::{Cursor, CursorAppearance, CursorShape, EraseMode, Screen, ScreenBuffer};
 pub use style::{Color, Style, Underline};
 pub use styles::{MAX_STYLES, StyleError, StyleTable};
-pub use text::{CellPosition, GridText};
+pub use text::{CellPosition, ScreenView, TextRange};
 pub use writer::{TextSink, UnicodeWriter};

@@ -1,6 +1,6 @@
 use std::{collections::VecDeque, ops::Range};
 
-use crate::{CellPosition, CellWidth, GridText, Row, StorageError, StyleId};
+use crate::{CellPosition, CellWidth, Row, ScreenView, StorageError, StyleId, TextRange};
 
 /// Maximum rows or columns in a grid.
 pub const MAX_DIMENSION: usize = u16::MAX as usize;
@@ -64,8 +64,8 @@ impl Grid {
     /// and automatic-wrap gaps are omitted. Empty ranges produce empty text.
     /// Creation and traversal use fixed auxiliary space and preserve the grid.
     /// The output sink controls allocation and may fail after receiving a prefix.
-    pub fn text(&self, range: Range<CellPosition>) -> Result<GridText<'_>, StorageError> {
-        GridText::new(self, range)
+    pub fn text(&self, range: Range<CellPosition>) -> Result<TextRange<'_>, StorageError> {
+        TextRange::new(ScreenView::new(self, None), range)
     }
 
     pub(crate) fn set_wrap_end(&mut self, row: usize, end: Option<usize>) {

@@ -1354,45 +1354,6 @@ fn resize_history_reaches_a_stable_requested_memory_high_water() {
 
 #[test]
 fn text_views_stream_without_allocation_and_propagate_sink_failures() {
-    let mut screen = Screen::new(130, 4).unwrap();
-    let long = "e\u{301}".repeat(341);
-    for row in 0..4 {
-        for column in 0..130 {
-            screen
-                .write(
-                    if (row + column) % 3 == 0 { &long } else { "é" },
-                    CellWidth::Single,
-                    StyleId(1),
-                )
-                .unwrap();
-        }
-    }
-    screen.set_cursor(3, 0);
-    screen.line_feed(StyleId(0)).unwrap();
-    screen.set_cursor(3, 129);
-    screen
-        .write("水\u{301}", CellWidth::Double, StyleId(2))
-        .unwrap();
-    let before = snapshot(screen.grid());
-    let cursor = screen.cursor();
-    let range = CellPosition { row: 0, column: 1 }..CellPosition {
-        row: 3,
-        column: 130,
-    };
-    let expected = screen.grid().text(range.clone()).unwrap().to_string();
-    let mut output = String::with_capacity(expected.len());
-    let (result, stats) = allocator::measure(Some(0), || {
-        for _ in 0..3 {
-            let view = screen.grid().text(range.clone()).unwrap();
-            output.clear();
-            write!(&mut output, "{view}")?;
-        }
-        Ok::<_, fmt::Error>(())
-    });
-    result.unwrap();
-    assert_eq!(stats.attempts, 0);
-    assert_eq!(output, expected);
-
     struct FailingSink {
         remaining: usize,
     }
@@ -1402,16 +1363,76 @@ fn text_views_stream_without_allocation_and_propagate_sink_failures() {
             Ok(())
         }
     }
-    for remaining in [0, 1, expected.len() / 2] {
+    for with_history in [false, true] {
+        let mut screen = Screen::new(130, 4).unwrap();
+        if with_history {
+            screen
+                .set_history_limits(HistoryLimits {
+                    max_rows: 8,
+                    max_bytes: 1 << 20,
+                })
+                .unwrap();
+        }
+        let long = "e\u{301}".repeat(341);
+        for row in 0..4 {
+            for column in 0..130 {
+                screen
+                    .write(
+                        if (row + column) % 3 == 0 { &long } else { "é" },
+                        CellWidth::Single,
+                        StyleId(1),
+                    )
+                    .unwrap();
+            }
+        }
+        screen.set_cursor(3, 0);
+        screen.line_feed(StyleId(0)).unwrap();
+        screen.set_cursor(3, 129);
+        screen
+            .write("水\u{301}", CellWidth::Double, StyleId(2))
+            .unwrap();
+        if with_history {
+            screen.resize(66, 4, StyleId(0)).unwrap();
+            screen.scroll_up(1, StyleId(0)).unwrap();
+        }
+        let before = snapshot(screen.grid());
+        let history = retained(screen.history());
+        let cursor = screen.cursor();
+        let range = CellPosition { row: 0, column: 1 }..CellPosition {
+            row: screen.view().rows() - 1,
+            column: screen.grid().columns(),
+        };
+        let selection = || {
+            if with_history {
+                screen.view().text(range.clone()).unwrap()
+            } else {
+                screen.grid().text(range.clone()).unwrap()
+            }
+        };
+        let expected = selection().to_string();
+        let mut output = String::with_capacity(expected.len());
         let (result, stats) = allocator::measure(Some(0), || {
-            let view = screen.grid().text(range.clone()).unwrap();
-            write!(FailingSink { remaining }, "{view}")
+            for _ in 0..3 {
+                let view = selection();
+                output.clear();
+                write!(&mut output, "{view}")?;
+            }
+            Ok::<_, fmt::Error>(())
         });
-        assert!(result.is_err());
+        result.unwrap();
         assert_eq!(stats.attempts, 0);
+        assert_eq!(output, expected);
+        for remaining in [0, 1, expected.len() / 2] {
+            let (result, stats) = allocator::measure(Some(0), || {
+                write!(FailingSink { remaining }, "{}", selection())
+            });
+            assert!(result.is_err());
+            assert_eq!(stats.attempts, 0);
+        }
+        assert_eq!(snapshot(screen.grid()), before);
+        assert_eq!(retained(screen.history()), history);
+        assert_eq!(screen.cursor(), cursor);
     }
-    assert_eq!(snapshot(screen.grid()), before);
-    assert_eq!(screen.cursor(), cursor);
 }
 
 #[test]

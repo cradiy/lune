@@ -1,8 +1,8 @@
 use std::ops::Range;
 
 use crate::{
-    CellPosition, CellWidth, Grid, HistoryLimits, MAX_CELL_TEXT_BYTES, RowHistory, StorageError,
-    StyleId,
+    CellPosition, CellWidth, Grid, HistoryLimits, MAX_CELL_TEXT_BYTES, RowHistory, ScreenView,
+    StorageError, StyleId,
 };
 use crate::{grid::validate_dimensions, tabs::TabStops};
 
@@ -108,6 +108,15 @@ impl Default for SavedCursor {
 }
 
 impl Screen {
+    /// Borrows chronological rows of the active buffer. Primary views include
+    /// retained history; alternate views start at their first visible row.
+    pub fn view(&self) -> ScreenView<'_> {
+        ScreenView::new(
+            &self.grid,
+            (self.active_buffer == ScreenBuffer::Primary).then_some(&self.history),
+        )
+    }
+
     /// Borrows retained primary-screen rows, oldest first.
     pub fn history(&self) -> &RowHistory {
         &self.history

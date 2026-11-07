@@ -193,3 +193,8 @@ cargo +nightly fuzz run history -- -max_len=2048 -len_control=0 -timeout=2 -rss_
 The `unicode` target also enables bounded history while its independent screen
 oracle checks visible placement. Whole and fragmented runs compare retained
 Unicode rows and wrap metadata across width revisions and callback retries.
+
+History view probes build an independent sequence of captured and visible row
+snapshots. Range extraction selects overlapping complete units, skips soft-wrap
+gaps, and inserts hard newlines. Probes compare full and arbitrary ranges,
+including mixed historical widths and alternate-buffer selection.

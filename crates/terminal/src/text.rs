@@ -1,57 +1,115 @@
 use std::{
     fmt::{self, Write},
+    iter::FusedIterator,
     ops::Range,
 };
 
-use crate::{Grid, StorageError};
+use crate::{Grid, Row, RowHistory, StorageError};
 
-/// A physical row and a column boundary. Column `grid.columns()` is the row end.
-/// Positions are ordered by row, then column.
+/// A row index and a column boundary in the addressed grid or screen view.
+/// Column `row.cells().len()` is that row's end. Positions are ordered by row,
+/// then column. View row indices start at the oldest retained row and remain
+/// valid for the lifetime of the borrow.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct CellPosition {
     pub row: usize,
     pub column: usize,
 }
 
-/// A validated, read-only text range borrowed from a grid.
-/// [`fmt::Display`] streams complete display units and propagates sink failures.
-/// A sink may retain output written before its failure. Formatting can be repeated;
-/// the selected text is fixed for the lifetime of the borrow.
+/// Borrowed chronological rows of the active screen buffer.
+/// Primary views contain retained history followed by visible rows. Alternate
+/// views contain visible rows only. Historical rows retain their captured widths.
+/// The borrow fixes contents and row indices; construction, lookup, and range
+/// validation take constant time and make no allocation requests.
 #[derive(Clone, Copy, Debug)]
-pub struct GridText<'a> {
+pub struct ScreenView<'a> {
     grid: &'a Grid,
+    history: Option<&'a RowHistory>,
+}
+
+impl<'a> ScreenView<'a> {
+    pub(crate) fn new(grid: &'a Grid, history: Option<&'a RowHistory>) -> Self {
+        Self { grid, history }
+    }
+
+    /// Number of history rows before the visible buffer. Add this to a physical
+    /// cursor row to address it in this view.
+    pub fn history_rows(&self) -> usize {
+        self.history.map_or(0, RowHistory::len)
+    }
+
+    pub fn rows(&self) -> usize {
+        self.history_rows() + self.grid.rows()
+    }
+
+    pub fn row(&self, index: usize) -> Option<&'a Row> {
+        let history_rows = self.history_rows();
+        if index < history_rows {
+            self.history.and_then(|history| history.row(index))
+        } else {
+            self.grid.row(index - history_rows)
+        }
+    }
+
+    /// Borrows rows in chronological order. Skipping rows and reverse traversal
+    /// preserve constant-time positioning.
+    pub fn iter_rows(
+        &self,
+    ) -> impl ExactSizeIterator<Item = &'a Row> + DoubleEndedIterator + FusedIterator + use<'a>
+    {
+        let view = *self;
+        (0..self.rows()).map(move |index| view.row(index).expect("A view row is in bounds"))
+    }
+
+    /// Validates a row-major half-open range against each endpoint row's width.
+    /// Endpoint rows must exist; columns may equal their row's width. Reversed
+    /// ranges fail. Borrowed coordinates remain fixed until the borrow ends.
+    pub fn text(&self, range: Range<CellPosition>) -> Result<TextRange<'a>, StorageError> {
+        TextRange::new(*self, range)
+    }
+}
+
+/// A validated, read-only text range borrowed from grid or screen rows.
+/// Formatting streams complete display units, preserves selected spaces, joins
+/// soft wraps, omits wrap gaps, and separates hard rows with newlines. Empty
+/// ranges emit nothing. Traversal visits only selected rows with constant auxiliary
+/// space. The output sink owns allocation and may retain a prefix on failure.
+/// The range can be formatted repeatedly for the lifetime of its source borrow.
+#[derive(Clone, Copy, Debug)]
+pub struct TextRange<'a> {
+    view: ScreenView<'a>,
     start: CellPosition,
     end: CellPosition,
 }
 
-impl<'a> GridText<'a> {
-    pub(crate) fn new(grid: &'a Grid, range: Range<CellPosition>) -> Result<Self, StorageError> {
+impl<'a> TextRange<'a> {
+    pub(crate) fn new(
+        view: ScreenView<'a>,
+        range: Range<CellPosition>,
+    ) -> Result<Self, StorageError> {
         if range.start > range.end
-            || range.start.row >= grid.rows()
-            || range.end.row >= grid.rows()
-            || range.start.column > grid.columns()
-            || range.end.column > grid.columns()
+            || view
+                .row(range.start.row)
+                .is_none_or(|row| range.start.column > row.cells().len())
+            || view
+                .row(range.end.row)
+                .is_none_or(|row| range.end.column > row.cells().len())
         {
             return Err(StorageError::OutOfBounds);
         }
         Ok(Self {
-            grid,
+            view,
             start: range.start,
             end: range.end,
         })
     }
 }
 
-impl fmt::Display for GridText<'_> {
+impl fmt::Display for TextRange<'_> {
     fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for (offset, row) in self
-            .grid
-            .iter_rows()
-            .skip(self.start.row)
-            .take(self.end.row - self.start.row + 1)
-            .enumerate()
-        {
-            let index = self.start.row + offset;
+        for index in self.start.row..=self.end.row {
+            let row = self.view.row(index).expect("Range endpoints are validated");
+            let columns = row.cells().len();
             let start = if index == self.start.row {
                 self.start.column
             } else {
@@ -60,10 +118,10 @@ impl fmt::Display for GridText<'_> {
             let end = if index == self.end.row {
                 self.end.column
             } else {
-                self.grid.columns()
+                columns
             };
             let wrap = row.wrap_end();
-            row.write_text(start..end.min(wrap.unwrap_or(self.grid.columns())), output)?;
+            row.write_text(start..end.min(wrap.unwrap_or(columns)), output)?;
             if index != self.end.row && wrap.is_none() {
                 output.write_char('\n')?;
             }
