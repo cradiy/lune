@@ -2,7 +2,7 @@ use std::ops::Range;
 
 use crate::{
     CellPosition, CellWidth, Grid, HistoryLimits, MAX_CELL_TEXT_BYTES, RowHistory, ScreenView,
-    StorageError, StyleId,
+    StorageError, StyleId, Viewport,
 };
 use crate::{grid::validate_dimensions, tabs::TabStops};
 
@@ -68,6 +68,7 @@ pub struct Screen {
     grid: Grid,
     history: RowHistory,
     history_capture: bool,
+    display_offset: usize,
     inactive: InactiveBuffer,
     active_buffer: ScreenBuffer,
     cursor: Cursor,
@@ -108,6 +109,65 @@ impl Default for SavedCursor {
 }
 
 impl Screen {
+    /// Borrows the current display window, with row coordinates local to it.
+    pub fn viewport(&self) -> Viewport<'_> {
+        Viewport::new(self.view(), self.viewport_offset(), &self.cursor)
+    }
+
+    /// Primary rows above the live buffer. Alternate buffers report zero.
+    /// Zero follows output; positive offsets keep the top retained row anchored.
+    pub fn viewport_offset(&self) -> usize {
+        if self.active_buffer == ScreenBuffer::Primary {
+            self.display_offset
+        } else {
+            0
+        }
+    }
+
+    /// Moves toward older primary rows, clamping to the oldest retained row.
+    /// Counts through `usize::MAX` are accepted. Alternate-buffer calls preserve
+    /// the primary position. Contents, cursor, and modes are preserved without allocating.
+    /// Paired text sinks retain their composition context.
+    pub fn scroll_viewport_up(&mut self, count: usize) {
+        if self.active_buffer == ScreenBuffer::Primary {
+            self.display_offset = self
+                .display_offset
+                .saturating_add(count)
+                .min(self.history.len());
+        }
+    }
+
+    /// Moves toward the live buffer, clamping at zero. Reaching zero resumes
+    /// output following. Other rules follow [`Self::scroll_viewport_up`].
+    pub fn scroll_viewport_down(&mut self, count: usize) {
+        if self.active_buffer == ScreenBuffer::Primary {
+            self.display_offset = self.display_offset.saturating_sub(count);
+        }
+    }
+
+    /// Follows the live primary buffer. Alternate-buffer calls preserve the
+    /// primary position. This preserves contents, cursor, and modes without allocating.
+    pub fn scroll_viewport_to_bottom(&mut self) {
+        if self.active_buffer == ScreenBuffer::Primary {
+            self.display_offset = 0;
+        }
+    }
+
+    fn history_captured(&mut self, captured: bool) {
+        if self.display_offset != 0 {
+            self.display_offset = self
+                .display_offset
+                .saturating_add(usize::from(captured))
+                .min(self.history.len());
+        }
+    }
+
+    fn capture_history(&mut self, style: StyleId) -> Result<bool, StorageError> {
+        let captured = self.history.capture(&mut self.grid, style)?;
+        self.history_captured(captured);
+        Ok(captured)
+    }
+
     /// Borrows chronological rows of the active buffer. Primary views include
     /// retained history; alternate views start at their first visible row.
     pub fn view(&self) -> ScreenView<'_> {
@@ -122,16 +182,20 @@ impl Screen {
         &self.history
     }
 
-    /// Sets bounded primary-screen capture. Either zero limit disables capture.
+    /// Sets bounded primary-screen capture and clamps the viewport to retained
+    /// history. Either zero limit disables capture and resumes live following.
     pub fn set_history_limits(&mut self, limits: HistoryLimits) -> Result<(), StorageError> {
         self.history.set_limits(limits)?;
+        self.display_offset = self.display_offset.min(self.history.len());
         self.update_history_capture();
         Ok(())
     }
 
-    /// Releases retained rows while preserving limits and live screen state.
+    /// Releases retained rows and follows the primary live buffer. Limits, both
+    /// display buffers, cursor, and modes are preserved.
     pub fn clear_history(&mut self) {
         self.history.clear();
+        self.display_offset = 0;
     }
 
     fn update_history_capture(&mut self) {
@@ -182,6 +246,7 @@ impl Screen {
             grid: Grid::new(columns, rows)?,
             history: RowHistory::default(),
             history_capture: false,
+            display_offset: 0,
             inactive: InactiveBuffer {
                 grid: Grid::new(columns, rows)?,
                 saved_cursor: SavedCursor::default(),
@@ -217,7 +282,8 @@ impl Screen {
 
     /// Selects storage and its cursor save slot. Live cursor placement, pending
     /// wrapping, scrolling region, tabs, modes, and appearance are shared and
-    /// preserved. Both buffers are allocated by `new`; switching does not allocate.
+    /// preserved. The primary viewport position survives alternate visits; the
+    /// alternate viewport follows its live buffer. Switching does not allocate.
     pub fn select_buffer(&mut self, buffer: ScreenBuffer) {
         if buffer == self.active_buffer {
             return;
@@ -260,12 +326,13 @@ impl Screen {
     /// enables automatic wrapping, and disables origin mode. Cursor appearance and
     /// both save slots return to defaults.
     /// History rows are released and their configured limits are preserved.
+    /// The viewport follows the primary live buffer.
     /// Grid row, queue, tab, and text-index capacities are retained. This does not allocate.
     pub fn reset(&mut self, style: StyleId) {
         self.select_buffer(ScreenBuffer::Primary);
         self.grid.clear(style);
         self.inactive.grid.clear(style);
-        self.history.clear();
+        self.clear_history();
         self.inactive.saved_cursor = SavedCursor::default();
         self.cursor = Cursor::default();
         self.saved_cursor = SavedCursor::default();
@@ -631,8 +698,10 @@ impl Screen {
         let (row, column) = if wrap {
             let row = if self.cursor.row == self.scroll_region.end - 1 {
                 if self.history_capture {
-                    self.history
-                        .write_scrolling(&mut self.grid, text, width, style, gap)?;
+                    let captured =
+                        self.history
+                            .write_scrolling(&mut self.grid, text, width, style, gap)?;
+                    self.history_captured(captured);
                 } else {
                     self.grid.write_scrolling(
                         self.scroll_region.clone(),
@@ -817,7 +886,7 @@ impl Screen {
                         continue;
                     }
                     if self.history_capture {
-                        let captured = self.history.capture(&mut self.grid, style)?;
+                        let captured = self.capture_history(style)?;
                         if self.grid.rows() == 1 && captured {
                             self.history.connect_latest(columns);
                         }
@@ -924,11 +993,10 @@ impl Screen {
         if self.history_capture {
             let count = count.min(self.scroll_region.len());
             if count == 1 {
-                return self.history.capture(&mut self.grid, style).map(|_| ());
+                return self.capture_history(style).map(|_| ());
             }
             let prepared = self.history.prepare(self.grid.columns(), count, style)?;
-            let result = (0..count)
-                .try_for_each(|_| self.history.capture(&mut self.grid, style).map(|_| ()));
+            let result = (0..count).try_for_each(|_| self.capture_history(style).map(|_| ()));
             if prepared {
                 self.history.finish();
             }
@@ -1048,7 +1116,7 @@ impl Screen {
     pub fn line_feed(&mut self, style: StyleId) -> Result<(), StorageError> {
         if self.cursor.row == self.scroll_region.end - 1 {
             if self.history_capture {
-                self.history.capture(&mut self.grid, style)?;
+                self.capture_history(style)?;
             } else {
                 self.grid
                     .scroll_up(self.scroll_region.clone(), 1, style)
@@ -1093,7 +1161,8 @@ impl Screen {
     /// Height-only changes preserve stops. Every error preserves both buffers,
     /// cursor, region, and stops. Automatic wrapping and origin modes are preserved.
     /// The cursor remains in the active region while origin mode is enabled.
-    /// Reserved tab capacity survives shrinking.
+    /// Reserved tab capacity survives shrinking. The primary viewport keeps its
+    /// top retained row; its window height follows the new grid height.
     pub fn resize(
         &mut self,
         columns: usize,

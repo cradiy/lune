@@ -46,8 +46,8 @@ impl<E, F: FnMut(&mut Screen, &str, StyleId) -> Result<(), E>> TextSink for F {
 /// preserves both screen and accepted grapheme state for processor retry.
 ///
 /// Processor controls, finish, and reset establish boundaries automatically.
-/// Call [`TextSink::boundary`] before externally changing the paired screen or
-/// replacing its processor. Width policy remains fixed for the writer's lifetime.
+/// Call [`TextSink::boundary`] before externally changing live text or placement,
+/// or replacing the processor. Width policy remains fixed for the writer's lifetime.
 pub struct UnicodeWriter {
     grapheme: GraphemeBuffer,
     position: Option<CellPosition>,

@@ -81,6 +81,19 @@ fn main() {
         measure(&format!("saturated capture / {columns}"), || {
             black_box(&mut screen).scroll_up(1, StyleId(0)).unwrap();
         });
+        screen.scroll_viewport_up(32);
+        measure(&format!("anchored capture / {columns}"), || {
+            black_box(&mut screen).scroll_up(1, StyleId(0)).unwrap();
+        });
+        measure(&format!("viewport snapshot / {columns}"), || {
+            black_box(black_box(&screen).viewport());
+        });
+        measure(&format!("viewport movement / {columns}"), || {
+            screen.scroll_viewport_down(1);
+            screen.scroll_viewport_up(1);
+            black_box(screen.viewport_offset());
+        });
+        screen.scroll_viewport_to_bottom();
         measure(&format!("owned write + capture / {columns}"), || {
             screen.set_cursor(0, 0);
             screen

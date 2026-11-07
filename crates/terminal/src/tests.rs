@@ -12,6 +12,7 @@ mod style;
 mod styles;
 mod text;
 mod unicode;
+mod viewport;
 
 use crate::{CellText, CellWidth, Grid, MAX_CELL_TEXT_BYTES, MAX_CELLS, StorageError, StyleId};
 

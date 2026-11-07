@@ -80,6 +80,7 @@ fn history_allocation_failures_preserve_owners_and_saturated_capture_reuses_rows
         screen.set_insert_mode(true);
         screen.clear_tab_stops();
         screen.set_tab_stop();
+        screen.scroll_viewport_up(1);
         screen
     }
     for case in 0..3 {
@@ -95,6 +96,7 @@ fn history_allocation_failures_preserve_owners_and_saturated_capture_reuses_rows
             let before_grid = snapshot(screen.grid());
             let alternate = snapshot(screen.buffer(ScreenBuffer::Alternate));
             let cursor = screen.cursor();
+            let offset = screen.viewport_offset();
             let cells = screen.grid().row(0).unwrap().cells().as_ptr();
             let (result, failed) =
                 allocator::measure(Some(point), || screen.scroll_up(1, StyleId(7)));
@@ -105,12 +107,14 @@ fn history_allocation_failures_preserve_owners_and_saturated_capture_reuses_rows
             assert_eq!(screen.grid().row(0).unwrap().cells().as_ptr(), cells);
             assert_eq!(snapshot(screen.buffer(ScreenBuffer::Alternate)), alternate);
             assert_eq!(screen.cursor(), cursor);
+            assert_eq!(screen.viewport_offset(), offset);
             assert!(screen.insert_mode());
             assert_eq!(screen.is_tab_stop(2), Some(true));
             assert_eq!(screen.is_tab_stop(0), Some(false));
             screen.scroll_up(1, StyleId(7)).unwrap();
             assert_eq!(retained(screen.history()), expected);
             assert_eq!(snapshot(screen.grid()), expected_grid);
+            assert_eq!(screen.viewport_offset(), expected_screen.viewport_offset());
             screen.carriage_return();
             screen.restore_cursor();
             assert_eq!(screen.cursor(), cursor);
@@ -137,6 +141,11 @@ fn history_allocation_failures_preserve_owners_and_saturated_capture_reuses_rows
         for _ in 0..128 {
             screen.scroll_up(1, StyleId(1)).unwrap();
         }
+        screen.scroll_viewport_up(usize::MAX);
+        black_box(screen.viewport().iter_rows().next());
+        black_box(screen.viewport().cursor());
+        screen.scroll_viewport_down(usize::MAX);
+        screen.scroll_viewport_to_bottom();
         screen
             .set_history_limits(HistoryLimits {
                 max_rows: 1,
@@ -213,6 +222,7 @@ fn automatic_history_preflights_complete_text_callbacks_and_counted_scrolls() {
                     .unwrap();
                 screen.set_cursor(1, 3);
             }
+            screen.scroll_viewport_up(1);
             (screen, writer)
         };
         let operation = |screen: &mut Screen, writer: &mut UnicodeWriter| match case {
@@ -244,6 +254,7 @@ fn automatic_history_preflights_complete_text_callbacks_and_counted_scrolls() {
             let before_history = retained(screen.history());
             let alternate = snapshot(screen.buffer(ScreenBuffer::Alternate));
             let cursor = screen.cursor();
+            let offset = screen.viewport_offset();
             let (result, failed) =
                 allocator::measure(Some(point), || operation(&mut screen, &mut writer));
             assert!(
@@ -259,10 +270,12 @@ fn automatic_history_preflights_complete_text_callbacks_and_counted_scrolls() {
             assert_eq!(retained(screen.history()), before_history);
             assert_eq!(snapshot(screen.buffer(ScreenBuffer::Alternate)), alternate);
             assert_eq!(screen.cursor(), cursor);
+            assert_eq!(screen.viewport_offset(), offset);
             operation(&mut screen, &mut writer).unwrap();
             assert_eq!(snapshot(screen.grid()), snapshot(expected.grid()));
             assert_eq!(retained(screen.history()), retained(expected.history()));
             assert_eq!(screen.cursor(), expected.cursor());
+            assert_eq!(screen.viewport_offset(), expected.viewport_offset());
         }
     }
 }
@@ -1363,7 +1376,8 @@ fn text_views_stream_without_allocation_and_propagate_sink_failures() {
             Ok(())
         }
     }
-    for with_history in [false, true] {
+    for source in 0..3 {
+        let with_history = source != 0;
         let mut screen = Screen::new(130, 4).unwrap();
         if with_history {
             screen
@@ -1395,19 +1409,24 @@ fn text_views_stream_without_allocation_and_propagate_sink_failures() {
             screen.resize(66, 4, StyleId(0)).unwrap();
             screen.scroll_up(1, StyleId(0)).unwrap();
         }
+        if source == 2 {
+            screen.scroll_viewport_up(1);
+        }
         let before = snapshot(screen.grid());
         let history = retained(screen.history());
         let cursor = screen.cursor();
         let range = CellPosition { row: 0, column: 1 }..CellPosition {
-            row: screen.view().rows() - 1,
+            row: if source == 2 {
+                screen.viewport().rows()
+            } else {
+                screen.view().rows()
+            } - 1,
             column: screen.grid().columns(),
         };
-        let selection = || {
-            if with_history {
-                screen.view().text(range.clone()).unwrap()
-            } else {
-                screen.grid().text(range.clone()).unwrap()
-            }
+        let selection = || match source {
+            0 => screen.grid().text(range.clone()).unwrap(),
+            1 => screen.view().text(range.clone()).unwrap(),
+            _ => screen.viewport().text(range.clone()).unwrap(),
         };
         let expected = selection().to_string();
         let mut output = String::with_capacity(expected.len());

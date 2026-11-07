@@ -197,7 +197,7 @@ impl RowHistory {
         width: CellWidth,
         style: StyleId,
         gap: bool,
-    ) -> Result<(), StorageError> {
+    ) -> Result<bool, StorageError> {
         self.capture_with(
             grid,
             style,
@@ -205,7 +205,6 @@ impl RowHistory {
             Some(grid.columns() - usize::from(gap)),
             gap,
         )
-        .map(|_| ())
     }
 
     fn capture_with(

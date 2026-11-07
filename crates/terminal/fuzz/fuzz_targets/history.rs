@@ -1,9 +1,11 @@
 #![no_main]
 
+use std::ops::Range;
+
 use libfuzzer_sys::fuzz_target;
 use lune_terminal::{
     Cell, CellPosition, CellText, CellWidth, EraseMode, HistoryLimits, MAX_HISTORY_BYTES,
-    MAX_HISTORY_ROWS, Row, Screen, ScreenBuffer, StorageError, StyleId,
+    MAX_HISTORY_ROWS, Row, Screen, ScreenBuffer, StorageError, StyleId, TextRange,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -60,6 +62,18 @@ fn check_text(screen: &Screen, bytes: [u8; 4]) {
     let view = screen.view();
     assert_eq!(view.rows(), rows.len());
     assert_eq!(view.iter_rows().map(row).collect::<Vec<_>>(), rows);
+    check_ranges(&rows, |range| view.text(range), bytes);
+    let viewport = screen.viewport();
+    let selected = &rows[viewport.range()];
+    assert_eq!(viewport.iter_rows().map(row).collect::<Vec<_>>(), selected);
+    check_ranges(selected, |range| viewport.text(range), bytes);
+}
+
+fn check_ranges<'a>(
+    rows: &[SavedRow],
+    mut text: impl FnMut(Range<CellPosition>) -> Result<TextRange<'a>, StorageError>,
+    bytes: [u8; 4],
+) {
     for range in [
         CellPosition { row: 0, column: 0 }..CellPosition {
             row: rows.len() - 1,
@@ -79,7 +93,7 @@ fn check_text(screen: &Screen, bytes: [u8; 4]) {
                     .is_some_and(|row| p.column <= row.cells.len())
             });
         if !valid {
-            assert!(matches!(view.text(range), Err(StorageError::OutOfBounds)));
+            assert!(matches!(text(range), Err(StorageError::OutOfBounds)));
             continue;
         }
         let mut expected = String::new();
@@ -111,7 +125,60 @@ fn check_text(screen: &Screen, bytes: [u8; 4]) {
                 expected.push('\n');
             }
         }
-        assert_eq!(view.text(range).unwrap().to_string(), expected);
+        assert_eq!(text(range).unwrap().to_string(), expected);
+    }
+}
+
+fn anchor(screen: &Screen, offset: usize) -> Option<*const Cell> {
+    (offset != 0).then(|| {
+        screen
+            .history()
+            .row(screen.history().len() - offset)
+            .unwrap()
+            .cells()
+            .as_ptr()
+    })
+}
+
+fn reconcile(screen: &Screen, offset: &mut usize, anchor: Option<*const Cell>) {
+    // Each tracked step captures at most one row. An evicted cell buffer can
+    // become visible, but cannot reenter history before this identity check.
+    *offset = anchor.map_or(0, |pointer| {
+        let index = screen
+            .history()
+            .iter_rows()
+            .position(|row| row.cells().as_ptr() == pointer)
+            .unwrap_or(0);
+        screen.history().len() - index
+    });
+}
+
+fn tracked(screen: &mut Screen, offset: &mut usize, action: impl FnOnce(&mut Screen)) {
+    let before = anchor(screen, *offset);
+    action(screen);
+    reconcile(screen, offset, before);
+}
+
+fn check_viewport(screen: &Screen, primary_offset: usize) {
+    let offset = if screen.active_buffer() == ScreenBuffer::Primary {
+        primary_offset
+    } else {
+        0
+    };
+    let viewport = screen.viewport();
+    assert_eq!(screen.viewport_offset(), offset);
+    assert_eq!(viewport.offset(), offset);
+    let top = screen.view().history_rows() - offset;
+    assert_eq!(viewport.range(), top..top + screen.grid().rows());
+    assert_eq!(viewport.rows(), screen.grid().rows());
+    let cursor = screen.cursor();
+    let actual = viewport.cursor();
+    if offset + cursor.row < viewport.rows() {
+        let mut expected = cursor;
+        expected.row += offset;
+        assert_eq!(actual, Some(expected));
+    } else {
+        assert!(actual.is_none());
     }
 }
 
@@ -127,6 +194,7 @@ fuzz_target!(|data: &[u8]| {
             })
             .unwrap();
     }
+    let mut primary_offset = 0;
     for bytes in data.as_chunks::<4>().0.iter().take(512) {
         let style = StyleId(u32::from_le_bytes(*bytes));
         let operation = bytes[0] % 20;
@@ -134,7 +202,21 @@ fuzz_target!(|data: &[u8]| {
             .into_iter()
             .enumerate()
         {
+            let old_anchor = if index == 1 {
+                anchor(screen, primary_offset)
+            } else {
+                None
+            };
+            let mut tracked_steps = false;
             match operation {
+                0 if index == 1 => {
+                    tracked_steps = true;
+                    for _ in 0..usize::from(bytes[1]).min(screen.scroll_region().len()) {
+                        tracked(screen, &mut primary_offset, |screen| {
+                            screen.scroll_up(1, style).unwrap()
+                        });
+                    }
+                }
                 0 => screen.scroll_up(usize::from(bytes[1]), style).unwrap(),
                 1 => screen.line_feed(style).unwrap(),
                 2 => screen.scroll_down(usize::from(bytes[1]), style),
@@ -174,8 +256,11 @@ fuzz_target!(|data: &[u8]| {
                     let run =
                         &b"abcdefghijklmnopqrstuvwxyz0123456789"[..usize::from(bytes[1] % 36) + 1];
                     if index == 1 {
+                        tracked_steps = true;
                         for &byte in run {
-                            screen.write_ascii(&[byte], style).unwrap();
+                            tracked(screen, &mut primary_offset, |screen| {
+                                screen.write_ascii(&[byte], style).unwrap()
+                            });
                         }
                     } else {
                         screen.write_ascii(run, style).unwrap();
@@ -211,9 +296,48 @@ fuzz_target!(|data: &[u8]| {
                 16 => screen.erase_line(EraseMode::All, style),
                 17 => screen.reset(style),
                 18 => screen.carriage_return(),
+                19 => {
+                    tracked_steps = true;
+                    let count = if bytes[1] == 255 {
+                        usize::MAX
+                    } else {
+                        usize::from(bytes[1])
+                    };
+                    match bytes[2] % 3 {
+                        0 => {
+                            screen.scroll_viewport_up(count);
+                            if index == 1 && screen.active_buffer() == ScreenBuffer::Primary {
+                                for _ in 0..count.min(screen.history().len()) {
+                                    if primary_offset < screen.history().len() {
+                                        primary_offset += 1;
+                                    }
+                                }
+                            }
+                        }
+                        1 => {
+                            screen.scroll_viewport_down(count);
+                            if index == 1 && screen.active_buffer() == ScreenBuffer::Primary {
+                                for _ in 0..count.min(primary_offset) {
+                                    primary_offset -= 1;
+                                }
+                            }
+                        }
+                        _ => {
+                            screen.scroll_viewport_to_bottom();
+                            if index == 1 && screen.active_buffer() == ScreenBuffer::Primary {
+                                primary_offset = 0;
+                            }
+                        }
+                    }
+                }
                 _ => {}
             }
+            if index == 1 && !tracked_steps {
+                reconcile(screen, &mut primary_offset, old_anchor);
+            }
         }
+        check_viewport(&bulk, primary_offset);
+        check_viewport(&fragmented, primary_offset);
         if bytes[0] & 3 == 0 {
             check_text(&bulk, *bytes);
         }

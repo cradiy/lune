@@ -122,6 +122,17 @@
 //! [`ScreenView::history_rows`] translates a physical cursor row into view space.
 //! Construction, row lookup, and validation take constant time. Formatting visits
 //! only selected rows, including soft-wrap connections across history and screen.
+//! [`Screen::viewport`] borrows a screen-height [`Viewport`] using window-local
+//! row coordinates. Its offset is bounded by retained primary history. Zero
+//! follows output; scrolling upward anchors the top retained row as captures
+//! arrive. Eviction clamps an expired anchor to the oldest retained row. Skipped
+//! oversized rows preserve the position. Viewport movement preserves buffers,
+//! cursor, and modes without allocating. Alternate buffers follow live output
+//! and preserve the primary position. History clearing and reset resume live
+//! following; resizing preserves the primary top row and changes window height.
+//! Successful captures update the position after storage preparation. Failed
+//! writes and counted scrolls preserve it. [`Viewport::cursor`] maps the physical
+//! cursor into the window when its row is included, with appearance kept separate.
 //!
 //! [`Processor`] executes byte streams through the parser and existing screen
 //! operations. Text layout is supplied by an atomic [`TextSink`]. [`ProcessError`]
@@ -158,8 +169,9 @@
 //! Orphan zero-width clusters retain their text in one column. Decoded C1 controls
 //! establish a boundary and are ignored. Failed writes preserve text state and
 //! screen contents for retry; the text limit remains [`MAX_CELL_TEXT_BYTES`].
-//! Pass a mutable sink to advance, finish, and reset. External screen mutations
-//! require an explicit [`TextSink::boundary`] before subsequent text input.
+//! Pass a mutable sink to advance, finish, and reset. External changes to live text
+//! contents or placement require [`TextSink::boundary`] before subsequent input.
+//! Viewport navigation preserves text placement and composition context.
 //!
 //! [`Screen::history`] borrows bounded chronological physical rows. Configure
 //! [`HistoryLimits`] through [`Screen::set_history_limits`]; capture starts disabled.
@@ -201,6 +213,7 @@ mod style;
 mod styles;
 mod tabs;
 mod text;
+mod viewport;
 mod writer;
 
 #[cfg(test)]
@@ -218,4 +231,5 @@ pub use screen::{Cursor, CursorAppearance, CursorShape, EraseMode, Screen, Scree
 pub use style::{Color, Style, Underline};
 pub use styles::{MAX_STYLES, StyleError, StyleTable};
 pub use text::{CellPosition, ScreenView, TextRange};
+pub use viewport::Viewport;
 pub use writer::{TextSink, UnicodeWriter};
