@@ -245,8 +245,8 @@ impl Processor {
                     } else {
                         ascii_prefix::<b'~'>(&input[consumed..])
                     };
-                    // SAFETY: the word scan rejects every high-bit byte, and its
-                    // scalar tail accepts only ASCII. The immutable run is valid UTF-8.
+                    // SAFETY: the first byte is checked above. The prefix scanner
+                    // accepts only ASCII after it. The immutable run is valid UTF-8.
                     let run = unsafe {
                         std::str::from_utf8_unchecked(&input[consumed..consumed + length])
                     };
@@ -501,21 +501,27 @@ fn ascii_range_mask<const LAST: u8>(word: u64) -> u64 {
 #[inline]
 fn ascii_prefix<const LAST: u8>(input: &[u8]) -> usize {
     let mut offset = 0;
-    while input.len() - offset >= 32 {
-        // Check four words together, then locate the first failing word.
-        let invalid = [0, 8, 16, 24].map(|index| {
-            let word = u64::from_ne_bytes(
-                input[offset + index..offset + index + 8]
-                    .try_into()
-                    .unwrap(),
-            );
-            ascii_range_mask::<LAST>(word)
-        });
-        if invalid.into_iter().fold(0, |all, word| all | word) != 0 {
-            offset += invalid.iter().take_while(|&&mask| mask == 0).count() * 8;
-            break;
+    // Block-sized inputs enter scanning before short-input dispatch.
+    if input.len() >= 32 {
+        while input.len() - offset >= 32 {
+            // Check four words together, then locate the first failing word.
+            let invalid = [0, 8, 16, 24].map(|index| {
+                let word = u64::from_ne_bytes(
+                    input[offset + index..offset + index + 8]
+                        .try_into()
+                        .unwrap(),
+                );
+                ascii_range_mask::<LAST>(word)
+            });
+            if invalid.into_iter().fold(0, |all, word| all | word) != 0 {
+                offset += invalid.iter().take_while(|&&mask| mask == 0).count() * 8;
+                break;
+            }
+            offset += 32;
         }
-        offset += 32;
+    } else if let [byte] = input {
+        // Classify a single byte before preparing word scans.
+        return usize::from((b' '..=LAST).contains(byte));
     }
     while input.len() - offset >= 8 {
         let word = u64::from_ne_bytes(input[offset..offset + 8].try_into().unwrap());
