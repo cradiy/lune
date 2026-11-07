@@ -153,6 +153,17 @@
 //! Pass a mutable sink to advance, finish, and reset. External screen mutations
 //! require an explicit [`TextSink::boundary`] before subsequent text input.
 //!
+//! [`RowHistory`] retains physical rows through explicit [`RowHistory::scroll_up`]
+//! operations. Primary full-region scrolling transfers ownership into history;
+//! alternate and partial regions follow their visible-screen scrolling rules.
+//! [`HistoryLimits`] bounds retained row count and row-owned heap capacity. Oldest
+//! rows are evicted first and their buffers can supply the exposed blank row.
+//! Preparation failures preserve logical history and both buffers. Retained rows
+//! keep their captured widths, Unicode payloads, styles, and soft-wrap connections.
+//! Queue allocation and the temporary replacement row are separate bounded costs.
+//! Include [`RowHistory::style_ids`] in style collection roots and use
+//! [`RowHistory::disconnect`] when external edits break primary top-row adjacency.
+//!
 //! [`Style`] represents unresolved colors and character rendition independently
 //! of [`StyleId`] storage. [`Style::apply_sgr`] interprets a parameter list
 //! atomically with fixed auxiliary space. [`Color`] preserves default and indexed
@@ -172,6 +183,7 @@ mod cell;
 mod charsets;
 mod error;
 mod grid;
+mod history;
 mod input;
 mod processor;
 mod reply;
@@ -189,6 +201,7 @@ mod tests;
 pub use cell::{Cell, CellText, CellWidth, MAX_CELL_TEXT_BYTES, StyleId};
 pub use error::StorageError;
 pub use grid::{Grid, MAX_CELLS, MAX_DIMENSION};
+pub use history::{HistoryLimits, MAX_HISTORY_BYTES, MAX_HISTORY_ROWS, RowHistory};
 pub use input::{InputModes, Key};
 pub use lune_text::WidthPolicy;
 pub use processor::{ProcessError, ProcessFailure, Processor};

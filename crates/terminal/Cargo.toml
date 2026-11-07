@@ -40,6 +40,10 @@ harness = false
 name = "unicode"
 harness = false
 
+[[bench]]
+name = "history"
+harness = false
+
 [dependencies]
 lune-vt = { path = "../vt" }
 lune-text = { path = "../text" }

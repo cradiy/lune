@@ -16,6 +16,24 @@ pub struct Row {
 }
 
 impl Row {
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.cells
+            .capacity()
+            .saturating_mul(size_of::<Cell>())
+            .saturating_add(
+                self.extended
+                    .capacity()
+                    .saturating_mul(size_of::<ExtendedText>()),
+            )
+            .saturating_add(self.extended.iter().fold(0_usize, |bytes, entry| {
+                bytes.saturating_add(entry.text.capacity())
+            }))
+    }
+
+    pub(crate) fn fits_columns(&self, columns: usize) -> bool {
+        self.cells.capacity() >= columns
+    }
+
     pub(crate) fn new(columns: usize, style: StyleId) -> Result<Self, StorageError> {
         let mut cells = Vec::new();
         cells.try_reserve_exact(columns)?;
@@ -32,7 +50,8 @@ impl Row {
 
     /// Exclusive column where this row joins the next row through automatic
     /// wrapping. A wide unit may leave one excluded column at the right edge.
-    /// The last physical row always returns `None`.
+    /// The last row of a [`crate::Grid`] returns `None`. A retained history row
+    /// can preserve its connection to the following primary-screen row.
     pub fn wrap_end(&self) -> Option<usize> {
         let columns = self.cells.len();
         // A gap join requires both edge markers. Replacing either cell leaves

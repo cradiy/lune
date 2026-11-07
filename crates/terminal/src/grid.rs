@@ -21,6 +21,13 @@ pub(crate) struct GridResize {
 }
 
 impl Grid {
+    pub(crate) fn exchange_top(&mut self, replacement: Row) -> Row {
+        debug_assert_eq!(replacement.cells().len(), self.columns);
+        let outgoing = std::mem::replace(&mut self.rows[0], replacement);
+        self.rows.rotate_left(1);
+        outgoing
+    }
+
     pub fn new(columns: usize, rows: usize) -> Result<Self, StorageError> {
         validate_dimensions(columns, rows)?;
         let mut storage = VecDeque::new();

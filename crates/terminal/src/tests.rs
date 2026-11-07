@@ -2,6 +2,7 @@ use std::ops::Range;
 
 mod buffers;
 mod erased;
+mod history;
 mod input;
 mod processor;
 mod replies;

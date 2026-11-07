@@ -7,12 +7,147 @@ use std::{
 };
 
 use lune_terminal::{
-    CellPosition, CellText, CellWidth, EraseMode, Grid, ProcessFailure, Processor, Screen,
-    ScreenBuffer, StorageError, Style, StyleError, StyleId, StyleTable, UnicodeWriter,
+    CellPosition, CellText, CellWidth, EraseMode, Grid, HistoryLimits, ProcessFailure, Processor,
+    RowHistory, Screen, ScreenBuffer, StorageError, Style, StyleError, StyleId, StyleTable,
+    UnicodeWriter,
 };
 
 #[global_allocator]
 static ALLOCATOR: allocator::TestAllocator = allocator::TestAllocator;
+
+#[test]
+fn history_allocation_failures_preserve_owners_and_saturated_capture_reuses_rows() {
+    #[derive(Debug, PartialEq, Eq)]
+    struct HistorySnapshot {
+        rows: Vec<Vec<SnapshotCell>>,
+        wraps: Vec<Option<usize>>,
+        limits: HistoryLimits,
+        bytes: usize,
+    }
+    fn retained(history: &RowHistory) -> HistorySnapshot {
+        HistorySnapshot {
+            rows: history
+                .iter_rows()
+                .map(|row| {
+                    row.cells()
+                        .iter()
+                        .enumerate()
+                        .map(|(column, cell)| SnapshotCell {
+                            text: match row.text(column).unwrap() {
+                                CellText::Scalar(value) => value.to_string(),
+                                CellText::Extended(value) => value.to_owned(),
+                                CellText::Continuation => String::new(),
+                            },
+                            width: cell.width(),
+                            style: cell.style(),
+                            erased: cell.is_erased(),
+                        })
+                        .collect()
+                })
+                .collect(),
+            wraps: history.iter_rows().map(|row| row.wrap_end()).collect(),
+            limits: history.limits(),
+            bytes: history.retained_bytes(),
+        }
+    }
+    fn prepared(case: usize) -> (Screen, RowHistory) {
+        let mut screen = Screen::new(4, 3).unwrap();
+        let mut history = RowHistory::new(HistoryLimits {
+            max_rows: if case == 1 { 1 } else { 32 },
+            max_bytes: 4096,
+        })
+        .unwrap();
+        if case != 0 {
+            for _ in 0..if case == 1 { 1 } else { 8 } {
+                screen.set_cursor(0, 0);
+                screen
+                    .write("水\u{301}", CellWidth::Double, StyleId(1))
+                    .unwrap();
+                history.scroll_up(&mut screen, StyleId(0)).unwrap();
+            }
+        }
+        if case == 1 {
+            screen.resize(9, 4, StyleId(2)).unwrap();
+        }
+        screen.set_cursor(0, 0);
+        screen
+            .write("e\u{301}", CellWidth::Single, StyleId(3))
+            .unwrap();
+        screen.set_cursor(1, 2);
+        screen.save_cursor();
+        screen.set_insert_mode(true);
+        screen.clear_tab_stops();
+        screen.set_tab_stop();
+        (screen, history)
+    }
+    for case in 0..3 {
+        let (mut expected_screen, mut expected_history) = prepared(case);
+        let (result, stats) = allocator::measure(None, || {
+            expected_history.scroll_up(&mut expected_screen, StyleId(7))
+        });
+        assert!(result.unwrap());
+        assert!(stats.attempts > 0);
+        let expected = retained(&expected_history);
+        let expected_grid = snapshot(expected_screen.grid());
+        for point in 0..stats.attempts {
+            let (mut screen, mut history) = prepared(case);
+            let before_history = retained(&history);
+            let before_grid = snapshot(screen.grid());
+            let alternate = snapshot(screen.buffer(ScreenBuffer::Alternate));
+            let cursor = screen.cursor();
+            let cells = screen.grid().row(0).unwrap().cells().as_ptr();
+            let (result, failed) =
+                allocator::measure(Some(point), || history.scroll_up(&mut screen, StyleId(7)));
+            assert!(matches!(result, Err(StorageError::Allocation(_))));
+            assert_eq!(failed.failures, 1);
+            assert_eq!(retained(&history), before_history);
+            assert_eq!(snapshot(screen.grid()), before_grid);
+            assert_eq!(screen.grid().row(0).unwrap().cells().as_ptr(), cells);
+            assert_eq!(snapshot(screen.buffer(ScreenBuffer::Alternate)), alternate);
+            assert_eq!(screen.cursor(), cursor);
+            assert!(screen.insert_mode());
+            assert_eq!(screen.is_tab_stop(2), Some(true));
+            assert_eq!(screen.is_tab_stop(0), Some(false));
+            history.scroll_up(&mut screen, StyleId(7)).unwrap();
+            assert_eq!(retained(&history), expected);
+            assert_eq!(snapshot(screen.grid()), expected_grid);
+            screen.carriage_return();
+            screen.restore_cursor();
+            assert_eq!(screen.cursor(), cursor);
+        }
+    }
+    let (_, mut owned) = prepared(2);
+    let bytes = owned.retained_bytes();
+    let ((), released) = allocator::measure(Some(0), || owned.clear());
+    assert_eq!(released.attempts, 0);
+    assert_eq!(released.live_bytes, -(bytes as i128));
+    let (history, stats) = allocator::measure(Some(0), || {
+        RowHistory::new(HistoryLimits {
+            max_rows: 3,
+            max_bytes: 4096,
+        })
+    });
+    let mut history = history.unwrap();
+    assert_eq!(stats.attempts, 0);
+    let mut screen = Screen::new(4, 3).unwrap();
+    for _ in 0..3 {
+        history.scroll_up(&mut screen, StyleId(0)).unwrap();
+    }
+    let ((), stats) = allocator::measure(Some(0), || {
+        for _ in 0..128 {
+            assert!(history.scroll_up(&mut screen, StyleId(1)).unwrap());
+        }
+        history
+            .set_limits(HistoryLimits {
+                max_rows: 1,
+                max_bytes: 1,
+            })
+            .unwrap();
+        assert!(!history.scroll_up(&mut screen, StyleId(1)).unwrap());
+        history.clear();
+    });
+    assert_eq!(stats.attempts, 0);
+}
 
 #[test]
 fn unicode_writer_failures_preserve_clusters_and_retry_processor_owned_bytes() {

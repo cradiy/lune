@@ -16,7 +16,7 @@ impl fmt::Display for StorageError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidDimensions => formatter.write_str("Grid dimensions must be positive"),
-            Self::CapacityExceeded => formatter.write_str("Grid dimensions exceed storage limits"),
+            Self::CapacityExceeded => formatter.write_str("Storage capacity exceeds limits"),
             Self::OutOfBounds => formatter.write_str("Cell range exceeds the grid bounds"),
             Self::EmptyText => formatter.write_str("A display unit must contain text"),
             Self::TextTooLong => formatter.write_str("Display-unit text exceeds the storage limit"),

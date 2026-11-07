@@ -103,6 +103,23 @@ impl Default for SavedCursor {
 }
 
 impl Screen {
+    pub(crate) fn scroll_history(
+        &mut self,
+        history: &mut crate::RowHistory,
+        style: StyleId,
+    ) -> Result<bool, StorageError> {
+        if self.active_buffer == ScreenBuffer::Primary {
+            if self.scroll_region == (0..self.grid.rows()) {
+                return history.capture(&mut self.grid, style);
+            }
+            if self.scroll_region.start == 0 {
+                history.disconnect();
+            }
+        }
+        self.scroll_up(1, style);
+        Ok(false)
+    }
+
     /// Allocates two equal grids, each bounded by `MAX_CELLS`, and shared tabs.
     /// Both buffers start erased with default style; the primary starts active.
     pub fn new(columns: usize, rows: usize) -> Result<Self, StorageError> {
