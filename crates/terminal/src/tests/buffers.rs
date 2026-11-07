@@ -100,10 +100,10 @@ fn alternate_modes_preserve_primary_saves_and_validate_whole_lists_across_splits
         let mut processor = Processor::default();
         let mut screen = Screen::new(8, 4).unwrap();
         processor
-            .advance(&input[..split], &mut screen, text)
+            .advance(&input[..split], &mut screen, &mut text)
             .unwrap();
         processor
-            .advance(&input[split..], &mut screen, text)
+            .advance(&input[split..], &mut screen, &mut text)
             .unwrap();
         assert_eq!(screen.active_buffer(), Primary);
         assert_eq!((screen.cursor().row, screen.cursor().column), (1, 3));
@@ -138,18 +138,18 @@ fn alternate_modes_preserve_primary_saves_and_validate_whole_lists_across_splits
         let cursor = screen.cursor();
         let style = processor.style_id();
         processor
-            .advance(b"\x1b[?47;1048;999h", &mut screen, text)
+            .advance(b"\x1b[?47;1048;999h", &mut screen, &mut text)
             .unwrap();
         assert_eq!(screen.active_buffer(), Primary);
         assert_eq!(screen.cursor(), cursor);
         assert_eq!(processor.style_id(), style);
         assert_eq!(super::snapshot(screen.buffer(Primary)), primary);
         assert_eq!(super::snapshot(screen.buffer(Alternate)), alternate);
-        processor.advance(b"\x1b8", &mut screen, text).unwrap();
+        processor.advance(b"\x1b8", &mut screen, &mut text).unwrap();
         assert_eq!((screen.cursor().row, screen.cursor().column), (1, 2));
         assert!(processor.consume_reply(6));
         processor
-            .advance(b"\x1b[?47h\x1bc", &mut screen, text)
+            .advance(b"\x1b[?47h\x1bc", &mut screen, &mut text)
             .unwrap();
         assert_eq!(screen.active_buffer(), Primary);
         processor.collect_styles(&screen, []).unwrap();
@@ -165,13 +165,13 @@ fn collection_traces_both_buffer_save_slots_even_without_styled_cells() {
         .advance(
             b"\x1b[31m\x1b7\x1b[0m\x1b[?47h\x1b[34m\x1b7\x1b[0m\x1b[32mG\x1b[0m\x1b[2J",
             &mut screen,
-            text,
+            &mut text,
         )
         .unwrap();
     assert_eq!(processor.collect_styles(&screen, []).unwrap(), 1);
     assert_eq!(processor.styles().style_count(), 3);
     processor
-        .advance(b"\x1b[?47l\x1b8p", &mut screen, text)
+        .advance(b"\x1b[?47l\x1b8p", &mut screen, &mut text)
         .unwrap();
     let primary = screen.grid().row(0).unwrap().cells()[0].style();
     assert_eq!(
@@ -179,14 +179,14 @@ fn collection_traces_both_buffer_save_slots_even_without_styled_cells() {
         Color::Indexed(1)
     );
     processor
-        .advance(b"\x1b[?47h\x1b8a", &mut screen, text)
+        .advance(b"\x1b[?47h\x1b8a", &mut screen, &mut text)
         .unwrap();
     let alternate = screen.grid().row(0).unwrap().cells()[0].style();
     assert_eq!(
         processor.styles().get(alternate).unwrap().foreground,
         Color::Indexed(4)
     );
-    processor.reset(&mut screen);
+    processor.reset(&mut screen, &mut text);
     processor.collect_styles(&screen, []).unwrap();
     assert_eq!(processor.styles().style_count(), 1);
 }

@@ -8,6 +8,7 @@ pub enum StorageError {
     EmptyText,
     TextTooLong,
     InvalidAscii,
+    InvalidText,
     Allocation(TryReserveError),
 }
 
@@ -21,6 +22,9 @@ impl fmt::Display for StorageError {
             Self::TextTooLong => formatter.write_str("Display-unit text exceeds the storage limit"),
             Self::InvalidAscii => {
                 formatter.write_str("ASCII writes require bytes from space to tilde")
+            }
+            Self::InvalidText => {
+                formatter.write_str("Text callbacks require printable ASCII or one scalar")
             }
             Self::Allocation(error) => {
                 write!(formatter, "Screen storage allocation failed: {error}")

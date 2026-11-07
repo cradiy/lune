@@ -36,8 +36,13 @@ harness = false
 name = "revision"
 harness = false
 
+[[bench]]
+name = "unicode"
+harness = false
+
 [dependencies]
 lune-vt = { path = "../vt" }
+lune-text = { path = "../text" }
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

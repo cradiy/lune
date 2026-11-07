@@ -116,7 +116,7 @@
 //! owns its allocation and failure behavior.
 //!
 //! [`Processor`] executes byte streams through the parser and existing screen
-//! operations. Text layout is supplied by an atomic callback. [`ProcessError`]
+//! operations. Text layout is supplied by an atomic [`TextSink`]. [`ProcessError`]
 //! reports the consumed input prefix; failed decoded text is retained in fixed
 //! storage for retry before further input. ASCII runs and complete UTF-8 scalars
 //! are dispatched directly in the parser's ground state. Lexical errors recover
@@ -141,6 +141,17 @@
 //! cursor, editing, F1–F12, and numeric-keypad keys into static byte slices without allocating.
 //! Backspace sends DEL by default and BS under DECBKM; Tab sends HT and Escape sends ESC.
 //! Snapshots and encoded bytes remain valid across later mode changes and partial writes.
+//!
+//! [`UnicodeWriter`] implements the sink with incremental extended-grapheme
+//! composition and a fixed [`WidthPolicy`]. Protocol boundaries end a cluster;
+//! input chunk boundaries retain it. Updates revise an existing unit through
+//! [`Screen::revise_unit`], including late emoji width changes. Widths are clamped
+//! to one or two columns and reduced to fit a narrow screen or a nonwrapping edge.
+//! Orphan zero-width clusters retain their text in one column. Decoded C1 controls
+//! establish a boundary and are ignored. Failed writes preserve text state and
+//! screen contents for retry; the text limit remains [`MAX_CELL_TEXT_BYTES`].
+//! Pass a mutable sink to advance, finish, and reset. External screen mutations
+//! require an explicit [`TextSink::boundary`] before subsequent text input.
 //!
 //! [`Style`] represents unresolved colors and character rendition independently
 //! of [`StyleId`] storage. [`Style::apply_sgr`] interprets a parameter list
@@ -170,6 +181,7 @@ mod style;
 mod styles;
 mod tabs;
 mod text;
+mod writer;
 
 #[cfg(test)]
 mod tests;
@@ -178,9 +190,11 @@ pub use cell::{Cell, CellText, CellWidth, MAX_CELL_TEXT_BYTES, StyleId};
 pub use error::StorageError;
 pub use grid::{Grid, MAX_CELLS, MAX_DIMENSION};
 pub use input::{InputModes, Key};
+pub use lune_text::WidthPolicy;
 pub use processor::{ProcessError, ProcessFailure, Processor};
 pub use row::Row;
 pub use screen::{Cursor, CursorAppearance, CursorShape, EraseMode, Screen, ScreenBuffer};
 pub use style::{Color, Style, Underline};
 pub use styles::{MAX_STYLES, StyleError, StyleTable};
 pub use text::{CellPosition, GridText};
+pub use writer::{TextSink, UnicodeWriter};

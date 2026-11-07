@@ -28,10 +28,10 @@ fn measure(name: &str, input: &[u8], chunk: usize) {
         while start.elapsed() < Duration::from_millis(150) {
             for bytes in input.chunks(chunk) {
                 processor
-                    .advance(black_box(bytes), black_box(&mut screen), text)
+                    .advance(black_box(bytes), black_box(&mut screen), &mut text)
                     .unwrap();
             }
-            processor.finish(black_box(&mut screen), text).unwrap();
+            processor.finish(black_box(&mut screen), &mut text).unwrap();
             black_box(screen.cursor());
             iterations += 1;
         }
@@ -51,7 +51,8 @@ fn measure_replies(name: &str, input: &[u8], chunk: usize, write_chunk: usize) {
         while start.elapsed() < Duration::from_millis(150) {
             for mut bytes in input.chunks(chunk) {
                 loop {
-                    let result = processor.advance(black_box(bytes), black_box(&mut screen), text);
+                    let result =
+                        processor.advance(black_box(bytes), black_box(&mut screen), &mut text);
                     while !processor.reply_bytes().is_empty() {
                         let count = processor.reply_bytes().len().min(write_chunk);
                         black_box(&processor.reply_bytes()[..count]);
@@ -69,7 +70,7 @@ fn measure_replies(name: &str, input: &[u8], chunk: usize, write_chunk: usize) {
                     }
                 }
             }
-            processor.finish(black_box(&mut screen), text).unwrap();
+            processor.finish(black_box(&mut screen), &mut text).unwrap();
             black_box(screen.cursor());
             iterations += 1;
         }

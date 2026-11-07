@@ -11,6 +11,8 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 lune-terminal = { path = ".." }
 lune-vt = { path = "../../vt" }
+unicode-segmentation = "=1.13.3"
+unicode-width = "=0.2.2"
 
 [workspace]
 members = ["."]
@@ -46,6 +48,13 @@ bench = false
 [[bin]]
 name = "styles"
 path = "fuzz_targets/styles.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "unicode"
+path = "fuzz_targets/unicode.rs"
 test = false
 doc = false
 bench = false

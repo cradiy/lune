@@ -18,7 +18,7 @@ fn drain(processor: &mut Processor, output: &mut Vec<u8>) {
 
 fn drive(processor: &mut Processor, screen: &mut Screen, mut input: &[u8], output: &mut Vec<u8>) {
     loop {
-        let result = processor.advance(input, screen, text);
+        let result = processor.advance(input, screen, &mut text);
         drain(processor, output);
         match result {
             Ok(consumed) => {
@@ -42,8 +42,8 @@ fn query_replies_preserve_wire_order_origin_coordinates_and_wrapping_across_spli
         let mut output = Vec::new();
         drive(&mut processor, &mut screen, &input[..split], &mut output);
         drive(&mut processor, &mut screen, &input[split..], &mut output);
-        processor.finish(&mut screen, text).unwrap();
-        processor.finish(&mut screen, text).unwrap();
+        processor.finish(&mut screen, &mut text).unwrap();
+        processor.finish(&mut screen, &mut text).unwrap();
         drain(&mut processor, &mut output);
         assert_eq!(output, b"\x1b[0n\x1b[1;4R\x1b[2;8R\x1b[3;2R\x1b[4;7R");
         assert_eq!(
@@ -69,7 +69,9 @@ fn blocked_replies_retain_captured_positions_and_partial_delivery_until_retry_or
     let mut screen = Screen::new(8, 4).unwrap();
     let mut processor = Processor::default();
     let input = b"\x1b[5nabc\x1b[6nTAIL";
-    let error = processor.advance(input, &mut screen, text).unwrap_err();
+    let error = processor
+        .advance(input, &mut screen, &mut text)
+        .unwrap_err();
     assert!(matches!(error.error, ProcessFailure::ReplyPending));
     assert_eq!(error.consumed, 11);
     let suffix = &input[error.consumed..];
@@ -82,11 +84,13 @@ fn blocked_replies_retain_captured_positions_and_partial_delivery_until_retry_or
     let checkpoint = super::snapshot(screen.grid());
     let cursor = screen.cursor();
     for _ in 0..2 {
-        let error = processor.advance(suffix, &mut screen, text).unwrap_err();
+        let error = processor
+            .advance(suffix, &mut screen, &mut text)
+            .unwrap_err();
         assert!(matches!(error.error, ProcessFailure::ReplyPending));
         assert_eq!(error.consumed, 0);
         assert!(matches!(
-            processor.finish(&mut screen, text),
+            processor.finish(&mut screen, &mut text),
             Err(ProcessFailure::ReplyPending)
         ));
         assert_eq!(super::snapshot(screen.grid()), checkpoint);
@@ -97,11 +101,11 @@ fn blocked_replies_retain_captured_positions_and_partial_delivery_until_retry_or
     screen.set_cursor(1, 3);
     assert!(processor.consume_reply(2));
     assert!(processor.reply_bytes().is_empty());
-    assert_eq!(processor.advance(&[], &mut screen, text).unwrap(), 0);
+    assert_eq!(processor.advance(&[], &mut screen, &mut text).unwrap(), 0);
     assert_eq!(processor.reply_bytes(), b"\x1b[1;4R");
-    processor.finish(&mut screen, text).unwrap();
+    processor.finish(&mut screen, &mut text).unwrap();
     assert_eq!(processor.reply_bytes(), b"\x1b[1;4R");
-    processor.advance(suffix, &mut screen, text).unwrap();
+    processor.advance(suffix, &mut screen, &mut text).unwrap();
     assert_eq!(
         screen.grid().row(0).unwrap().text(3),
         Some(crate::CellText::Scalar('T'))
@@ -111,21 +115,21 @@ fn blocked_replies_retain_captured_positions_and_partial_delivery_until_retry_or
         Some(crate::CellText::Scalar('A'))
     );
     let error = processor
-        .advance(b"\x1b[5n", &mut screen, text)
+        .advance(b"\x1b[5n", &mut screen, &mut text)
         .unwrap_err();
     assert!(matches!(error.error, ProcessFailure::ReplyPending));
-    processor.reset(&mut screen);
+    processor.reset(&mut screen, &mut text);
     assert!(processor.reply_bytes().is_empty());
-    processor.advance(b"ok", &mut screen, text).unwrap();
+    processor.advance(b"ok", &mut screen, &mut text).unwrap();
     assert!(processor.reply_bytes().is_empty());
     processor
-        .advance(b"\x1b[5n\x1bc", &mut screen, text)
+        .advance(b"\x1b[5n\x1bc", &mut screen, &mut text)
         .unwrap();
     assert_eq!(processor.reply_bytes(), b"\x1b[0n");
-    processor.finish(&mut screen, text).unwrap();
+    processor.finish(&mut screen, &mut text).unwrap();
     assert_eq!(processor.reply_bytes(), b"\x1b[0n");
     assert!(processor.consume_reply(4));
-    processor.finish(&mut screen, text).unwrap();
+    processor.finish(&mut screen, &mut text).unwrap();
     assert!(processor.reply_bytes().is_empty());
 }
 

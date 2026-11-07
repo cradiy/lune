@@ -6,7 +6,7 @@ use crate::charsets::Charsets;
 use crate::reply::{self, Reply, Report};
 use crate::{
     CursorShape, EraseMode, InputModes, MAX_STYLES, Screen, ScreenBuffer, Style, StyleError,
-    StyleId, StyleTable,
+    StyleId, StyleTable, TextSink,
 };
 
 /// A failure while applying a completed text, rendition, or reply event.
@@ -66,6 +66,7 @@ impl<E: Error + 'static> Error for ProcessError<E> {
 #[derive(Clone, Copy)]
 enum Pending {
     Text(char),
+    Boundary,
     Execute(u8),
     Rendition(Style),
     Reply(Report),
@@ -80,15 +81,15 @@ struct State {
     input: InputModes,
 }
 
-/// Incremental execution of screen controls with caller-owned text layout.
-/// Pair a processor with one screen and text writer across calls. Text callbacks
-/// receive a printable ASCII run or one Unicode scalar, including replacements
-/// for malformed UTF-8. A callback must preserve the screen and accepted-text
-/// state on error. Apply accepted text synchronously and reconcile layout state
-/// with screen control changes. The writer supplies display units and widths.
+/// Incremental screen execution with an atomic [`TextSink`]. Pair one processor,
+/// screen, and sink across calls. Writes receive printable ASCII or one Unicode
+/// scalar. Controls, ESC/DEL bytes, successful finish, and reset notify the sink
+/// of text boundaries in execution order. Unfinished byte chunks retain text
+/// state. [`crate::UnicodeWriter`] supplies grapheme composition and column widths;
+/// closures supply complete units through the same sink contract.
 ///
-/// A byte can complete a replacement and a second text/control event. Two fixed
-/// slots retain these events across writer failures; sequence headers remain in
+/// A byte can complete a replacement and a second text/control/boundary event.
+/// Two fixed slots retain these events across writer failures; sequence headers remain in
 /// the fixed-capacity parser. Rendition changes use a bounded, owned style table.
 /// Include retained screen/rendering snapshots when collecting style storage.
 /// Screen edits use keys from this processor's table; callbacks receive the
@@ -204,13 +205,13 @@ impl Processor {
     /// Reply backpressure retains a complete reply captured at query execution;
     /// drain and acknowledge active output before retrying the unconsumed input.
     #[inline(always)]
-    pub fn advance<E>(
+    pub fn advance<E, T: TextSink<Error = E>>(
         &mut self,
         input: &[u8],
         screen: &mut Screen,
-        mut text: impl FnMut(&mut Screen, &str, StyleId) -> Result<(), E>,
+        text: &mut T,
     ) -> Result<usize, ProcessError<E>> {
-        self.drain(screen, &mut text)
+        self.drain(screen, text)
             .map_err(|error| ProcessError { consumed: 0, error })?;
         let mut consumed = 0;
         while consumed < input.len() {
@@ -221,9 +222,11 @@ impl Processor {
                         if first >= b'_' {
                             let character = self.state.charsets.map(char::from(first));
                             consumed += 1;
-                            if let Err(error) =
-                                text(screen, character.encode_utf8(&mut [0; 4]), self.state.style)
-                            {
+                            if let Err(error) = text.write(
+                                screen,
+                                character.encode_utf8(&mut [0; 4]),
+                                self.state.style,
+                            ) {
                                 self.pending[0] = Some(Pending::Text(character));
                                 self.end = 1;
                                 return Err(ProcessError {
@@ -242,10 +245,11 @@ impl Processor {
                     let run = unsafe {
                         std::str::from_utf8_unchecked(&input[consumed..consumed + length])
                     };
-                    text(screen, run, self.state.style).map_err(|error| ProcessError {
-                        consumed,
-                        error: ProcessFailure::Text(error),
-                    })?;
+                    text.write(screen, run, self.state.style)
+                        .map_err(|error| ProcessError {
+                            consumed,
+                            error: ProcessFailure::Text(error),
+                        })?;
                     consumed += length;
                     continue;
                 }
@@ -260,7 +264,7 @@ impl Processor {
                     && let Ok(value) = std::str::from_utf8(bytes)
                 {
                     consumed += scalar_bytes;
-                    if let Err(error) = text(screen, value, self.state.style) {
+                    if let Err(error) = text.write(screen, value, self.state.style) {
                         self.pending[0] = Some(Pending::Text(value.chars().next().unwrap()));
                         self.end = 1;
                         return Err(ProcessError {
@@ -337,8 +341,15 @@ impl Processor {
                 }
                 Event::Error(_) => *parse_errors = parse_errors.saturating_add(1),
             });
+            if T::STATEFUL && matches!(input[consumed], 0x1b | 0x7f) {
+                // These bytes emit no Execute event. A replacement from a broken
+                // UTF-8 prefix belongs before their boundary, including on retry.
+                debug_assert!(self.end < self.pending.len());
+                self.pending[self.end] = Some(Pending::Boundary);
+                self.end += 1;
+            }
             consumed += 1;
-            self.drain(screen, &mut text)
+            self.drain(screen, text)
                 .map_err(|error| ProcessError { consumed, error })?;
         }
         Ok(consumed)
@@ -350,9 +361,9 @@ impl Processor {
     pub fn finish<E>(
         &mut self,
         screen: &mut Screen,
-        mut text: impl FnMut(&mut Screen, &str, StyleId) -> Result<(), E>,
+        text: &mut impl TextSink<Error = E>,
     ) -> Result<(), ProcessFailure<E>> {
-        self.drain(screen, &mut text)?;
+        self.drain(screen, text)?;
         let Self {
             parser,
             pending,
@@ -368,13 +379,16 @@ impl Processor {
             Event::Error(_) => *parse_errors = parse_errors.saturating_add(1),
             _ => unreachable!("Finishing emits text or a lexical error"),
         });
-        self.drain(screen, &mut text)
+        self.drain(screen, text)?;
+        text.boundary();
+        Ok(())
     }
 
     /// Discards buffered input, replies, and events; clears diagnostics and resets
-    /// the screen. Synchronize caller-owned text and transport state at this stream
-    /// boundary. Style storage remains available for retained snapshots until collection.
-    pub fn reset(&mut self, screen: &mut Screen) {
+    /// the screen and establishes a sink boundary. The transport owns its output
+    /// state. Style storage remains available for retained snapshots until collection.
+    pub fn reset(&mut self, screen: &mut Screen, text: &mut impl TextSink) {
+        text.boundary();
         self.parser.reset();
         self.pending = [None; 2];
         self.head = 0;
@@ -390,7 +404,7 @@ impl Processor {
     fn drain<E>(
         &mut self,
         screen: &mut Screen,
-        text: &mut impl FnMut(&mut Screen, &str, StyleId) -> Result<(), E>,
+        text: &mut impl TextSink<Error = E>,
     ) -> Result<(), ProcessFailure<E>> {
         if self.head == self.end {
             return Ok(());
@@ -402,18 +416,21 @@ impl Processor {
     fn drain_pending<E>(
         &mut self,
         screen: &mut Screen,
-        text: &mut impl FnMut(&mut Screen, &str, StyleId) -> Result<(), E>,
+        text: &mut impl TextSink<Error = E>,
     ) -> Result<(), ProcessFailure<E>> {
         while self.head < self.end {
             match self.pending[self.head].expect("A pending action is present") {
-                Pending::Text(character) => {
-                    text(screen, character.encode_utf8(&mut [0; 4]), self.state.style)
-                        .map_err(ProcessFailure::Text)?
-                }
-                Pending::Execute(0x0e) => self.state.charsets.shift(true),
-                Pending::Execute(0x0f) => self.state.charsets.shift(false),
+                Pending::Text(character) => text
+                    .write(screen, character.encode_utf8(&mut [0; 4]), self.state.style)
+                    .map_err(ProcessFailure::Text)?,
+                Pending::Boundary => text.boundary(),
                 Pending::Execute(control) => {
-                    execute(screen, control, self.state.style, self.state.input.new_line)
+                    text.boundary();
+                    match control {
+                        0x0e => self.state.charsets.shift(true),
+                        0x0f => self.state.charsets.shift(false),
+                        _ => execute(screen, control, self.state.style, self.state.input.new_line),
+                    }
                 }
                 Pending::Rendition(style) => {
                     self.state.style = self.styles.intern(style).map_err(ProcessFailure::Style)?;

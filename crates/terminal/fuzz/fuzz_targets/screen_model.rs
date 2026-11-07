@@ -76,6 +76,22 @@ pub struct ScreenModel {
 impl ScreenModel {
     #[allow(
         dead_code,
+        reason = "Unicode placement uses physical cursor and width bounds."
+    )]
+    pub fn placement(&self) -> (lune_terminal::Cursor, usize, bool) {
+        (
+            lune_terminal::Cursor {
+                row: self.row,
+                column: self.visible_column(),
+                wrap_pending: self.column == self.storage[self.active].columns(),
+            },
+            self.storage[self.active].columns(),
+            self.auto_wrap,
+        )
+    }
+
+    #[allow(
+        dead_code,
         reason = "Cursor reports are checked by the processor target."
     )]
     pub fn report_position(&self) -> (usize, usize) {

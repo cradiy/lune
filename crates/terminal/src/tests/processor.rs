@@ -24,10 +24,10 @@ fn cursor_presentation_controls_compose_across_chunks_reject_headers_and_reset()
             let mut screen = Screen::new(4, 4).unwrap();
             let mut processor = Processor::default();
             processor
-                .advance(&input[..split], &mut screen, write_text)
+                .advance(&input[..split], &mut screen, &mut write_text)
                 .unwrap();
             processor
-                .advance(&input[split..], &mut screen, write_text)
+                .advance(&input[split..], &mut screen, &mut write_text)
                 .unwrap();
             let appearance = CursorAppearance {
                 visible: false,
@@ -45,7 +45,7 @@ fn cursor_presentation_controls_compose_across_chunks_reject_headers_and_reset()
             );
             assert_eq!(row_text(&screen, 0), "abcd");
             processor
-                .advance(b"\x1b[?25h\x1b[?12l\x1b8", &mut screen, write_text)
+                .advance(b"\x1b[?25h\x1b[?12l\x1b8", &mut screen, &mut write_text)
                 .unwrap();
             assert_eq!(
                 screen.cursor_appearance(),
@@ -67,14 +67,14 @@ fn cursor_presentation_controls_compose_across_chunks_reject_headers_and_reset()
             ] {
                 let before = screen.cursor_appearance();
                 processor
-                    .advance(rejected, &mut screen, write_text)
+                    .advance(rejected, &mut screen, &mut write_text)
                     .unwrap();
                 assert_eq!(screen.cursor_appearance(), before);
                 assert!(screen.cursor().wrap_pending);
             }
             assert_eq!(processor.ignored_sequences(), 8);
             processor
-                .advance(b"\x1b[?12h", &mut screen, write_text)
+                .advance(b"\x1b[?12h", &mut screen, &mut write_text)
                 .unwrap();
             assert_eq!(
                 screen.cursor_appearance(),
@@ -85,13 +85,13 @@ fn cursor_presentation_controls_compose_across_chunks_reject_headers_and_reset()
                 }
             );
             processor
-                .advance(b"\x1b[?25l\x1b[6 q\x1bc", &mut screen, write_text)
+                .advance(b"\x1b[?25l\x1b[6 q\x1bc", &mut screen, &mut write_text)
                 .unwrap();
             assert_eq!(screen.cursor_appearance(), CursorAppearance::default());
             processor
-                .advance(b"\x1b[?25l\x1b[4 q", &mut screen, write_text)
+                .advance(b"\x1b[?25l\x1b[4 q", &mut screen, &mut write_text)
                 .unwrap();
-            processor.reset(&mut screen);
+            processor.reset(&mut screen, &mut write_text);
             assert_eq!(screen.cursor_appearance(), CursorAppearance::default());
         }
     }
@@ -120,13 +120,13 @@ fn run(input: &[u8], cuts: &[usize]) -> (Screen, Processor) {
     for end in cuts.iter().copied().chain([input.len()]) {
         assert_eq!(
             processor
-                .advance(&input[start..end], &mut screen, write_text)
+                .advance(&input[start..end], &mut screen, &mut write_text)
                 .unwrap(),
             end - start
         );
         start = end;
     }
-    processor.finish(&mut screen, write_text).unwrap();
+    processor.finish(&mut screen, &mut write_text).unwrap();
     (screen, processor)
 }
 
@@ -178,7 +178,7 @@ fn byte_stream_controls_compose_with_origin_modes_and_split_input() {
             (1, 3)
         );
         split_processor
-            .advance(b"\x1b8", &mut split_screen, write_text)
+            .advance(b"\x1b8", &mut split_screen, &mut write_text)
             .unwrap();
         assert_eq!(
             split_screen.cursor(),
@@ -204,7 +204,7 @@ fn byte_stream_controls_compose_with_origin_modes_and_split_input() {
         (1, 3)
     );
     let mut reset_screen = screen;
-    processor.reset(&mut reset_screen);
+    processor.reset(&mut reset_screen, &mut write_text);
     assert_eq!(reset_screen.cursor(), Cursor::default());
     assert_eq!(
         (processor.parse_errors(), processor.ignored_sequences()),
@@ -218,46 +218,68 @@ fn failures_preserve_ascii_runs_and_both_events_of_a_reprocessed_byte() {
     let mut processor = Processor::default();
     let before: Snapshot = snapshot(screen.grid());
     let error = processor
-        .advance(b"abc", &mut screen, |_, _, _| Err("blocked"))
+        .advance(
+            b"abc",
+            &mut screen,
+            &mut |_: &mut Screen, _: &str, _: StyleId| Err("blocked"),
+        )
         .unwrap_err();
     assert_eq!(error.consumed, 0);
     assert!(matches!(error.error, ProcessFailure::Text("blocked")));
     assert_eq!(snapshot(screen.grid()), before);
-    processor.advance(b"abc", &mut screen, write_text).unwrap();
-    processor.reset(&mut screen);
     processor
-        .advance(b"\xf0\x9f", &mut screen, write_text)
+        .advance(b"abc", &mut screen, &mut write_text)
+        .unwrap();
+    processor.reset(&mut screen, &mut write_text);
+    processor
+        .advance(b"\xf0\x9f", &mut screen, &mut write_text)
         .unwrap();
     let error = processor
-        .advance(b"XA", &mut screen, |s, text, style| {
-            if text == "X" {
-                return Err("blocked");
-            }
-            write_text(s, text, style).unwrap();
-            Ok(())
-        })
+        .advance(
+            b"XA",
+            &mut screen,
+            &mut |s: &mut Screen, text: &str, style: StyleId| {
+                if text == "X" {
+                    return Err("blocked");
+                }
+                write_text(s, text, style).unwrap();
+                Ok(())
+            },
+        )
         .unwrap_err();
     assert_eq!(error.consumed, 1);
     assert_eq!(row_text(&screen, 0), "�       ");
     let before = snapshot(screen.grid());
     let error = processor
-        .advance(b"A", &mut screen, |_, _, _| Err("blocked"))
+        .advance(
+            b"A",
+            &mut screen,
+            &mut |_: &mut Screen, _: &str, _: StyleId| Err("blocked"),
+        )
         .unwrap_err();
     assert_eq!(error.consumed, 0);
     assert_eq!(snapshot(screen.grid()), before);
-    processor.advance(b"A", &mut screen, write_text).unwrap();
+    processor
+        .advance(b"A", &mut screen, &mut write_text)
+        .unwrap();
     assert_eq!(row_text(&screen, 0), "�XA     ");
 
-    processor.reset(&mut screen);
+    processor.reset(&mut screen, &mut write_text);
     processor
-        .advance(b"\xf0\x9f", &mut screen, write_text)
+        .advance(b"\xf0\x9f", &mut screen, &mut write_text)
         .unwrap();
     let error = processor
-        .advance(b"\nA", &mut screen, |_, _, _| Err("blocked"))
+        .advance(
+            b"\nA",
+            &mut screen,
+            &mut |_: &mut Screen, _: &str, _: StyleId| Err("blocked"),
+        )
         .unwrap_err();
     assert_eq!(error.consumed, 1);
     assert_eq!(screen.cursor(), Cursor::default());
-    processor.advance(b"A", &mut screen, write_text).unwrap();
+    processor
+        .advance(b"A", &mut screen, &mut write_text)
+        .unwrap();
     assert_eq!(
         screen.cursor(),
         Cursor {
@@ -275,39 +297,45 @@ fn finishing_and_resetting_own_pending_input_without_duplicate_effects() {
     let mut screen = Screen::new(8, 4).unwrap();
     let mut processor = Processor::default();
     processor
-        .advance(b"\xe6\xb0", &mut screen, write_text)
+        .advance(b"\xe6\xb0", &mut screen, &mut write_text)
         .unwrap();
     assert!(
         processor
-            .finish(&mut screen, |_, _, _| Err("blocked"))
+            .finish(&mut screen, &mut |_: &mut Screen, _: &str, _: StyleId| Err(
+                "blocked"
+            ))
             .is_err()
     );
     assert_eq!(screen.cursor(), Cursor::default());
     assert!(
         processor
-            .finish(&mut screen, |_, _, _| Err("blocked"))
+            .finish(&mut screen, &mut |_: &mut Screen, _: &str, _: StyleId| Err(
+                "blocked"
+            ))
             .is_err()
     );
-    processor.finish(&mut screen, write_text).unwrap();
+    processor.finish(&mut screen, &mut write_text).unwrap();
     let before = snapshot(screen.grid());
-    processor.finish(&mut screen, write_text).unwrap();
+    processor.finish(&mut screen, &mut write_text).unwrap();
     assert_eq!(snapshot(screen.grid()), before);
     assert_eq!(screen.cursor().column, 1);
     processor
-        .advance(b"\x1b[", &mut screen, write_text)
+        .advance(b"\x1b[", &mut screen, &mut write_text)
         .unwrap();
-    processor.finish(&mut screen, write_text).unwrap();
+    processor.finish(&mut screen, &mut write_text).unwrap();
     assert_eq!(processor.parse_errors(), 1);
-    processor.finish(&mut screen, write_text).unwrap();
+    processor.finish(&mut screen, &mut write_text).unwrap();
     assert_eq!(processor.parse_errors(), 1);
     processor
-        .advance(b"\xe6\xb0", &mut screen, write_text)
+        .advance(b"\xe6\xb0", &mut screen, &mut write_text)
         .unwrap();
     processor
-        .finish(&mut screen, |_, _, _| Err("blocked"))
+        .finish(&mut screen, &mut |_: &mut Screen, _: &str, _: StyleId| {
+            Err("blocked")
+        })
         .unwrap_err();
-    processor.reset(&mut screen);
-    processor.finish(&mut screen, write_text).unwrap();
+    processor.reset(&mut screen, &mut write_text);
+    processor.finish(&mut screen, &mut write_text).unwrap();
     assert_eq!(screen.cursor(), Cursor::default());
     assert_eq!(processor.parse_errors(), 0);
     assert_eq!(row_text(&screen, 0), "        ");
@@ -383,16 +411,16 @@ fn full_style_storage_retries_after_tracing_current_saved_and_external_owners() 
     let mut screen = Screen::new(8, 4).unwrap();
     let mut processor = Processor::new(4).unwrap();
     processor
-        .advance(b"\x1b[31m\x1b7\x1b[34m", &mut screen, write_text)
+        .advance(b"\x1b[31m\x1b7\x1b[34m", &mut screen, &mut write_text)
         .unwrap();
     let blue = processor.style_id();
     processor
-        .advance(b"\x1b[32m", &mut screen, write_text)
+        .advance(b"\x1b[32m", &mut screen, &mut write_text)
         .unwrap();
     let green = processor.style_id();
     let input = b"\x1b[35mX";
     let error = processor
-        .advance(input, &mut screen, write_text)
+        .advance(input, &mut screen, &mut write_text)
         .unwrap_err();
     assert_eq!(error.consumed, 5);
     assert!(matches!(
@@ -403,23 +431,23 @@ fn full_style_storage_retries_after_tracing_current_saved_and_external_owners() 
     assert_eq!(screen.cursor(), Cursor::default());
     assert_eq!(processor.collect_styles(&screen, [blue]).unwrap(), 0);
     let error = processor
-        .advance(&input[5..], &mut screen, write_text)
+        .advance(&input[5..], &mut screen, &mut write_text)
         .unwrap_err();
     assert_eq!(error.consumed, 0);
     assert!(matches!(
-        processor.finish(&mut screen, write_text),
+        processor.finish(&mut screen, &mut write_text),
         Err(ProcessFailure::Style(StyleError::CapacityExceeded))
     ));
     assert_eq!(processor.collect_styles(&screen, []).unwrap(), 1);
     processor
-        .advance(&input[5..], &mut screen, write_text)
+        .advance(&input[5..], &mut screen, &mut write_text)
         .unwrap();
     let magenta = processor.style_id();
     assert_ne!(magenta, blue);
     assert_eq!(processor.styles().get(blue), None);
     assert_eq!(row_text(&screen, 0), "X       ");
     processor
-        .advance(b"\x1b8R", &mut screen, write_text)
+        .advance(b"\x1b8R", &mut screen, &mut write_text)
         .unwrap();
     let red = processor.style_id();
     assert_eq!(
@@ -430,7 +458,7 @@ fn full_style_storage_retries_after_tracing_current_saved_and_external_owners() 
         })
     );
     assert_eq!(row_text(&screen, 0), "R       ");
-    processor.reset(&mut screen);
+    processor.reset(&mut screen, &mut write_text);
     assert_eq!(processor.style_id(), StyleId(0));
     assert_eq!(processor.collect_styles(&screen, [red]).unwrap(), 2);
     assert!(processor.styles().get(red).is_some());
@@ -440,12 +468,12 @@ fn full_style_storage_retries_after_tracing_current_saved_and_external_owners() 
     let mut limited = Processor::new(1).unwrap();
     assert!(
         limited
-            .advance(b"\x1b[31mR", &mut screen, write_text)
+            .advance(b"\x1b[31mR", &mut screen, &mut write_text)
             .is_err()
     );
-    limited.reset(&mut screen);
-    limited.finish(&mut screen, write_text).unwrap();
-    limited.advance(b"D", &mut screen, write_text).unwrap();
+    limited.reset(&mut screen, &mut write_text);
+    limited.finish(&mut screen, &mut write_text).unwrap();
+    limited.advance(b"D", &mut screen, &mut write_text).unwrap();
     assert_eq!(row_text(&screen, 0), "D       ");
     assert_eq!(limited.style_id(), StyleId(0));
 }
@@ -458,12 +486,12 @@ fn designated_charsets_shift_save_restore_and_preserve_unicode_across_chunks() {
         let mut screen = Screen::new(64, 4).unwrap();
         let mut processor = Processor::default();
         processor
-            .advance(&input[..split], &mut screen, write_text)
+            .advance(&input[..split], &mut screen, &mut write_text)
             .unwrap();
         processor
-            .advance(&input[split..], &mut screen, write_text)
+            .advance(&input[split..], &mut screen, &mut write_text)
             .unwrap();
-        processor.finish(&mut screen, write_text).unwrap();
+        processor.finish(&mut screen, &mut write_text).unwrap();
         assert_eq!(row_text(&screen, 0).trim_end(), expected);
         assert_eq!(row_text(&screen, 1).trim_end(), "┌──┐q│x─");
         assert_eq!(row_text(&screen, 2).trim_end(), "─水");
@@ -476,13 +504,13 @@ fn designated_charsets_shift_save_restore_and_preserve_unicode_across_chunks() {
             })
         );
         processor
-            .advance(b"\x1bcq\x1b8x", &mut screen, write_text)
+            .advance(b"\x1bcq\x1b8x", &mut screen, &mut write_text)
             .unwrap();
         assert_eq!(row_text(&screen, 0).trim_end(), "x");
         assert_eq!(processor.style_id(), StyleId(0));
-        processor.reset(&mut screen);
+        processor.reset(&mut screen, &mut write_text);
         processor
-            .advance(b"q\x0ex", &mut screen, write_text)
+            .advance(b"q\x0ex", &mut screen, &mut write_text)
             .unwrap();
         assert_eq!(row_text(&screen, 0).trim_end(), "qx");
     }
@@ -494,35 +522,47 @@ fn mapped_text_retries_once_after_ground_and_reprocessed_utf8_input() {
     let mut processor = Processor::default();
     let input = b"\x1b(0q\x1b(BX";
     let error = processor
-        .advance(input, &mut screen, |_, _, _| Err("blocked"))
+        .advance(
+            input,
+            &mut screen,
+            &mut |_: &mut Screen, _: &str, _: StyleId| Err("blocked"),
+        )
         .unwrap_err();
     assert_eq!(error.consumed, 4);
     assert_eq!(screen.cursor(), Cursor::default());
     let again = processor
-        .advance(&input[4..], &mut screen, |_, _, _| Err("blocked"))
+        .advance(
+            &input[4..],
+            &mut screen,
+            &mut |_: &mut Screen, _: &str, _: StyleId| Err("blocked"),
+        )
         .unwrap_err();
     assert_eq!(again.consumed, 0);
     processor
-        .advance(&input[4..], &mut screen, write_text)
+        .advance(&input[4..], &mut screen, &mut write_text)
         .unwrap();
     assert_eq!(row_text(&screen, 0), "─X      ");
-    processor.reset(&mut screen);
+    processor.reset(&mut screen, &mut write_text);
     processor
-        .advance(b"\x1b)0\x0e\xf0\x9f", &mut screen, write_text)
+        .advance(b"\x1b)0\x0e\xf0\x9f", &mut screen, &mut write_text)
         .unwrap();
     let error = processor
-        .advance(b"q\x0fq", &mut screen, |s, value, style| {
-            if value == "─" {
-                return Err("blocked");
-            }
-            write_text(s, value, style).unwrap();
-            Ok(())
-        })
+        .advance(
+            b"q\x0fq",
+            &mut screen,
+            &mut |s: &mut Screen, value: &str, style: StyleId| {
+                if value == "─" {
+                    return Err("blocked");
+                }
+                write_text(s, value, style).unwrap();
+                Ok(())
+            },
+        )
         .unwrap_err();
     assert_eq!(error.consumed, 1);
     assert_eq!(row_text(&screen, 0), "�       ");
     processor
-        .advance(b"\x0fq", &mut screen, write_text)
+        .advance(b"\x0fq", &mut screen, &mut write_text)
         .unwrap();
     assert_eq!(row_text(&screen, 0), "�─q     ");
 }
@@ -534,10 +574,10 @@ fn new_line_mode_composes_with_mode_lists_saved_cursors_and_explicit_indexing() 
         let mut screen = Screen::new(8, 8).unwrap();
         let mut processor = Processor::default();
         processor
-            .advance(&input[..split], &mut screen, write_text)
+            .advance(&input[..split], &mut screen, &mut write_text)
             .unwrap();
         processor
-            .advance(&input[split..], &mut screen, write_text)
+            .advance(&input[split..], &mut screen, &mut write_text)
             .unwrap();
         assert_eq!(
             (0..8).map(|row| row_text(&screen, row)).collect::<Vec<_>>(),
@@ -557,13 +597,13 @@ fn new_line_mode_composes_with_mode_lists_saved_cursors_and_explicit_indexing() 
         assert!(!processor.input_modes().new_line && !screen.insert_mode());
         assert_eq!(processor.ignored_sequences(), 1);
         processor
-            .advance(b"\x1b[20h\x1bc", &mut screen, write_text)
+            .advance(b"\x1b[20h\x1bc", &mut screen, &mut write_text)
             .unwrap();
         assert!(!processor.input_modes().new_line);
         processor
-            .advance(b"\x1b[20h", &mut screen, write_text)
+            .advance(b"\x1b[20h", &mut screen, &mut write_text)
             .unwrap();
-        processor.reset(&mut screen);
+        processor.reset(&mut screen, &mut write_text);
         assert!(!processor.input_modes().new_line);
     }
 }
@@ -573,15 +613,21 @@ fn new_line_mode_applies_after_a_failed_replacement_before_following_text() {
     let mut screen = Screen::new(8, 4).unwrap();
     let mut processor = Processor::default();
     processor
-        .advance(b"ab\x1b[20h\xf0\x9f", &mut screen, write_text)
+        .advance(b"ab\x1b[20h\xf0\x9f", &mut screen, &mut write_text)
         .unwrap();
     let error = processor
-        .advance(b"\nX", &mut screen, |_, _, _| Err("blocked"))
+        .advance(
+            b"\nX",
+            &mut screen,
+            &mut |_: &mut Screen, _: &str, _: StyleId| Err("blocked"),
+        )
         .unwrap_err();
     assert_eq!(error.consumed, 1);
     assert_eq!(screen.cursor().column, 2);
     assert!(processor.input_modes().new_line);
-    processor.advance(b"X", &mut screen, write_text).unwrap();
+    processor
+        .advance(b"X", &mut screen, &mut write_text)
+        .unwrap();
     assert_eq!(row_text(&screen, 0), "ab�     ");
     assert_eq!(row_text(&screen, 1), "X       ");
     assert_eq!(

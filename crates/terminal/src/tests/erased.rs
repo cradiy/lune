@@ -52,15 +52,19 @@ fn styled_printed_spaces_and_wide_wrap_gaps_preserve_distinct_erasure_state() {
     let mut screen = Screen::new(4, 3).unwrap();
     let mut processor = Processor::default();
     processor
-        .advance(b"\x1b[4;31m \x1b[K", &mut screen, |s, text, style| {
-            s.write_ascii(text.as_bytes(), style)
-        })
+        .advance(
+            b"\x1b[4;31m \x1b[K",
+            &mut screen,
+            &mut |s: &mut Screen, text: &str, style: StyleId| s.write_ascii(text.as_bytes(), style),
+        )
         .unwrap();
     let row = screen.grid().row(0).unwrap();
     assert_eq!(row.cells()[0].style(), row.cells()[1].style());
     assert!(!row.cells()[0].is_erased());
     assert!(row.cells()[1..].iter().all(|cell| cell.is_erased()));
-    processor.reset(&mut screen);
+    processor.reset(&mut screen, &mut |_: &mut Screen, _: &str, _: StyleId| {
+        Ok::<_, crate::StorageError>(())
+    });
     screen.write_ascii(b"abc", StyleId(0)).unwrap();
     screen.write("水", CellWidth::Double, StyleId(0)).unwrap();
     assert_eq!(screen.grid().row(0).unwrap().wrap_end(), Some(3));
