@@ -122,6 +122,11 @@
 //! [`ScreenView::history_rows`] translates a physical cursor row into view space.
 //! Construction, row lookup, and validation take constant time. Formatting visits
 //! only selected rows, including soft-wrap connections across history and screen.
+//! [`ScreenView::logical_lines`] groups retained rows connected by automatic
+//! wrapping. [`ScreenView::logical_line`] finds the group containing a physical
+//! view row. [`LogicalLine`] borrows its row range, rows, and text. History eviction
+//! may leave the oldest group as a fragment. Double-ended traversal takes linear
+//! time in physical rows and constant auxiliary space without allocating.
 //! [`Screen::viewport`] borrows a screen-height [`Viewport`] using window-local
 //! row coordinates. Its offset is bounded by retained primary history. Zero
 //! follows output; scrolling upward anchors the top retained row as captures
@@ -205,6 +210,7 @@ mod error;
 mod grid;
 mod history;
 mod input;
+mod lines;
 mod processor;
 mod reply;
 mod row;
@@ -224,6 +230,7 @@ pub use error::StorageError;
 pub use grid::{Grid, MAX_CELLS, MAX_DIMENSION};
 pub use history::{HistoryLimits, MAX_HISTORY_BYTES, MAX_HISTORY_ROWS, RowHistory};
 pub use input::{InputModes, Key};
+pub use lines::{LogicalLine, LogicalLines};
 pub use lune_text::WidthPolicy;
 pub use processor::{ProcessError, ProcessFailure, Processor};
 pub use row::Row;

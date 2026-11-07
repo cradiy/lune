@@ -4,6 +4,7 @@ mod buffers;
 mod erased;
 mod history;
 mod input;
+mod lines;
 mod processor;
 mod replies;
 mod revision;

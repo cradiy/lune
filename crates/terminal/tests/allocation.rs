@@ -1451,6 +1451,27 @@ fn text_views_stream_without_allocation_and_propagate_sink_failures() {
         assert_eq!(snapshot(screen.grid()), before);
         assert_eq!(retained(screen.history()), history);
         assert_eq!(screen.cursor(), cursor);
+        let expected_lines: String = screen
+            .view()
+            .logical_lines()
+            .map(|line| line.text().to_string())
+            .collect();
+        output = String::with_capacity(expected_lines.len());
+        let (result, stats) = allocator::measure(Some(0), || {
+            let view = screen.view();
+            for line in view.logical_lines() {
+                let found = view.logical_line(black_box(line.range().start)).unwrap();
+                black_box(found.iter_rows().count());
+                write!(&mut output, "{}", line.text())?;
+            }
+            for line in view.logical_lines().rev() {
+                black_box(line.range());
+            }
+            Ok::<_, fmt::Error>(())
+        });
+        result.unwrap();
+        assert_eq!(stats.attempts, 0);
+        assert_eq!(output, expected_lines);
     }
 }
 

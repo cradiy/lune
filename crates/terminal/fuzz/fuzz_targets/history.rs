@@ -62,6 +62,43 @@ fn check_text(screen: &Screen, bytes: [u8; 4]) {
     let view = screen.view();
     assert_eq!(view.rows(), rows.len());
     assert_eq!(view.iter_rows().map(row).collect::<Vec<_>>(), rows);
+    let mut expected_lines = Vec::new();
+    let mut start = 0;
+    for (index, row) in rows.iter().enumerate() {
+        if row.wrap.is_none() || index + 1 == rows.len() {
+            expected_lines.push(start..index + 1);
+            start = index + 1;
+        }
+    }
+    assert_eq!(
+        view.logical_lines()
+            .map(|line| line.range())
+            .collect::<Vec<_>>(),
+        expected_lines
+    );
+    assert_eq!(
+        view.logical_lines()
+            .rev()
+            .map(|line| line.range())
+            .collect::<Vec<_>>(),
+        expected_lines.iter().rev().cloned().collect::<Vec<_>>()
+    );
+    let index = usize::from(bytes[0]) % rows.len();
+    let line = view.logical_line(index).unwrap();
+    let range = expected_lines
+        .iter()
+        .find(|range| range.contains(&index))
+        .unwrap();
+    assert_eq!(line.range(), *range);
+    let mut expected_text = String::new();
+    for row in &rows[range.clone()] {
+        for (column, cell) in row.cells.iter().enumerate() {
+            if cell.width() != 0 && column < row.wrap.unwrap_or(row.cells.len()) {
+                expected_text.push_str(&row.text[column]);
+            }
+        }
+    }
+    assert_eq!(line.text().to_string(), expected_text);
     check_ranges(&rows, |range| view.text(range), bytes);
     let viewport = screen.viewport();
     let selected = &rows[viewport.range()];

@@ -198,6 +198,8 @@ History view probes build an independent sequence of captured and visible row
 snapshots. Range extraction selects overlapping complete units, skips soft-wrap
 gaps, and inserts hard newlines. Probes compare full and arbitrary ranges,
 including mixed historical widths and alternate-buffer selection.
+Logical-line probes partition those snapshots at hard breaks, compare forward
+and reverse row ranges, and check containing-line lookup and complete text.
 
 Viewport probes track retained cell-buffer identity across individual captures,
 clamp removed anchors to the oldest retained row, and walk navigation counts in
