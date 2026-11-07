@@ -144,7 +144,7 @@ fn tracing_cells_and_external_owners_preserves_only_reachable_styles() {
         .unwrap();
     let mut screen = Screen::new(8, 4).unwrap();
     screen.write_ascii(b"red", red).unwrap();
-    screen.line_feed(StyleId(0));
+    screen.line_feed(StyleId(0)).unwrap();
     screen.write_ascii(b"blue", blue).unwrap();
     let cells = || {
         screen

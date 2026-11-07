@@ -137,8 +137,11 @@ impl UnicodeWriter {
                 return Ok(());
             }
         }
+        // A Prepend extension can consume one extra column before the ASCII suffix.
+        let prepared = ascii && screen.prepare_ascii_text(text.len().saturating_add(1), style)?;
         let position = &mut self.position;
-        self.grapheme
+        let result = self
+            .grapheme
             .advance(text, |update| {
                 match update {
                     TextUpdate::Ascii(run) => {
@@ -192,7 +195,11 @@ impl UnicodeWriter {
                 TextFailure::Rejected(error) => error,
                 TextFailure::TooLong => StorageError::TextTooLong,
                 TextFailure::Control(_) => StorageError::InvalidText,
-            })
+            });
+        if prepared {
+            screen.finish_text_reservation();
+        }
+        result
     }
 }
 

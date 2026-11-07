@@ -155,7 +155,7 @@ fn main() {
     let mut screen = Screen::new(120, 24).unwrap();
     screen.set_cursor(23, 0);
     measure("line feed + scroll", 1, || {
-        black_box(&mut screen).line_feed(StyleId(0));
+        black_box(&mut screen).line_feed(StyleId(0)).unwrap();
     });
     measure("wide edge + scroll + placement", 1, || {
         let screen = black_box(&mut screen);
@@ -171,13 +171,13 @@ fn main() {
             screen.set_cursor(rows - 1, 0);
             if wrapped {
                 for _ in 0..rows / 2 {
-                    screen.line_feed(StyleId(0));
+                    screen.line_feed(StyleId(0)).unwrap();
                 }
             }
             screen.set_scroll_region(1..rows - 1).unwrap();
             screen.set_cursor(rows - 2, 0);
             measure(&format!("region LF / {rows}, wrapped={wrapped}"), 1, || {
-                black_box(&mut screen).line_feed(StyleId(0));
+                black_box(&mut screen).line_feed(StyleId(0)).unwrap();
             });
             let ascii = [b'x'; 240];
             measure(
@@ -313,7 +313,7 @@ fn main() {
         Screen::insert_lines,
         Screen::delete_lines,
         Screen::scroll_down,
-        Screen::scroll_up,
+        |screen, count, style| screen.scroll_up(count, style).unwrap(),
     ];
     for (name, edit) in ["IL", "DL", "SD", "SU"].into_iter().zip(line_edits) {
         let mut screen = Screen::new(120, 24).unwrap();
@@ -327,7 +327,7 @@ fn main() {
                 screen.set_cursor(rows - 1, 0);
                 if wrapped {
                     for _ in 0..rows / 4 {
-                        screen.line_feed(StyleId(0));
+                        screen.line_feed(StyleId(0)).unwrap();
                     }
                 }
                 screen.set_scroll_region(1..rows - 1).unwrap();

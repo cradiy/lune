@@ -13,8 +13,8 @@ mod screen_model;
 
 use libfuzzer_sys::fuzz_target;
 use lune_terminal::{
-    CellPosition, CellWidth, EraseMode, ProcessFailure, Processor, Screen, StorageError, StyleId,
-    TextSink, UnicodeWriter, WidthPolicy,
+    CellPosition, CellWidth, EraseMode, HistoryLimits, MAX_HISTORY_BYTES, ProcessFailure,
+    Processor, Screen, StorageError, StyleId, TextSink, UnicodeWriter, WidthPolicy,
 };
 use screen_model::{Command, ScreenModel};
 use unicode_segmentation::UnicodeSegmentation;
@@ -111,9 +111,21 @@ impl TextSink for FaultSink {
     }
 }
 
-fn run(wire: &[u8], chunk: usize, policy: WidthPolicy, fail_at: usize, oracle: &ScreenModel) {
+fn run(
+    wire: &[u8],
+    chunk: usize,
+    policy: WidthPolicy,
+    fail_at: usize,
+    oracle: &ScreenModel,
+) -> String {
     let mut processor = Processor::default();
     let mut screen = Screen::new(8, 4).unwrap();
+    screen
+        .set_history_limits(HistoryLimits {
+            max_rows: 7,
+            max_bytes: MAX_HISTORY_BYTES,
+        })
+        .unwrap();
     let mut sink = FaultSink {
         writer: UnicodeWriter::new(policy),
         calls: 0,
@@ -137,6 +149,9 @@ fn run(wire: &[u8], chunk: usize, policy: WidthPolicy, fail_at: usize, oracle: &
     processor.finish(&mut screen, &mut sink).unwrap();
     assert_eq!(processor.parse_errors(), 0);
     oracle.check(&screen);
+    assert!(screen.history().len() <= screen.history().limits().max_rows);
+    assert!(screen.history().retained_bytes() <= screen.history().limits().max_bytes);
+    format!("{:?}", screen.history().iter_rows().collect::<Vec<_>>())
 }
 
 fuzz_target!(|data: &[u8]| {
@@ -260,12 +275,13 @@ fuzz_target!(|data: &[u8]| {
             }
         }
     }
-    run(&wire, wire.len().max(1), policy, usize::MAX, &oracle.screen);
-    run(
+    let bulk = run(&wire, wire.len().max(1), policy, usize::MAX, &oracle.screen);
+    let fragmented = run(
         &wire,
         1 + usize::from(data.get(1).copied().unwrap_or(0)) % 17,
         policy,
         usize::from(data.get(2).copied().unwrap_or(0)) % 31,
         &oracle.screen,
     );
+    assert_eq!(bulk, fragmented);
 });

@@ -175,3 +175,21 @@ cargo +nightly fuzz run styles -- -max_len=512 -timeout=2 -rss_limit_mb=1024 -ma
 Pass a finding's artifact file as the corpus argument to replay it. The command
 uses AddressSanitizer; input limits and duration define the campaign scope. Add
 `-len_control=0` to sample the full allowed input length from the start of a campaign.
+
+## History Target
+
+The `history` target compares history-enabled bulk ASCII with per-byte writes,
+then compares both visible buffers against a history-disabled screen. It mixes
+line feed, counted scrolling, Unicode units, resizing, region and buffer changes,
+line edits, erasure, reset, and limit changes. Every operation checks retained
+rows and soft wraps, cursor state, and both history budgets. Limits use zero or
+the maximum byte budget so row retention compares independently of allocation
+capacity differences. Allocation fault tests cover bounded preflight and retry.
+
+```sh
+cargo +nightly fuzz run history -- -max_len=2048 -len_control=0 -timeout=2 -rss_limit_mb=1024 -max_total_time=60
+```
+
+The `unicode` target also enables bounded history while its independent screen
+oracle checks visible placement. Whole and fragmented runs compare retained
+Unicode rows and wrap metadata across width revisions and callback retries.

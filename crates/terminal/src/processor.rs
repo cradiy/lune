@@ -5,14 +5,15 @@ use lune_vt::{CsiSequence, EscapeSequence, Event, Parameter, Parser};
 use crate::charsets::Charsets;
 use crate::reply::{self, Reply, Report};
 use crate::{
-    CursorShape, EraseMode, InputModes, MAX_STYLES, Screen, ScreenBuffer, Style, StyleError,
-    StyleId, StyleTable, TextSink,
+    CursorShape, EraseMode, InputModes, MAX_STYLES, Screen, ScreenBuffer, StorageError, Style,
+    StyleError, StyleId, StyleTable, TextSink,
 };
 
-/// A failure while applying a completed text, rendition, or reply event.
+/// A failure while applying a completed text, screen, rendition, or reply event.
 #[derive(Debug)]
 pub enum ProcessFailure<E> {
     Text(E),
+    Screen(StorageError),
     Style(StyleError),
     /// A completed reply is waiting for the occupied output slot. Drain
     /// [`Processor::reply_bytes`] and confirm delivery with [`Processor::consume_reply`].
@@ -23,6 +24,7 @@ impl<E: fmt::Display> fmt::Display for ProcessFailure<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Text(error) => write!(f, "Text processing failed: {error}"),
+            Self::Screen(error) => error.fmt(f),
             Self::Style(error) => error.fmt(f),
             Self::ReplyPending => f.write_str("Reply output requires draining"),
         }
@@ -33,6 +35,7 @@ impl<E: Error + 'static> Error for ProcessFailure<E> {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Text(error) => Some(error),
+            Self::Screen(error) => Some(error),
             Self::Style(error) => Some(error),
             Self::ReplyPending => None,
         }
@@ -68,6 +71,8 @@ enum Pending {
     Text(char),
     Boundary,
     Execute(u8),
+    Index(bool),
+    ScrollUp(usize),
     Rendition(Style),
     Reply(Report),
 }
@@ -304,7 +309,12 @@ impl Processor {
                 }
                 Event::Escape(sequence) => {
                     debug_assert_eq!(*end, 0);
-                    if !escape(screen, sequence, state) {
+                    if sequence.intermediates.is_empty()
+                        && matches!(sequence.final_byte, b'D' | b'E')
+                    {
+                        pending[*end] = Some(Pending::Index(sequence.final_byte == b'E'));
+                        *end += 1;
+                    } else if !escape(screen, sequence, state) {
                         *ignored_sequences = ignored_sequences.saturating_add(1);
                     }
                 }
@@ -319,6 +329,18 @@ impl Processor {
                             .expect("Current rendition is rooted");
                         if next.apply_sgr(sequence.parameters) {
                             pending[*end] = Some(Pending::Rendition(next));
+                            *end += 1;
+                            true
+                        } else {
+                            false
+                        }
+                    } else if sequence.final_byte == b'S' {
+                        if sequence.private_markers.is_empty()
+                            && sequence.intermediates.is_empty()
+                            && sequence.parameters.len() <= 1
+                            && sequence.parameters.iter().all(|p| !p.is_subparameter)
+                        {
+                            pending[*end] = Some(Pending::ScrollUp(count(sequence.parameters)));
                             *end += 1;
                             true
                         } else {
@@ -429,8 +451,24 @@ impl Processor {
                     match control {
                         0x0e => self.state.charsets.shift(true),
                         0x0f => self.state.charsets.shift(false),
-                        _ => execute(screen, control, self.state.style, self.state.input.new_line),
+                        _ => execute(screen, control, self.state.style, self.state.input.new_line)
+                            .map_err(ProcessFailure::Screen)?,
                     }
+                }
+                Pending::Index(carriage) => {
+                    text.boundary();
+                    screen
+                        .line_feed(self.state.style)
+                        .map_err(ProcessFailure::Screen)?;
+                    if carriage {
+                        screen.carriage_return();
+                    }
+                }
+                Pending::ScrollUp(count) => {
+                    text.boundary();
+                    screen
+                        .scroll_up(count, self.state.style)
+                        .map_err(ProcessFailure::Screen)?;
                 }
                 Pending::Rendition(style) => {
                     self.state.style = self.styles.intern(style).map_err(ProcessFailure::Style)?;
@@ -494,19 +532,25 @@ fn ascii_prefix<const LAST: u8>(input: &[u8]) -> usize {
             .unwrap_or(input.len() - offset)
 }
 
-fn execute(screen: &mut Screen, control: u8, style: StyleId, new_line_mode: bool) {
+fn execute(
+    screen: &mut Screen,
+    control: u8,
+    style: StyleId,
+    new_line_mode: bool,
+) -> Result<(), StorageError> {
     match control {
         0x08 => screen.backspace(),
         0x09 => screen.tab_forward(1),
         0x0a..=0x0c => {
+            screen.line_feed(style)?;
             if new_line_mode {
                 screen.carriage_return();
             }
-            screen.line_feed(style);
         }
         0x0d => screen.carriage_return(),
         _ => {}
     }
+    Ok(())
 }
 
 fn escape(screen: &mut Screen, sequence: EscapeSequence<'_>, state: &mut State) -> bool {
@@ -524,11 +568,6 @@ fn escape(screen: &mut Screen, sequence: EscapeSequence<'_>, state: &mut State) 
         }
         b'8' => {
             restore_cursor(screen, state);
-        }
-        b'D' => screen.line_feed(state.style),
-        b'E' => {
-            screen.carriage_return();
-            screen.line_feed(state.style);
         }
         b'H' => screen.set_tab_stop(),
         b'=' => state.input.application_keypad = true,
@@ -724,7 +763,6 @@ fn csi(screen: &mut Screen, sequence: CsiSequence<'_>, state: &mut State) -> boo
         b'X' => screen.erase_cells(n, style),
         b'L' => screen.insert_lines(n, style),
         b'M' => screen.delete_lines(n, style),
-        b'S' => screen.scroll_up(n, style),
         b'T' => screen.scroll_down(n, style),
         b'J' | b'K' => {
             let Some(mode) = erase_mode(value(p, 0, 0)) else {

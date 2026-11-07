@@ -16,6 +16,68 @@ pub struct Row {
 }
 
 impl Row {
+    pub(crate) fn bytes_without_last_unit(&self) -> usize {
+        let column =
+            self.cells.len() - 1 - usize::from(self.cells.last().unwrap().is_continuation());
+        let removed = self
+            .extended_index(column)
+            .ok()
+            .map_or(0, |index| self.extended[index].text.capacity());
+        self.retained_bytes().saturating_sub(removed)
+    }
+
+    pub(crate) fn reset_write(
+        &mut self,
+        columns: usize,
+        text: &str,
+        width: CellWidth,
+        style: StyleId,
+    ) -> Result<(), StorageError> {
+        debug_assert!(self.fits_columns(columns));
+        if width.columns() > columns {
+            return Err(StorageError::OutOfBounds);
+        }
+        let character = text.chars().next().ok_or(StorageError::EmptyText)?;
+        if text.len() > MAX_CELL_TEXT_BYTES {
+            return Err(StorageError::TextTooLong);
+        }
+        let owned = if text.len() > character.len_utf8() {
+            if let Ok(index) = self.extended_index(0) {
+                let entry = &mut self.extended[index];
+                entry
+                    .text
+                    .try_reserve(text.len().saturating_sub(entry.text.len()))?;
+                let mut owned = std::mem::take(&mut entry.text);
+                owned.clear();
+                owned.push_str(text);
+                Some(owned)
+            } else {
+                let mut owned = String::new();
+                owned.try_reserve_exact(text.len())?;
+                if self.extended.capacity() == 0 {
+                    self.extended.try_reserve(1)?;
+                }
+                owned.push_str(text);
+                Some(owned)
+            }
+        } else {
+            None
+        };
+        // Every fallible reservation precedes clearing or resizing the row.
+        self.clear(style);
+        self.resize_prepared(columns, style);
+        let mut cell = Cell::scalar(character, width, style);
+        if let Some(text) = owned {
+            self.extended.push(ExtendedText { column: 0, text });
+            cell.set_extended();
+        }
+        self.cells[0] = cell;
+        if width == CellWidth::Double {
+            self.cells[1] = Cell::continuation(style);
+        }
+        Ok(())
+    }
+
     pub(crate) fn retained_bytes(&self) -> usize {
         self.cells
             .capacity()

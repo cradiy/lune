@@ -47,7 +47,8 @@
 //! zero counts preserve all state and positive counts cancel pending wrapping.
 //! Explicit upward and downward scrolling affects the entire active region,
 //! preserves cursor coordinates and pending wrapping even outside the region,
-//! and recycles row buffers without allocating.
+//! and reuses row buffers. Primary full-screen upward scrolling can allocate
+//! replacement buffers while its bounded history is filling.
 //! Horizontal tab stops use one bit per column and default to columns 0, 8, 16,
 //! and so on. Stops can be set or cleared at the cursor, or cleared together.
 //! Forward and backward tabulation preserve contents and clamp at screen edges;
@@ -153,16 +154,16 @@
 //! Pass a mutable sink to advance, finish, and reset. External screen mutations
 //! require an explicit [`TextSink::boundary`] before subsequent text input.
 //!
-//! [`RowHistory`] retains physical rows through explicit [`RowHistory::scroll_up`]
-//! operations. Primary full-region scrolling transfers ownership into history;
-//! alternate and partial regions follow their visible-screen scrolling rules.
-//! [`HistoryLimits`] bounds retained row count and row-owned heap capacity. Oldest
-//! rows are evicted first and their buffers can supply the exposed blank row.
-//! Preparation failures preserve logical history and both buffers. Retained rows
-//! keep their captured widths, Unicode payloads, styles, and soft-wrap connections.
-//! Queue allocation and the temporary replacement row are separate bounded costs.
-//! Include [`RowHistory::style_ids`] in style collection roots and use
-//! [`RowHistory::disconnect`] when external edits break primary top-row adjacency.
+//! [`Screen::history`] borrows bounded chronological physical rows. Configure
+//! [`HistoryLimits`] through [`Screen::set_history_limits`]; capture starts disabled.
+//! Full-screen primary LF, IND/NEL, automatic wrapping, and explicit upward
+//! scrolling transfer outgoing rows into history. Oldest rows are evicted first.
+//! Retained rows preserve captured widths, Unicode text, styles, and soft wraps.
+//! Batch writes reserve replacements before mutation; failures preserve history,
+//! both buffers, and cursor state. Metadata and bounded transaction buffers are
+//! separate from the retained row byte budget. Screen edits and width changes
+//! maintain history-to-screen adjacency. Reset clears rows and preserves limits.
+//! Style collection includes all retained history cells automatically.
 //!
 //! [`Style`] represents unresolved colors and character rendition independently
 //! of [`StyleId`] storage. [`Style::apply_sgr`] interprets a parameter list
@@ -171,8 +172,8 @@
 //! [`Processor`] owns its [`StyleTable`] and supplies its current key to the text
 //! callback and screen operations. [`Processor::collect_styles`] traces the paired
 //! screen and current/saved rendition, together with caller-supplied snapshot roots.
-//! [`ProcessFailure`] distinguishes text errors from rendition storage errors;
-//! failed style changes remain buffered for retry before further input.
+//! [`ProcessFailure`] distinguishes text, screen storage, rendition, and reply
+//! failures. Failed completed controls remain buffered for retry before further input.
 //! [`StyleTable`] interns values behind bounded, table-local IDs. Explicit
 //! collection traces caller-owned roots, preserves retained IDs, and invalidates
 //! reclaimed IDs through slot generations. Default rendition permanently uses

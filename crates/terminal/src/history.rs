@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 
-use crate::{Grid, Row, Screen, StorageError, StyleId};
+use crate::{Cell, CellWidth, Grid, Row, StorageError, StyleId};
 
 /// Maximum retained physical rows.
 pub const MAX_HISTORY_ROWS: usize = u16::MAX as usize;
@@ -32,45 +32,39 @@ struct Entry {
     bytes: usize,
 }
 
-/// A bounded chronological collection of immutable physical rows.
+/// Bounded chronological physical rows owned by a [`crate::Screen`].
 ///
-/// [`Self::scroll_up`] captures one row during an explicit primary-screen,
-/// full-region scroll. It transfers row ownership, preserving cell and text
-/// allocations, styles, erased cells, and outgoing soft-wrap metadata. History
-/// rows retain their captured widths. Reads borrow their original storage.
+/// Primary full-screen upward scrolling transfers row ownership, including text,
+/// styles, erased cells, and outgoing soft wraps. Rows retain their captured widths.
+/// Configure capture with [`crate::Screen::set_history_limits`] and borrow rows
+/// through [`crate::Screen::history`]. Capture starts disabled.
 ///
 /// Oldest rows are evicted to satisfy both limits. An oversized incoming row is
-/// discarded and disconnects the preceding history row from the new screen top.
-/// Evicted cell buffers are reused for the exposed row when their capacity fits.
-/// Otherwise one blank replacement row is prepared before any logical mutation.
-/// Queue growth and replacement allocation failures preserve logical history and
-/// screen state. Preparation may retain additional reserved queue capacity.
+/// discarded and disconnects the preceding row from the screen top. Fitting
+/// evicted buffers supply replacement rows. Fallible preparation preserves logical
+/// history and screen state; reserved queue capacity may grow during preparation.
 ///
-/// The byte budget includes allocated capacities for cells, sparse text entries,
-/// and UTF-8 payloads. Queue allocation and a temporary grid-width replacement
-/// row are separate, bounded costs. Clear and limit reductions release row-owned
-/// storage; the queue retains its capacity. Construction makes no allocations.
-///
-/// Pair this history with one screen. External changes to the primary screen's
-/// top-row adjacency require [`Self::disconnect`]; pass [`Self::style_ids`] as
-/// external roots to [`crate::Processor::collect_styles`]. Stateful text writers
-/// require a boundary before this explicit screen mutation.
+/// The byte budget counts cell, sparse-index, and UTF-8 allocated capacities.
+/// Queue and transaction metadata retain their high-water capacity. A text batch
+/// can reserve up to `max_rows` blank buffers. Newly allocated cell capacity is
+/// bounded by `max_bytes`; recycled buffers retain their existing capacities.
+/// Spare rows are released when the batch ends.
+/// Screen reset clears history while preserving configured limits and metadata.
 #[derive(Debug, Default)]
 pub struct RowHistory {
     rows: VecDeque<Entry>,
     bytes: usize,
     limits: HistoryLimits,
+    // Preflight replacements for a whole atomic ASCII callback. Evicted buffers
+    // can replenish this pool when byte limits evict several rows at once.
+    spares: Vec<Row>,
+    remaining: usize,
+    // Cache fitting retained buffers so saturated preflight avoids a history scan.
+    warm_columns: usize,
+    warm_count: usize,
 }
 
 impl RowHistory {
-    pub fn new(limits: HistoryLimits) -> Result<Self, StorageError> {
-        limits.validate()?;
-        Ok(Self {
-            limits,
-            ..Self::default()
-        })
-    }
-
     pub fn limits(&self) -> HistoryLimits {
         self.limits
     }
@@ -103,7 +97,7 @@ impl RowHistory {
 
     /// Changes limits, evicting oldest rows until both are satisfied. Validation
     /// fails before mutation. This makes no allocation requests.
-    pub fn set_limits(&mut self, limits: HistoryLimits) -> Result<(), StorageError> {
+    pub(crate) fn set_limits(&mut self, limits: HistoryLimits) -> Result<(), StorageError> {
         limits.validate()?;
         self.limits = limits;
         while self.rows.len() > limits.max_rows || self.bytes > limits.max_bytes {
@@ -113,30 +107,79 @@ impl RowHistory {
     }
 
     /// Releases all retained rows while preserving the queue allocation and limits.
-    pub fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) {
+        self.finish();
+        self.warm_count = 0;
         self.rows.clear();
         self.bytes = 0;
     }
 
     /// Ends the newest row's soft-wrap connection to the primary screen top.
-    pub fn disconnect(&mut self) {
+    pub(crate) fn disconnect(&mut self) {
         if let Some(entry) = self.rows.back_mut() {
             entry.row.set_wrap_end(None);
         }
     }
 
-    /// Scrolls one row of the screen's active region, preserving cursor placement,
-    /// pending wrapping, modes, and cursor save slots. Primary full-region scrolling
-    /// retains the outgoing row when it fits. Alternate and partial-region scrolling
-    /// use the screen's regular recycling rules. Returns whether a row was retained.
-    /// Every error preserves history and both display buffers.
-    #[inline]
-    pub fn scroll_up(&mut self, screen: &mut Screen, style: StyleId) -> Result<bool, StorageError> {
-        if self.limits.max_rows == 0 || self.limits.max_bytes == 0 {
-            screen.scroll_up(1, style);
+    pub(crate) fn enabled_for(&self, columns: usize) -> bool {
+        self.limits.max_rows != 0 && self.limits.max_bytes / size_of::<Cell>() >= columns
+    }
+
+    pub(crate) fn prepare(
+        &mut self,
+        columns: usize,
+        scrolls: usize,
+        style: StyleId,
+    ) -> Result<bool, StorageError> {
+        if scrolls == 0 || self.remaining != 0 {
             return Ok(false);
         }
-        screen.scroll_history(self, style)
+        if self.warm_columns != columns {
+            self.warm_columns = columns;
+            self.warm_count = self
+                .rows
+                .iter()
+                .filter(|entry| entry.row.fits_columns(columns))
+                .count();
+        }
+        let maximum = self
+            .limits
+            .max_rows
+            .min(self.limits.max_bytes / (columns * size_of::<Cell>()));
+        let new_rows = scrolls.min(maximum.saturating_sub(self.warm_count));
+        let cache = new_rows.max(scrolls.saturating_sub(1).min(maximum));
+        let slots = self
+            .rows
+            .len()
+            .saturating_add(scrolls)
+            .min(self.limits.max_rows);
+        self.rows
+            .try_reserve_exact(slots.saturating_sub(self.rows.len()))?;
+        self.spares
+            .try_reserve_exact(cache.saturating_sub(self.spares.len()))?;
+        for _ in 0..new_rows {
+            match Row::new(columns, style) {
+                Ok(row) => self.spares.push(row),
+                Err(error) => {
+                    self.spares.clear();
+                    return Err(error);
+                }
+            }
+        }
+        self.remaining = scrolls;
+        Ok(true)
+    }
+
+    pub(crate) fn finish(&mut self) {
+        self.spares.clear();
+        self.remaining = 0;
+    }
+
+    fn finish_scroll(&mut self) {
+        if self.remaining != 0 {
+            self.remaining -= 1;
+            self.spares.truncate(self.remaining);
+        }
     }
 
     pub(crate) fn capture(
@@ -144,16 +187,51 @@ impl RowHistory {
         grid: &mut Grid,
         style: StyleId,
     ) -> Result<bool, StorageError> {
-        let enabled = self.limits.max_rows != 0 && self.limits.max_bytes != 0;
-        let bytes = if enabled {
-            grid.row(0).expect("A grid contains a row").retained_bytes()
+        self.capture_with(grid, style, None, None, false)
+    }
+
+    pub(crate) fn write_scrolling(
+        &mut self,
+        grid: &mut Grid,
+        text: &str,
+        width: CellWidth,
+        style: StyleId,
+        gap: bool,
+    ) -> Result<(), StorageError> {
+        self.capture_with(
+            grid,
+            style,
+            Some((text, width)),
+            Some(grid.columns() - usize::from(gap)),
+            gap,
+        )
+        .map(|_| ())
+    }
+
+    fn capture_with(
+        &mut self,
+        grid: &mut Grid,
+        style: StyleId,
+        unit: Option<(&str, CellWidth)>,
+        wrap: Option<usize>,
+        gap: bool,
+    ) -> Result<bool, StorageError> {
+        let columns = grid.columns();
+        let top = grid.row(0).expect("A grid contains a row");
+        let bytes = if gap && grid.rows() == 1 {
+            top.bytes_without_last_unit()
         } else {
-            0
+            top.retained_bytes()
         };
-        if !enabled || bytes > self.limits.max_bytes {
+        if !self.enabled_for(columns) || bytes > self.limits.max_bytes {
+            if let Some((text, width)) = unit {
+                grid.write_scrolling(0..grid.rows(), text, width, style, gap)?;
+            } else {
+                grid.scroll_up(0..grid.rows(), 1, style)
+                    .expect("The full grid is valid");
+            }
             self.disconnect();
-            grid.scroll_up(0..grid.rows(), 1, style)
-                .expect("The full grid is a valid region");
+            self.finish_scroll();
             return Ok(false);
         }
         let mut remaining_bytes = self.bytes;
@@ -164,23 +242,48 @@ impl RowHistory {
             remaining_bytes -= self.rows[evicted].bytes;
             evicted += 1;
         }
-        if evicted == 0 {
+        if evicted == 0 && self.remaining == 0 {
             self.reserve_entry()?;
         }
-        let columns = grid.columns();
         let reuse = (0..evicted).find(|&index| self.rows[index].row.fits_columns(columns));
-        let mut replacement = if reuse.is_some() {
+        let mut replacement = if let Some(index) = reuse {
+            if let Some((text, width)) = unit {
+                self.rows[index]
+                    .row
+                    .reset_write(columns, text, width, style)?;
+            }
             None
         } else {
-            Some(Row::new(columns, style)?)
+            let mut row = if self.remaining != 0 {
+                self.spares
+                    .pop()
+                    .expect("Batch scrolling reserved a replacement row")
+            } else {
+                Row::new(columns, style)?
+            };
+            if let Some((text, width)) = unit {
+                row.reset_write(columns, text, width, style)?;
+            }
+            Some(row)
         };
+        let future = self.remaining.saturating_sub(1);
         for index in 0..evicted {
             let entry = self.evict();
             if reuse == Some(index) {
                 let mut row = entry.row;
+                if unit.is_none() {
+                    row.clear(style);
+                    row.resize_prepared(columns, style);
+                }
+                replacement = Some(row);
+            } else if self.remaining != 0
+                && self.spares.len() < future
+                && entry.row.fits_columns(columns)
+            {
+                let mut row = entry.row;
                 row.clear(style);
                 row.resize_prepared(columns, style);
-                replacement = Some(row);
+                self.spares.push(row);
             }
         }
         if self
@@ -190,15 +293,41 @@ impl RowHistory {
         {
             self.disconnect();
         }
-        let row = grid.exchange_top(replacement.expect("The replacement row is prepared"));
+        if gap {
+            grid.clear_row(grid.rows() - 1, columns - 1..columns, style)
+                .expect("The final cell is in bounds");
+        }
+        let mut row = grid.exchange_top(replacement.expect("A replacement row is prepared"));
+        if grid.rows() == 1 {
+            row.set_wrap_end(wrap);
+        }
+        debug_assert_eq!(row.retained_bytes(), bytes);
+        if self.warm_columns != 0 && row.fits_columns(self.warm_columns) {
+            self.warm_count += 1;
+        }
         self.rows.push_back(Entry { row, bytes });
         self.bytes += bytes;
+        if grid.rows() > 1
+            && let Some(end) = wrap
+        {
+            grid.set_wrap_end(grid.rows() - 2, Some(end));
+        }
+        self.finish_scroll();
         Ok(true)
+    }
+
+    pub(crate) fn connect_latest(&mut self, end: usize) {
+        if let Some(entry) = self.rows.back_mut() {
+            entry.row.set_wrap_end(Some(end));
+        }
     }
 
     fn evict(&mut self) -> Entry {
         let entry = self.rows.pop_front().expect("A retained row is present");
         self.bytes -= entry.bytes;
+        if self.warm_columns != 0 && entry.row.fits_columns(self.warm_columns) {
+            self.warm_count -= 1;
+        }
         entry
     }
 

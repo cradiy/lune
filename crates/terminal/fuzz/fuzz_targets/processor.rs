@@ -89,6 +89,9 @@ fn drive(wire: &[u8], chunk: usize, fail_at: usize, expected: &Expected<'_>) {
                             drain_reply(&mut processor, &mut replies, chunk % 3 + 1);
                         }
                         ProcessFailure::Text(()) => {}
+                        ProcessFailure::Screen(error) => {
+                            panic!("Unexpected screen failure: {error}")
+                        }
                         ProcessFailure::Style(error) => panic!("Unexpected style failure: {error}"),
                     }
                     processor.collect_styles(&screen, []).unwrap();
@@ -102,6 +105,7 @@ fn drive(wire: &[u8], chunk: usize, fail_at: usize, expected: &Expected<'_>) {
             Ok(()) => break,
             Err(ProcessFailure::ReplyPending) => drain_reply(&mut processor, &mut replies, 1),
             Err(ProcessFailure::Text(())) => {}
+            Err(ProcessFailure::Screen(error)) => panic!("Unexpected screen failure: {error}"),
             Err(ProcessFailure::Style(error)) => panic!("Unexpected style failure: {error}"),
         }
     }

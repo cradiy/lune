@@ -9,61 +9,63 @@ use std::{
 use lune_terminal::{
     CellPosition, CellText, CellWidth, EraseMode, Grid, HistoryLimits, ProcessFailure, Processor,
     RowHistory, Screen, ScreenBuffer, StorageError, Style, StyleError, StyleId, StyleTable,
-    UnicodeWriter,
+    TextSink, UnicodeWriter,
 };
 
 #[global_allocator]
 static ALLOCATOR: allocator::TestAllocator = allocator::TestAllocator;
 
+#[derive(Debug, PartialEq, Eq)]
+struct HistorySnapshot {
+    rows: Vec<Vec<SnapshotCell>>,
+    wraps: Vec<Option<usize>>,
+    limits: HistoryLimits,
+    bytes: usize,
+}
+fn retained(history: &RowHistory) -> HistorySnapshot {
+    HistorySnapshot {
+        rows: history
+            .iter_rows()
+            .map(|row| {
+                row.cells()
+                    .iter()
+                    .enumerate()
+                    .map(|(column, cell)| SnapshotCell {
+                        text: match row.text(column).unwrap() {
+                            CellText::Scalar(value) => value.to_string(),
+                            CellText::Extended(value) => value.to_owned(),
+                            CellText::Continuation => String::new(),
+                        },
+                        width: cell.width(),
+                        style: cell.style(),
+                        erased: cell.is_erased(),
+                    })
+                    .collect()
+            })
+            .collect(),
+        wraps: history.iter_rows().map(|row| row.wrap_end()).collect(),
+        limits: history.limits(),
+        bytes: history.retained_bytes(),
+    }
+}
+
 #[test]
 fn history_allocation_failures_preserve_owners_and_saturated_capture_reuses_rows() {
-    #[derive(Debug, PartialEq, Eq)]
-    struct HistorySnapshot {
-        rows: Vec<Vec<SnapshotCell>>,
-        wraps: Vec<Option<usize>>,
-        limits: HistoryLimits,
-        bytes: usize,
-    }
-    fn retained(history: &RowHistory) -> HistorySnapshot {
-        HistorySnapshot {
-            rows: history
-                .iter_rows()
-                .map(|row| {
-                    row.cells()
-                        .iter()
-                        .enumerate()
-                        .map(|(column, cell)| SnapshotCell {
-                            text: match row.text(column).unwrap() {
-                                CellText::Scalar(value) => value.to_string(),
-                                CellText::Extended(value) => value.to_owned(),
-                                CellText::Continuation => String::new(),
-                            },
-                            width: cell.width(),
-                            style: cell.style(),
-                            erased: cell.is_erased(),
-                        })
-                        .collect()
-                })
-                .collect(),
-            wraps: history.iter_rows().map(|row| row.wrap_end()).collect(),
-            limits: history.limits(),
-            bytes: history.retained_bytes(),
-        }
-    }
-    fn prepared(case: usize) -> (Screen, RowHistory) {
+    fn prepared(case: usize) -> Screen {
         let mut screen = Screen::new(4, 3).unwrap();
-        let mut history = RowHistory::new(HistoryLimits {
-            max_rows: if case == 1 { 1 } else { 32 },
-            max_bytes: 4096,
-        })
-        .unwrap();
+        screen
+            .set_history_limits(HistoryLimits {
+                max_rows: if case == 1 { 1 } else { 32 },
+                max_bytes: 4096,
+            })
+            .unwrap();
         if case != 0 {
             for _ in 0..if case == 1 { 1 } else { 8 } {
                 screen.set_cursor(0, 0);
                 screen
                     .write("水\u{301}", CellWidth::Double, StyleId(1))
                     .unwrap();
-                history.scroll_up(&mut screen, StyleId(0)).unwrap();
+                screen.scroll_up(1, StyleId(0)).unwrap();
             }
         }
         if case == 1 {
@@ -78,29 +80,27 @@ fn history_allocation_failures_preserve_owners_and_saturated_capture_reuses_rows
         screen.set_insert_mode(true);
         screen.clear_tab_stops();
         screen.set_tab_stop();
-        (screen, history)
+        screen
     }
     for case in 0..3 {
-        let (mut expected_screen, mut expected_history) = prepared(case);
-        let (result, stats) = allocator::measure(None, || {
-            expected_history.scroll_up(&mut expected_screen, StyleId(7))
-        });
-        assert!(result.unwrap());
+        let mut expected_screen = prepared(case);
+        let (result, stats) = allocator::measure(None, || expected_screen.scroll_up(1, StyleId(7)));
+        result.unwrap();
         assert!(stats.attempts > 0);
-        let expected = retained(&expected_history);
+        let expected = retained(expected_screen.history());
         let expected_grid = snapshot(expected_screen.grid());
         for point in 0..stats.attempts {
-            let (mut screen, mut history) = prepared(case);
-            let before_history = retained(&history);
+            let mut screen = prepared(case);
+            let before_history = retained(screen.history());
             let before_grid = snapshot(screen.grid());
             let alternate = snapshot(screen.buffer(ScreenBuffer::Alternate));
             let cursor = screen.cursor();
             let cells = screen.grid().row(0).unwrap().cells().as_ptr();
             let (result, failed) =
-                allocator::measure(Some(point), || history.scroll_up(&mut screen, StyleId(7)));
+                allocator::measure(Some(point), || screen.scroll_up(1, StyleId(7)));
             assert!(matches!(result, Err(StorageError::Allocation(_))));
             assert_eq!(failed.failures, 1);
-            assert_eq!(retained(&history), before_history);
+            assert_eq!(retained(screen.history()), before_history);
             assert_eq!(snapshot(screen.grid()), before_grid);
             assert_eq!(screen.grid().row(0).unwrap().cells().as_ptr(), cells);
             assert_eq!(snapshot(screen.buffer(ScreenBuffer::Alternate)), alternate);
@@ -108,45 +108,240 @@ fn history_allocation_failures_preserve_owners_and_saturated_capture_reuses_rows
             assert!(screen.insert_mode());
             assert_eq!(screen.is_tab_stop(2), Some(true));
             assert_eq!(screen.is_tab_stop(0), Some(false));
-            history.scroll_up(&mut screen, StyleId(7)).unwrap();
-            assert_eq!(retained(&history), expected);
+            screen.scroll_up(1, StyleId(7)).unwrap();
+            assert_eq!(retained(screen.history()), expected);
             assert_eq!(snapshot(screen.grid()), expected_grid);
             screen.carriage_return();
             screen.restore_cursor();
             assert_eq!(screen.cursor(), cursor);
         }
     }
-    let (_, mut owned) = prepared(2);
-    let bytes = owned.retained_bytes();
-    let ((), released) = allocator::measure(Some(0), || owned.clear());
+    let mut owned = prepared(2);
+    let bytes = owned.history().retained_bytes();
+    let ((), released) = allocator::measure(Some(0), || owned.clear_history());
     assert_eq!(released.attempts, 0);
     assert_eq!(released.live_bytes, -(bytes as i128));
-    let (history, stats) = allocator::measure(Some(0), || {
-        RowHistory::new(HistoryLimits {
+    let mut screen = Screen::new(4, 3).unwrap();
+    let (result, stats) = allocator::measure(Some(0), || {
+        screen.set_history_limits(HistoryLimits {
             max_rows: 3,
             max_bytes: 4096,
         })
     });
-    let mut history = history.unwrap();
+    result.unwrap();
     assert_eq!(stats.attempts, 0);
-    let mut screen = Screen::new(4, 3).unwrap();
     for _ in 0..3 {
-        history.scroll_up(&mut screen, StyleId(0)).unwrap();
+        screen.scroll_up(1, StyleId(0)).unwrap();
     }
     let ((), stats) = allocator::measure(Some(0), || {
         for _ in 0..128 {
-            assert!(history.scroll_up(&mut screen, StyleId(1)).unwrap());
+            screen.scroll_up(1, StyleId(1)).unwrap();
         }
-        history
-            .set_limits(HistoryLimits {
+        screen
+            .set_history_limits(HistoryLimits {
                 max_rows: 1,
                 max_bytes: 1,
             })
             .unwrap();
-        assert!(!history.scroll_up(&mut screen, StyleId(1)).unwrap());
-        history.clear();
+        screen.scroll_up(1, StyleId(1)).unwrap();
+        screen.clear_history();
     });
     assert_eq!(stats.attempts, 0);
+}
+
+#[test]
+fn automatic_history_preflights_complete_text_callbacks_and_counted_scrolls() {
+    for case in 0..9 {
+        let prepare = || {
+            let mut screen = Screen::new(4, if case == 2 || case == 3 { 1 } else { 2 }).unwrap();
+            screen
+                .set_history_limits(HistoryLimits {
+                    max_rows: if case == 8 {
+                        8
+                    } else if case >= 6 {
+                        1
+                    } else {
+                        3
+                    },
+                    max_bytes: if case == 8 { 512 } else { 4096 },
+                })
+                .unwrap();
+            let mut writer = UnicodeWriter::default();
+            if case == 8 {
+                for _ in 0..4 {
+                    screen.scroll_up(1, StyleId(0)).unwrap();
+                }
+                screen.set_cursor(0, 0);
+                screen
+                    .write(
+                        &(String::from("e") + &"\u{301}".repeat(160)),
+                        CellWidth::Single,
+                        StyleId(1),
+                    )
+                    .unwrap();
+                screen.set_cursor(1, 3);
+            } else if case >= 6 {
+                screen.set_cursor(0, usize::from(case == 7));
+                screen
+                    .write("e\u{301}", CellWidth::Single, StyleId(1))
+                    .unwrap();
+                screen.scroll_up(1, StyleId(0)).unwrap();
+                screen.set_cursor(1, 3);
+                writer.write(&mut screen, "❤", StyleId(1)).unwrap();
+            } else if case == 3 {
+                writer.write(&mut screen, "abc", StyleId(0)).unwrap();
+                writer.write(&mut screen, "\u{600}", StyleId(1)).unwrap();
+            } else {
+                screen
+                    .write("e\u{301}", CellWidth::Single, StyleId(1))
+                    .unwrap();
+                screen.set_cursor(screen.grid().rows() - 1, 3);
+                if case == 2 {
+                    writer.write(&mut screen, "❤", StyleId(1)).unwrap();
+                }
+            }
+            if case == 4 {
+                screen.resize(8, 2, StyleId(0)).unwrap();
+            }
+            if case == 5 {
+                for _ in 0..3 {
+                    screen.scroll_up(1, StyleId(0)).unwrap();
+                }
+                screen.set_cursor(0, 0);
+                screen
+                    .write("e\u{301}", CellWidth::Single, StyleId(1))
+                    .unwrap();
+                screen.set_cursor(1, 3);
+            }
+            (screen, writer)
+        };
+        let operation = |screen: &mut Screen, writer: &mut UnicodeWriter| match case {
+            0 | 4 | 5 | 8 => screen.write_ascii(
+                b"abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJK",
+                StyleId(2),
+            ),
+            1 => screen.scroll_up(usize::MAX, StyleId(2)),
+            2 | 6 | 7 => writer.write(screen, "\u{fe0f}", StyleId(2)),
+            _ => writer.write(screen, "abcdefghijkl", StyleId(2)),
+        };
+        let (mut expected, mut writer) = prepare();
+        let (result, stats) = allocator::measure(None, || operation(&mut expected, &mut writer));
+        result.unwrap();
+        assert!(stats.attempts > 0);
+        if case == 5 {
+            let (result, warm) =
+                allocator::measure(Some(0), || operation(&mut expected, &mut writer));
+            result.unwrap();
+            assert_eq!(warm.attempts, 0);
+            // Restore the one-callback expectation for fault-injection retries.
+            let (mut screen, mut writer) = prepare();
+            operation(&mut screen, &mut writer).unwrap();
+            expected = screen;
+        }
+        for point in 0..stats.attempts {
+            let (mut screen, mut writer) = prepare();
+            let before = snapshot(screen.grid());
+            let before_history = retained(screen.history());
+            let alternate = snapshot(screen.buffer(ScreenBuffer::Alternate));
+            let cursor = screen.cursor();
+            let (result, failed) =
+                allocator::measure(Some(point), || operation(&mut screen, &mut writer));
+            assert!(
+                matches!(result, Err(StorageError::Allocation(_))),
+                "case {case}, point {point}"
+            );
+            assert_eq!(failed.failures, 1);
+            assert_eq!(
+                snapshot(screen.grid()),
+                before,
+                "case {case}, point {point}"
+            );
+            assert_eq!(retained(screen.history()), before_history);
+            assert_eq!(snapshot(screen.buffer(ScreenBuffer::Alternate)), alternate);
+            assert_eq!(screen.cursor(), cursor);
+            operation(&mut screen, &mut writer).unwrap();
+            assert_eq!(snapshot(screen.grid()), snapshot(expected.grid()));
+            assert_eq!(retained(screen.history()), retained(expected.history()));
+            assert_eq!(screen.cursor(), expected.cursor());
+        }
+    }
+}
+
+#[test]
+fn history_control_failures_retain_consumed_events_and_retry_without_partial_scrolling() {
+    for (control, new_line) in [
+        (b"\n".as_slice(), false),
+        (b"\x0b", false),
+        (b"\x0c", false),
+        (b"\n", true),
+        (b"\x1bD", false),
+        (b"\x1bE", false),
+        (b"\x1b[2S", false),
+    ] {
+        let prepare = || {
+            let mut screen = Screen::new(4, 2).unwrap();
+            screen
+                .set_history_limits(HistoryLimits {
+                    max_rows: 3,
+                    max_bytes: 4096,
+                })
+                .unwrap();
+            screen
+                .write("e\u{301}", CellWidth::Single, StyleId(0))
+                .unwrap();
+            screen.set_cursor(1, 3);
+            screen.write_ascii(b"x", StyleId(0)).unwrap();
+            let mut processor = Processor::default();
+            let mut writer = UnicodeWriter::default();
+            if new_line {
+                processor
+                    .advance(b"\x1b[20h", &mut screen, &mut writer)
+                    .unwrap();
+            }
+            (screen, processor, writer)
+        };
+        let wire = [control, b"\r"].concat();
+        let (mut expected, mut processor, mut writer) = prepare();
+        let (result, stats) = allocator::measure(None, || {
+            processor.advance(&wire, &mut expected, &mut writer)
+        });
+        result.unwrap();
+        assert!(stats.attempts > 0);
+        for point in 0..stats.attempts {
+            let (mut screen, mut processor, mut writer) = prepare();
+            let before = snapshot(screen.grid());
+            let cursor = screen.cursor();
+            let (result, failed) = allocator::measure(Some(point), || {
+                processor.advance(&wire, &mut screen, &mut writer)
+            });
+            let error = result.unwrap_err();
+            assert_eq!(error.consumed, control.len());
+            assert!(matches!(
+                error.error,
+                ProcessFailure::Screen(StorageError::Allocation(_))
+            ));
+            assert_eq!(failed.failures, 1);
+            assert_eq!(snapshot(screen.grid()), before);
+            assert_eq!(screen.cursor(), cursor);
+            assert!(screen.history().is_empty());
+            let suffix = &wire[error.consumed..];
+            let (again, _) = allocator::measure(Some(0), || {
+                processor.advance(suffix, &mut screen, &mut writer)
+            });
+            let again = again.unwrap_err();
+            assert_eq!(again.consumed, 0);
+            assert!(matches!(
+                again.error,
+                ProcessFailure::Screen(StorageError::Allocation(_))
+            ));
+            assert_eq!(snapshot(screen.grid()), before);
+            assert_eq!(screen.cursor(), cursor);
+            processor.advance(suffix, &mut screen, &mut writer).unwrap();
+            assert_eq!(snapshot(screen.grid()), snapshot(expected.grid()));
+            assert_eq!(retained(screen.history()), retained(expected.history()));
+            assert_eq!(screen.cursor(), expected.cursor());
+        }
+    }
 }
 
 #[test]
@@ -1001,7 +1196,7 @@ fn warm_writes_edits_scrolling_and_column_growth_make_no_allocation_requests() {
             screen.backspace();
             screen.write("水", CellWidth::Double, StyleId(2))?;
             screen.carriage_return();
-            screen.line_feed(StyleId(0));
+            screen.line_feed(StyleId(0)).unwrap();
             screen.set_cursor(0, 0);
             screen.reverse_index(StyleId(0));
             screen.set_scroll_region(0..24)?;
@@ -1048,7 +1243,10 @@ fn warm_writes_edits_scrolling_and_column_growth_make_no_allocation_requests() {
     let mut edit_screens = [prepare(), prepare(), prepare()];
     let line_edits = [Screen::insert_lines, Screen::delete_lines];
     let mut line_screens = [prepare(), prepare()];
-    let scrolls = [Screen::scroll_up, Screen::scroll_down];
+    let scrolls: [fn(&mut Screen, usize, StyleId); 2] = [
+        |screen, count, style| screen.scroll_up(count, style).unwrap(),
+        Screen::scroll_down,
+    ];
     let mut scroll_screens = [prepare(), prepare()];
     for screen in &mut scroll_screens {
         screen.set_cursor(0, 7);
@@ -1170,7 +1368,7 @@ fn text_views_stream_without_allocation_and_propagate_sink_failures() {
         }
     }
     screen.set_cursor(3, 0);
-    screen.line_feed(StyleId(0));
+    screen.line_feed(StyleId(0)).unwrap();
     screen.set_cursor(3, 129);
     screen
         .write("水\u{301}", CellWidth::Double, StyleId(2))

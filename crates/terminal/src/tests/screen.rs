@@ -62,7 +62,7 @@ fn soft_wraps_record_actual_joins_and_invalidate_edited_boundaries() {
     assert_eq!(screen.grid().row(0).unwrap().wrap_end(), None);
     screen.write("x", CellWidth::Single, StyleId(2)).unwrap();
     screen.set_cursor(0, 0);
-    screen.line_feed(StyleId(0));
+    screen.line_feed(StyleId(0)).unwrap();
     assert_eq!(screen.grid().row(0).unwrap().wrap_end(), None);
 
     let mut grid = crate::Grid::new(4, 2).unwrap();
@@ -258,7 +258,7 @@ fn reset_clears_owned_units_restores_state_and_reuses_wrapped_row_buffers() {
             let mut screen = Screen::new(columns + 8, rows).unwrap();
             screen.resize(columns, rows, StyleId(0)).unwrap();
             screen.set_cursor(rows - 1, 0);
-            screen.line_feed(StyleId(1));
+            screen.line_feed(StyleId(1)).unwrap();
             for row in 0..rows {
                 screen.set_cursor(row, 0);
                 screen
@@ -567,7 +567,7 @@ fn origin_writes_movement_and_resize_preserve_region_bounds_and_error_state() {
         screen.reverse_index(StyleId(7));
         screen.move_cursor_down(usize::MAX);
         assert_eq!(screen.cursor().row, 3);
-        screen.line_feed(StyleId(7));
+        screen.line_feed(StyleId(7)).unwrap();
     }
     let scrolled = snapshot(screen.grid());
     for row in [0, 4] {
@@ -764,7 +764,7 @@ fn controls_and_resize_cancel_wrapping_without_losing_cursor_bounds() {
         screen.grid().row(0).unwrap().text(1),
         Some(CellText::Scalar('X'))
     );
-    screen.line_feed(StyleId(3));
+    screen.line_feed(StyleId(3)).unwrap();
     assert_eq!(
         screen.cursor(),
         Cursor {
@@ -774,7 +774,7 @@ fn controls_and_resize_cancel_wrapping_without_losing_cursor_bounds() {
         }
     );
     screen.write("Y", CellWidth::Single, StyleId(4)).unwrap();
-    screen.line_feed(StyleId(5));
+    screen.line_feed(StyleId(5)).unwrap();
     assert_eq!(
         screen.grid().row(0).unwrap().text(2),
         Some(CellText::Scalar('Y'))
@@ -843,7 +843,7 @@ fn regional_indices_preserve_outside_rows_and_recycle_owned_buffers() {
                         let mut screen = Screen::new(4, rows).unwrap();
                         screen.set_cursor(rows - 1, 0);
                         for _ in 0..offset {
-                            screen.line_feed(StyleId(0));
+                            screen.line_feed(StyleId(0)).unwrap();
                         }
                         for row in 0..rows {
                             screen.set_cursor(row, 0);
@@ -871,7 +871,7 @@ fn regional_indices_preserve_outside_rows_and_recycle_owned_buffers() {
                             .collect();
                         let scroll = cursor_row == if up { region.end - 1 } else { region.start };
                         if up {
-                            screen.line_feed(StyleId(9));
+                            screen.line_feed(StyleId(9)).unwrap();
                         } else {
                             screen.reverse_index(StyleId(9));
                         }
@@ -939,8 +939,8 @@ fn regional_indices_preserve_outside_rows_and_recycle_owned_buffers() {
 fn regional_wide_wraps_preserve_units_and_handle_the_physical_bottom() {
     let mut screen = Screen::new(2, 4).unwrap();
     screen.set_cursor(3, 0);
-    screen.line_feed(StyleId(0));
-    screen.line_feed(StyleId(0));
+    screen.line_feed(StyleId(0)).unwrap();
+    screen.line_feed(StyleId(0)).unwrap();
     screen.set_cursor(0, 0);
     screen.write_ascii(b"abcdefgh", StyleId(1)).unwrap();
     screen.set_scroll_region(1..3).unwrap();
@@ -1028,7 +1028,7 @@ fn erasure_clears_intersecting_units_and_preserves_screen_state_and_buffers() {
                                     let mut screen = Screen::new(columns, rows).unwrap();
                                     screen.set_cursor(rows - 1, 0);
                                     for _ in 0..offset {
-                                        screen.line_feed(StyleId(0));
+                                        screen.line_feed(StyleId(0)).unwrap();
                                     }
                                     for row in 0..rows {
                                         let mut column = 0;
@@ -1187,7 +1187,7 @@ fn cursor_cell_edits_preserve_units_buffers_and_zero_count_state() {
                                 let mut screen = Screen::new(columns, 4).unwrap();
                                 screen.set_cursor(3, 0);
                                 for _ in 0..offset {
-                                    screen.line_feed(StyleId(0));
+                                    screen.line_feed(StyleId(0)).unwrap();
                                 }
                                 for target in 0..4 {
                                     screen.set_cursor(target, 0);
@@ -1321,7 +1321,11 @@ fn line_edits_and_scrolls_preserve_state_and_recycle_rows_within_their_extent() 
         ),
         (Screen::delete_lines, true, false),
         (Screen::scroll_down, false, true),
-        (Screen::scroll_up, false, false),
+        (
+            |screen, count, style| screen.scroll_up(count, style).unwrap(),
+            false,
+            false,
+        ),
     ];
     for rows in 1..=6 {
         for offset in 0..rows {
@@ -1333,7 +1337,7 @@ fn line_edits_and_scrolls_preserve_state_and_recycle_rows_within_their_extent() 
                             let mut screen = Screen::new(4, rows).unwrap();
                             screen.set_cursor(rows - 1, 0);
                             for _ in 0..offset {
-                                screen.line_feed(StyleId(0));
+                                screen.line_feed(StyleId(0)).unwrap();
                             }
                             for row in 0..rows {
                                 screen.set_cursor(row, 0);

@@ -14,7 +14,7 @@ fn text_ranges_join_rows_preserve_units_and_validate_physical_boundaries() {
         .unwrap();
     screen.write_ascii(b"xy", StyleId(3)).unwrap();
     screen.write("é", CellWidth::Single, StyleId(4)).unwrap();
-    screen.line_feed(StyleId(0));
+    screen.line_feed(StyleId(0)).unwrap();
     screen.carriage_return();
     screen
         .write("👩\u{200d}💻", CellWidth::Double, StyleId(5))
