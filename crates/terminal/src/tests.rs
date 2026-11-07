@@ -5,6 +5,7 @@ mod erased;
 mod input;
 mod processor;
 mod replies;
+mod revision;
 mod screen;
 mod style;
 mod styles;

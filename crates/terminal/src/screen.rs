@@ -1,6 +1,6 @@
 use std::ops::Range;
 
-use crate::{CellWidth, Grid, MAX_CELL_TEXT_BYTES, StorageError, StyleId};
+use crate::{CellPosition, CellWidth, Grid, MAX_CELL_TEXT_BYTES, StorageError, StyleId};
 use crate::{grid::validate_dimensions, tabs::TabStops};
 
 /// Cursor-relative extent for line or display erasure. Both directions include
@@ -447,6 +447,72 @@ impl Screen {
         } else {
             self.write_mode::<false>(text, width, style)
         }
+    }
+
+    /// Replaces a leading display unit and returns its resulting physical position.
+    /// The caller retains this position while extending a grapheme and ends that
+    /// association when controls change the text's placement or interpretation.
+    /// Continuation positions and units wider than the screen are rejected.
+    ///
+    /// Equal widths preserve the row's soft-wrap connection. Width changes cancel
+    /// it. Insertion mode moves the suffix only by the width difference; shrinking
+    /// exposes styled erased cells at the right edge. Earlier discarded content
+    /// stays discarded. Overwrite mode erases a released continuation in place.
+    ///
+    /// Growth across the right edge wraps the complete unit, clearing its old edge
+    /// cell and establishing an early-wrap connection. Scrolling follows the active
+    /// region. With automatic wrapping disabled, growth that cannot fit fails.
+    /// Success places the cursor after the revised footprint, using physical rows
+    /// independently of origin mode; origin mode requires the position to be
+    /// inside the scrolling region. Every error preserves both grids, cursor,
+    /// connections, and modes; text storage is reserved before any shift or scroll.
+    pub fn revise_unit(
+        &mut self,
+        position: CellPosition,
+        text: &str,
+        width: CellWidth,
+        style: StyleId,
+    ) -> Result<CellPosition, StorageError> {
+        let columns = self.grid.columns();
+        let cell = self
+            .grid
+            .row(position.row)
+            .and_then(|row| row.cells().get(position.column))
+            .ok_or(StorageError::OutOfBounds)?;
+        if cell.is_continuation()
+            || width.columns() > columns
+            || (self.origin_mode && !self.scroll_region.contains(&position.row))
+        {
+            return Err(StorageError::OutOfBounds);
+        }
+        if position.column + width.columns() <= columns {
+            self.grid
+                .revise(position, text, width, style, self.insert_mode)?;
+            self.advance(position.row, position.column + width.columns());
+            return Ok(position);
+        }
+        if !self.auto_wrap {
+            return Err(StorageError::OutOfBounds);
+        }
+        let cursor = self.cursor;
+        self.cursor = Cursor {
+            row: position.row,
+            column: position.column,
+            wrap_pending: false,
+        };
+        let result = if self.insert_mode {
+            self.write_mode::<true>(text, width, style)
+        } else {
+            self.write_mode::<false>(text, width, style)
+        };
+        if let Err(error) = result {
+            self.cursor = cursor;
+            return Err(error);
+        }
+        Ok(CellPosition {
+            row: self.cursor.row,
+            column: 0,
+        })
     }
 
     #[inline(never)]

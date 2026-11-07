@@ -15,6 +15,121 @@ use lune_terminal::{
 static ALLOCATOR: allocator::TestAllocator = allocator::TestAllocator;
 
 #[test]
+fn unit_revision_reserves_before_changes_and_reuses_warmed_storage() {
+    fn prepared(case: usize, insert: bool) -> (Screen, CellPosition) {
+        let mut screen = Screen::new(7, 4).unwrap();
+        screen.write_ascii(b"primary", StyleId(8)).unwrap();
+        screen.select_buffer(ScreenBuffer::Alternate);
+        for row in 0..4 {
+            screen.set_cursor(row, 0);
+            screen.write_ascii(b"abcdefg", StyleId(1)).unwrap();
+        }
+        let position = CellPosition {
+            row: if case == 4 { 2 } else { 1 },
+            column: if case >= 3 { 6 } else { 1 },
+        };
+        screen.set_cursor(position.row, position.column);
+        screen
+            .write(
+                if case == 1 || case == 2 {
+                    "e\u{301}"
+                } else {
+                    "❤"
+                },
+                if case == 2 {
+                    CellWidth::Double
+                } else {
+                    CellWidth::Single
+                },
+                StyleId(2),
+            )
+            .unwrap();
+        screen.save_cursor();
+        screen.set_scroll_region(1..3).unwrap();
+        screen.set_origin_mode(true);
+        screen.set_cursor(0, 4);
+        screen.set_insert_mode(insert);
+        screen.clear_tab_stops();
+        screen.set_tab_stop();
+        (screen, position)
+    }
+    let text = String::from("❤\u{fe0f}") + &"\u{301}".repeat(200);
+    for case in 0..5 {
+        for insert in [false, true] {
+            let width = if case == 2 {
+                CellWidth::Single
+            } else {
+                CellWidth::Double
+            };
+            let (mut expected, position) = prepared(case, insert);
+            let (result, stats) = allocator::measure(None, || {
+                expected.revise_unit(position, &text, width, StyleId(9))
+            });
+            let target = result.unwrap();
+            let expected_cursor = expected.cursor();
+            assert!(stats.attempts > 0);
+            let expected_primary = snapshot(expected.buffer(ScreenBuffer::Primary));
+            let expected_alternate = snapshot(expected.buffer(ScreenBuffer::Alternate));
+            expected.restore_cursor();
+            let expected_saved = expected.cursor();
+            for point in 0..stats.attempts {
+                let (mut screen, position) = prepared(case, insert);
+                let primary = snapshot(screen.buffer(ScreenBuffer::Primary));
+                let alternate = snapshot(screen.buffer(ScreenBuffer::Alternate));
+                let cursor = screen.cursor();
+                let (result, failed) = allocator::measure(Some(point), || {
+                    screen.revise_unit(position, &text, width, StyleId(9))
+                });
+                assert!(matches!(result, Err(StorageError::Allocation(_))));
+                assert_eq!(failed.failures, 1);
+                assert_eq!(snapshot(screen.buffer(ScreenBuffer::Primary)), primary);
+                assert_eq!(snapshot(screen.buffer(ScreenBuffer::Alternate)), alternate);
+                assert_eq!(screen.cursor(), cursor);
+                assert_eq!(screen.active_buffer(), ScreenBuffer::Alternate);
+                assert_eq!(screen.scroll_region(), 1..3);
+                assert!(screen.origin_mode());
+                assert_eq!(screen.insert_mode(), insert);
+                assert_eq!(screen.is_tab_stop(4), Some(true));
+                assert_eq!(screen.is_tab_stop(0), Some(false));
+                assert_eq!(
+                    screen
+                        .revise_unit(position, &text, width, StyleId(9))
+                        .unwrap(),
+                    target
+                );
+                assert_eq!(
+                    snapshot(screen.buffer(ScreenBuffer::Primary)),
+                    expected_primary
+                );
+                assert_eq!(
+                    snapshot(screen.buffer(ScreenBuffer::Alternate)),
+                    expected_alternate
+                );
+                assert_eq!(screen.cursor(), expected_cursor);
+                screen.restore_cursor();
+                assert_eq!(screen.cursor(), expected_saved);
+            }
+        }
+    }
+    for insert in [false, true] {
+        let (mut screen, position) = prepared(0, insert);
+        screen
+            .revise_unit(position, &text, CellWidth::Double, StyleId(9))
+            .unwrap();
+        let ((), stats) = allocator::measure(Some(0), || {
+            for _ in 0..32 {
+                for width in [CellWidth::Single, CellWidth::Double, CellWidth::Double] {
+                    screen
+                        .revise_unit(position, &text, width, StyleId(9))
+                        .unwrap();
+                }
+            }
+        });
+        assert_eq!(stats.attempts, 0);
+    }
+}
+
+#[test]
 fn paired_resize_failures_preserve_both_buffers_and_saved_cursors() {
     use ScreenBuffer::{Alternate, Primary};
     fn prepared() -> Screen {

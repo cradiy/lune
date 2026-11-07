@@ -98,6 +98,18 @@ impl Grid {
             .write_inserting(column, text, width, style, clear_gap)
     }
 
+    pub(crate) fn revise(
+        &mut self,
+        position: crate::CellPosition,
+        text: &str,
+        width: CellWidth,
+        style: StyleId,
+        insert: bool,
+    ) -> Result<(), StorageError> {
+        self.row_mut(position.row)?
+            .revise(position.column, text, width, style, insert)
+    }
+
     /// Writes a printable ASCII run in one pass after validating the entire run.
     pub fn write_ascii(
         &mut self,

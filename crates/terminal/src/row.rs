@@ -180,6 +180,48 @@ impl Row {
         Ok(())
     }
 
+    pub(crate) fn revise(
+        &mut self,
+        column: usize,
+        text: &str,
+        width: CellWidth,
+        style: StyleId,
+        insert: bool,
+    ) -> Result<(), StorageError> {
+        let previous = self
+            .cells
+            .get(column)
+            .ok_or(StorageError::OutOfBounds)?
+            .width();
+        if previous == 0 {
+            return Err(StorageError::OutOfBounds);
+        }
+        self.end(column, width.columns())?;
+        let join = self.wrap_end();
+        if insert && width.columns() > previous {
+            // Reserve and publish the revised text in the existing footprint.
+            // The following shift preserves this entry and its capacity, making
+            // the final width update infallible even for extended text.
+            self.write(column, text, CellWidth::Single, style)?;
+            self.insert_cells(column + previous, width.columns() - previous, style)
+                .expect("The additional columns fit");
+            self.write(column, text, width, style)
+                .expect("Revised text storage was reserved before the shift");
+        } else {
+            self.write(column, text, width, style)?;
+            if insert && width.columns() < previous {
+                self.delete_cells(column + width.columns(), previous - width.columns(), style)
+                    .expect("The released columns fit");
+            }
+        }
+        if previous == width.columns() {
+            self.set_wrap_end(join);
+        } else {
+            self.set_wrap_end(None);
+        }
+        Ok(())
+    }
+
     // Keep allocation and sparse-index updates outside the scalar write path.
     #[inline(never)]
     fn write_extended(

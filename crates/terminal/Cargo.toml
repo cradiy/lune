@@ -32,6 +32,10 @@ harness = false
 name = "input"
 harness = false
 
+[[bench]]
+name = "revision"
+harness = false
+
 [dependencies]
 lune-vt = { path = "../vt" }
 

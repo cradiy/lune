@@ -75,6 +75,15 @@
 //! the initial cursor, save slot, full-screen region, default tabs, and modes.
 //! Row buffers, the row queue, text indices, and the tab bitmap retain capacity;
 //! owned text is released. Repeated resets do not allocate.
+//! [`Screen::revise_unit`] replaces an existing leading unit at a retained physical
+//! position and returns its new position. It places the cursor after the revised
+//! footprint. Same-width updates preserve soft wraps; width changes adjust the
+//! footprint and move the suffix by only the width difference under insertion mode.
+//! Growth at the right edge relocates the complete unit through normal wrapping and
+//! region scrolling. With wrapping disabled, an expansion that cannot fit fails.
+//! Every failure preserves both buffers and logical screen state. Consumers retain
+//! the returned position while extending a grapheme and end that association when
+//! protocol controls change its placement or interpretation.
 //! Insertion mode starts disabled. Enabling it shifts the row suffix right by
 //! each written unit's width, discards overflow, and repairs split wide units.
 //! ASCII batches shift once per row segment after validating the full input.

@@ -70,6 +70,11 @@ fn column_dimension(byte: u8) -> usize {
 fn apply(screen: &mut Screen, command: &Command<'_>, style: StyleId) -> Result<(), StorageError> {
     match command {
         Command::Write(text, width) => return screen.write(text, *width, style),
+        Command::Revise(position, text, width) => {
+            return screen
+                .revise_unit(*position, text, *width, style)
+                .map(|_| ());
+        }
         Command::Ascii(bytes) => return screen.write_ascii(bytes, style),
         Command::Cursor(row, column) => screen.set_cursor(*row, *column),
         Command::Region(region) => return screen.set_scroll_region(region.clone()),
@@ -148,7 +153,7 @@ fuzz_target!(|data: &[u8]| {
             1 => EraseMode::ToCursor,
             _ => EraseMode::All,
         };
-        let operation = bytes[0] % 39;
+        let operation = bytes[0] % 40;
         if operation == 34 {
             let range = if bytes[7] & 1 != 0 {
                 CellPosition { row: 0, column: 0 }..CellPosition {
@@ -172,7 +177,7 @@ fuzz_target!(|data: &[u8]| {
             continue;
         }
         let command = match operation {
-            0 => {
+            0 | 39 => {
                 let text = match bytes[4] % 10 {
                     8 => &long_text[..MAX_CELL_TEXT_BYTES],
                     9 => &long_text,
@@ -183,7 +188,11 @@ fuzz_target!(|data: &[u8]| {
                 } else {
                     CellWidth::Double
                 };
-                Command::Write(text, width)
+                if operation == 39 {
+                    Command::Revise(CellPosition { row, column }, text, width)
+                } else {
+                    Command::Write(text, width)
+                }
             }
             1 => Command::Ascii(ASCII[bytes[4] as usize % ASCII.len()]),
             2 => Command::Cursor(row, column),

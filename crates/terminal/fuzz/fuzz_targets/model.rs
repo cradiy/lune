@@ -30,6 +30,27 @@ pub struct Model {
 }
 
 impl Model {
+    #[allow(dead_code, reason = "Unit revision is checked by the screen model.")]
+    pub fn unit_width(&self, position: CellPosition) -> Result<usize, StorageError> {
+        self.bounds(position.row, position.column, 1)?;
+        let mut column = 0;
+        for unit in &self.rows[position.row] {
+            if column == position.column {
+                return Ok(unit.width);
+            }
+            column += unit.width;
+            if column > position.column {
+                return Err(StorageError::OutOfBounds);
+            }
+        }
+        unreachable!("An in-bounds column has a containing unit")
+    }
+
+    #[allow(dead_code, reason = "Unit revision is checked by the screen model.")]
+    pub fn wrap(&self, row: usize) -> Option<usize> {
+        self.wraps[row]
+    }
+
     pub fn new(columns: usize, rows: usize) -> Self {
         Self {
             columns,

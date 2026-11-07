@@ -9,6 +9,7 @@ use crate::model::Model;
 
 pub enum Command<'a> {
     Write(&'a str, CellWidth),
+    Revise(CellPosition, &'a str, CellWidth),
     Ascii(&'a [u8]),
     Cursor(usize, usize),
     Region(Range<usize>),
@@ -217,6 +218,9 @@ impl ScreenModel {
                 }
             }
             Command::Write(text, width) => return self.write(text, *width, style),
+            Command::Revise(position, text, width) => {
+                return self.revise(*position, text, *width, style);
+            }
             Command::Ascii(bytes) => {
                 if bytes.iter().any(|&byte| !(b' '..=b'~').contains(&byte)) {
                     return Err(StorageError::InvalidAscii);
@@ -386,6 +390,63 @@ impl ScreenModel {
                 }
             }
         }
+        Ok(())
+    }
+
+    fn revise(
+        &mut self,
+        position: CellPosition,
+        text: &str,
+        width: CellWidth,
+        style: StyleId,
+    ) -> Result<(), StorageError> {
+        let storage = &mut self.storage[self.active];
+        let previous = storage.unit_width(position)?;
+        let next = if width == CellWidth::Single { 1 } else { 2 };
+        if next > storage.columns()
+            || (self.origin_mode && !self.region.contains(&position.row))
+            || (!self.auto_wrap && position.column + next > storage.columns())
+        {
+            return Err(StorageError::OutOfBounds);
+        }
+        if text.is_empty() {
+            return Err(StorageError::EmptyText);
+        }
+        if text.len() > MAX_CELL_TEXT_BYTES {
+            return Err(StorageError::TextTooLong);
+        }
+        if position.column + next > storage.columns() {
+            self.row = position.row;
+            self.column = position.column;
+            return self.write(text, width, style);
+        }
+        let join = storage.wrap(position.row);
+        if self.insert_mode && next > previous {
+            storage.edit(
+                position.row,
+                position.column + previous,
+                next - previous,
+                true,
+                style,
+            )?;
+        }
+        storage.write(position.row, position.column, text, width, style)?;
+        if self.insert_mode && next < previous {
+            storage.edit(
+                position.row,
+                position.column + next,
+                previous - next,
+                false,
+                style,
+            )?;
+        }
+        storage.set_wrap(position.row, if next == previous { join } else { None });
+        self.row = position.row;
+        self.column = if self.auto_wrap {
+            position.column + next
+        } else {
+            (position.column + next).min(storage.columns() - 1)
+        };
         Ok(())
     }
 
