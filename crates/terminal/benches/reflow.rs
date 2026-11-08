@@ -175,21 +175,36 @@ fn source(name: &str, depth: usize, long: &str) -> Screen {
     screen
 }
 
+fn transaction(name: &str, depth: usize, long: &str, columns: usize, rows: usize) -> f64 {
+    let mut screen = source(name, depth, long);
+    screen.scroll_viewport_up(depth / 2);
+    let start = Instant::now();
+    screen
+        .reflow(black_box(columns), black_box(rows), StyleId(9))
+        .unwrap();
+    let elapsed = start.elapsed().as_nanos() as f64;
+    black_box(&screen);
+    elapsed
+}
+
 fn measure_transaction(name: &str, depth: usize, long: &str, columns: usize, rows: usize) {
-    let mut samples = [0.0_f64; 11];
-    for sample in &mut samples {
-        let mut screen = source(name, depth, long);
-        screen.scroll_viewport_up(depth / 2);
-        let start = Instant::now();
-        screen.reflow(black_box(columns), rows, StyleId(9)).unwrap();
-        *sample = start.elapsed().as_nanos() as f64;
-        black_box(&screen);
+    for _ in 0..3 {
+        black_box(transaction(name, depth, long, columns, rows));
     }
-    samples.sort_by(f64::total_cmp);
-    println!(
-        "transaction {name:<12} history={depth:<4} columns={columns:<3} rows={rows:<2} {:>10.2} us/resize",
-        samples[samples.len() / 2] / 1000.0
-    );
+    for batch in 1..=3 {
+        let mut samples = [0.0_f64; 21];
+        for sample in &mut samples {
+            *sample = transaction(name, depth, long, columns, rows);
+        }
+        samples.sort_by(f64::total_cmp);
+        println!(
+            "transaction {name:<12} history={depth:<4} columns={columns:<3} rows={rows:<2} batch={batch} n={} median={:.2} p25={:.2} p75={:.2} us/resize",
+            samples.len(),
+            samples[samples.len() / 2] / 1000.0,
+            samples[samples.len() / 4] / 1000.0,
+            samples[samples.len() * 3 / 4] / 1000.0,
+        );
+    }
 }
 
 fn main() {
