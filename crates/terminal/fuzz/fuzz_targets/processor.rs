@@ -15,8 +15,8 @@ use std::io::Write;
 
 use libfuzzer_sys::fuzz_target;
 use lune_terminal::{
-    CellWidth, Color, CursorShape, EraseMode, InputModes, ProcessFailure, Processor, Screen, Style,
-    StyleId, Underline,
+    CellWidth, Color, CursorShape, EraseMode, InputModes, Key, Modifiers, ProcessFailure,
+    Processor, Screen, Style, StyleId, Underline,
 };
 use screen_model::{Command, ScreenModel};
 
@@ -124,6 +124,30 @@ fn drive(wire: &[u8], chunk: usize, fail_at: usize, expected: &Expected<'_>) {
         Some(&expected.style)
     );
     assert_eq!(processor.input_modes(), expected.input);
+    let flags = chunk % 8;
+    let modifiers = Modifiers {
+        shift: flags & 1 != 0,
+        alt: flags & 2 != 0,
+        control: flags & 4 != 0,
+    };
+    let function: [&[u8]; 8] = [
+        b"\x1b[24~",
+        b"\x1b[24;2~",
+        b"\x1b[24;3~",
+        b"\x1b[24;4~",
+        b"\x1b[24;5~",
+        b"\x1b[24;6~",
+        b"\x1b[24;7~",
+        b"\x1b[24;8~",
+    ];
+    assert_eq!(
+        processor
+            .input_modes()
+            .encode_key(Key::Function(12), modifiers)
+            .unwrap()
+            .as_bytes(),
+        function[flags]
+    );
     let expected_paste = if expected.input.bracketed_paste {
         "\x1b[200~a水\n\x1b[201~".as_bytes()
     } else {

@@ -1,6 +1,8 @@
+use std::num::NonZeroU8;
+
 use crate::Paste;
 
-/// Unmodified ANSI control, cursor, editing, function, and numeric-keypad keys.
+/// Terminal keys with protocol-defined encodings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Key {
     Up,
@@ -29,6 +31,53 @@ pub enum Key {
     KeypadEnter,
 }
 
+/// Shift, Alt and Control state for one key event.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Modifiers {
+    pub shift: bool,
+    pub alt: bool,
+    pub control: bool,
+}
+
+impl Modifiers {
+    #[inline]
+    fn parameter(self) -> u8 {
+        1 + u8::from(self.shift) + 2 * u8::from(self.alt) + 4 * u8::from(self.control)
+    }
+}
+
+/// Owned key bytes that remain valid across mode changes and short writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use]
+pub struct KeySequence {
+    bytes: [u8; 7],
+    len: NonZeroU8,
+}
+
+impl KeySequence {
+    #[inline]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..usize::from(self.len.get())]
+    }
+
+    fn new(bytes: &[u8]) -> Self {
+        let mut result = Self {
+            bytes: [0; 7],
+            len: NonZeroU8::new(bytes.len() as u8).expect("Key sequences are nonempty"),
+        };
+        result.bytes[..bytes.len()].copy_from_slice(bytes);
+        result
+    }
+
+    fn modified(prefix: &[u8], parameter: u8, final_byte: u8) -> Self {
+        let mut result = Self::new(prefix);
+        let end = prefix.len();
+        result.bytes[end..end + 3].copy_from_slice(&[b';', b'0' + parameter, final_byte]);
+        result.len = NonZeroU8::new((end + 3) as u8).unwrap();
+        result
+    }
+}
+
 /// A copyable snapshot of keyboard and paste modes selected by the output stream.
 /// Cursor-key and keypad application modes are independent. Default modes use
 /// CSI cursor sequences, numeric keypad characters, CR for Return, and DEL for Backspace.
@@ -51,13 +100,35 @@ impl InputModes {
         Paste::new(payload, self.bracketed_paste)
     }
 
-    /// Encodes a key without allocating. Returned bytes have static storage and
-    /// can be retained across mode changes or partial transport writes.
-    /// Returns `None` for keypad digits above nine or function keys outside 1–12.
-    /// In application keypad mode, keypad Enter sends SS3 M; the main Return key
-    /// follows new-line mode.
+    /// Encodes navigation/editing/function modifiers and Shift-Tab without allocating.
+    /// Unsupported key/modifier pairs and invalid key numbers return `None`.
     #[inline]
-    pub fn encode_key(self, key: Key) -> Option<&'static [u8]> {
+    pub fn encode_key(self, key: Key, modifiers: Modifiers) -> Option<KeySequence> {
+        let base = self.unmodified_key(key)?;
+        let parameter = modifiers.parameter();
+        if parameter == 1 {
+            return Some(KeySequence::new(base));
+        }
+        Some(match key {
+            Key::Up
+            | Key::Down
+            | Key::Right
+            | Key::Left
+            | Key::Home
+            | Key::End
+            | Key::Function(1..=4) => {
+                KeySequence::modified(b"\x1b[1", parameter, *base.last().unwrap())
+            }
+            Key::Insert | Key::Delete | Key::PageUp | Key::PageDown | Key::Function(5..=12) => {
+                KeySequence::modified(&base[..base.len() - 1], parameter, b'~')
+            }
+            Key::Tab if parameter == 2 => KeySequence::new(b"\x1b[Z"),
+            _ => return None,
+        })
+    }
+
+    #[inline]
+    fn unmodified_key(self, key: Key) -> Option<&'static [u8]> {
         Some(match key {
             Key::Up => {
                 if self.application_cursor {

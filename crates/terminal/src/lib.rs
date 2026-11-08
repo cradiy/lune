@@ -27,7 +27,7 @@ pub use cell::{Cell, CellText, CellWidth, MAX_CELL_TEXT_BYTES, StyleId};
 pub use error::StorageError;
 pub use grid::{Grid, MAX_CELLS, MAX_DIMENSION};
 pub use history::{HistoryLimits, MAX_HISTORY_BYTES, MAX_HISTORY_ROWS, RowHistory};
-pub use input::{InputModes, Key};
+pub use input::{InputModes, Key, KeySequence, Modifiers};
 pub use lines::{LogicalLine, LogicalLines};
 pub use lune_text::WidthPolicy;
 pub use paste::Paste;

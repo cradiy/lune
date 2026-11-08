@@ -3,9 +3,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use lune_terminal::{InputModes, Key};
+use lune_terminal::{InputModes, Key, Modifiers};
 
-fn measure(name: &str, modes: InputModes, keys: &[Key]) {
+fn measure(name: &str, modes: InputModes, modifiers: Modifiers, keys: &[Key]) {
     let mut samples = [0.0_f64; 5];
     for sample in &mut samples {
         let start = Instant::now();
@@ -13,7 +13,7 @@ fn measure(name: &str, modes: InputModes, keys: &[Key]) {
         while start.elapsed() < Duration::from_millis(100) {
             for _ in 0..128 {
                 for &key in black_box(keys) {
-                    black_box(black_box(modes).encode_key(black_box(key)));
+                    black_box(black_box(modes).encode_key(black_box(key), black_box(modifiers)));
                 }
             }
             iterations += 128;
@@ -69,10 +69,64 @@ fn main() {
             },
         ),
     ] {
-        measure(&format!("{name} cursor"), modes, &cursor);
-        measure(&format!("{name} controls"), modes, &controls);
-        measure(&format!("{name} editing"), modes, &editing);
-        measure(&format!("{name} functions"), modes, &functions);
-        measure(&format!("{name} keypad"), modes, &keypad);
+        measure(
+            &format!("{name} cursor"),
+            modes,
+            Modifiers::default(),
+            &cursor,
+        );
+        measure(
+            &format!("{name} controls"),
+            modes,
+            Modifiers::default(),
+            &controls,
+        );
+        measure(
+            &format!("{name} editing"),
+            modes,
+            Modifiers::default(),
+            &editing,
+        );
+        measure(
+            &format!("{name} functions"),
+            modes,
+            Modifiers::default(),
+            &functions,
+        );
+        measure(
+            &format!("{name} keypad"),
+            modes,
+            Modifiers::default(),
+            &keypad,
+        );
+    }
+    for (name, modifiers) in [
+        (
+            "shift",
+            Modifiers {
+                shift: true,
+                ..Modifiers::default()
+            },
+        ),
+        (
+            "control",
+            Modifiers {
+                control: true,
+                ..Modifiers::default()
+            },
+        ),
+        (
+            "shift/alt/control",
+            Modifiers {
+                shift: true,
+                alt: true,
+                control: true,
+            },
+        ),
+    ] {
+        let modes = InputModes::default();
+        measure(&format!("{name} cursor"), modes, modifiers, &cursor[..4]);
+        measure(&format!("{name} editing"), modes, modifiers, &editing);
+        measure(&format!("{name} functions"), modes, modifiers, &functions);
     }
 }

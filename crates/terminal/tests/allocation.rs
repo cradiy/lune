@@ -7,9 +7,9 @@ use std::{
 };
 
 use lune_terminal::{
-    CellPosition, CellText, CellWidth, Cursor, EraseMode, Grid, HistoryLimits, ProcessFailure,
-    Processor, ReflowAffinity, Row, RowHistory, Screen, ScreenBuffer, StorageError, Style,
-    StyleError, StyleId, StyleTable, TextSink, UnicodeWriter,
+    CellPosition, CellText, CellWidth, Cursor, EraseMode, Grid, HistoryLimits, Modifiers,
+    ProcessFailure, Processor, ReflowAffinity, Row, RowHistory, Screen, ScreenBuffer, StorageError,
+    Style, StyleError, StyleId, StyleTable, TextSink, UnicodeWriter,
 };
 
 #[global_allocator]
@@ -2026,29 +2026,36 @@ fn processor_retries_style_and_text_allocations_without_replaying_accepted_input
                 }
             }
         }
-        for digit in 0..=255 {
-            black_box(modes.encode_key(lune_terminal::Key::KeypadDigit(digit)));
-            black_box(modes.encode_key(lune_terminal::Key::Function(digit)));
-        }
-        for key in [
-            lune_terminal::Key::Up,
-            lune_terminal::Key::Enter,
-            lune_terminal::Key::KeypadEnter,
-            lune_terminal::Key::Home,
-            lune_terminal::Key::End,
-            lune_terminal::Key::Insert,
-            lune_terminal::Key::Delete,
-            lune_terminal::Key::PageUp,
-            lune_terminal::Key::PageDown,
-            lune_terminal::Key::Tab,
-            lune_terminal::Key::Escape,
-            lune_terminal::Key::Backspace,
-            lune_terminal::Key::KeypadMultiply,
-            lune_terminal::Key::KeypadAdd,
-            lune_terminal::Key::KeypadDivide,
-            lune_terminal::Key::KeypadEqual,
-        ] {
-            black_box(modes.encode_key(key));
+        for flags in 0..8 {
+            let modifiers = Modifiers {
+                shift: flags & 1 != 0,
+                alt: flags & 2 != 0,
+                control: flags & 4 != 0,
+            };
+            for digit in 0..=255 {
+                black_box(modes.encode_key(lune_terminal::Key::KeypadDigit(digit), modifiers));
+                black_box(modes.encode_key(lune_terminal::Key::Function(digit), modifiers));
+            }
+            for key in [
+                lune_terminal::Key::Up,
+                lune_terminal::Key::Enter,
+                lune_terminal::Key::KeypadEnter,
+                lune_terminal::Key::Home,
+                lune_terminal::Key::End,
+                lune_terminal::Key::Insert,
+                lune_terminal::Key::Delete,
+                lune_terminal::Key::PageUp,
+                lune_terminal::Key::PageDown,
+                lune_terminal::Key::Tab,
+                lune_terminal::Key::Escape,
+                lune_terminal::Key::Backspace,
+                lune_terminal::Key::KeypadMultiply,
+                lune_terminal::Key::KeypadAdd,
+                lune_terminal::Key::KeypadDivide,
+                lune_terminal::Key::KeypadEqual,
+            ] {
+                black_box(modes.encode_key(key, modifiers));
+            }
         }
     });
     assert_eq!(stats.attempts, 0);

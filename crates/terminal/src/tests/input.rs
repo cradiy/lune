@@ -1,12 +1,27 @@
-use crate::{InputModes, Key, Processor, Screen, StorageError};
+use crate::{InputModes, Key, Modifiers, Processor, Screen, StorageError};
+
+fn assert_key(modes: InputModes, key: Key, modifiers: Modifiers, expected: &[u8]) {
+    let sequence = modes.encode_key(key, modifiers).unwrap();
+    assert_eq!(sequence.as_bytes(), expected, "{key:?} {modifiers:?}");
+}
 
 fn encoded(modes: InputModes) -> Vec<u8> {
     let mut result = Vec::new();
     for key in [Key::Up, Key::Down, Key::Right, Key::Left, Key::Enter] {
-        result.extend(modes.encode_key(key).unwrap());
+        result.extend_from_slice(
+            modes
+                .encode_key(key, Modifiers::default())
+                .unwrap()
+                .as_bytes(),
+        );
     }
     for digit in 0..10 {
-        result.extend(modes.encode_key(Key::KeypadDigit(digit)).unwrap());
+        result.extend_from_slice(
+            modes
+                .encode_key(Key::KeypadDigit(digit), Modifiers::default())
+                .unwrap()
+                .as_bytes(),
+        );
     }
     for key in [
         Key::KeypadDecimal,
@@ -21,7 +36,12 @@ fn encoded(modes: InputModes) -> Vec<u8> {
         Key::KeypadDivide,
         Key::KeypadEqual,
     ] {
-        result.extend(modes.encode_key(key).unwrap());
+        result.extend_from_slice(
+            modes
+                .encode_key(key, Modifiers::default())
+                .unwrap()
+                .as_bytes(),
+        );
     }
     result
 }
@@ -46,6 +66,7 @@ fn output_selected_input_modes_encode_keys_and_survive_as_independent_snapshots(
             .advance(&program[split..], &mut screen, &mut text)
             .unwrap();
         let snapshot = processor.input_modes();
+        let key = snapshot.encode_key(Key::Up, Modifiers::default()).unwrap();
         assert!(snapshot.bracketed_paste);
         let mut paste = snapshot.encode_paste("水\nx");
         assert!(paste.consume(2));
@@ -78,6 +99,85 @@ fn output_selected_input_modes_encode_keys_and_survive_as_independent_snapshots(
             assert!(paste.consume(paste.bytes().len()));
         }
         assert_eq!(remaining, "200~水\nx\x1b[201~".as_bytes());
+        assert_eq!(key.as_bytes(), b"\x1bOA");
+    }
+}
+
+#[test]
+fn modified_keys_follow_pc_sequences_independently_of_output_modes() {
+    let keys = [
+        (Key::Up, "1", 'A'),
+        (Key::Down, "1", 'B'),
+        (Key::Right, "1", 'C'),
+        (Key::Left, "1", 'D'),
+        (Key::Home, "1", 'H'),
+        (Key::End, "1", 'F'),
+        (Key::Insert, "2", '~'),
+        (Key::Delete, "3", '~'),
+        (Key::PageUp, "5", '~'),
+        (Key::PageDown, "6", '~'),
+        (Key::Function(1), "1", 'P'),
+        (Key::Function(2), "1", 'Q'),
+        (Key::Function(3), "1", 'R'),
+        (Key::Function(4), "1", 'S'),
+        (Key::Function(5), "15", '~'),
+        (Key::Function(6), "17", '~'),
+        (Key::Function(7), "18", '~'),
+        (Key::Function(8), "19", '~'),
+        (Key::Function(9), "20", '~'),
+        (Key::Function(10), "21", '~'),
+        (Key::Function(11), "23", '~'),
+        (Key::Function(12), "24", '~'),
+    ];
+    for flags in 0..32 {
+        let modes = InputModes {
+            application_cursor: flags & 1 != 0,
+            application_keypad: flags & 2 != 0,
+            new_line: flags & 4 != 0,
+            backarrow: flags & 8 != 0,
+            bracketed_paste: flags & 16 != 0,
+        };
+        for (shift, alt, control, parameter) in [
+            (true, false, false, 2),
+            (false, true, false, 3),
+            (true, true, false, 4),
+            (false, false, true, 5),
+            (true, false, true, 6),
+            (false, true, true, 7),
+            (true, true, true, 8),
+        ] {
+            let modifiers = Modifiers {
+                shift,
+                alt,
+                control,
+            };
+            for (key, prefix, final_byte) in keys {
+                let expected = format!("\x1b[{prefix};{parameter}{final_byte}");
+                assert_key(modes, key, modifiers, expected.as_bytes());
+            }
+            if parameter == 2 {
+                assert_key(modes, Key::Tab, modifiers, b"\x1b[Z");
+            } else {
+                assert!(modes.encode_key(Key::Tab, modifiers).is_none());
+            }
+            for key in [
+                Key::Enter,
+                Key::Escape,
+                Key::Backspace,
+                Key::KeypadEnter,
+                Key::KeypadDigit(0),
+                Key::KeypadDigit(9),
+                Key::KeypadDigit(10),
+                Key::Function(0),
+                Key::Function(13),
+                Key::Function(255),
+            ] {
+                assert!(
+                    modes.encode_key(key, modifiers).is_none(),
+                    "{key:?} {modifiers:?}"
+                );
+            }
+        }
     }
 }
 
@@ -140,32 +240,38 @@ fn cursor_keypad_and_new_line_modes_encode_independently_and_reject_invalid_digi
         .advance(b"\x1b[?1h", &mut screen, &mut text)
         .unwrap();
     let cursor = processor.input_modes();
-    assert_eq!(cursor.encode_key(Key::Up), Some(&b"\x1bOA"[..]));
-    assert_eq!(cursor.encode_key(Key::KeypadDigit(3)), Some(&b"3"[..]));
-    assert_eq!(cursor.encode_key(Key::Enter), Some(&b"\r"[..]));
+    assert_key(cursor, Key::Up, Modifiers::default(), b"\x1bOA");
+    assert_key(cursor, Key::KeypadDigit(3), Modifiers::default(), b"3");
+    assert_key(cursor, Key::Enter, Modifiers::default(), b"\r");
     processor
         .advance(b"\x1b[?1l\x1b=\x1b[20h", &mut screen, &mut text)
         .unwrap();
     let keypad = processor.input_modes();
-    assert_eq!(keypad.encode_key(Key::Up), Some(&b"\x1b[A"[..]));
-    assert_eq!(keypad.encode_key(Key::KeypadDigit(3)), Some(&b"\x1bOs"[..]));
-    assert_eq!(keypad.encode_key(Key::KeypadEnter), Some(&b"\x1bOM"[..]));
-    assert_eq!(keypad.encode_key(Key::Enter), Some(&b"\r\n"[..]));
-    assert_eq!(keypad.encode_key(Key::Backspace), Some(&b"\x7f"[..]));
+    assert_key(keypad, Key::Up, Modifiers::default(), b"\x1b[A");
+    assert_key(keypad, Key::KeypadDigit(3), Modifiers::default(), b"\x1bOs");
+    assert_key(keypad, Key::KeypadEnter, Modifiers::default(), b"\x1bOM");
+    assert_key(keypad, Key::Enter, Modifiers::default(), b"\r\n");
+    assert_key(keypad, Key::Backspace, Modifiers::default(), b"\x7f");
     processor
         .advance(b"\x1b[?67h\x1b>", &mut screen, &mut text)
         .unwrap();
     let numeric = processor.input_modes();
-    assert_eq!(numeric.encode_key(Key::Backspace), Some(&b"\x08"[..]));
-    assert_eq!(numeric.encode_key(Key::KeypadMultiply), Some(&b"*"[..]));
-    assert_eq!(numeric.encode_key(Key::Enter), Some(&b"\r\n"[..]));
+    assert_key(numeric, Key::Backspace, Modifiers::default(), b"\x08");
+    assert_key(numeric, Key::KeypadMultiply, Modifiers::default(), b"*");
+    assert_key(numeric, Key::Enter, Modifiers::default(), b"\r\n");
     processor
         .advance(b"\x1b[?66;67;999l", &mut screen, &mut text)
         .unwrap();
     assert_eq!(processor.input_modes(), numeric);
     for digit in 10..=255 {
-        assert_eq!(cursor.encode_key(Key::KeypadDigit(digit)), None);
-        assert_eq!(keypad.encode_key(Key::KeypadDigit(digit)), None);
+        assert_eq!(
+            cursor.encode_key(Key::KeypadDigit(digit), Modifiers::default()),
+            None
+        );
+        assert_eq!(
+            keypad.encode_key(Key::KeypadDigit(digit), Modifiers::default()),
+            None
+        );
     }
 }
 
@@ -188,10 +294,20 @@ fn editing_and_function_keys_preserve_distinct_sequences_across_all_mode_combina
             Key::PageUp,
             Key::PageDown,
         ] {
-            actual.extend(modes.encode_key(key).unwrap());
+            actual.extend_from_slice(
+                modes
+                    .encode_key(key, Modifiers::default())
+                    .unwrap()
+                    .as_bytes(),
+            );
         }
         for number in 1..=12 {
-            actual.extend(modes.encode_key(Key::Function(number)).unwrap());
+            actual.extend_from_slice(
+                modes
+                    .encode_key(Key::Function(number), Modifiers::default())
+                    .unwrap()
+                    .as_bytes(),
+            );
         }
         let mut expected = Vec::from(if modes.application_cursor {
             &b"\x1bOH\x1bOF"[..]
@@ -200,9 +316,15 @@ fn editing_and_function_keys_preserve_distinct_sequences_across_all_mode_combina
         });
         expected.extend(b"\x1b[2~\x1b[3~\x1b[5~\x1b[6~\x1bOP\x1bOQ\x1bOR\x1bOS\x1b[15~\x1b[17~\x1b[18~\x1b[19~\x1b[20~\x1b[21~\x1b[23~\x1b[24~");
         assert_eq!(actual, expected);
-        assert_eq!(modes.encode_key(Key::Function(0)), None);
+        assert_eq!(
+            modes.encode_key(Key::Function(0), Modifiers::default()),
+            None
+        );
         for number in 13..=255 {
-            assert_eq!(modes.encode_key(Key::Function(number)), None);
+            assert_eq!(
+                modes.encode_key(Key::Function(number), Modifiers::default()),
+                None
+            );
         }
     }
 }

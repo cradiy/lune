@@ -97,6 +97,7 @@ Final probes restore and write through each buffer's save slot. Style collection
 between chunks must retain inactive cells and both saved renditions.
 The reference also tracks application cursor/keypad, ANSI new-line, and backarrow modes
 independently of cursor saves. Mode changes and resets compare complete snapshots.
+F12 encoding is checked against fixed reference bytes for every Shift/Alt/Control combination.
 Both ESC keypad selection and DEC mode 66 update the same reference keypad flag;
 DEC mode 67 independently selects BS or DEL for Backspace.
 DEC mode 2004 updates the reference bracketed-paste flag. Final checks drain a
