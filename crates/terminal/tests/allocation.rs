@@ -2010,9 +2010,22 @@ fn processor_retries_style_and_text_allocations_without_replaying_accepted_input
             }
         }
         processor
-            .advance(b"\x1b[?1;66;67h\x1b[20h", &mut screen, &mut text)
+            .advance(b"\x1b[?1;66;67;2004h\x1b[20h", &mut screen, &mut text)
             .unwrap();
         let modes = processor.input_modes();
+        for bracketed_paste in [false, true] {
+            let modes = lune_terminal::InputModes {
+                bracketed_paste,
+                ..modes
+            };
+            for payload in ["", "line\nnext", "水e\u{301}"] {
+                let mut paste = modes.encode_paste(payload);
+                while !paste.is_empty() {
+                    black_box(paste.bytes());
+                    assert!(paste.consume(paste.bytes().len().min(2)));
+                }
+            }
+        }
         for digit in 0..=255 {
             black_box(modes.encode_key(lune_terminal::Key::KeypadDigit(digit)));
             black_box(modes.encode_key(lune_terminal::Key::Function(digit)));

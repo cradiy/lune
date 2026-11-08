@@ -124,6 +124,24 @@ fn drive(wire: &[u8], chunk: usize, fail_at: usize, expected: &Expected<'_>) {
         Some(&expected.style)
     );
     assert_eq!(processor.input_modes(), expected.input);
+    let expected_paste = if expected.input.bracketed_paste {
+        "\x1b[200~a水\n\x1b[201~".as_bytes()
+    } else {
+        "a水\n".as_bytes()
+    };
+    let mut paste = processor.input_modes().encode_paste("a水\n");
+    let mut offset = 0;
+    while !paste.is_empty() {
+        let count = paste.bytes().len().min(chunk);
+        assert_eq!(
+            &paste.bytes()[..count],
+            &expected_paste[offset..offset + count]
+        );
+        assert!(!paste.consume(usize::MAX));
+        assert!(paste.consume(count));
+        offset += count;
+    }
+    assert_eq!(offset, expected_paste.len());
     assert_eq!(
         (processor.parse_errors(), processor.ignored_sequences()),
         expected.diagnostics
@@ -541,9 +559,12 @@ fuzz_target!(|data: &[u8]| {
                 let mode = if bytes[0] % 64 == 55 {
                     input.application_keypad = enabled;
                     66
-                } else {
+                } else if bytes[1] & 2 == 0 {
                     input.backarrow = enabled;
                     67
+                } else {
+                    input.bracketed_paste = enabled;
+                    2004
                 };
                 write!(&mut wire, "\x1b[?{mode}{}", if enabled { 'h' } else { 'l' }).unwrap();
                 None

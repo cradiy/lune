@@ -58,6 +58,7 @@ fn main() {
                 application_keypad: true,
                 new_line: false,
                 backarrow: true,
+                bracketed_paste: false,
             },
         ),
         (

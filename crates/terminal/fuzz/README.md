@@ -99,6 +99,9 @@ The reference also tracks application cursor/keypad, ANSI new-line, and backarro
 independently of cursor saves. Mode changes and resets compare complete snapshots.
 Both ESC keypad selection and DEC mode 66 update the same reference keypad flag;
 DEC mode 67 independently selects BS or DEL for Backspace.
+DEC mode 2004 updates the reference bracketed-paste flag. Final checks drain a
+UTF-8 paste through partial chunk acknowledgements and compare its framing with
+that flag. Oversized acknowledgements must preserve the pending byte stream.
 LF, VT, and FF select either vertical movement or carriage return plus line feed;
 explicit IND/NEL and reset commands check the distinct mode boundaries.
 DEC cursor visibility/blinking modes and DECSCUSR commands update reference

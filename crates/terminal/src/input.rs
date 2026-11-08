@@ -1,3 +1,5 @@
+use crate::Paste;
+
 /// Unmodified ANSI control, cursor, editing, function, and numeric-keypad keys.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Key {
@@ -27,7 +29,7 @@ pub enum Key {
     KeypadEnter,
 }
 
-/// A copyable snapshot of keyboard modes selected by the output stream.
+/// A copyable snapshot of keyboard and paste modes selected by the output stream.
 /// Cursor-key and keypad application modes are independent. Default modes use
 /// CSI cursor sequences, numeric keypad characters, CR for Return, and DEL for Backspace.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -37,9 +39,18 @@ pub struct InputModes {
     pub new_line: bool,
     /// DECBKM: Backspace sends BS when enabled and DEL when disabled.
     pub backarrow: bool,
+    /// DEC mode 2004: frame a paste with CSI 200~/201~ markers.
+    pub bracketed_paste: bool,
 }
 
 impl InputModes {
+    /// Borrows the payload with this snapshot's paste framing.
+    /// Payload bytes and line endings are preserved.
+    #[inline]
+    pub fn encode_paste(self, payload: &str) -> Paste<'_> {
+        Paste::new(payload, self.bracketed_paste)
+    }
+
     /// Encodes a key without allocating. Returned bytes have static storage and
     /// can be retained across mode changes or partial transport writes.
     /// Returns `None` for keypad digits above nine or function keys outside 1–12.
