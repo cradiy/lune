@@ -2032,6 +2032,19 @@ fn processor_retries_style_and_text_allocations_without_replaying_accepted_input
                 alt: flags & 2 != 0,
                 control: flags & 4 != 0,
             };
+            for character in (0..=127).map(char::from).chain([
+                '\u{80}',
+                '\u{7ff}',
+                '\u{800}',
+                '水',
+                '🦀',
+                '\u{10ffff}',
+            ]) {
+                black_box(lune_terminal::KeySequence::from_character(
+                    black_box(character),
+                    modifiers,
+                ));
+            }
             for digit in 0..=255 {
                 black_box(modes.encode_key(lune_terminal::Key::KeypadDigit(digit), modifiers));
                 black_box(modes.encode_key(lune_terminal::Key::Function(digit), modifiers));

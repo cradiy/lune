@@ -4,6 +4,19 @@ This standalone workspace uses cargo-fuzz and nightly Rust to compare terminal
 storage, cursor-driven screen mutations, byte-stream execution, and SGR rendition
 with independent expectations.
 
+## Input Target
+
+The `input` target checks scalar key encoding with arbitrary Unicode values and
+Shift/Alt/Control combinations. Control results use an independent ASCII table;
+ordinary UTF-8 is decoded back to its scalar. Checks include the Alt prefix,
+Shift independence, unmapped Control pairs, and the five-byte output bound.
+Each five-byte record supplies a little-endian scalar value modulo `0x110000`
+and modifier bits 0–2. Surrogate values are skipped. Trailing bytes are ignored.
+
+```sh
+cargo +nightly fuzz run input -- -max_len=2048 -len_control=0 -timeout=2 -rss_limit_mb=1024 -max_total_time=60
+```
+
 ## Storage Target
 
 The `storage` target compares each mutation with a model that owns complete display

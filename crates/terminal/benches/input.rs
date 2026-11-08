@@ -3,7 +3,29 @@ use std::{
     time::{Duration, Instant},
 };
 
-use lune_terminal::{InputModes, Key, Modifiers};
+use lune_terminal::{InputModes, Key, KeySequence, Modifiers};
+
+fn measure_characters(name: &str, modifiers: Modifiers, characters: &[char]) {
+    let mut samples = [0.0_f64; 5];
+    for sample in &mut samples {
+        let start = Instant::now();
+        let mut iterations = 0_u64;
+        while start.elapsed() < Duration::from_millis(100) {
+            for _ in 0..128 {
+                for &character in black_box(characters) {
+                    black_box(KeySequence::from_character(
+                        black_box(character),
+                        black_box(modifiers),
+                    ));
+                }
+            }
+            iterations += 128;
+        }
+        *sample = start.elapsed().as_nanos() as f64 / (iterations as f64 * characters.len() as f64);
+    }
+    samples.sort_by(f64::total_cmp);
+    println!("{name:<26} {:>8.3} ns/key", samples[2]);
+}
 
 fn measure(name: &str, modes: InputModes, modifiers: Modifiers, keys: &[Key]) {
     let mut samples = [0.0_f64; 5];
@@ -128,5 +150,38 @@ fn main() {
         measure(&format!("{name} cursor"), modes, modifiers, &cursor[..4]);
         measure(&format!("{name} editing"), modes, modifiers, &editing);
         measure(&format!("{name} functions"), modes, modifiers, &functions);
+    }
+    for (name, characters) in [
+        ("ASCII", &['a', 'A', ' ', '2', '?', '~'][..]),
+        ("Unicode", &['é', '水', '🦀', '\u{301}', '\u{10ffff}'][..]),
+        ("control aliases", &['c', 'D', ' ', '3', '/', '?'][..]),
+    ] {
+        for (suffix, modifiers) in [
+            ("plain", Modifiers::default()),
+            (
+                "alt",
+                Modifiers {
+                    alt: true,
+                    ..Modifiers::default()
+                },
+            ),
+            (
+                "ctrl",
+                Modifiers {
+                    control: true,
+                    ..Modifiers::default()
+                },
+            ),
+            (
+                "alt/ctrl",
+                Modifiers {
+                    alt: true,
+                    control: true,
+                    ..Modifiers::default()
+                },
+            ),
+        ] {
+            measure_characters(&format!("{name} {suffix}"), modifiers, characters);
+        }
     }
 }

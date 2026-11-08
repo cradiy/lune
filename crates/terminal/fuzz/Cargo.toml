@@ -18,6 +18,13 @@ unicode-width = "=0.2.2"
 members = ["."]
 
 [[bin]]
+name = "input"
+path = "fuzz_targets/input.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "storage"
 path = "fuzz_targets/storage.rs"
 test = false

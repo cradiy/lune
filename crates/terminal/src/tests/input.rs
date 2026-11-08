@@ -1,4 +1,131 @@
-use crate::{InputModes, Key, Modifiers, Processor, Screen, StorageError};
+use crate::{InputModes, Key, KeySequence, Modifiers, Processor, Screen, StorageError};
+
+#[test]
+fn character_keys_preserve_ascii_and_encode_control_aliases_with_alt_prefixes() {
+    let controls = [
+        ("\0 @`2", 0),
+        ("\x01Aa", 1),
+        ("\x02Bb", 2),
+        ("\x03Cc", 3),
+        ("\x04Dd", 4),
+        ("\x05Ee", 5),
+        ("\x06Ff", 6),
+        ("\x07Gg", 7),
+        ("\x08Hh", 8),
+        ("\tIi", 9),
+        ("\nJj", 10),
+        ("\x0bKk", 11),
+        ("\x0cLl", 12),
+        ("\rMm", 13),
+        ("\x0eNn", 14),
+        ("\x0fOo", 15),
+        ("\x10Pp", 16),
+        ("\x11Qq", 17),
+        ("\x12Rr", 18),
+        ("\x13Ss", 19),
+        ("\x14Tt", 20),
+        ("\x15Uu", 21),
+        ("\x16Vv", 22),
+        ("\x17Ww", 23),
+        ("\x18Xx", 24),
+        ("\x19Yy", 25),
+        ("\x1aZz", 26),
+        ("\x1b[{3", 27),
+        ("\x1c\\|4", 28),
+        ("\x1d]}5", 29),
+        ("\x1e^~6", 30),
+        ("\x1f_/7", 31),
+        ("\x7f?8", 127),
+    ];
+    for flags in 0..8 {
+        let modifiers = Modifiers {
+            shift: flags & 1 != 0,
+            alt: flags & 2 != 0,
+            control: flags & 4 != 0,
+        };
+        for ascii in 0..=127 {
+            let character = char::from(ascii);
+            let expected = if modifiers.control {
+                controls
+                    .iter()
+                    .find_map(|(aliases, byte)| aliases.contains(character).then_some(*byte))
+            } else {
+                Some(ascii)
+            };
+            let actual = KeySequence::from_character(character, modifiers);
+            if let Some(byte) = expected {
+                let bytes = [0x1b, byte];
+                assert_eq!(
+                    actual.unwrap().as_bytes(),
+                    &bytes[usize::from(!modifiers.alt)..],
+                    "{character:?} {modifiers:?}"
+                );
+            } else {
+                assert!(actual.is_none(), "{character:?} {modifiers:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn character_keys_preserve_utf8_boundaries_and_owned_bytes() {
+    let characters = [
+        '\u{80}',
+        '\u{9f}',
+        '\u{7ff}',
+        '\u{800}',
+        '\u{d7ff}',
+        '\u{e000}',
+        '\u{ffff}',
+        '\u{10000}',
+        '\u{10ffff}',
+        'é',
+        '水',
+        '🦀',
+        '\u{301}',
+        '\u{200d}',
+    ];
+    let retained = KeySequence::from_character(
+        '🦀',
+        Modifiers {
+            alt: true,
+            ..Modifiers::default()
+        },
+    )
+    .unwrap();
+    for character in characters {
+        for shift in [false, true] {
+            for alt in [false, true] {
+                let modifiers = Modifiers {
+                    shift,
+                    alt,
+                    control: false,
+                };
+                let sequence = KeySequence::from_character(character, modifiers).unwrap();
+                let bytes = sequence.as_bytes();
+                assert_eq!(bytes.len(), character.len_utf8() + usize::from(alt));
+                if alt {
+                    assert_eq!(bytes[0], 0x1b);
+                }
+                let text = std::str::from_utf8(&bytes[usize::from(alt)..]).unwrap();
+                let mut decoded = text.chars();
+                assert_eq!(decoded.next(), Some(character));
+                assert_eq!(decoded.next(), None);
+                assert!(
+                    KeySequence::from_character(
+                        character,
+                        Modifiers {
+                            control: true,
+                            ..modifiers
+                        }
+                    )
+                    .is_none()
+                );
+            }
+        }
+    }
+    assert_eq!(retained.as_bytes(), b"\x1b\xf0\x9f\xa6\x80");
+}
 
 fn assert_key(modes: InputModes, key: Key, modifiers: Modifiers, expected: &[u8]) {
     let sequence = modes.encode_key(key, modifiers).unwrap();

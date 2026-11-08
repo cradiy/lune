@@ -55,6 +55,35 @@ pub struct KeySequence {
 }
 
 impl KeySequence {
+    /// Encodes a layout-resolved scalar with legacy Control mapping and an Alt ESC prefix.
+    /// Shift is already reflected in the scalar; unmapped Control combinations return `None`.
+    pub fn from_character(character: char, modifiers: Modifiers) -> Option<Self> {
+        let mut result = Self {
+            bytes: [0; 7],
+            len: NonZeroU8::MIN,
+        };
+        let start = usize::from(modifiers.alt);
+        if modifiers.alt {
+            result.bytes[0] = 0x1b;
+        }
+        let len = if modifiers.control {
+            result.bytes[start] = match character {
+                '\0'..='\x1f' | '\x7f' => character as u8,
+                '@'..='~' | ' ' => character as u8 & 0x1f,
+                '2' => 0,
+                '3'..='7' => character as u8 - b'3' + 0x1b,
+                '8' | '?' => 0x7f,
+                '/' => 0x1f,
+                _ => return None,
+            };
+            1
+        } else {
+            character.encode_utf8(&mut result.bytes[start..]).len()
+        };
+        result.len = NonZeroU8::new((start + len) as u8).unwrap();
+        Some(result)
+    }
+
     #[inline]
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes[..usize::from(self.len.get())]
