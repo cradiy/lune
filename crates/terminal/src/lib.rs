@@ -9,7 +9,7 @@
 //! erased single-width spaces. Cell edits retain the state of moved units;
 //! nonempty text appends establish text. Extraction emits spaces for both states.
 //!
-//! Resizing preserves the upper-left intersection. A wide unit cut by the new
+//! Grid resizing preserves the upper-left intersection. A wide unit cut by the new
 //! right edge is cleared. Scrolling an exclusive row range recycles row buffers
 //! and clears exposed rows. Cells outside the range remain unchanged. Fallible
 //! operations reserve storage before changing visible contents.
@@ -106,7 +106,7 @@
 //! cancel the edited row's outgoing connection. Clearing complete rows also
 //! disconnects the preceding row. Explicit line feed cancels the source join;
 //! other cursor movement preserves stored joins. Scrolling and whole-row edits
-//! retain connections only between surviving adjacent rows. Width changes clear
+//! retain connections only between surviving adjacent rows. Grid width changes clear
 //! all joins; height changes retain surviving adjacent joins. Reset clears them.
 //! Metadata updates do not allocate and fallible operations preserve it on error.
 //!
@@ -147,6 +147,14 @@
 //! mapping at different widths. [`ReflowRow::map_anchor`] checks its source view
 //! and maps it during row traversal. Both endpoints are included so consumers
 //! can select their boundary affinity.
+//! [`Screen::reflow`] prepares replacement primary history, live rows, alternate
+//! storage and updated tab stops, then commits them together. Its latest primary window
+//! contains the mapped live cursor, or the primary save slot while alternate
+//! storage is active. Rows below that window are cropped. History retains an
+//! adjacent bounded suffix; an oversized row clears the preceding suffix.
+//! Current and saved cursors and the primary viewport are mapped or clamped.
+//! Commit selects the full-screen scrolling region and preserves modes and
+//! appearance. Allocation failure preserves the complete source state.
 //! [`Screen::viewport`] borrows a screen-height [`Viewport`] using window-local
 //! row coordinates. Its offset is bounded by retained primary history. Zero
 //! follows output; scrolling upward anchors the top retained row as captures

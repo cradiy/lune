@@ -21,6 +21,40 @@ pub(crate) struct GridResize {
 }
 
 impl Grid {
+    pub(crate) fn from_rows(columns: usize, mut rows: VecDeque<Row>) -> Self {
+        debug_assert!(!rows.is_empty());
+        debug_assert!(rows.iter().all(|row| row.cells().len() == columns));
+        rows.back_mut().unwrap().set_wrap_end(None);
+        Self { columns, rows }
+    }
+
+    pub(crate) fn resized_copy(
+        &self,
+        columns: usize,
+        height: usize,
+        style: StyleId,
+    ) -> Result<Self, StorageError> {
+        let mut rows = VecDeque::new();
+        rows.try_reserve_exact(height)?;
+        for index in 0..height {
+            let mut row = Row::new(columns, style)?;
+            if let Some(source) = self.row(index) {
+                let mut end = columns.min(self.columns);
+                if end < self.columns && source.cells()[end].is_continuation() {
+                    end -= 1;
+                }
+                if end != 0 {
+                    row.copy_segment(0, source, 0..end)?;
+                }
+                if columns == self.columns && index + 1 < height.min(self.rows()) {
+                    row.set_wrap_end(source.wrap_end());
+                }
+            }
+            rows.push_back(row);
+        }
+        Ok(Self::from_rows(columns, rows))
+    }
+
     pub(crate) fn exchange_top(&mut self, replacement: Row) -> Row {
         debug_assert_eq!(replacement.cells().len(), self.columns);
         let outgoing = std::mem::replace(&mut self.rows[0], replacement);

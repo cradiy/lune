@@ -1,5 +1,7 @@
 #![no_main]
 
+mod screen_reflow_model;
+
 use std::ops::Range;
 
 use libfuzzer_sys::fuzz_target;
@@ -556,4 +558,7 @@ fuzz_target!(|data: &[u8]| {
             );
         }
     }
+    let bytes = std::array::from_fn(|index| data.get(index).copied().unwrap_or(0));
+    screen_reflow_model::check(&mut bulk, bytes);
+    screen_reflow_model::check(&mut bulk, [bytes[3], bytes[2], bytes[1], bytes[0]]);
 });

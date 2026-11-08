@@ -207,6 +207,11 @@ Materialization probes compare owned text, styles, erased state, wide pairs,
 padding and outgoing connections against the packed source units.
 Position probes derive logical column offsets from the snapshots, compare both
 boundary affinities with streaming row lookup, and translate cursor edge states.
+Final screen-reflow probes own complete cells and pack logical lines independently.
+They compare two consecutive transactions, both buffers, saved origin/automatic-wrap
+modes, cursor placement, tab stops at bitmap boundaries and viewport anchors.
+The model uses zero or maximum byte budgets for independent row-suffix comparison;
+targeted tests cover oversized rows and allocation failure at every request.
 
 Viewport probes track retained cell-buffer identity across individual captures,
 clamp removed anchors to the oldest retained row, and walk navigation counts in

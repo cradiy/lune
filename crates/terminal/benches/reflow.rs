@@ -142,6 +142,52 @@ fn measure_mapping(name: &str, line: LogicalLine<'_>, columns: usize) {
     );
 }
 
+fn source(name: &str, depth: usize, long: &str) -> Screen {
+    let mut screen = Screen::new(119, 24).unwrap();
+    screen
+        .set_history_limits(HistoryLimits {
+            max_rows: depth,
+            max_bytes: MAX_HISTORY_BYTES,
+        })
+        .unwrap();
+    let units = if name == "CJK" { 59 } else { 119 };
+    for index in 0..(depth + 24) * units {
+        let (text, width) = match name {
+            "ASCII" => ("x", CellWidth::Single),
+            "CJK" => ("水", CellWidth::Double),
+            "owned" => ("e\u{301}", CellWidth::Single),
+            "long cluster" => (long, CellWidth::Single),
+            _ => match index % 4 {
+                0 => ("x", CellWidth::Single),
+                1 => ("水", CellWidth::Double),
+                2 => ("e\u{301}", CellWidth::Single),
+                _ => ("👩\u{200d}💻", CellWidth::Double),
+            },
+        };
+        screen
+            .write(text, width, StyleId(index as u32 % 4))
+            .unwrap();
+    }
+    screen
+}
+
+fn measure_transaction(name: &str, depth: usize, long: &str, columns: usize) {
+    let mut samples = [0.0_f64; 5];
+    for sample in &mut samples {
+        let mut screen = source(name, depth, long);
+        screen.scroll_viewport_up(depth / 2);
+        let start = Instant::now();
+        screen.reflow(black_box(columns), 24, StyleId(9)).unwrap();
+        *sample = start.elapsed().as_nanos() as f64;
+        black_box(&screen);
+    }
+    samples.sort_by(f64::total_cmp);
+    println!(
+        "transaction {name:<12} history={depth:<4} columns={columns:<3} {:>10.2} us/resize",
+        samples[2] / 1000.0
+    );
+}
+
 fn main() {
     let long = String::from("e") + &"\u{301}".repeat(511);
     for (name, depth) in [
@@ -154,31 +200,7 @@ fn main() {
         ("mixed", 4096),
         ("long cluster", 0),
     ] {
-        let mut screen = Screen::new(119, 24).unwrap();
-        screen
-            .set_history_limits(HistoryLimits {
-                max_rows: depth,
-                max_bytes: MAX_HISTORY_BYTES,
-            })
-            .unwrap();
-        let units = if name == "CJK" { 59 } else { 119 };
-        for index in 0..(depth + 24) * units {
-            let (text, width) = match name {
-                "ASCII" => ("x", CellWidth::Single),
-                "CJK" => ("水", CellWidth::Double),
-                "owned" => ("e\u{301}", CellWidth::Single),
-                "long cluster" => (long.as_str(), CellWidth::Single),
-                _ => match index % 4 {
-                    0 => ("x", CellWidth::Single),
-                    1 => ("水", CellWidth::Double),
-                    2 => ("e\u{301}", CellWidth::Single),
-                    _ => ("👩\u{200d}💻", CellWidth::Double),
-                },
-            };
-            screen
-                .write(text, width, StyleId(index as u32 % 4))
-                .unwrap();
-        }
+        let screen = source(name, depth, &long);
         let line = screen.view().logical_line(0).unwrap();
         if name == "ASCII" {
             measure(&format!("{name} / history={depth}"), line, 1);
@@ -189,6 +211,9 @@ fn main() {
             if name == "ASCII" || name == "mixed" {
                 measure_mapping(&format!("{name} / history={depth}"), line, columns);
             }
+        }
+        for columns in [2, 80, 240] {
+            measure_transaction(name, depth, &long, columns);
         }
     }
 }

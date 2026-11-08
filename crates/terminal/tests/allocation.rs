@@ -1366,6 +1366,140 @@ fn resize_history_reaches_a_stable_requested_memory_high_water() {
 }
 
 #[test]
+fn screen_reflow_failures_release_staging_and_preserve_both_buffers_and_saved_states() {
+    let prepare = |alternate: bool| {
+        let mut screen = Screen::new(5, 4).unwrap();
+        screen
+            .set_history_limits(HistoryLimits {
+                max_rows: 5,
+                max_bytes: 1 << 20,
+            })
+            .unwrap();
+        for index in 0..40 {
+            screen
+                .write(
+                    if index % 2 == 0 {
+                        "e\u{301}"
+                    } else {
+                        "👩\u{200d}💻"
+                    },
+                    if index % 2 == 0 {
+                        CellWidth::Single
+                    } else {
+                        CellWidth::Double
+                    },
+                    StyleId(index % 4),
+                )
+                .unwrap();
+        }
+        screen.scroll_viewport_up(2);
+        screen.set_scroll_region(1..4).unwrap();
+        screen.set_origin_mode(true);
+        screen.set_cursor(1, 2);
+        screen.save_cursor();
+        screen.select_buffer(ScreenBuffer::Alternate);
+        screen.set_origin_mode(false);
+        screen.write_ascii(b"abcdefghijk", StyleId(6)).unwrap();
+        screen.save_cursor();
+        screen.set_cursor(0, 2);
+        screen.set_tab_stop();
+        screen.set_insert_mode(true);
+        if !alternate {
+            screen.select_buffer(ScreenBuffer::Primary);
+            screen.restore_cursor();
+        }
+        screen
+    };
+    let state = |screen: &Screen| {
+        (
+            snapshot(screen.buffer(ScreenBuffer::Primary)),
+            snapshot(screen.buffer(ScreenBuffer::Alternate)),
+            retained(screen.history()),
+            (
+                screen.cursor(),
+                screen.cursor_appearance(),
+                screen.scroll_region(),
+                screen.origin_mode(),
+                screen.auto_wrap(),
+                screen.insert_mode(),
+                screen.active_buffer(),
+            ),
+            (screen.viewport().range(), screen.viewport_offset()),
+            (0..screen.grid().columns())
+                .map(|column| screen.is_tab_stop(column))
+                .collect::<Vec<_>>(),
+            [ScreenBuffer::Primary, ScreenBuffer::Alternate]
+                .into_iter()
+                .flat_map(|buffer| {
+                    screen
+                        .buffer(buffer)
+                        .iter_rows()
+                        .map(|row| row.cells().as_ptr())
+                })
+                .chain(screen.history().iter_rows().map(|row| row.cells().as_ptr()))
+                .collect::<Vec<_>>(),
+        )
+    };
+    let saved = |screen: &mut Screen| {
+        screen.select_buffer(ScreenBuffer::Primary);
+        screen.restore_cursor();
+        let primary = (
+            screen.cursor(),
+            screen.origin_mode(),
+            screen.auto_wrap(),
+            screen.viewport_offset(),
+        );
+        screen.select_buffer(ScreenBuffer::Alternate);
+        screen.restore_cursor();
+        (
+            primary,
+            (screen.cursor(), screen.origin_mode(), screen.auto_wrap()),
+        )
+    };
+    for (alternate, columns, height) in [(false, 3, 3), (true, 9, 6)] {
+        let mut expected = prepare(alternate);
+        let before = state(&expected);
+        let (result, noop) = allocator::measure(Some(0), || expected.reflow(5, 4, StyleId(9)));
+        result.unwrap();
+        assert_eq!(noop.attempts, 0);
+        assert_eq!(state(&expected), before);
+        let (result, stats) =
+            allocator::measure(None, || expected.reflow(columns, height, StyleId(9)));
+        result.unwrap();
+        assert!(stats.attempts > 0);
+        let expected_state = state(&expected);
+        let expected_saved = saved(&mut expected);
+        for point in 0..stats.attempts {
+            let mut screen = prepare(alternate);
+            let before = state(&screen);
+            let (result, failed) =
+                allocator::measure(Some(point), || screen.reflow(columns, height, StyleId(9)));
+            assert!(matches!(result, Err(StorageError::Allocation(_))));
+            assert_eq!(failed.failures, 1);
+            assert_eq!(failed.live_bytes, 0);
+            assert_eq!(state(&screen), before);
+            screen.reflow(columns, height, StyleId(9)).unwrap();
+            let actual = state(&screen);
+            // Independent successful builds own different buffers; compare their values.
+            assert_eq!(
+                (
+                    &actual.0, &actual.1, &actual.2, &actual.3, &actual.4, &actual.5
+                ),
+                (
+                    &expected_state.0,
+                    &expected_state.1,
+                    &expected_state.2,
+                    &expected_state.3,
+                    &expected_state.4,
+                    &expected_state.5
+                )
+            );
+            assert_eq!(saved(&mut screen), expected_saved);
+        }
+    }
+}
+
+#[test]
 fn reflow_row_allocation_failures_release_partial_storage_and_preserve_sources() {
     let contents = |row: &Row| {
         (

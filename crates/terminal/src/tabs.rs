@@ -12,6 +12,19 @@ pub(crate) struct TabStops {
 }
 
 impl TabStops {
+    pub(crate) fn resized_copy(&self, old: usize, columns: usize) -> Result<Self, StorageError> {
+        let count = columns.div_ceil(64);
+        let mut words = Vec::new();
+        words.try_reserve_exact(count)?;
+        words.extend_from_slice(&self.words[..count.min(self.words.len())]);
+        let mut copy = Self {
+            words,
+            total: self.total,
+        };
+        copy.resize_prepared(old, columns);
+        Ok(copy)
+    }
+
     pub(crate) fn new(columns: usize) -> Result<Self, StorageError> {
         let mut stops = Self {
             words: Vec::new(),

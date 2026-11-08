@@ -1,5 +1,7 @@
 use std::ops::Range;
 
+mod reflow;
+
 use crate::{
     CellPosition, CellWidth, Grid, HistoryLimits, MAX_CELL_TEXT_BYTES, RowHistory, ScreenView,
     StorageError, StyleId, Viewport,
