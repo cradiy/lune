@@ -135,6 +135,111 @@ fn screen_reflow_moves_text_allocations_and_budgets_their_retained_capacity() {
 }
 
 #[test]
+fn screen_reflow_orders_pending_and_following_anchors_at_the_same_boundary() {
+    let mut screen = Screen::new(4, 2).unwrap();
+    screen
+        .set_history_limits(HistoryLimits {
+            max_rows: 4,
+            max_bytes: 4096,
+        })
+        .unwrap();
+    screen.write_ascii(b"abcd", StyleId(1)).unwrap();
+    screen.save_cursor();
+    screen.write_ascii(b"efghijkl", StyleId(1)).unwrap();
+    screen.set_cursor(1, 0);
+    screen.scroll_viewport_up(1);
+    screen.reflow(2, 2, StyleId(9)).unwrap();
+    assert_eq!(rows(&screen, ScreenBuffer::Primary), ["ij", "kl"]);
+    assert_eq!(history(&screen), ["ab", "cd", "ef", "gh"]);
+    assert_eq!(screen.viewport_offset(), 4);
+    assert_eq!(
+        screen.cursor(),
+        Cursor {
+            row: 0,
+            column: 0,
+            wrap_pending: false
+        }
+    );
+    screen.restore_cursor();
+    assert_eq!(
+        screen.cursor(),
+        Cursor {
+            row: 0,
+            column: 1,
+            wrap_pending: false
+        }
+    );
+}
+
+#[test]
+fn screen_reflow_replays_suffixes_across_hard_lines_and_early_cursor_windows() {
+    for (early, keep_history) in [(false, true), (true, true), (false, false), (true, false)] {
+        let mut screen = Screen::new(9, 3).unwrap();
+        screen
+            .set_history_limits(HistoryLimits {
+                max_rows: 4,
+                max_bytes: 4096,
+            })
+            .unwrap();
+        for digit in b'0'..=b'6' {
+            if digit != b'0' {
+                screen.carriage_return();
+                screen.line_feed(StyleId(9)).unwrap();
+            }
+            screen.write_ascii(&[digit; 9], StyleId(1)).unwrap();
+        }
+        screen.save_cursor();
+        screen.scroll_viewport_up(4);
+        if early {
+            screen.set_cursor(0, 0);
+        }
+        if !keep_history {
+            screen
+                .set_history_limits(HistoryLimits {
+                    max_rows: 4,
+                    max_bytes: 0,
+                })
+                .unwrap();
+        }
+        screen.reflow(2, 3, StyleId(9)).unwrap();
+        assert_eq!(
+            rows(&screen, ScreenBuffer::Primary),
+            if early {
+                ["44", "44", "44"]
+            } else {
+                ["66", "66", "6 "]
+            }
+        );
+        let expected = if !keep_history {
+            vec![]
+        } else if early {
+            vec!["33", "33", "33", "3 "]
+        } else {
+            vec!["55", "5 ", "66", "66"]
+        };
+        assert_eq!(history(&screen), expected);
+        assert_eq!(screen.viewport_offset(), if keep_history { 4 } else { 0 });
+        assert_eq!(
+            screen.cursor(),
+            Cursor {
+                row: if early { 0 } else { 2 },
+                column: usize::from(!early),
+                wrap_pending: false,
+            }
+        );
+        screen.restore_cursor();
+        assert_eq!(
+            screen.cursor(),
+            Cursor {
+                row: 2,
+                column: 1,
+                wrap_pending: false
+            }
+        );
+    }
+}
+
+#[test]
 fn screen_reflow_preserves_primary_content_cursors_and_viewport_then_pulls_history_on_growth() {
     let mut screen = Screen::new(4, 2).unwrap();
     screen

@@ -158,6 +158,8 @@
 //! moves existing text allocations into retained rows. History accounts for
 //! their allocated capacities. Allocation failure preserves the complete source
 //! state and its allocations.
+//! Three borrowed layout checkpoints bound preparation's prefix replay by the
+//! history row limit and target height without allocating checkpoint storage.
 //! [`Screen::viewport`] borrows a screen-height [`Viewport`] using window-local
 //! row coordinates. Its offset is bounded by retained primary history. Zero
 //! follows output; scrolling upward anchors the top retained row as captures

@@ -2,10 +2,18 @@ use std::{collections::VecDeque, ops::Range};
 
 use super::{Cursor, SavedCursor, Screen, ScreenBuffer};
 use crate::grid::validate_dimensions;
+use crate::reflow::normalize_position;
 use crate::row::RowTransfer;
 use crate::{
-    Cell, CellPosition, Grid, ReflowAffinity, Row, RowHistory, ScreenView, StorageError, StyleId,
+    Cell, CellPosition, Grid, ReflowAffinity, ReflowRows, Row, RowHistory, ScreenView,
+    StorageError, StyleId,
 };
+
+struct Checkpoint<'a> {
+    index: usize,
+    source_row: usize,
+    rows: ReflowRows<'a>,
+}
 
 struct Layout {
     window: Range<usize>,
@@ -103,14 +111,15 @@ fn clipped(mut cursor: Cursor, window: Range<usize>) -> Cursor {
     cursor
 }
 
-fn layout(
-    view: ScreenView<'_>,
+fn layout<'a>(
+    view: ScreenView<'a>,
     columns: usize,
     height: usize,
     pivot: Cursor,
     saved: Cursor,
     offset: usize,
-) -> Result<Layout, StorageError> {
+    retained_rows: usize,
+) -> Result<(Layout, Checkpoint<'a>), StorageError> {
     let history = view.history_rows();
     let sources = [
         Some(position(pivot, history)),
@@ -133,31 +142,62 @@ fn layout(
         },
         ReflowAffinity::After,
     ];
+    let mut anchors = [None; 3];
+    for (index, source) in sources.into_iter().enumerate() {
+        if let Some(source) = source {
+            anchors[index] = Some((normalize_position(view, source)?, index));
+        }
+    }
+    // Resolve preceding-row anchors first when several anchors share a boundary.
+    anchors.sort_unstable_by_key(|anchor| {
+        (
+            anchor.is_none(),
+            anchor.map(|(source, index)| (source, affinities[index] == ReflowAffinity::After)),
+        )
+    });
+    let mut next_anchor = 0;
     let mut mapped = [None; 3];
     let mut count = 0_usize;
+    let stride = retained_rows + height;
+    let interval = stride.div_ceil(2);
+    let mut checkpoint_at = 0;
+    let mut checkpoints = [None, None, None];
+    let mut slot = 0;
+    let mut replay = None;
     for line in view.logical_lines() {
-        let mut anchors = [None; 3];
-        for index in 0..3 {
-            if let Some(source) = sources[index]
-                && line.range().contains(&source.row)
-            {
-                anchors[index] = Some(line.anchor(source)?);
+        let mut rows = line.reflow(columns)?;
+        while let Some(row) = rows.next() {
+            if mapped[0].is_none() && count == checkpoint_at {
+                checkpoints[slot] = Some(Checkpoint {
+                    index: count,
+                    source_row: row.source_range().start.row,
+                    rows: rows.replay_from(row),
+                });
+                slot = (slot + 1) % checkpoints.len();
+                checkpoint_at = count.saturating_add(interval);
             }
-        }
-        for row in line.reflow(columns)? {
-            for index in 0..3 {
-                if mapped[index].is_none()
-                    && let Some(anchor) = anchors[index]
-                    && let Some(column) = row.map_anchor(anchor)?
+            while let Some(Some((source, index))) = anchors.get(next_anchor) {
+                let Some(column) = row.map_normalized_position(*source) else {
+                    break;
+                };
+                if affinities[*index] == ReflowAffinity::After
+                    && row.wrap_end().is_some()
+                    && column == row.used_columns()
                 {
-                    if affinities[index] == ReflowAffinity::After
-                        && row.wrap_end().is_some()
-                        && column == row.used_columns()
-                    {
-                        continue;
-                    }
-                    mapped[index] = Some(CellPosition { row: count, column });
+                    break;
                 }
+                mapped[*index] = Some(CellPosition { row: count, column });
+                next_anchor += 1;
+            }
+            if replay.is_none() && mapped[0].is_some() {
+                // The selected window starts no earlier than pivot - height + 1.
+                // Three half-stride checkpoints bracket its candidate history.
+                let first = count.saturating_sub(stride - 1);
+                replay = checkpoints
+                    .iter_mut()
+                    .filter(|entry| entry.as_ref().is_some_and(|entry| entry.index <= first))
+                    .max_by_key(|entry| entry.as_ref().unwrap().index)
+                    .and_then(Option::take);
             }
             count = count.checked_add(1).ok_or(StorageError::CapacityExceeded)?;
         }
@@ -168,12 +208,15 @@ fn layout(
     );
     let saved = placed(mapped[1].expect("The retained saved cursor maps"), columns);
     let start = count.saturating_sub(height).min(cursor.row);
-    Ok(Layout {
-        window: start..start + height,
-        cursor: clipped(cursor, start..start + height),
-        saved: clipped(saved, start..start + height),
-        anchor: mapped[2].map(|point| point.row),
-    })
+    Ok((
+        Layout {
+            window: start..start + height,
+            cursor: clipped(cursor, start..start + height),
+            saved: clipped(saved, start..start + height),
+            anchor: mapped[2].map(|point| point.row),
+        },
+        replay.expect("The primary cursor selects a replay checkpoint"),
+    ))
 }
 
 impl Screen {
@@ -189,6 +232,9 @@ impl Screen {
     /// History retains the adjacent suffix within its row and byte budgets;
     /// an oversized row clears its preceding suffix. Expired viewport anchors
     /// clamp to the oldest retained row; output following stays enabled at zero.
+    /// Layout keeps three borrowed iterator checkpoints. Row preparation resumes
+    /// near the candidate history suffix, bounding prefix replay by the retained
+    /// row limit and target height without allocating checkpoint storage.
     ///
     /// Commit resets the scrolling region to the whole screen, preserves modes,
     /// appearance and overlapping tab stops, and initializes added stops.
@@ -226,22 +272,41 @@ impl Screen {
         );
         let pivot = if primary_active { self.cursor } else { saved };
         let view = ScreenView::new(primary, Some(&self.history));
-        let plan = layout(view, columns, rows, pivot, saved, self.display_offset)?;
         let limits = self.history.limits();
+        let retained_rows = if limits.max_bytes / size_of::<Cell>() < columns {
+            0
+        } else {
+            limits.max_rows
+        };
+        let (plan, checkpoint) = layout(
+            view,
+            columns,
+            rows,
+            pivot,
+            saved,
+            self.display_offset,
+            retained_rows,
+        )?;
         let mut history = RowHistory::default();
         history.set_limits(limits)?;
-        let skip = if limits.max_bytes / size_of::<Cell>() < columns {
-            plan.window.start
-        } else {
-            plan.window.start.saturating_sub(limits.max_rows)
-        };
+        let skip = plan.window.start.saturating_sub(retained_rows);
         let mut storage = VecDeque::new();
         storage.try_reserve_exact(rows)?;
         let mut transfers: VecDeque<RowTransfer> = VecDeque::new();
-        let mut index = 0;
+        debug_assert!(checkpoint.index <= skip);
+        let mut index = checkpoint.index;
+        let source_row = checkpoint.source_row;
+        let mut replay = Some(checkpoint.rows);
         let mut offset = 0;
-        'copy: for line in view.logical_lines() {
-            for row in line.reflow(columns)? {
+        'copy: for line in view
+            .logical_lines()
+            .skip_while(|line| line.range().end <= source_row)
+        {
+            let rows = match replay.take() {
+                Some(rows) => rows,
+                None => line.reflow(columns)?,
+            };
+            for row in rows {
                 if index == plan.window.end {
                     break 'copy;
                 }

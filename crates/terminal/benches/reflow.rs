@@ -171,20 +171,20 @@ fn source(name: &str, depth: usize, long: &str) -> Screen {
     screen
 }
 
-fn measure_transaction(name: &str, depth: usize, long: &str, columns: usize) {
-    let mut samples = [0.0_f64; 5];
+fn measure_transaction(name: &str, depth: usize, long: &str, columns: usize, rows: usize) {
+    let mut samples = [0.0_f64; 11];
     for sample in &mut samples {
         let mut screen = source(name, depth, long);
         screen.scroll_viewport_up(depth / 2);
         let start = Instant::now();
-        screen.reflow(black_box(columns), 24, StyleId(9)).unwrap();
+        screen.reflow(black_box(columns), rows, StyleId(9)).unwrap();
         *sample = start.elapsed().as_nanos() as f64;
         black_box(&screen);
     }
     samples.sort_by(f64::total_cmp);
     println!(
-        "transaction {name:<12} history={depth:<4} columns={columns:<3} {:>10.2} us/resize",
-        samples[2] / 1000.0
+        "transaction {name:<12} history={depth:<4} columns={columns:<3} rows={rows:<2} {:>10.2} us/resize",
+        samples[samples.len() / 2] / 1000.0
     );
 }
 
@@ -213,7 +213,10 @@ fn main() {
             }
         }
         for columns in [2, 80, 240] {
-            measure_transaction(name, depth, &long, columns);
+            measure_transaction(name, depth, &long, columns, 24);
         }
+    }
+    for rows in [1, 24] {
+        measure_transaction("mixed", 0, &long, 2, rows);
     }
 }

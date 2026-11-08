@@ -53,6 +53,16 @@ pub struct ReflowRows<'a> {
 }
 
 impl<'a> ReflowRows<'a> {
+    /// Replays the just-yielded row and the remaining layout.
+    pub(crate) fn replay_from(&self, row: ReflowRow<'a>) -> Self {
+        debug_assert!(self.view.same_source(row.view));
+        debug_assert_eq!(self.next, row.end);
+        Self {
+            next: row.start,
+            ..self.clone()
+        }
+    }
+
     pub(crate) fn new(
         view: ScreenView<'a>,
         rows: Range<usize>,
