@@ -1366,6 +1366,30 @@ fn resize_history_reaches_a_stable_requested_memory_high_water() {
 }
 
 #[test]
+fn screen_reflow_text_transfer_allocations_follow_row_count() {
+    let mut counts = Vec::new();
+    for columns in [64, 1024] {
+        let mut screen = Screen::new(columns, 2).unwrap();
+        screen
+            .set_history_limits(HistoryLimits {
+                max_rows: 8,
+                max_bytes: 1 << 20,
+            })
+            .unwrap();
+        for _ in 0..columns * 2 {
+            screen
+                .write("e\u{301}", CellWidth::Single, StyleId(1))
+                .unwrap();
+        }
+        let (result, stats) =
+            allocator::measure(None, || screen.reflow(columns / 2, 2, StyleId(9)));
+        result.unwrap();
+        counts.push(stats.attempts);
+    }
+    assert_eq!(counts[0], counts[1]);
+}
+
+#[test]
 fn screen_reflow_failures_release_staging_and_preserve_both_buffers_and_saved_states() {
     let prepare = |alternate: bool| {
         let mut screen = Screen::new(5, 4).unwrap();
@@ -1430,13 +1454,22 @@ fn screen_reflow_failures_release_staging_and_preserve_both_buffers_and_saved_st
                 .collect::<Vec<_>>(),
             [ScreenBuffer::Primary, ScreenBuffer::Alternate]
                 .into_iter()
-                .flat_map(|buffer| {
-                    screen
-                        .buffer(buffer)
-                        .iter_rows()
-                        .map(|row| row.cells().as_ptr())
+                .flat_map(|buffer| screen.buffer(buffer).iter_rows())
+                .chain(screen.history().iter_rows())
+                .map(|row| {
+                    (
+                        row.cells().as_ptr(),
+                        (0..row.cells().len())
+                            .filter_map(|column| {
+                                if let CellText::Extended(text) = row.text(column).unwrap() {
+                                    Some(text.as_ptr())
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect::<Vec<_>>(),
+                    )
                 })
-                .chain(screen.history().iter_rows().map(|row| row.cells().as_ptr()))
                 .collect::<Vec<_>>(),
         )
     };

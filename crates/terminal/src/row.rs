@@ -1,6 +1,6 @@
 use std::{fmt, ops::Range};
 
-use crate::{Cell, CellText, CellWidth, MAX_CELL_TEXT_BYTES, StorageError, StyleId};
+use crate::{Cell, CellPosition, CellText, CellWidth, MAX_CELL_TEXT_BYTES, StorageError, StyleId};
 
 #[derive(Debug)]
 struct ExtendedText {
@@ -16,7 +16,85 @@ pub struct Row {
     extended: Vec<ExtendedText>,
 }
 
+/// Unpublished cell storage whose extended-text slots are filled during commit.
+pub(crate) struct PreparedRow {
+    row: Row,
+    text_capacity: usize,
+}
+
+/// One retained destination row's source spans and post-transfer byte charge.
+pub(crate) struct RowTransfer {
+    pub(crate) target: usize,
+    pub(crate) source: Range<CellPosition>,
+    pub(crate) bytes: usize,
+}
+
+impl PreparedRow {
+    pub(crate) fn new(columns: usize, style: StyleId) -> Result<Self, StorageError> {
+        Ok(Self {
+            row: Row::new(columns, style)?,
+            text_capacity: 0,
+        })
+    }
+
+    pub(crate) fn prepare_segment(
+        &mut self,
+        column: usize,
+        source: &Row,
+        range: Range<usize>,
+    ) -> Result<(), StorageError> {
+        self.row.copy_cells(column, source, range.clone());
+        if source.extended.is_empty() {
+            return Ok(());
+        }
+        let entries = source.extended_range(range.clone());
+        self.row.extended.try_reserve(entries.len())?;
+        for entry in &source.extended[entries] {
+            self.text_capacity = self.text_capacity.saturating_add(entry.text.capacity());
+            self.row.extended.push(ExtendedText {
+                column: column + entry.column - range.start,
+                text: String::new(),
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn set_wrap_end(&mut self, end: Option<usize>) {
+        self.row.set_wrap_end(end);
+    }
+
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.row.metadata_bytes().saturating_add(self.text_capacity)
+    }
+
+    pub(crate) fn finish_preparation(self) -> (Row, usize, bool) {
+        let bytes = self.retained_bytes();
+        let has_text = !self.row.extended.is_empty();
+        (self.row, bytes, has_text)
+    }
+}
+
 impl Row {
+    /// Moves disjoint source units into reserved destination slots during commit.
+    pub(crate) fn transfer_segment(
+        &mut self,
+        column: usize,
+        source: &mut Row,
+        range: Range<usize>,
+    ) {
+        let entries = source.extended_range(range.clone());
+        let start = self.extended.partition_point(|entry| entry.column < column);
+        for (target, entry) in self.extended[start..start + entries.len()]
+            .iter_mut()
+            .zip(&mut source.extended[entries])
+        {
+            debug_assert_eq!(target.column, column + entry.column - range.start);
+            debug_assert_eq!(target.text.capacity(), 0);
+            debug_assert!(!entry.text.is_empty());
+            target.text = std::mem::take(&mut entry.text);
+        }
+    }
+
     /// Copies aligned units into the next segment of a fresh unpublished row.
     /// The caller supplies valid ranges and discards the destination on error.
     pub(crate) fn copy_segment(
@@ -30,22 +108,10 @@ impl Row {
                 .last()
                 .is_none_or(|entry| entry.column < column)
         );
-        self.cells[column..column + range.len()].copy_from_slice(&source.cells[range.clone()]);
-        // Source edge markers can become interior cells in the destination.
-        for edge in source.cells.len().saturating_sub(2)..source.cells.len() {
-            if range.contains(&edge) {
-                let cell = &mut self.cells[column + edge - range.start];
-                *cell = cell.without_row_metadata();
-            }
-        }
-        let start = source
-            .extended
-            .partition_point(|entry| entry.column < range.start);
-        let end = source
-            .extended
-            .partition_point(|entry| entry.column < range.end);
-        self.extended.try_reserve(end - start)?;
-        for entry in &source.extended[start..end] {
+        self.copy_cells(column, source, range.clone());
+        let entries = source.extended_range(range.clone());
+        self.extended.try_reserve(entries.len())?;
+        for entry in &source.extended[entries] {
             let mut text = String::new();
             text.try_reserve_exact(entry.text.len())?;
             text.push_str(&entry.text);
@@ -55,6 +121,26 @@ impl Row {
             });
         }
         Ok(())
+    }
+
+    fn extended_range(&self, range: Range<usize>) -> Range<usize> {
+        self.extended
+            .partition_point(|entry| entry.column < range.start)
+            ..self
+                .extended
+                .partition_point(|entry| entry.column < range.end)
+    }
+
+    #[inline]
+    fn copy_cells(&mut self, column: usize, source: &Self, range: Range<usize>) {
+        self.cells[column..column + range.len()].copy_from_slice(&source.cells[range.clone()]);
+        // Source edge markers can become interior cells in the destination.
+        for edge in source.cells.len().saturating_sub(2)..source.cells.len() {
+            if range.contains(&edge) {
+                let cell = &mut self.cells[column + edge - range.start];
+                *cell = cell.without_row_metadata();
+            }
+        }
     }
 
     pub(crate) fn bytes_without_last_unit(&self) -> usize {
@@ -120,6 +206,13 @@ impl Row {
     }
 
     pub(crate) fn retained_bytes(&self) -> usize {
+        self.metadata_bytes()
+            .saturating_add(self.extended.iter().fold(0_usize, |bytes, entry| {
+                bytes.saturating_add(entry.text.capacity())
+            }))
+    }
+
+    fn metadata_bytes(&self) -> usize {
         self.cells
             .capacity()
             .saturating_mul(size_of::<Cell>())
@@ -128,9 +221,6 @@ impl Row {
                     .capacity()
                     .saturating_mul(size_of::<ExtendedText>()),
             )
-            .saturating_add(self.extended.iter().fold(0_usize, |bytes, entry| {
-                bytes.saturating_add(entry.text.capacity())
-            }))
     }
 
     pub(crate) fn fits_columns(&self, columns: usize) -> bool {

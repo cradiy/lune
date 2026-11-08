@@ -36,6 +36,105 @@ fn history(screen: &Screen) -> Vec<String> {
 }
 
 #[test]
+fn screen_reflow_moves_text_allocations_and_budgets_their_retained_capacity() {
+    let mut screen = Screen::new(4, 2).unwrap();
+    screen
+        .set_history_limits(HistoryLimits {
+            max_rows: 8,
+            max_bytes: 4096,
+        })
+        .unwrap();
+    for _ in 0..12 {
+        screen
+            .write("e\u{301}", CellWidth::Single, StyleId(1))
+            .unwrap();
+    }
+    screen.save_cursor();
+    let before = screen
+        .view()
+        .iter_rows()
+        .flat_map(|row| {
+            (0..row.cells().len()).filter_map(move |column| {
+                if let CellText::Extended(text) = row.text(column).unwrap() {
+                    Some(text.as_ptr())
+                } else {
+                    None
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    screen.select_buffer(ScreenBuffer::Alternate);
+    screen.set_cursor(0, 0);
+    screen
+        .write("👩\u{200d}💻", CellWidth::Double, StyleId(2))
+        .unwrap();
+    screen
+        .write("e\u{301}", CellWidth::Single, StyleId(3))
+        .unwrap();
+    let pointers = [0, 2].map(
+        |column| match screen.grid().row(0).unwrap().text(column).unwrap() {
+            CellText::Extended(text) => text.as_ptr(),
+            _ => unreachable!(),
+        },
+    );
+    screen.select_buffer(ScreenBuffer::Primary);
+    screen.restore_cursor();
+    screen.reflow(3, 2, StyleId(9)).unwrap();
+    let after = screen
+        .view()
+        .iter_rows()
+        .flat_map(|row| {
+            (0..row.cells().len()).filter_map(move |column| {
+                if let CellText::Extended(text) = row.text(column).unwrap() {
+                    Some(text.as_ptr())
+                } else {
+                    None
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(after, before);
+    let after = [0, 2].map(|column| {
+        match screen
+            .buffer(ScreenBuffer::Alternate)
+            .row(0)
+            .unwrap()
+            .text(column)
+            .unwrap()
+        {
+            CellText::Extended(text) => text.as_ptr(),
+            _ => unreachable!(),
+        }
+    });
+    assert_eq!(after, pointers);
+
+    let mut bounded = Screen::new(2, 2).unwrap();
+    bounded
+        .set_history_limits(HistoryLimits {
+            max_rows: 8,
+            max_bytes: 512,
+        })
+        .unwrap();
+    bounded
+        .write(
+            &(String::from("e") + &"\u{301}".repeat(511)),
+            CellWidth::Single,
+            StyleId(1),
+        )
+        .unwrap();
+    bounded.set_cursor(0, 0);
+    bounded
+        .write("e\u{301}", CellWidth::Single, StyleId(1))
+        .unwrap();
+    assert!(bounded.grid().row(0).unwrap().retained_bytes() > 512);
+    bounded.set_cursor(1, 0);
+    bounded.write_ascii(b"bb", StyleId(1)).unwrap();
+    bounded.reflow(2, 1, StyleId(9)).unwrap();
+    assert!(bounded.history().is_empty());
+    assert_eq!(rows(&bounded, ScreenBuffer::Primary), ["bb"]);
+}
+
+#[test]
 fn screen_reflow_preserves_primary_content_cursors_and_viewport_then_pulls_history_on_growth() {
     let mut screen = Screen::new(4, 2).unwrap();
     screen

@@ -154,7 +154,10 @@
 //! adjacent bounded suffix; an oversized row clears the preceding suffix.
 //! Current and saved cursors and the primary viewport are mapped or clamped.
 //! Commit selects the full-screen scrolling region and preserves modes and
-//! appearance. Allocation failure preserves the complete source state.
+//! appearance. Preparation reserves cell headers and sparse text slots; commit
+//! moves existing text allocations into retained rows. History accounts for
+//! their allocated capacities. Allocation failure preserves the complete source
+//! state and its allocations.
 //! [`Screen::viewport`] borrows a screen-height [`Viewport`] using window-local
 //! row coordinates. Its offset is bounded by retained primary history. Zero
 //! follows output; scrolling upward anchors the top retained row as captures

@@ -1,5 +1,6 @@
 use std::{iter::FusedIterator, ops::Range};
 
+use crate::row::PreparedRow;
 use crate::{CellPosition, MAX_DIMENSION, Row, ScreenView, StorageError, StyleId, TextRange};
 
 /// Destination side chosen when a source position is shared by two output rows.
@@ -107,6 +108,31 @@ pub struct ReflowRow<'a> {
 }
 
 impl<'a> ReflowRow<'a> {
+    pub(crate) fn prepare_transfer(&self, style: StyleId) -> Result<PreparedRow, StorageError> {
+        let mut row = PreparedRow::new(self.columns, style)?;
+        let mut column = 0;
+        for index in self.start.row..=self.end.row {
+            let source = self.view.row(index).expect("A reflow source row exists");
+            let start = if index == self.start.row {
+                self.start.column
+            } else {
+                0
+            };
+            let end = if index == self.end.row {
+                self.end.column
+            } else {
+                source.wrap_end().unwrap_or(source.cells().len())
+            };
+            if start < end {
+                row.prepare_segment(column, source, start..end)?;
+                column += end - start;
+            }
+        }
+        debug_assert_eq!(column, self.used);
+        row.set_wrap_end(self.wrap_end());
+        Ok(row)
+    }
+
     /// Maps a validated source anchor to a column in this output row.
     /// Positions at either range boundary are included, so a shared boundary
     /// belongs to both adjacent output rows. Soft-wrapped source row ends and

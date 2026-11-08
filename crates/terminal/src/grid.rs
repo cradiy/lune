@@ -1,5 +1,6 @@
 use std::{collections::VecDeque, ops::Range};
 
+use crate::row::{PreparedRow, RowTransfer};
 use crate::{CellPosition, CellWidth, Row, ScreenView, StorageError, StyleId, TextRange};
 
 /// Maximum rows or columns in a grid.
@@ -21,38 +22,55 @@ pub(crate) struct GridResize {
 }
 
 impl Grid {
-    pub(crate) fn from_rows(columns: usize, mut rows: VecDeque<Row>) -> Self {
-        debug_assert!(!rows.is_empty());
-        debug_assert!(rows.iter().all(|row| row.cells().len() == columns));
-        rows.back_mut().unwrap().set_wrap_end(None);
-        Self { columns, rows }
-    }
-
-    pub(crate) fn resized_copy(
+    pub(crate) fn prepare_resized(
         &self,
         columns: usize,
         height: usize,
         style: StyleId,
-    ) -> Result<Self, StorageError> {
+    ) -> Result<(Self, Vec<RowTransfer>), StorageError> {
         let mut rows = VecDeque::new();
         rows.try_reserve_exact(height)?;
+        let mut transfers = Vec::new();
         for index in 0..height {
-            let mut row = Row::new(columns, style)?;
+            let mut row = PreparedRow::new(columns, style)?;
+            let mut end = 0;
             if let Some(source) = self.row(index) {
-                let mut end = columns.min(self.columns);
+                end = columns.min(self.columns);
                 if end < self.columns && source.cells()[end].is_continuation() {
                     end -= 1;
                 }
                 if end != 0 {
-                    row.copy_segment(0, source, 0..end)?;
+                    row.prepare_segment(0, source, 0..end)?;
                 }
                 if columns == self.columns && index + 1 < height.min(self.rows()) {
                     row.set_wrap_end(source.wrap_end());
                 }
             }
+            let (row, bytes, has_text) = row.finish_preparation();
             rows.push_back(row);
+            if has_text {
+                transfers.try_reserve(1)?;
+                transfers.push(RowTransfer {
+                    target: index,
+                    source: CellPosition {
+                        row: index,
+                        column: 0,
+                    }..CellPosition {
+                        row: index,
+                        column: end,
+                    },
+                    bytes,
+                });
+            }
         }
-        Ok(Self::from_rows(columns, rows))
+        Ok((Self::from_rows(columns, rows), transfers))
+    }
+
+    pub(crate) fn from_rows(columns: usize, mut rows: VecDeque<Row>) -> Self {
+        debug_assert!(!rows.is_empty());
+        debug_assert!(rows.iter().all(|row| row.cells().len() == columns));
+        rows.back_mut().unwrap().set_wrap_end(None);
+        Self { columns, rows }
     }
 
     pub(crate) fn exchange_top(&mut self, replacement: Row) -> Row {
@@ -502,7 +520,7 @@ impl Grid {
         self.columns = columns;
     }
 
-    fn row_mut(&mut self, row: usize) -> Result<&mut Row, StorageError> {
+    pub(crate) fn row_mut(&mut self, row: usize) -> Result<&mut Row, StorageError> {
         self.rows.get_mut(row).ok_or(StorageError::OutOfBounds)
     }
 }

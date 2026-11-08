@@ -2,6 +2,7 @@ use std::{collections::VecDeque, ops::Range};
 
 use super::{Cursor, SavedCursor, Screen, ScreenBuffer};
 use crate::grid::validate_dimensions;
+use crate::row::RowTransfer;
 use crate::{
     Cell, CellPosition, Grid, ReflowAffinity, Row, RowHistory, ScreenView, StorageError, StyleId,
 };
@@ -11,6 +12,52 @@ struct Layout {
     cursor: Cursor,
     saved: Cursor,
     anchor: Option<usize>,
+}
+
+enum Source<'a> {
+    Primary(&'a mut RowHistory, &'a mut Grid),
+    Alternate(&'a mut Grid),
+}
+
+impl Source<'_> {
+    fn row(&mut self, index: usize) -> &mut Row {
+        match self {
+            Self::Primary(history, grid) => {
+                let count = history.len();
+                if index < count {
+                    history
+                        .row_mut(index)
+                        .expect("A retained source row exists")
+                } else {
+                    grid.row_mut(index - count)
+                        .expect("A live source row exists")
+                }
+            }
+            Self::Alternate(grid) => grid.row_mut(index).expect("An alternate source row exists"),
+        }
+    }
+}
+
+fn transfer_text(target: &mut Row, source: &mut Source<'_>, transfer: RowTransfer) {
+    let mut column = 0;
+    for index in transfer.source.start.row..=transfer.source.end.row {
+        let row = source.row(index);
+        let start = if index == transfer.source.start.row {
+            transfer.source.start.column
+        } else {
+            0
+        };
+        let end = if index == transfer.source.end.row {
+            transfer.source.end.column
+        } else {
+            row.wrap_end().unwrap_or(row.cells().len())
+        };
+        if start < end {
+            target.transfer_segment(column, row, start..end);
+            column += end - start;
+        }
+    }
+    debug_assert_eq!(target.retained_bytes(), transfer.bytes);
 }
 
 fn resolve(saved: SavedCursor, region: Range<usize>, columns: usize, rows: usize) -> Cursor {
@@ -144,9 +191,11 @@ impl Screen {
     /// clamp to the oldest retained row; output following stays enabled at zero.
     ///
     /// Commit resets the scrolling region to the whole screen, preserves modes,
-    /// appearance and overlapping tab stops, and initializes added stops. All
-    /// allocations precede commit. Errors preserve both buffers, history, cursor
-    /// slots, viewport, tabs and modes, including their existing allocations.
+    /// appearance and overlapping tab stops, and initializes added stops.
+    /// Preparation reserves cell headers and extended-text slots. Commit moves
+    /// existing text allocations into retained rows; history charges their full
+    /// capacity. All allocations precede commit. Errors preserve both buffers,
+    /// history, cursor slots, viewport, tabs and modes, including their allocations.
     pub fn reflow(
         &mut self,
         columns: usize,
@@ -188,6 +237,7 @@ impl Screen {
         };
         let mut storage = VecDeque::new();
         storage.try_reserve_exact(rows)?;
+        let mut transfers: VecDeque<RowTransfer> = VecDeque::new();
         let mut index = 0;
         let mut offset = 0;
         'copy: for line in view.logical_lines() {
@@ -196,9 +246,16 @@ impl Screen {
                     break 'copy;
                 }
                 if index >= skip {
-                    let owned = row.materialize(style)?;
+                    let (owned, bytes, has_text) =
+                        row.prepare_transfer(style)?.finish_preparation();
+                    let mut retained = true;
                     if index < plan.window.start {
-                        let kept = history.append_reflow(owned)?;
+                        let kept = history.append_reflow(owned, bytes)?;
+                        retained = kept;
+                        let first = index + 1 - history.len();
+                        while transfers.front().is_some_and(|entry| entry.target < first) {
+                            transfers.pop_front();
+                        }
                         if let Some(anchor) = plan.anchor
                             && index >= anchor
                         {
@@ -213,6 +270,14 @@ impl Screen {
                     } else {
                         storage.push_back(owned);
                     }
+                    if retained && has_text {
+                        transfers.try_reserve(1)?;
+                        transfers.push_back(RowTransfer {
+                            target: index,
+                            source: row.source_range(),
+                            bytes,
+                        });
+                    }
                 }
                 index += 1;
             }
@@ -220,10 +285,10 @@ impl Screen {
         while storage.len() < rows {
             storage.push_back(Row::new(columns, style)?);
         }
-        let primary = Grid::from_rows(columns, storage);
-        let alternate = self
+        let mut primary = Grid::from_rows(columns, storage);
+        let (mut alternate, alternate_transfers) = self
             .buffer(ScreenBuffer::Alternate)
-            .resized_copy(columns, rows, style)?;
+            .prepare_resized(columns, rows, style)?;
         let tabs = if columns == self.grid.columns() {
             None
         } else {
@@ -259,7 +324,42 @@ impl Screen {
             column: self.cursor.column.min(columns - 1),
             wrap_pending: false,
         };
-        // Prepared state is fully owned; every operation below is infallible.
+        // Every allocation is complete. Move source payloads before publishing state.
+        {
+            let old_primary = if primary_active {
+                &mut self.grid
+            } else {
+                &mut self.inactive.grid
+            };
+            let mut source = Source::Primary(&mut self.history, old_primary);
+            let first = plan.window.start - history.len();
+            for transfer in transfers {
+                let target = if transfer.target < plan.window.start {
+                    history
+                        .row_mut(transfer.target - first)
+                        .expect("A prepared history row exists")
+                } else {
+                    primary
+                        .row_mut(transfer.target - plan.window.start)
+                        .expect("A prepared primary row exists")
+                };
+                transfer_text(target, &mut source, transfer);
+            }
+        }
+        {
+            let old_alternate = if primary_active {
+                &mut self.inactive.grid
+            } else {
+                &mut self.grid
+            };
+            let mut source = Source::Alternate(old_alternate);
+            for transfer in alternate_transfers {
+                let target = alternate
+                    .row_mut(transfer.target)
+                    .expect("A prepared alternate row exists");
+                transfer_text(target, &mut source, transfer);
+            }
+        }
         if primary_active {
             self.grid = primary;
             self.inactive.grid = alternate;

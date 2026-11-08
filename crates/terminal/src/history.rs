@@ -66,9 +66,9 @@ pub struct RowHistory {
 
 impl RowHistory {
     /// Appends to an unpublished contiguous reflow suffix. An unretainable row
-    /// releases the preceding suffix; the caller discards this history on error.
-    pub(crate) fn append_reflow(&mut self, row: Row) -> Result<bool, StorageError> {
-        let bytes = row.retained_bytes();
+    /// releases the preceding suffix. `bytes` includes reserved source text
+    /// capacities that will move during commit. Discard the history on error.
+    pub(crate) fn append_reflow(&mut self, row: Row, bytes: usize) -> Result<bool, StorageError> {
         if self.limits.max_rows == 0 || bytes > self.limits.max_bytes {
             self.clear();
             return Ok(false);
@@ -91,6 +91,10 @@ impl RowHistory {
         self.rows.push_back(Entry { row, bytes });
         self.warm_count += usize::from(warm);
         Ok(true)
+    }
+
+    pub(crate) fn row_mut(&mut self, index: usize) -> Option<&mut Row> {
+        self.rows.get_mut(index).map(|entry| &mut entry.row)
     }
 
     pub fn limits(&self) -> HistoryLimits {
