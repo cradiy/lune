@@ -8,7 +8,7 @@ use std::{
 
 use lune_terminal::{
     CellPosition, CellText, CellWidth, EraseMode, Grid, HistoryLimits, ProcessFailure, Processor,
-    RowHistory, Screen, ScreenBuffer, StorageError, Style, StyleError, StyleId, StyleTable,
+    Row, RowHistory, Screen, ScreenBuffer, StorageError, Style, StyleError, StyleId, StyleTable,
     TextSink, UnicodeWriter,
 };
 
@@ -1363,6 +1363,76 @@ fn resize_history_reaches_a_stable_requested_memory_high_water() {
         "Requested heap bytes: initial={initial}, retained={}, peak={}, after_drop={}",
         retained[0], released.peak_bytes, released.live_bytes
     );
+}
+
+#[test]
+fn reflow_row_allocation_failures_release_partial_storage_and_preserve_sources() {
+    let contents = |row: &Row| {
+        (
+            row.cells()
+                .iter()
+                .enumerate()
+                .map(|(column, cell)| {
+                    let text = match row.text(column).unwrap() {
+                        CellText::Scalar(value) => value.to_string(),
+                        CellText::Extended(value) => value.to_owned(),
+                        CellText::Continuation => String::new(),
+                    };
+                    (cell.width(), cell.style(), cell.is_erased(), text)
+                })
+                .collect::<Vec<_>>(),
+            row.wrap_end(),
+        )
+    };
+    let long = String::from("e") + &"\u{301}".repeat(511);
+    for case in 0..4 {
+        let mut screen = Screen::new(5, 3).unwrap();
+        screen
+            .set_history_limits(HistoryLimits {
+                max_rows: 8,
+                max_bytes: 1 << 20,
+            })
+            .unwrap();
+        for index in 0..32 {
+            let (text, width) = match case {
+                0 => ("x", CellWidth::Single),
+                1 => ("水", CellWidth::Double),
+                2 if index % 3 == 0 => ("👩\u{200d}💻", CellWidth::Double),
+                2 => ("e\u{301}", CellWidth::Single),
+                _ => (long.as_str(), CellWidth::Single),
+            };
+            screen.write(text, width, StyleId(index % 4)).unwrap();
+        }
+        screen.scroll_viewport_up(1);
+        let before = snapshot(screen.grid());
+        let history = retained(screen.history());
+        let cursor = screen.cursor();
+        let offset = screen.viewport_offset();
+        let columns = if case == 1 { 3 } else { 17 };
+        let layout = screen
+            .view()
+            .logical_line(0)
+            .unwrap()
+            .reflow(columns)
+            .unwrap()
+            .next()
+            .unwrap();
+        let (result, stats) = allocator::measure(None, || layout.materialize(StyleId(9)));
+        let expected = contents(&result.unwrap());
+        assert!(stats.attempts > 0);
+        for point in 0..stats.attempts {
+            let (result, failed) =
+                allocator::measure(Some(point), || layout.materialize(StyleId(9)));
+            assert!(matches!(result, Err(StorageError::Allocation(_))));
+            assert_eq!(failed.failures, 1);
+            assert_eq!(failed.live_bytes, 0);
+            assert_eq!(snapshot(screen.grid()), before);
+            assert_eq!(retained(screen.history()), history);
+            assert_eq!(screen.cursor(), cursor);
+            assert_eq!(screen.viewport_offset(), offset);
+            assert_eq!(contents(&layout.materialize(StyleId(9)).unwrap()), expected);
+        }
+    }
 }
 
 #[test]

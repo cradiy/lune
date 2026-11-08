@@ -1,6 +1,6 @@
 use std::{iter::FusedIterator, ops::Range};
 
-use crate::{CellPosition, MAX_DIMENSION, ScreenView, StorageError, TextRange};
+use crate::{CellPosition, MAX_DIMENSION, Row, ScreenView, StorageError, StyleId, TextRange};
 
 /// A borrowed layout of one retained logical line at a new column width.
 /// Rows preserve complete display units, printed spaces, erased cells and their
@@ -68,9 +68,42 @@ pub struct ReflowRow<'a> {
     end: CellPosition,
     used: usize,
     wrapped: bool,
+    columns: usize,
 }
 
 impl<'a> ReflowRow<'a> {
+    /// Builds an independently owned row at this layout's target width.
+    /// Copies complete cells and owned text, fills unused columns with erased
+    /// spaces in `padding_style`, and establishes this output row's soft wrap.
+    /// Source rows remain borrowed and unchanged. Failure releases the partial
+    /// destination. Row storage is bounded by the target width and per-unit text
+    /// limit. Style IDs belong to their source table; include these cells as
+    /// external roots when collecting styles while the row is retained separately.
+    pub fn materialize(&self, padding_style: StyleId) -> Result<Row, StorageError> {
+        let mut owned = Row::new(self.columns, padding_style)?;
+        let mut column = 0;
+        for index in self.start.row..=self.end.row {
+            let source = self.view.row(index).expect("A reflow source row exists");
+            let start = if index == self.start.row {
+                self.start.column
+            } else {
+                0
+            };
+            let end = if index == self.end.row {
+                self.end.column
+            } else {
+                source.wrap_end().unwrap_or(source.cells().len())
+            };
+            if start < end {
+                owned.copy_segment(column, source, start..end)?;
+                column += end - start;
+            }
+        }
+        debug_assert_eq!(column, self.used);
+        owned.set_wrap_end(self.wrap_end());
+        Ok(owned)
+    }
+
     /// Half-open source range of complete units. It can span source row edges
     /// and their excluded wrap gaps. Borrowing fixes all source coordinates.
     #[inline]
@@ -130,6 +163,7 @@ impl<'a> Iterator for ReflowRows<'a> {
                     end: self.next,
                     used,
                     wrapped: true,
+                    columns: self.columns,
                 });
             }
             if self.next.column == end && self.next.row != self.end.row {
@@ -146,6 +180,7 @@ impl<'a> Iterator for ReflowRows<'a> {
             end: self.next,
             used,
             wrapped: self.next != self.end,
+            columns: self.columns,
         })
     }
 

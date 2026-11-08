@@ -41,6 +41,31 @@ fn measure(name: &str, line: LogicalLine<'_>, columns: usize) {
     );
 }
 
+fn measure_owned(name: &str, line: LogicalLine<'_>, columns: usize) {
+    let source_columns: usize = line
+        .iter_rows()
+        .map(|row| row.wrap_end().unwrap_or(row.cells().len()))
+        .sum();
+    let mut samples = [0.0_f64; 3];
+    for sample in &mut samples {
+        let start = Instant::now();
+        let mut iterations = 0_u64;
+        while start.elapsed() < Duration::from_millis(100) {
+            for row in black_box(line).reflow(black_box(columns)).unwrap() {
+                let owned = row.materialize(StyleId(9)).unwrap();
+                black_box(&owned);
+            }
+            iterations += 1;
+        }
+        *sample = start.elapsed().as_nanos() as f64 / (iterations as f64 * source_columns as f64);
+    }
+    samples.sort_by(f64::total_cmp);
+    println!(
+        "materialize {name:<36} columns={columns:<3} {:>8.3} ns/source column",
+        samples[1]
+    );
+}
+
 fn main() {
     let long = String::from("e") + &"\u{301}".repeat(511);
     for (name, depth) in [
@@ -84,6 +109,7 @@ fn main() {
         }
         for columns in [2, 80, 240] {
             measure(&format!("{name} / history={depth}"), line, columns);
+            measure_owned(&format!("{name} / history={depth}"), line, columns);
         }
     }
 }

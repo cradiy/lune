@@ -93,6 +93,35 @@ fn reflow_partitions_complete_units_across_widths_and_source_wrap_gaps() {
                         assert_eq!(row.used_columns(), count);
                         assert_eq!(row.wrap_end(), (index + 1 < groups.len()).then_some(count));
                         assert_eq!(row.text().to_string(), expected);
+                        let owned = row.materialize(StyleId(u32::MAX)).unwrap();
+                        assert_eq!(owned.cells().len(), columns);
+                        assert_eq!(owned.wrap_end(), row.wrap_end());
+                        let mut column = 0;
+                        for &i in group {
+                            let (position, width, _) = &units[i];
+                            let source = view.row(position.row).unwrap();
+                            assert_eq!(
+                                &owned.cells()[column..column + width],
+                                &source.cells()[position.column..position.column + width]
+                            );
+                            assert_eq!(owned.text(column), source.text(position.column));
+                            column += width;
+                        }
+                        for cell in &owned.cells()[count..] {
+                            assert!(cell.is_erased());
+                            assert_eq!(cell.width(), 1);
+                            assert_eq!(cell.style(), StyleId(u32::MAX));
+                        }
+                        for (column, cell) in owned.cells().iter().enumerate() {
+                            let gap = row.wrap_end().is_some_and(|end| end < columns);
+                            assert_eq!(
+                                cell.row_wrap(),
+                                (column + 1 == columns)
+                                    .then_some(gap)
+                                    .filter(|_| row.wrap_end().is_some())
+                            );
+                            assert_eq!(cell.is_row_gap(), gap && column + 2 >= columns);
+                        }
                         joined.push_str(&expected);
                     }
                     assert!(rows.next().is_none());
@@ -166,6 +195,10 @@ fn reflow_retains_spaces_metadata_history_fragments_and_captured_widths() {
     assert_eq!(screen.view().row(0).unwrap().cells()[1].style(), StyleId(1));
     assert!(!screen.view().row(0).unwrap().cells()[1].is_erased());
     assert!(screen.grid().row(1).unwrap().cells()[4].is_erased());
+    let retained = rows
+        .iter()
+        .map(|row| row.materialize(StyleId(9)).unwrap())
+        .collect::<Vec<_>>();
     drop(rows);
     screen.resize(3, 2, StyleId(0)).unwrap();
     check(&screen);
@@ -178,4 +211,12 @@ fn reflow_retains_spaces_metadata_history_fragments_and_captured_widths() {
     screen.reset(StyleId(0));
     let line = screen.view().logical_line(0).unwrap();
     assert_eq!(line.reflow(1).unwrap().count(), 3);
+    drop(screen);
+    assert_eq!(
+        retained[1].text(1),
+        Some(CellText::Extended("👩\u{200d}💻"))
+    );
+    assert_eq!(retained[2].text(0), Some(CellText::Extended("e\u{301}")));
+    assert_eq!(retained[4].cells()[2].style(), StyleId(9));
+    assert!(retained[4].cells()[2].is_erased());
 }

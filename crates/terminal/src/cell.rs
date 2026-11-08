@@ -53,6 +53,13 @@ impl PartialEq for Cell {
 impl Eq for Cell {}
 
 impl Cell {
+    pub(crate) fn without_row_metadata(self) -> Self {
+        Self {
+            text: self.text & !ROW_MASK,
+            ..self
+        }
+    }
+
     pub(crate) fn row_wrap(self) -> Option<bool> {
         (self.text & ROW_WRAP != 0).then_some(self.text & ROW_GAP != 0)
     }

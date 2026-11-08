@@ -133,6 +133,11 @@
 //! and cell metadata while skipping source wrap gaps. A one-column target rejects
 //! double-width units before traversal. Planning uses constant auxiliary space
 //! without allocating; consumers own destination storage and padding.
+//! [`ReflowRow::materialize`] builds an independently owned [`Row`] at the target
+//! width. It copies complete cells and owned text, preserves erased state and
+//! style keys, replaces source row markers, and fills unused columns with styled
+//! erased spaces. Allocation failures release partial storage and preserve the
+//! source. Retained rows remain valid after the source screen is released.
 //! [`Screen::viewport`] borrows a screen-height [`Viewport`] using window-local
 //! row coordinates. Its offset is bounded by retained primary history. Zero
 //! follows output; scrolling upward anchors the top retained row as captures

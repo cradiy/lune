@@ -157,6 +157,29 @@ fn check_reflow(line: LogicalLine<'_>, rows: &[SavedRow], columns: usize) {
         assert_eq!(row.wrap_end(), (index + 1 < groups.len()).then_some(used));
         let expected: String = units[start..finish].iter().map(|unit| unit.2).collect();
         assert_eq!(row.text().to_string(), expected);
+        let owned = row.materialize(StyleId(u32::MAX)).unwrap();
+        assert_eq!(owned.cells().len(), columns);
+        assert_eq!(owned.wrap_end(), row.wrap_end());
+        let mut column = 0;
+        for &(position, width, _) in &units[start..finish] {
+            let source = &rows[position.row];
+            assert_eq!(
+                &owned.cells()[column..column + width],
+                &source.cells[position.column..position.column + width]
+            );
+            let text = match owned.text(column).unwrap() {
+                CellText::Scalar(character) => character.to_string(),
+                CellText::Extended(text) => text.to_owned(),
+                CellText::Continuation => unreachable!(),
+            };
+            assert_eq!(text, source.text[position.column]);
+            column += width;
+        }
+        for cell in &owned.cells()[used..] {
+            assert!(cell.is_erased());
+            assert_eq!(cell.width(), 1);
+            assert_eq!(cell.style(), StyleId(u32::MAX));
+        }
     }
 }
 

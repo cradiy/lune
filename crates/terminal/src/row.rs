@@ -8,7 +8,8 @@ struct ExtendedText {
     text: String,
 }
 
-/// A read-only row view. Grid mutations preserve its width and wide-cell pairs.
+/// An owned display row with read-only cell and text access.
+/// Grid mutations preserve its width and wide-cell pairs.
 #[derive(Debug)]
 pub struct Row {
     cells: Vec<Cell>,
@@ -16,6 +17,46 @@ pub struct Row {
 }
 
 impl Row {
+    /// Copies aligned units into the next segment of a fresh unpublished row.
+    /// The caller supplies valid ranges and discards the destination on error.
+    pub(crate) fn copy_segment(
+        &mut self,
+        column: usize,
+        source: &Self,
+        range: Range<usize>,
+    ) -> Result<(), StorageError> {
+        debug_assert!(
+            self.extended
+                .last()
+                .is_none_or(|entry| entry.column < column)
+        );
+        self.cells[column..column + range.len()].copy_from_slice(&source.cells[range.clone()]);
+        // Source edge markers can become interior cells in the destination.
+        for edge in source.cells.len().saturating_sub(2)..source.cells.len() {
+            if range.contains(&edge) {
+                let cell = &mut self.cells[column + edge - range.start];
+                *cell = cell.without_row_metadata();
+            }
+        }
+        let start = source
+            .extended
+            .partition_point(|entry| entry.column < range.start);
+        let end = source
+            .extended
+            .partition_point(|entry| entry.column < range.end);
+        self.extended.try_reserve(end - start)?;
+        for entry in &source.extended[start..end] {
+            let mut text = String::new();
+            text.try_reserve_exact(entry.text.len())?;
+            text.push_str(&entry.text);
+            self.extended.push(ExtendedText {
+                column: column + entry.column - range.start,
+                text,
+            });
+        }
+        Ok(())
+    }
+
     pub(crate) fn bytes_without_last_unit(&self) -> usize {
         let column =
             self.cells.len() - 1 - usize::from(self.cells.last().unwrap().is_continuation());
@@ -114,6 +155,7 @@ impl Row {
     /// wrapping. A wide unit may leave one excluded column at the right edge.
     /// The last row of a [`crate::Grid`] returns `None`. A retained history row
     /// can preserve its connection to the following primary-screen row.
+    /// A materialized [`crate::ReflowRow`] can retain an outgoing connection independently.
     pub fn wrap_end(&self) -> Option<usize> {
         let columns = self.cells.len();
         // A gap join requires both edge markers. Replacing either cell leaves
