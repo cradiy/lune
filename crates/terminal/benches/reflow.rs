@@ -156,6 +156,10 @@ fn source(name: &str, depth: usize, long: &str) -> Screen {
             "ASCII" => ("x", CellWidth::Single),
             "CJK" => ("水", CellWidth::Double),
             "owned" => ("e\u{301}", CellWidth::Single),
+            "sparse" => (
+                if index % 31 == 0 { "e\u{301}" } else { "x" },
+                CellWidth::Single,
+            ),
             "long cluster" => (long, CellWidth::Single),
             _ => match index % 4 {
                 0 => ("x", CellWidth::Single),
@@ -197,6 +201,7 @@ fn main() {
         ("CJK", 4096),
         ("owned", 0),
         ("owned", 4096),
+        ("sparse", 4096),
         ("mixed", 4096),
         ("long cluster", 0),
     ] {

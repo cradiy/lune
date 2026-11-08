@@ -154,7 +154,8 @@
 //! adjacent bounded suffix; an oversized row clears the preceding suffix.
 //! Current and saved cursors and the primary viewport are mapped or clamped.
 //! Commit selects the full-screen scrolling region and preserves modes and
-//! appearance. Preparation reserves cell headers and sparse text slots; commit
+//! appearance. Preparation reserves cell headers and counts sparse text slots
+//! across source segments for one reservation per destination row; commit
 //! moves existing text allocations into retained rows. History accounts for
 //! their allocated capacities. Allocation failure preserves the complete source
 //! state and its allocations.

@@ -118,9 +118,38 @@ pub struct ReflowRow<'a> {
 }
 
 impl<'a> ReflowRow<'a> {
+    fn segments(&self) -> impl Iterator<Item = (&'a Row, Range<usize>)> + Clone + use<'a> {
+        let layout = *self;
+        (layout.start.row..=layout.end.row).filter_map(move |index| {
+            let source = layout.view.row(index).expect("A reflow source row exists");
+            let start = if index == layout.start.row {
+                layout.start.column
+            } else {
+                0
+            };
+            let end = if index == layout.end.row {
+                layout.end.column
+            } else {
+                source.wrap_end().unwrap_or(source.cells().len())
+            };
+            (start < end).then_some((source, start..end))
+        })
+    }
+
+    // Keep source-index counting outside the cell-copy loop.
+    #[inline(never)]
+    fn reserve_transfer_text(&self, row: &mut PreparedRow) -> Result<(), StorageError> {
+        let entries = self
+            .segments()
+            .map(|(source, range)| source.extended_count(range))
+            .sum();
+        row.reserve_text(entries)
+    }
+
     pub(crate) fn prepare_transfer(&self, style: StyleId) -> Result<PreparedRow, StorageError> {
         let mut row = PreparedRow::new(self.columns, style)?;
         let mut column = 0;
+        let mut reserved = false;
         for index in self.start.row..=self.end.row {
             let source = self.view.row(index).expect("A reflow source row exists");
             let start = if index == self.start.row {
@@ -134,6 +163,10 @@ impl<'a> ReflowRow<'a> {
                 source.wrap_end().unwrap_or(source.cells().len())
             };
             if start < end {
+                if source.has_extended() && !reserved && self.start.row != self.end.row {
+                    self.reserve_transfer_text(&mut row)?;
+                    reserved = true;
+                }
                 row.prepare_segment(column, source, start..end)?;
                 column += end - start;
             }

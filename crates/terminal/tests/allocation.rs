@@ -1367,26 +1367,25 @@ fn resize_history_reaches_a_stable_requested_memory_high_water() {
 
 #[test]
 fn screen_reflow_text_transfer_allocations_follow_row_count() {
-    let mut counts = Vec::new();
-    for columns in [64, 1024] {
-        let mut screen = Screen::new(columns, 2).unwrap();
+    let count = |columns, rows, target| {
+        let mut screen = Screen::new(columns, rows).unwrap();
         screen
             .set_history_limits(HistoryLimits {
                 max_rows: 8,
                 max_bytes: 1 << 20,
             })
             .unwrap();
-        for _ in 0..columns * 2 {
+        for _ in 0..columns * rows {
             screen
                 .write("e\u{301}", CellWidth::Single, StyleId(1))
                 .unwrap();
         }
-        let (result, stats) =
-            allocator::measure(None, || screen.reflow(columns / 2, 2, StyleId(9)));
+        let (result, stats) = allocator::measure(None, || screen.reflow(target, 2, StyleId(9)));
         result.unwrap();
-        counts.push(stats.attempts);
-    }
-    assert_eq!(counts[0], counts[1]);
+        stats.attempts
+    };
+    assert_eq!(count(64, 2, 32), count(1024, 2, 512));
+    assert_eq!(count(60, 4, 80), count(120, 2, 80));
 }
 
 #[test]

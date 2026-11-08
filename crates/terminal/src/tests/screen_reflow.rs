@@ -135,6 +135,32 @@ fn screen_reflow_moves_text_allocations_and_budgets_their_retained_capacity() {
 }
 
 #[test]
+fn screen_reflow_bounds_sparse_capacity_across_source_segments() {
+    let mut screen = Screen::new(119, 3).unwrap();
+    screen
+        .set_history_limits(HistoryLimits {
+            max_rows: 8,
+            max_bytes: 1 << 20,
+        })
+        .unwrap();
+    for _ in 0..119 * 3 {
+        screen
+            .write("e\u{301}", CellWidth::Single, StyleId(1))
+            .unwrap();
+    }
+    screen.reflow(80, 2, StyleId(9)).unwrap();
+    let full_row_bytes = screen.grid().row(0).unwrap().retained_bytes();
+    assert_eq!(
+        screen
+            .history()
+            .iter_rows()
+            .map(|row| row.retained_bytes())
+            .collect::<Vec<_>>(),
+        vec![full_row_bytes; 3]
+    );
+}
+
+#[test]
 fn screen_reflow_orders_pending_and_following_anchors_at_the_same_boundary() {
     let mut screen = Screen::new(4, 2).unwrap();
     screen

@@ -30,6 +30,12 @@ pub(crate) struct RowTransfer {
 }
 
 impl PreparedRow {
+    /// Requests only the additional sparse slots needed by the prepared row.
+    pub(crate) fn reserve_text(&mut self, entries: usize) -> Result<(), StorageError> {
+        self.row.extended.try_reserve_exact(entries)?;
+        Ok(())
+    }
+
     pub(crate) fn new(columns: usize, style: StyleId) -> Result<Self, StorageError> {
         Ok(Self {
             row: Row::new(columns, style)?,
@@ -48,7 +54,7 @@ impl PreparedRow {
             return Ok(());
         }
         let entries = source.extended_range(range.clone());
-        self.row.extended.try_reserve(entries.len())?;
+        self.reserve_text(entries.len())?;
         for entry in &source.extended[entries] {
             self.text_capacity = self.text_capacity.saturating_add(entry.text.capacity());
             self.row.extended.push(ExtendedText {
@@ -121,6 +127,19 @@ impl Row {
             });
         }
         Ok(())
+    }
+
+    #[inline]
+    pub(crate) fn has_extended(&self) -> bool {
+        !self.extended.is_empty()
+    }
+
+    pub(crate) fn extended_count(&self, range: Range<usize>) -> usize {
+        if self.extended.is_empty() {
+            0
+        } else {
+            self.extended_range(range).len()
+        }
     }
 
     fn extended_range(&self, range: Range<usize>) -> Range<usize> {

@@ -238,7 +238,8 @@ impl Screen {
     ///
     /// Commit resets the scrolling region to the whole screen, preserves modes,
     /// appearance and overlapping tab stops, and initializes added stops.
-    /// Preparation reserves cell headers and extended-text slots. Commit moves
+    /// Preparation reserves cell headers and extended-text slots. Sparse slots
+    /// are reserved once per destination row across source segments. Commit moves
     /// existing text allocations into retained rows; history charges their full
     /// capacity. All allocations precede commit. Errors preserve both buffers,
     /// history, cursor slots, viewport, tabs and modes, including their allocations.
