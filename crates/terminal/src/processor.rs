@@ -665,7 +665,20 @@ fn csi(screen: &mut Screen, sequence: CsiSequence<'_>, state: &mut State) -> boo
                     (false, Some(4 | 20))
                         | (
                             true,
-                            Some(1 | 6 | 7 | 12 | 25 | 47 | 66 | 67 | 1047 | 1048 | 1049 | 2004)
+                            Some(
+                                1 | 6
+                                    | 7
+                                    | 12
+                                    | 25
+                                    | 47
+                                    | 66
+                                    | 67
+                                    | 1004
+                                    | 1047
+                                    | 1048
+                                    | 1049
+                                    | 2004
+                            )
                         )
                 )
             })
@@ -681,6 +694,7 @@ fn csi(screen: &mut Screen, sequence: CsiSequence<'_>, state: &mut State) -> boo
                 (true, Some(66)) => state.input.application_keypad = enabled,
                 (true, Some(67)) => state.input.backarrow = enabled,
                 (true, Some(2004)) => state.input.bracketed_paste = enabled,
+                (true, Some(1004)) => state.input.focus_reporting = enabled,
                 (true, Some(6)) => screen.set_origin_mode(enabled),
                 (true, Some(7)) => screen.set_auto_wrap(enabled),
                 (true, Some(47 | 1047 | 1049)) => {

@@ -124,6 +124,12 @@ fn drive(wire: &[u8], chunk: usize, fail_at: usize, expected: &Expected<'_>) {
         Some(&expected.style)
     );
     assert_eq!(processor.input_modes(), expected.input);
+    for (focused, bytes) in [(true, &b"\x1b[I"[..]), (false, &b"\x1b[O"[..])] {
+        assert_eq!(
+            processor.input_modes().encode_focus(focused),
+            expected.input.focus_reporting.then_some(bytes)
+        );
+    }
     let flags = chunk % 8;
     let modifiers = Modifiers {
         shift: flags & 1 != 0,
@@ -385,7 +391,7 @@ fuzz_target!(|data: &[u8]| {
                 Some(Command::Reset)
             }
             34 => {
-                wire.extend(b"\x1b[?6;999h");
+                wire.extend(b"\x1b[?6;1004;999h");
                 diagnostics.1 += 1;
                 None
             }
@@ -583,6 +589,9 @@ fuzz_target!(|data: &[u8]| {
                 let mode = if bytes[0] % 64 == 55 {
                     input.application_keypad = enabled;
                     66
+                } else if bytes[1] & 4 != 0 {
+                    input.focus_reporting = enabled;
+                    1004
                 } else if bytes[1] & 2 == 0 {
                     input.backarrow = enabled;
                     67

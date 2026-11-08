@@ -175,7 +175,7 @@ fn encoded(modes: InputModes) -> Vec<u8> {
 
 #[test]
 fn output_selected_input_modes_encode_keys_and_survive_as_independent_snapshots() {
-    let program = b"\x1b[?1;66;67;2004h\x1b[20h\x1b7\x1b[?1;2004;999l";
+    let program = b"\x1b[?1;66;67;1004;2004h\x1b[20h\x1b7\x1b[?1;1004;2004;999l";
     let normal = b"\x1b[A\x1b[B\x1b[C\x1b[D\r0123456789.,-\r\t\x1b\x7f*+/=";
     let application = b"\x1bOA\x1bOB\x1bOC\x1bOD\r\n\x1bOp\x1bOq\x1bOr\x1bOs\x1bOt\x1bOu\x1bOv\x1bOw\x1bOx\x1bOy\x1bOn\x1bOl\x1bOm\x1bOM\t\x1b\x08\x1bOj\x1bOk\x1bOo\x1bOX";
     let mut text = |_: &mut Screen, _: &str, _| Ok::<_, StorageError>(());
@@ -195,6 +195,8 @@ fn output_selected_input_modes_encode_keys_and_survive_as_independent_snapshots(
         let snapshot = processor.input_modes();
         let key = snapshot.encode_key(Key::Up, Modifiers::default()).unwrap();
         assert!(snapshot.bracketed_paste);
+        let focus = snapshot.encode_focus(true).unwrap();
+        assert_eq!(snapshot.encode_focus(false), Some(&b"\x1b[O"[..]));
         let mut paste = snapshot.encode_paste("水\nx");
         assert!(paste.consume(2));
         assert_eq!(encoded(snapshot), application);
@@ -206,17 +208,26 @@ fn output_selected_input_modes_encode_keys_and_survive_as_independent_snapshots(
             .unwrap();
         assert_eq!(processor.input_modes(), snapshot);
         processor
-            .advance(b"\x1b[?1;66;67;2004l\x1b[20l\x1b8", &mut screen, &mut text)
+            .advance(
+                b"\x1b[?1;66;67;1004;2004l\x1b[20l\x1b8",
+                &mut screen,
+                &mut text,
+            )
             .unwrap();
         assert_eq!(encoded(processor.input_modes()), normal);
         assert!(!processor.input_modes().bracketed_paste);
+        assert!(!processor.input_modes().focus_reporting);
         assert_eq!(encoded(snapshot), application);
         processor
-            .advance(b"\x1b[?1;66;67;2004h\x1b[20h\x1bc", &mut screen, &mut text)
+            .advance(
+                b"\x1b[?1;66;67;1004;2004h\x1b[20h\x1bc",
+                &mut screen,
+                &mut text,
+            )
             .unwrap();
         assert_eq!(processor.input_modes(), InputModes::default());
         processor
-            .advance(b"\x1b[?1;66;67;2004h\x1b[20h", &mut screen, &mut text)
+            .advance(b"\x1b[?1;66;67;1004;2004h\x1b[20h", &mut screen, &mut text)
             .unwrap();
         processor.reset(&mut screen, &mut text);
         assert_eq!(processor.input_modes(), InputModes::default());
@@ -227,6 +238,61 @@ fn output_selected_input_modes_encode_keys_and_survive_as_independent_snapshots(
         }
         assert_eq!(remaining, "200~水\nx\x1b[201~".as_bytes());
         assert_eq!(key.as_bytes(), b"\x1bOA");
+        assert_eq!(focus, b"\x1b[I");
+    }
+}
+
+#[test]
+fn focus_reporting_validates_modes_across_fragments_and_emits_only_on_request() {
+    let cases: &[(&[u8], Option<bool>)] = &[
+        (b"\x1b[?1004h", Some(true)),
+        (b"\x1b[?1004l", Some(false)),
+        (b"\x1b[?1004;1004h", Some(true)),
+        (b"\x1b[?1004;1004l", Some(false)),
+        (b"\x1b[?1004;999h", None),
+        (b"\x1b[?1004;999l", None),
+        (b"\x1b[1004h", None),
+        (b"\x1b[?1004:1h", None),
+        (b"\x1b[?1004;h", None),
+        (b"\x1b[>1004h", None),
+        (b"\x1b[?1004 h", None),
+    ];
+    for initially_enabled in [false, true] {
+        for &(wire, change) in cases {
+            for split in 0..=wire.len() {
+                let mut screen = Screen::new(8, 4).unwrap();
+                let mut processor = Processor::default();
+                let mut text = |_: &mut Screen, _: &str, _| Ok::<_, StorageError>(());
+                if initially_enabled {
+                    processor
+                        .advance(b"\x1b[?1004h", &mut screen, &mut text)
+                        .unwrap();
+                }
+                processor
+                    .advance(&wire[..split], &mut screen, &mut text)
+                    .unwrap();
+                processor
+                    .advance(&wire[split..], &mut screen, &mut text)
+                    .unwrap();
+                let modes = processor.input_modes();
+                assert_eq!(modes.focus_reporting, change.unwrap_or(initially_enabled));
+                assert_eq!(processor.ignored_sequences(), u64::from(change.is_none()));
+                assert_eq!(processor.parse_errors(), 0);
+                assert!(processor.reply_bytes().is_empty());
+                for focused in [false, true] {
+                    let expected = if modes.focus_reporting {
+                        Some(if focused {
+                            &b"\x1b[I"[..]
+                        } else {
+                            &b"\x1b[O"[..]
+                        })
+                    } else {
+                        None
+                    };
+                    assert_eq!(modes.encode_focus(focused), expected);
+                }
+            }
+        }
     }
 }
 
@@ -256,14 +322,23 @@ fn modified_keys_follow_pc_sequences_independently_of_output_modes() {
         (Key::Function(11), "23", '~'),
         (Key::Function(12), "24", '~'),
     ];
-    for flags in 0..32 {
+    for flags in 0..64 {
         let modes = InputModes {
             application_cursor: flags & 1 != 0,
             application_keypad: flags & 2 != 0,
             new_line: flags & 4 != 0,
             backarrow: flags & 8 != 0,
             bracketed_paste: flags & 16 != 0,
+            focus_reporting: flags & 32 != 0,
         };
+        for focused in [false, true] {
+            let expected = modes.focus_reporting.then_some(if focused {
+                &b"\x1b[I"[..]
+            } else {
+                &b"\x1b[O"[..]
+            });
+            assert_eq!(modes.encode_focus(focused), expected);
+        }
         for (shift, alt, control, parameter) in [
             (true, false, false, 2),
             (false, true, false, 3),
@@ -404,13 +479,14 @@ fn cursor_keypad_and_new_line_modes_encode_independently_and_reject_invalid_digi
 
 #[test]
 fn editing_and_function_keys_preserve_distinct_sequences_across_all_mode_combinations() {
-    for flags in 0..32 {
+    for flags in 0..64 {
         let modes = InputModes {
             application_cursor: flags & 1 != 0,
             application_keypad: flags & 2 != 0,
             new_line: flags & 4 != 0,
             backarrow: flags & 8 != 0,
             bracketed_paste: flags & 16 != 0,
+            focus_reporting: flags & 32 != 0,
         };
         let mut actual = Vec::<u8>::new();
         for key in [

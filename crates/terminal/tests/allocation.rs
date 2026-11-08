@@ -2010,9 +2010,20 @@ fn processor_retries_style_and_text_allocations_without_replaying_accepted_input
             }
         }
         processor
-            .advance(b"\x1b[?1;66;67;2004h\x1b[20h", &mut screen, &mut text)
+            .advance(b"\x1b[?1;66;67;1004;2004h\x1b[20h", &mut screen, &mut text)
             .unwrap();
         let modes = processor.input_modes();
+        for enabled in [false, true] {
+            for focused in [false, true] {
+                black_box(
+                    lune_terminal::InputModes {
+                        focus_reporting: enabled,
+                        ..modes
+                    }
+                    .encode_focus(black_box(focused)),
+                );
+            }
+        }
         for bracketed_paste in [false, true] {
             let modes = lune_terminal::InputModes {
                 bracketed_paste,

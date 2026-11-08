@@ -5,6 +5,25 @@ use std::{
 
 use lune_terminal::{InputModes, Key, KeySequence, Modifiers};
 
+fn measure_focus(name: &str, modes: InputModes) {
+    let mut samples = [0.0_f64; 5];
+    for sample in &mut samples {
+        let start = Instant::now();
+        let mut iterations = 0_u64;
+        while start.elapsed() < Duration::from_millis(100) {
+            for _ in 0..128 {
+                for focused in black_box([true, false]) {
+                    black_box(black_box(modes).encode_focus(black_box(focused)));
+                }
+            }
+            iterations += 128;
+        }
+        *sample = start.elapsed().as_nanos() as f64 / (iterations as f64 * 2.0);
+    }
+    samples.sort_by(f64::total_cmp);
+    println!("{name:<26} {:>8.3} ns/event", samples[2]);
+}
+
 fn measure_characters(name: &str, modifiers: Modifiers, characters: &[char]) {
     let mut samples = [0.0_f64; 5];
     for sample in &mut samples {
@@ -47,6 +66,19 @@ fn measure(name: &str, modes: InputModes, modifiers: Modifiers, keys: &[Key]) {
 }
 
 fn main() {
+    for focus_reporting in [false, true] {
+        measure_focus(
+            if focus_reporting {
+                "focus enabled"
+            } else {
+                "focus disabled"
+            },
+            InputModes {
+                focus_reporting,
+                ..InputModes::default()
+            },
+        );
+    }
     let cursor = [Key::Up, Key::Down, Key::Right, Key::Left, Key::Enter];
     let controls = [Key::Tab, Key::Escape, Key::Backspace, Key::Enter];
     let editing = [
@@ -81,6 +113,7 @@ fn main() {
                 new_line: false,
                 backarrow: true,
                 bracketed_paste: false,
+                focus_reporting: false,
             },
         ),
         (

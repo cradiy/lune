@@ -107,9 +107,7 @@ impl KeySequence {
     }
 }
 
-/// A copyable snapshot of keyboard and paste modes selected by the output stream.
-/// Cursor-key and keypad application modes are independent. Default modes use
-/// CSI cursor sequences, numeric keypad characters, CR for Return, and DEL for Backspace.
+/// A copyable snapshot of input modes selected by the output stream.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct InputModes {
     pub application_cursor: bool,
@@ -119,9 +117,23 @@ pub struct InputModes {
     pub backarrow: bool,
     /// DEC mode 2004: frame a paste with CSI 200~/201~ markers.
     pub bracketed_paste: bool,
+    /// DEC mode 1004: report terminal focus changes.
+    pub focus_reporting: bool,
 }
 
 impl InputModes {
+    /// Encodes a focus change when reporting is enabled.
+    #[inline]
+    pub fn encode_focus(self, focused: bool) -> Option<&'static [u8]> {
+        if !self.focus_reporting {
+            None
+        } else if focused {
+            Some(b"\x1b[I")
+        } else {
+            Some(b"\x1b[O")
+        }
+    }
+
     /// Borrows the payload with this snapshot's paste framing.
     /// Payload bytes and line endings are preserved.
     #[inline]

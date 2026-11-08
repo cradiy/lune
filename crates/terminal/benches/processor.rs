@@ -90,6 +90,7 @@ fn main() {
     let graphics =
         b"\x1b)0\x0elqqqqqqqqqqqqk\r\nx            x\r\nmqqqqqqqqqqqqj\x0f plain\r\n".repeat(1024);
     let cursor = b"\x1b[?25l\x1b[6 q\x1b[?12htext\x1b[?25h\x1b[ q\r\n".repeat(1024);
+    let focus = b"\x1b[?1004;2004h\x1b[?1004;2004l".repeat(1024);
     let queries = b"row\r\n\x1b[5n\x1b[6n\x1b[2;8H\x1b[6n\x1b[?6h\x1b[6n\x1b[?6l".repeat(1024);
     let alternate = b"\x1b[31mprimary\r\n\x1b[?1049h\x1b[34m\x1b[2;3Halternate\r\n\x1b[?1048h\x1b[?47l\x1b[?47h\x1b[?1048l\x1b[?1049l\x1b[0m".repeat(512);
     let mut newlines = Vec::from(&b"\x1b[20h"[..]);
@@ -111,6 +112,8 @@ fn main() {
     measure("new-line mode / 1-byte", &newlines, 1);
     measure("cursor state / bulk", &cursor, cursor.len());
     measure("cursor state / 1-byte", &cursor, 1);
+    measure("focus mode / bulk", &focus, focus.len());
+    measure("focus mode / 1-byte", &focus, 1);
     measure_replies("queries / bulk", &queries, queries.len(), 14);
     measure_replies("queries / 17-byte", &queries, 17, 3);
     measure_replies("queries / 1-byte", &queries, 1, 1);
