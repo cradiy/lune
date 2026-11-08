@@ -205,6 +205,8 @@ and compare output source ranges, occupied columns, soft wraps and text.
 One-column layouts reject wide units before traversal.
 Materialization probes compare owned text, styles, erased state, wide pairs,
 padding and outgoing connections against the packed source units.
+Position probes derive logical column offsets from the snapshots, compare both
+boundary affinities with streaming row lookup, and translate cursor edge states.
 
 Viewport probes track retained cell-buffer identity across individual captures,
 clamp removed anchors to the oldest retained row, and walk navigation counts in

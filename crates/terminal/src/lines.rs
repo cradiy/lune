@@ -1,6 +1,9 @@
 use std::{iter::FusedIterator, ops::Range};
 
-use crate::{CellPosition, ReflowRows, Row, ScreenView, StorageError, TextRange};
+use crate::{
+    CellPosition, Cursor, ReflowAffinity, ReflowAnchor, ReflowRows, Row, ScreenView, StorageError,
+    TextRange,
+};
 
 impl<'a> ScreenView<'a> {
     /// Groups retained rows connected by automatic wrapping. Hard row breaks
@@ -39,6 +42,81 @@ pub struct LogicalLine<'a> {
 }
 
 impl<'a> LogicalLine<'a> {
+    /// Validates a source position in this retained line and normalizes connected
+    /// row ends and wrap gaps. The borrowed anchor can map into several layouts
+    /// without repeating coordinate validation. Construction is constant-time,
+    /// uses constant space, and makes no allocation requests.
+    pub fn anchor(&self, source: CellPosition) -> Result<ReflowAnchor<'a>, StorageError> {
+        if !(self.start..self.end).contains(&source.row) {
+            return Err(StorageError::OutOfBounds);
+        }
+        Ok(ReflowAnchor {
+            view: self.view,
+            position: crate::reflow::normalize_position(self.view, source)?,
+        })
+    }
+
+    /// Maps a chronological source position into a layout at `columns` width.
+    /// Destination row indices are relative to this logical line. Source columns
+    /// may address continuations or a row's exclusive end. Connected source row
+    /// ends and excluded gaps join the next row's start. `affinity` chooses a side
+    /// of a shared output boundary. Final ends can equal the target width.
+    /// Positions outside this retained line fail. Width validation follows
+    /// [`Self::reflow`]; lookup visits the layout prefix through the mapped row,
+    /// with constant auxiliary space and no allocation requests.
+    pub fn map_position(
+        &self,
+        columns: usize,
+        source: CellPosition,
+        affinity: ReflowAffinity,
+    ) -> Result<CellPosition, StorageError> {
+        let source = self.anchor(source)?.position;
+        for (index, row) in self.reflow(columns)?.enumerate() {
+            if let Some(column) = row.map_normalized_position(source) {
+                if affinity == ReflowAffinity::After
+                    && row.wrap_end().is_some()
+                    && column == row.used_columns()
+                {
+                    continue;
+                }
+                return Ok(CellPosition { row: index, column });
+            }
+        }
+        Err(StorageError::OutOfBounds)
+    }
+
+    /// Maps a cursor whose source row uses chronological view coordinates.
+    /// Pending wrapping requires the source right-edge cell and maps the boundary
+    /// after it with preceding-row affinity. Other cursors use following-row
+    /// affinity. Destination rows are relative to this logical line. A destination
+    /// right-edge boundary becomes its last cell with wrapping pending; other
+    /// boundaries clear pending wrapping. Invalid source cursor coordinates fail.
+    /// Complexity and allocation behavior follow [`Self::map_position`].
+    pub fn map_cursor(&self, columns: usize, cursor: Cursor) -> Result<Cursor, StorageError> {
+        let row = self.view.row(cursor.row).ok_or(StorageError::OutOfBounds)?;
+        if cursor.column >= row.cells().len()
+            || (cursor.wrap_pending && cursor.column + 1 != row.cells().len())
+        {
+            return Err(StorageError::OutOfBounds);
+        }
+        let source = CellPosition {
+            row: cursor.row,
+            column: cursor.column + usize::from(cursor.wrap_pending),
+        };
+        let affinity = if cursor.wrap_pending {
+            ReflowAffinity::Before
+        } else {
+            ReflowAffinity::After
+        };
+        let destination = self.map_position(columns, source, affinity)?;
+        let wrap_pending = destination.column == columns;
+        Ok(Cursor {
+            row: destination.row,
+            column: destination.column - usize::from(wrap_pending),
+            wrap_pending,
+        })
+    }
+
     /// Lays out retained units at a target width from 1 through [`crate::MAX_DIMENSION`].
     /// All spaces and cell metadata are retained; source soft-wrap gaps are omitted.
     /// A one-column target containing a double-width unit fails before traversal.

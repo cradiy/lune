@@ -1,6 +1,6 @@
 use crate::{
-    CellPosition, CellText, CellWidth, HistoryLimits, MAX_DIMENSION, Screen, ScreenBuffer,
-    StorageError, StyleId,
+    CellPosition, CellText, CellWidth, Cursor, HistoryLimits, MAX_DIMENSION, ReflowAffinity,
+    Screen, ScreenBuffer, StorageError, StyleId,
 };
 
 #[test]
@@ -128,10 +128,218 @@ fn reflow_partitions_complete_units_across_widths_and_source_wrap_gaps() {
                     assert_eq!(rows.size_hint(), (0, Some(0)));
                     assert!(rows.next().is_none());
                     assert_eq!(joined, line.text().to_string());
+                    let mut source_base = 0;
+                    for source_row in line.range() {
+                        let source = view.row(source_row).unwrap();
+                        let source_end = source.wrap_end().unwrap_or(source.cells().len());
+                        for column in 0..=source.cells().len() {
+                            let point = CellPosition {
+                                row: source_row,
+                                column,
+                            };
+                            let offset = source_base + column.min(source_end);
+                            let mut base = 0;
+                            let mut expected = Vec::new();
+                            for (index, group) in groups.iter().enumerate() {
+                                let count = group.iter().map(|&i| units[i].1).sum::<usize>();
+                                if (base..=base + count).contains(&offset) {
+                                    expected.push(CellPosition {
+                                        row: index,
+                                        column: offset - base,
+                                    });
+                                }
+                                base += count;
+                            }
+                            for (affinity, destination) in [
+                                (ReflowAffinity::Before, *expected.first().unwrap()),
+                                (ReflowAffinity::After, *expected.last().unwrap()),
+                            ] {
+                                assert_eq!(
+                                    line.map_position(columns, point, affinity).unwrap(),
+                                    destination
+                                );
+                            }
+                            let anchor = line.anchor(point).unwrap();
+                            let actual = line
+                                .reflow(columns)
+                                .unwrap()
+                                .enumerate()
+                                .filter_map(|(index, row)| {
+                                    row.map_anchor(anchor)
+                                        .unwrap()
+                                        .map(|column| CellPosition { row: index, column })
+                                })
+                                .collect::<Vec<_>>();
+                            assert_eq!(actual, expected);
+                        }
+                        source_base += source_end;
+                    }
                 }
             }
         }
     }
+}
+
+#[test]
+fn reflow_maps_cursor_pending_wraps_continuations_gaps_and_rejects_invalid_positions() {
+    let mut screen = Screen::new(4, 3).unwrap();
+    screen.write_ascii(b"abc", StyleId(0)).unwrap();
+    screen.write("水", CellWidth::Double, StyleId(1)).unwrap();
+    screen.write_ascii(b"xyZ", StyleId(0)).unwrap();
+    let line = screen.view().logical_line(0).unwrap();
+    for (columns, source, expected) in [
+        (
+            3,
+            Cursor {
+                row: 0,
+                column: 3,
+                wrap_pending: false,
+            },
+            Cursor {
+                row: 1,
+                column: 0,
+                wrap_pending: false,
+            },
+        ),
+        (
+            3,
+            Cursor {
+                row: 1,
+                column: 1,
+                wrap_pending: false,
+            },
+            Cursor {
+                row: 1,
+                column: 1,
+                wrap_pending: false,
+            },
+        ),
+        (
+            3,
+            Cursor {
+                row: 1,
+                column: 3,
+                wrap_pending: true,
+            },
+            Cursor {
+                row: 2,
+                column: 1,
+                wrap_pending: false,
+            },
+        ),
+        (
+            7,
+            Cursor {
+                row: 1,
+                column: 3,
+                wrap_pending: true,
+            },
+            Cursor {
+                row: 0,
+                column: 6,
+                wrap_pending: true,
+            },
+        ),
+        (
+            3,
+            Cursor {
+                row: 0,
+                column: 3,
+                wrap_pending: true,
+            },
+            Cursor {
+                row: 0,
+                column: 2,
+                wrap_pending: true,
+            },
+        ),
+    ] {
+        assert_eq!(line.map_cursor(columns, source).unwrap(), expected);
+    }
+    let anchor = line.anchor(CellPosition { row: 1, column: 1 }).unwrap();
+    for (columns, destination) in [
+        (2, CellPosition { row: 2, column: 1 }),
+        (3, CellPosition { row: 1, column: 1 }),
+        (7, CellPosition { row: 0, column: 4 }),
+    ] {
+        let actual = line
+            .reflow(columns)
+            .unwrap()
+            .enumerate()
+            .filter_map(|(index, row)| {
+                row.map_anchor(anchor)
+                    .unwrap()
+                    .map(|column| CellPosition { row: index, column })
+            })
+            .last()
+            .unwrap();
+        assert_eq!(actual, destination);
+    }
+    for source in [
+        CellPosition {
+            row: usize::MAX,
+            column: 0,
+        },
+        CellPosition {
+            row: 0,
+            column: usize::MAX,
+        },
+    ] {
+        assert!(matches!(
+            line.map_position(3, source, ReflowAffinity::After),
+            Err(StorageError::OutOfBounds)
+        ));
+    }
+    for source in [
+        Cursor {
+            row: 0,
+            column: 1,
+            wrap_pending: true,
+        },
+        Cursor {
+            row: 0,
+            column: 4,
+            wrap_pending: false,
+        },
+    ] {
+        assert!(matches!(
+            line.map_cursor(3, source),
+            Err(StorageError::OutOfBounds)
+        ));
+    }
+    for columns in [0, MAX_DIMENSION + 1, usize::MAX] {
+        assert!(line.map_cursor(columns, Cursor::default()).is_err());
+    }
+    screen.set_cursor(2, 0);
+    screen.line_feed(StyleId(0)).unwrap();
+    let view = screen.view();
+    let line = view.logical_line(0).unwrap();
+    let outside = CellPosition {
+        row: line.range().end,
+        column: 0,
+    };
+    assert!(matches!(
+        line.map_position(3, outside, ReflowAffinity::After),
+        Err(StorageError::OutOfBounds)
+    ));
+    let row = line.reflow(3).unwrap().next().unwrap();
+    let outside_anchor = view
+        .logical_line(outside.row)
+        .unwrap()
+        .anchor(outside)
+        .unwrap();
+    assert_eq!(row.map_anchor(outside_anchor).unwrap(), None);
+    let other = Screen::new(4, 3).unwrap();
+    let other_anchor = other
+        .view()
+        .logical_line(0)
+        .unwrap()
+        .anchor(CellPosition { row: 0, column: 0 })
+        .unwrap();
+    assert!(matches!(
+        row.map_anchor(other_anchor),
+        Err(StorageError::OutOfBounds)
+    ));
 }
 
 #[test]

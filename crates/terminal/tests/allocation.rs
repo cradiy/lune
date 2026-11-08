@@ -7,9 +7,9 @@ use std::{
 };
 
 use lune_terminal::{
-    CellPosition, CellText, CellWidth, EraseMode, Grid, HistoryLimits, ProcessFailure, Processor,
-    Row, RowHistory, Screen, ScreenBuffer, StorageError, Style, StyleError, StyleId, StyleTable,
-    TextSink, UnicodeWriter,
+    CellPosition, CellText, CellWidth, Cursor, EraseMode, Grid, HistoryLimits, ProcessFailure,
+    Processor, ReflowAffinity, Row, RowHistory, Screen, ScreenBuffer, StorageError, Style,
+    StyleError, StyleId, StyleTable, TextSink, UnicodeWriter,
 };
 
 #[global_allocator]
@@ -1547,7 +1547,30 @@ fn text_views_stream_without_allocation_and_propagate_sink_failures() {
             let (result, stats) = allocator::measure(Some(0), || {
                 for line in screen.view().logical_lines() {
                     let _ = black_box(line.reflow(1));
+                    let last = line.range().end - 1;
+                    let end = screen.view().row(last).unwrap().cells().len();
+                    let point = CellPosition {
+                        row: last,
+                        column: end,
+                    };
+                    black_box(
+                        line.map_position(columns, point, ReflowAffinity::After)
+                            .unwrap(),
+                    );
+                    black_box(
+                        line.map_cursor(
+                            columns,
+                            Cursor {
+                                row: last,
+                                column: end - 1,
+                                wrap_pending: true,
+                            },
+                        )
+                        .unwrap(),
+                    );
+                    let anchor = line.anchor(point).unwrap();
                     for row in line.reflow(columns).unwrap() {
+                        black_box(row.map_anchor(anchor).unwrap());
                         black_box((row.source_range(), row.used_columns(), row.wrap_end()));
                         write!(&mut output, "{}", row.text())?;
                     }

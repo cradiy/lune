@@ -138,6 +138,15 @@
 //! style keys, replaces source row markers, and fills unused columns with styled
 //! erased spaces. Allocation failures release partial storage and preserve the
 //! source. Retained rows remain valid after the source screen is released.
+//! [`LogicalLine::map_position`] maps chronological source coordinates into
+//! logical-line-relative output rows, with [`ReflowAffinity`] choosing either
+//! side of shared boundaries. Source wrap gaps join the following content and
+//! wide-unit column offsets are preserved. [`LogicalLine::map_cursor`] translates
+//! delayed wrapping through a boundary after the source right edge.
+//! [`LogicalLine::anchor`] validates a borrowed [`ReflowAnchor`] once for repeated
+//! mapping at different widths. [`ReflowRow::map_anchor`] checks its source view
+//! and maps it during row traversal. Both endpoints are included so consumers
+//! can select their boundary affinity.
 //! [`Screen::viewport`] borrows a screen-height [`Viewport`] using window-local
 //! row coordinates. Its offset is bounded by retained primary history. Zero
 //! follows output; scrolling upward anchors the top retained row as captures
@@ -245,7 +254,7 @@ pub use input::{InputModes, Key};
 pub use lines::{LogicalLine, LogicalLines};
 pub use lune_text::WidthPolicy;
 pub use processor::{ProcessError, ProcessFailure, Processor};
-pub use reflow::{ReflowRow, ReflowRows};
+pub use reflow::{ReflowAffinity, ReflowAnchor, ReflowRow, ReflowRows};
 pub use row::Row;
 pub use screen::{Cursor, CursorAppearance, CursorShape, EraseMode, Screen, ScreenBuffer};
 pub use style::{Color, Style, Underline};

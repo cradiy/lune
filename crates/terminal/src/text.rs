@@ -28,6 +28,16 @@ pub struct ScreenView<'a> {
 }
 
 impl<'a> ScreenView<'a> {
+    #[inline]
+    pub(crate) fn same_source(&self, other: ScreenView<'_>) -> bool {
+        std::ptr::eq(self.grid, other.grid)
+            && match (self.history, other.history) {
+                (Some(left), Some(right)) => std::ptr::eq(left, right),
+                (None, None) => true,
+                _ => false,
+            }
+    }
+
     pub(crate) fn new(grid: &'a Grid, history: Option<&'a RowHistory>) -> Self {
         Self { grid, history }
     }

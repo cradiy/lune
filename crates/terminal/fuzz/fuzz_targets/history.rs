@@ -4,9 +4,9 @@ use std::ops::Range;
 
 use libfuzzer_sys::fuzz_target;
 use lune_terminal::{
-    Cell, CellPosition, CellText, CellWidth, EraseMode, HistoryLimits, LogicalLine,
-    MAX_HISTORY_BYTES, MAX_HISTORY_ROWS, Row, Screen, ScreenBuffer, StorageError, StyleId,
-    TextRange,
+    Cell, CellPosition, CellText, CellWidth, Cursor, EraseMode, HistoryLimits, LogicalLine,
+    MAX_HISTORY_BYTES, MAX_HISTORY_ROWS, ReflowAffinity, Row, Screen, ScreenBuffer, StorageError,
+    StyleId, TextRange,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -100,7 +100,12 @@ fn check_text(screen: &Screen, bytes: [u8; 4]) {
         }
     }
     assert_eq!(line.text().to_string(), expected_text);
-    check_reflow(line, &rows, usize::from(bytes[1] % 17) + 1);
+    check_reflow(
+        line,
+        &rows,
+        usize::from(bytes[1] % 17) + 1,
+        usize::from(bytes[2]) * 256 + usize::from(bytes[3]),
+    );
     check_ranges(&rows, |range| view.text(range), bytes);
     let viewport = screen.viewport();
     let selected = &rows[viewport.range()];
@@ -108,7 +113,7 @@ fn check_text(screen: &Screen, bytes: [u8; 4]) {
     check_ranges(selected, |range| viewport.text(range), bytes);
 }
 
-fn check_reflow(line: LogicalLine<'_>, rows: &[SavedRow], columns: usize) {
+fn check_reflow(line: LogicalLine<'_>, rows: &[SavedRow], columns: usize, probe: usize) {
     let mut units = Vec::new();
     for index in line.range() {
         let row = &rows[index];
@@ -148,6 +153,79 @@ fn check_reflow(line: LogicalLine<'_>, rows: &[SavedRow], columns: usize) {
     };
     let actual = line.reflow(columns).unwrap().collect::<Vec<_>>();
     assert_eq!(actual.len(), groups.len());
+    let source_row = line.range().start + probe % line.range().len();
+    let width = rows[source_row].cells.len();
+    let point = CellPosition {
+        row: source_row,
+        column: (probe / line.range().len()) % (width + 1),
+    };
+    let base: usize = rows[line.range().start..source_row]
+        .iter()
+        .map(|row| row.wrap.unwrap_or(row.cells.len()))
+        .sum();
+    let source_end = rows[source_row].wrap.unwrap_or(width);
+    let destinations = |offset: usize| {
+        let mut base = 0;
+        let mut expected = Vec::new();
+        for (index, &(_, _, used)) in groups.iter().enumerate() {
+            if (base..=base + used).contains(&offset) {
+                expected.push(CellPosition {
+                    row: index,
+                    column: offset - base,
+                });
+            }
+            base += used;
+        }
+        expected
+    };
+    let expected = destinations(base + point.column.min(source_end));
+    assert_eq!(
+        line.map_position(columns, point, ReflowAffinity::Before)
+            .unwrap(),
+        *expected.first().unwrap()
+    );
+    assert_eq!(
+        line.map_position(columns, point, ReflowAffinity::After)
+            .unwrap(),
+        *expected.last().unwrap()
+    );
+    let anchor = line.anchor(point).unwrap();
+    assert_eq!(
+        actual
+            .iter()
+            .enumerate()
+            .filter_map(|(index, row)| row
+                .map_anchor(anchor)
+                .unwrap()
+                .map(|column| CellPosition { row: index, column }))
+            .collect::<Vec<_>>(),
+        expected
+    );
+    let pending = probe & 1 != 0;
+    let column = if pending { width - 1 } else { probe % width };
+    let expected = destinations(base + (column + usize::from(pending)).min(source_end));
+    let position = if pending {
+        *expected.first().unwrap()
+    } else {
+        *expected.last().unwrap()
+    };
+    let wraps = position.column == columns;
+    assert_eq!(
+        line.map_cursor(
+            columns,
+            Cursor {
+                row: source_row,
+                column,
+                wrap_pending: pending
+            }
+        )
+        .unwrap(),
+        Cursor {
+            row: position.row,
+            column: position.column - usize::from(wraps),
+            wrap_pending: wraps
+        }
+    );
     for (index, (row, &(start, finish, used))) in actual.iter().zip(&groups).enumerate() {
         assert_eq!(
             row.source_range(),
