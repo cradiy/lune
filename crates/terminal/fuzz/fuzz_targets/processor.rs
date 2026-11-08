@@ -15,8 +15,9 @@ use std::io::Write;
 
 use libfuzzer_sys::fuzz_target;
 use lune_terminal::{
-    CellWidth, Color, CursorShape, EraseMode, InputModes, Key, Modifiers, ProcessFailure,
-    Processor, Screen, Style, StyleId, Underline,
+    CellPosition, CellWidth, Color, CursorShape, EraseMode, InputModes, Key, Modifiers,
+    MouseButton, MouseEvent, MouseTracking, ProcessFailure, Processor, Screen, Style, StyleId,
+    Underline,
 };
 use screen_model::{Command, ScreenModel};
 
@@ -124,6 +125,41 @@ fn drive(wire: &[u8], chunk: usize, fail_at: usize, expected: &Expected<'_>) {
         Some(&expected.style)
     );
     assert_eq!(processor.input_modes(), expected.input);
+    for (event, normal, sgr, suffix, enabled) in [
+        (
+            MouseEvent::Release(MouseButton::Right),
+            3,
+            2,
+            'm',
+            expected.input.mouse_tracking != MouseTracking::Disabled,
+        ),
+        (
+            MouseEvent::Motion(None),
+            35,
+            35,
+            'M',
+            expected.input.mouse_tracking == MouseTracking::AnyMotion,
+        ),
+    ] {
+        let actual = processor.input_modes().encode_mouse(
+            event,
+            CellPosition { row: 2, column: 4 },
+            Modifiers::default(),
+        );
+        if !enabled {
+            assert!(actual.is_none());
+        } else if expected.input.sgr_mouse {
+            assert_eq!(
+                actual.unwrap().as_bytes(),
+                format!("\x1b[<{sgr};5;3{suffix}").as_bytes()
+            );
+        } else {
+            assert_eq!(
+                actual.unwrap().as_bytes(),
+                &[27, 91, 77, normal + 32, 37, 35]
+            );
+        }
+    }
     for (focused, bytes) in [(true, &b"\x1b[I"[..]), (false, &b"\x1b[O"[..])] {
         assert_eq!(
             processor.input_modes().encode_focus(focused),
@@ -391,7 +427,7 @@ fuzz_target!(|data: &[u8]| {
                 Some(Command::Reset)
             }
             34 => {
-                wire.extend(b"\x1b[?6;1004;999h");
+                wire.extend(b"\x1b[?6;1003;1004;1006;999h");
                 diagnostics.1 += 1;
                 None
             }
@@ -586,7 +622,38 @@ fuzz_target!(|data: &[u8]| {
             }
             55 | 56 => {
                 let enabled = bytes[1] & 1 != 0;
-                let mode = if bytes[0] % 64 == 55 {
+                let mode = if bytes[1] & 8 != 0 {
+                    match bytes[2] % 4 {
+                        0 => {
+                            input.mouse_tracking = if enabled {
+                                MouseTracking::Buttons
+                            } else {
+                                MouseTracking::Disabled
+                            };
+                            1000
+                        }
+                        1 => {
+                            input.mouse_tracking = if enabled {
+                                MouseTracking::ButtonMotion
+                            } else {
+                                MouseTracking::Disabled
+                            };
+                            1002
+                        }
+                        2 => {
+                            input.mouse_tracking = if enabled {
+                                MouseTracking::AnyMotion
+                            } else {
+                                MouseTracking::Disabled
+                            };
+                            1003
+                        }
+                        _ => {
+                            input.sgr_mouse = enabled;
+                            1006
+                        }
+                    }
+                } else if bytes[0] % 64 == 55 {
                     input.application_keypad = enabled;
                     66
                 } else if bytes[1] & 4 != 0 {

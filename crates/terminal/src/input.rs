@@ -1,6 +1,6 @@
 use std::num::NonZeroU8;
 
-use crate::Paste;
+use crate::{MouseTracking, Paste};
 
 /// Terminal keys with protocol-defined encodings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -119,6 +119,8 @@ pub struct InputModes {
     pub bracketed_paste: bool,
     /// DEC mode 1004: report terminal focus changes.
     pub focus_reporting: bool,
+    pub mouse_tracking: MouseTracking,
+    pub sgr_mouse: bool,
 }
 
 impl InputModes {

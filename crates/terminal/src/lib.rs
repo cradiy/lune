@@ -7,6 +7,7 @@ mod grid;
 mod history;
 mod input;
 mod lines;
+mod mouse;
 mod paste;
 mod processor;
 mod reflow;
@@ -30,6 +31,7 @@ pub use history::{HistoryLimits, MAX_HISTORY_BYTES, MAX_HISTORY_ROWS, RowHistory
 pub use input::{InputModes, Key, KeySequence, Modifiers};
 pub use lines::{LogicalLine, LogicalLines};
 pub use lune_text::WidthPolicy;
+pub use mouse::{MouseButton, MouseEvent, MouseSequence, MouseTracking};
 pub use paste::Paste;
 pub use processor::{ProcessError, ProcessFailure, Processor};
 pub use reflow::{ReflowAffinity, ReflowAnchor, ReflowRow, ReflowRows};

@@ -17,6 +17,18 @@ and modifier bits 0–2. Surrogate values are skipped. Trailing bytes are ignore
 cargo +nightly fuzz run input -- -max_len=2048 -len_control=0 -timeout=2 -rss_limit_mb=1024 -max_total_time=60
 ```
 
+## Mouse Target
+
+The `mouse` target compares mouse reports with independent event-code and filtering
+tables. Eight-byte records contain two little-endian cell coordinates, modifier
+bits, event selection, tracking selection, and an SGR flag. Checks cover ordinary
+and SGR encoding, release identity, motion filtering, coordinate bounds, and the
+18-byte output bound.
+
+```sh
+cargo +nightly fuzz run mouse -- -max_len=2048 -len_control=0 -timeout=2 -rss_limit_mb=1024 -max_total_time=60
+```
+
 ## Storage Target
 
 The `storage` target compares each mutation with a model that owns complete display
@@ -112,6 +124,9 @@ The reference also tracks application cursor/keypad, ANSI new-line, and backarro
 independently of cursor saves. Mode changes and resets compare complete snapshots.
 Mode 1004 independently gates focus reports; final probes compare both report bytes
 with the reference flag. Rejected mixed mode lists include focus reporting.
+Modes 1000/1002/1003 select one mouse-tracking state; resetting any of them disables
+tracking. Mode 1006 independently selects SGR encoding. Final probes compare release
+and unheld-motion reports, and rejected mode lists preserve both mouse settings.
 F12 encoding is checked against fixed reference bytes for every Shift/Alt/Control combination.
 Both ESC keypad selection and DEC mode 66 update the same reference keypad flag;
 DEC mode 67 independently selects BS or DEL for Backspace.

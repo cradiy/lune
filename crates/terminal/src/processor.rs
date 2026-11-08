@@ -673,7 +673,11 @@ fn csi(screen: &mut Screen, sequence: CsiSequence<'_>, state: &mut State) -> boo
                                     | 47
                                     | 66
                                     | 67
+                                    | 1000
+                                    | 1002
+                                    | 1003
                                     | 1004
+                                    | 1006
                                     | 1047
                                     | 1048
                                     | 1049
@@ -736,7 +740,7 @@ fn csi(screen: &mut Screen, sequence: CsiSequence<'_>, state: &mut State) -> boo
                     }
                     screen.set_cursor_appearance(appearance);
                 }
-                _ => unreachable!("Mode parameters were validated"),
+                _ => mouse_mode(&mut state.input, parameter.value.unwrap(), enabled),
             }
         }
         return true;
@@ -813,6 +817,27 @@ fn csi(screen: &mut Screen, sequence: CsiSequence<'_>, state: &mut State) -> boo
         _ => return false,
     }
     true
+}
+
+#[cold]
+fn mouse_mode(input: &mut InputModes, mode: u16, enabled: bool) {
+    use crate::MouseTracking;
+    match mode {
+        1000 | 1002 | 1003 => {
+            input.mouse_tracking = if !enabled {
+                MouseTracking::Disabled
+            } else {
+                match mode {
+                    1000 => MouseTracking::Buttons,
+                    1002 => MouseTracking::ButtonMotion,
+                    1003 => MouseTracking::AnyMotion,
+                    _ => unreachable!("Mouse mode was validated"),
+                }
+            };
+        }
+        1006 => input.sgr_mouse = enabled,
+        _ => unreachable!("Mode parameters were validated"),
+    }
 }
 
 #[cfg(test)]

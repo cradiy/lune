@@ -2010,9 +2010,61 @@ fn processor_retries_style_and_text_allocations_without_replaying_accepted_input
             }
         }
         processor
-            .advance(b"\x1b[?1;66;67;1004;2004h\x1b[20h", &mut screen, &mut text)
+            .advance(
+                b"\x1b[?1;66;67;1003;1004;1006;2004h\x1b[20h",
+                &mut screen,
+                &mut text,
+            )
             .unwrap();
         let modes = processor.input_modes();
+        for mouse_tracking in [
+            lune_terminal::MouseTracking::Disabled,
+            lune_terminal::MouseTracking::Buttons,
+            lune_terminal::MouseTracking::ButtonMotion,
+            lune_terminal::MouseTracking::AnyMotion,
+        ] {
+            for sgr_mouse in [false, true] {
+                let modes = lune_terminal::InputModes {
+                    mouse_tracking,
+                    sgr_mouse,
+                    ..modes
+                };
+                for event in [
+                    lune_terminal::MouseEvent::Press(lune_terminal::MouseButton::Left),
+                    lune_terminal::MouseEvent::Release(lune_terminal::MouseButton::Right),
+                    lune_terminal::MouseEvent::Motion(Some(lune_terminal::MouseButton::Middle)),
+                    lune_terminal::MouseEvent::Motion(None),
+                    lune_terminal::MouseEvent::WheelUp,
+                    lune_terminal::MouseEvent::WheelDown,
+                ] {
+                    for position in [
+                        CellPosition { row: 0, column: 0 },
+                        CellPosition {
+                            row: 222,
+                            column: 222,
+                        },
+                        CellPosition {
+                            row: 65534,
+                            column: 65534,
+                        },
+                        CellPosition {
+                            row: usize::MAX,
+                            column: usize::MAX,
+                        },
+                    ] {
+                        black_box(modes.encode_mouse(
+                            black_box(event),
+                            position,
+                            Modifiers {
+                                shift: true,
+                                alt: true,
+                                control: true,
+                            },
+                        ));
+                    }
+                }
+            }
+        }
         for enabled in [false, true] {
             for focused in [false, true] {
                 black_box(

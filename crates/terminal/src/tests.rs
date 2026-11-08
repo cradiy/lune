@@ -5,6 +5,7 @@ mod erased;
 mod history;
 mod input;
 mod lines;
+mod mouse;
 mod processor;
 mod reflow;
 mod replies;

@@ -330,6 +330,7 @@ fn modified_keys_follow_pc_sequences_independently_of_output_modes() {
             backarrow: flags & 8 != 0,
             bracketed_paste: flags & 16 != 0,
             focus_reporting: flags & 32 != 0,
+            ..InputModes::default()
         };
         for focused in [false, true] {
             let expected = modes.focus_reporting.then_some(if focused {
@@ -487,6 +488,7 @@ fn editing_and_function_keys_preserve_distinct_sequences_across_all_mode_combina
             backarrow: flags & 8 != 0,
             bracketed_paste: flags & 16 != 0,
             focus_reporting: flags & 32 != 0,
+            ..InputModes::default()
         };
         let mut actual = Vec::<u8>::new();
         for key in [

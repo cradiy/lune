@@ -3,7 +3,37 @@ use std::{
     time::{Duration, Instant},
 };
 
-use lune_terminal::{InputModes, Key, KeySequence, Modifiers};
+use lune_terminal::{
+    CellPosition, InputModes, Key, KeySequence, Modifiers, MouseButton, MouseEvent, MouseTracking,
+};
+
+fn measure_mouse(name: &str, modes: InputModes, position: CellPosition, events: &[MouseEvent]) {
+    let modifiers = Modifiers {
+        shift: true,
+        alt: true,
+        control: true,
+    };
+    let mut samples = [0.0_f64; 5];
+    for sample in &mut samples {
+        let start = Instant::now();
+        let mut iterations = 0_u64;
+        while start.elapsed() < Duration::from_millis(100) {
+            for _ in 0..128 {
+                for &event in black_box(events) {
+                    black_box(black_box(modes).encode_mouse(
+                        black_box(event),
+                        black_box(position),
+                        black_box(modifiers),
+                    ));
+                }
+            }
+            iterations += 128;
+        }
+        *sample = start.elapsed().as_nanos() as f64 / (iterations as f64 * events.len() as f64);
+    }
+    samples.sort_by(f64::total_cmp);
+    println!("{name:<26} {:>8.3} ns/event", samples[2]);
+}
 
 fn measure_focus(name: &str, modes: InputModes) {
     let mut samples = [0.0_f64; 5];
@@ -66,6 +96,58 @@ fn measure(name: &str, modes: InputModes, modifiers: Modifiers, keys: &[Key]) {
 }
 
 fn main() {
+    let mouse = [
+        MouseEvent::Press(MouseButton::Left),
+        MouseEvent::Release(MouseButton::Right),
+        MouseEvent::Motion(Some(MouseButton::Middle)),
+        MouseEvent::Motion(None),
+        MouseEvent::WheelUp,
+        MouseEvent::WheelDown,
+    ];
+    for (name, mouse_tracking) in [
+        ("disabled", MouseTracking::Disabled),
+        ("buttons", MouseTracking::Buttons),
+        ("drag", MouseTracking::ButtonMotion),
+        ("motion", MouseTracking::AnyMotion),
+    ] {
+        for sgr_mouse in [false, true] {
+            measure_mouse(
+                &format!(
+                    "mouse {name} / {}",
+                    if sgr_mouse { "SGR" } else { "normal" }
+                ),
+                InputModes {
+                    mouse_tracking,
+                    sgr_mouse,
+                    ..InputModes::default()
+                },
+                CellPosition {
+                    row: 23,
+                    column: 79,
+                },
+                &mouse,
+            );
+        }
+    }
+    for (name, sgr_mouse, coordinate) in [
+        ("mouse normal / edge", false, 222),
+        ("mouse normal / overflow", false, 223),
+        ("mouse SGR / maximum", true, 65534),
+    ] {
+        measure_mouse(
+            name,
+            InputModes {
+                mouse_tracking: MouseTracking::AnyMotion,
+                sgr_mouse,
+                ..InputModes::default()
+            },
+            CellPosition {
+                row: coordinate,
+                column: coordinate,
+            },
+            &mouse,
+        );
+    }
     for focus_reporting in [false, true] {
         measure_focus(
             if focus_reporting {
@@ -113,7 +195,7 @@ fn main() {
                 new_line: false,
                 backarrow: true,
                 bracketed_paste: false,
-                focus_reporting: false,
+                ..InputModes::default()
             },
         ),
         (
