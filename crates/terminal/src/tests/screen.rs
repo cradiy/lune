@@ -892,7 +892,7 @@ fn regional_indices_preserve_outside_rows_and_recycle_owned_buffers() {
                         );
                         assert_eq!(screen.scroll_region(), region);
                         let after = snapshot(screen.grid());
-                        for row in 0..rows {
+                        for (row, after_row) in after.rows[..rows].iter().enumerate() {
                             let inside = scroll && region.contains(&row);
                             let source = if !inside {
                                 Some(row)
@@ -914,7 +914,7 @@ fn regional_indices_preserve_outside_rows_and_recycle_owned_buffers() {
                                 buffers[buffer].0
                             );
                             if let Some(source) = source {
-                                assert_eq!(after.rows[row], before.rows[source]);
+                                assert_eq!(*after_row, before.rows[source]);
                                 let Some(CellText::Extended(text)) =
                                     screen.grid().row(row).unwrap().text(1)
                                 else {
@@ -922,7 +922,7 @@ fn regional_indices_preserve_outside_rows_and_recycle_owned_buffers() {
                                 };
                                 assert_eq!(text.as_ptr(), buffers[source].1);
                             } else {
-                                assert!(after.rows[row].iter().all(|cell| cell.text == " "
+                                assert!(after_row.iter().all(|cell| cell.text == " "
                                     && cell.width == 1
                                     && cell.style == StyleId(9)));
                             }
@@ -1384,7 +1384,7 @@ fn line_edits_and_scrolls_preserve_state_and_recycle_rows_within_their_extent() 
                             );
                             assert_eq!(screen.scroll_region(), region);
                             let after = snapshot(screen.grid());
-                            for row in 0..rows {
+                            for (row, after_row) in after.rows[..rows].iter().enumerate() {
                                 let inside = active && extent.contains(&row);
                                 let source = if !inside {
                                     Some(row)
@@ -1407,7 +1407,7 @@ fn line_edits_and_scrolls_preserve_state_and_recycle_rows_within_their_extent() 
                                 );
                                 if let Some(source) = source {
                                     assert_eq!(
-                                        after.rows[row], before.rows[source],
+                                        *after_row, before.rows[source],
                                         "rows={rows}, region={region:?}, cursor={cursor_row}, count={requested}, insert={insert}, cursor_relative={cursor_relative}"
                                     );
                                     let Some(CellText::Extended(text)) =
@@ -1417,7 +1417,7 @@ fn line_edits_and_scrolls_preserve_state_and_recycle_rows_within_their_extent() 
                                     };
                                     assert_eq!(text.as_ptr(), buffers[source].1);
                                 } else {
-                                    assert!(after.rows[row].iter().all(|cell| cell.text == " "
+                                    assert!(after_row.iter().all(|cell| cell.text == " "
                                         && cell.width == 1
                                         && cell.style == StyleId(9)));
                                 }

@@ -243,7 +243,7 @@ fn scrolling_preserves_region_boundaries_and_owned_buffers() {
                             grid.scroll_down(start..end, lines, style).unwrap();
                         }
                         let after = snapshot(&grid);
-                        for row in 0..height {
+                        for (row, after_row) in after.rows[..height].iter().enumerate() {
                             let inside = (start..end).contains(&row);
                             let count = lines.min(end - start);
                             let source = if !inside {
@@ -265,14 +265,14 @@ fn scrolling_preserves_region_boundaries_and_owned_buffers() {
                                 buffers[buffer_row].0
                             );
                             if let Some(source) = source {
-                                assert_eq!(after.rows[row], before.rows[source]);
+                                assert_eq!(*after_row, before.rows[source]);
                                 let Some(CellText::Extended(text)) = grid.row(row).unwrap().text(1)
                                 else {
                                     panic!("Moved extended text is present");
                                 };
                                 assert_eq!(text.as_ptr(), buffers[source].1);
                             } else {
-                                assert!(after.rows[row].iter().all(|cell| {
+                                assert!(after_row.iter().all(|cell| {
                                     cell.text == " " && cell.width == 1 && cell.style == style
                                 }));
                             }

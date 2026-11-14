@@ -98,8 +98,8 @@ impl TabStops {
         }
         let start = column + 1;
         let mut remaining = count;
-        for index in start / 64..self.words.len() {
-            let mut word = self.words[index];
+        for (index, &word) in self.words.iter().enumerate().skip(start / 64) {
+            let mut word = word;
             if index == start / 64 {
                 word &= u64::MAX << (start % 64);
             }
