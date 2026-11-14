@@ -1994,6 +1994,7 @@ fn processor_retries_style_and_text_allocations_without_replaying_accepted_input
         processor.reset(&mut screen, &mut text);
         processor.collect_styles(&screen, []).unwrap();
         for _ in 0..32 {
+            processor.advance(b"x", &mut screen, &mut text).unwrap();
             let error = processor
                 .advance(b"\x1b[5n\x1b[6n", &mut screen, &mut text)
                 .unwrap_err();

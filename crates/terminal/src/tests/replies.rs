@@ -83,9 +83,9 @@ fn blocked_replies_retain_captured_positions_and_partial_delivery_until_retry_or
     assert_eq!(processor.reply_bytes(), b"0n");
     let checkpoint = super::snapshot(screen.grid());
     let cursor = screen.cursor();
-    for _ in 0..2 {
+    for input in [suffix, &b"A"[..]] {
         let error = processor
-            .advance(suffix, &mut screen, &mut text)
+            .advance(input, &mut screen, &mut text)
             .unwrap_err();
         assert!(matches!(error.error, ProcessFailure::ReplyPending));
         assert_eq!(error.consumed, 0);

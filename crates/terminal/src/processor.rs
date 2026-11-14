@@ -219,6 +219,20 @@ impl Processor {
     ) -> Result<usize, ProcessError<E>> {
         self.drain(screen, text)
             .map_err(|error| ProcessError { consumed: 0, error })?;
+        if input.len() == 1 && self.parser.is_ground() {
+            let byte = input[0];
+            if (b' '..=b'~').contains(&byte) && (!self.state.charsets.is_graphics() || byte < b'_')
+            {
+                // SAFETY: this slice contains exactly one printable ASCII byte.
+                let value = unsafe { std::str::from_utf8_unchecked(input) };
+                text.write(screen, value, self.state.style)
+                    .map_err(|error| ProcessError {
+                        consumed: 0,
+                        error: ProcessFailure::Text(error),
+                    })?;
+                return Ok(1);
+            }
+        }
         let mut consumed = 0;
         while consumed < input.len() {
             if self.parser.is_ground() {
@@ -355,16 +369,16 @@ impl Processor {
                         } else {
                             false
                         }
-                    } else {
-                        match csi(screen, sequence, state) {
-                            CsiResult::Applied => true,
-                            CsiResult::Ignored => false,
-                            CsiResult::Reply(reply) => {
-                                pending[*end] = Some(Pending::ModeReply(reply));
-                                *end += 1;
-                                true
-                            }
+                    } else if sequence.final_byte == b'p' {
+                        if let Some(reply) = reply::mode_query(screen, state.input, sequence) {
+                            pending[*end] = Some(Pending::ModeReply(reply));
+                            *end += 1;
+                            true
+                        } else {
+                            false
                         }
+                    } else {
+                        csi(screen, sequence, state)
                     };
                     if !accepted {
                         *ignored_sequences = ignored_sequences.saturating_add(1);
@@ -638,21 +652,11 @@ fn erase_mode(value: usize) -> Option<EraseMode> {
     }
 }
 
-enum CsiResult {
-    Applied,
-    Ignored,
-    Reply(ModeReport),
-}
-
-fn csi(screen: &mut Screen, sequence: CsiSequence<'_>, state: &mut State) -> CsiResult {
-    if sequence.final_byte == b'p' {
-        return reply::mode_query(screen, state.input, sequence)
-            .map_or(CsiResult::Ignored, CsiResult::Reply);
-    }
+fn csi(screen: &mut Screen, sequence: CsiSequence<'_>, state: &mut State) -> bool {
     let style = state.style;
     let p = sequence.parameters;
     if p.iter().any(|p| p.is_subparameter) {
-        return CsiResult::Ignored;
+        return false;
     }
     if !sequence.intermediates.is_empty() {
         if sequence.intermediates != b" "
@@ -660,7 +664,7 @@ fn csi(screen: &mut Screen, sequence: CsiSequence<'_>, state: &mut State) -> Csi
             || !sequence.private_markers.is_empty()
             || p.len() > 1
         {
-            return CsiResult::Ignored;
+            return false;
         }
         let (shape, blinking) = match value(p, 0, 0) {
             0 | 1 => (CursorShape::Block, true),
@@ -669,19 +673,19 @@ fn csi(screen: &mut Screen, sequence: CsiSequence<'_>, state: &mut State) -> Csi
             4 => (CursorShape::Underline, false),
             5 => (CursorShape::Bar, true),
             6 => (CursorShape::Bar, false),
-            _ => return CsiResult::Ignored,
+            _ => return false,
         };
         let mut appearance = screen.cursor_appearance();
         appearance.shape = shape;
         appearance.blinking = blinking;
         screen.set_cursor_appearance(appearance);
-        return CsiResult::Applied;
+        return true;
     }
     if matches!(sequence.final_byte, b'h' | b'l') {
         let private = match sequence.private_markers {
             [] => false,
             [b'?'] => true,
-            _ => return CsiResult::Ignored,
+            _ => return false,
         };
         if p.is_empty()
             || !p.iter().all(|p| {
@@ -712,7 +716,7 @@ fn csi(screen: &mut Screen, sequence: CsiSequence<'_>, state: &mut State) -> Csi
                 )
             })
         {
-            return CsiResult::Ignored;
+            return false;
         }
         let enabled = sequence.final_byte == b'h';
         for parameter in p {
@@ -768,10 +772,10 @@ fn csi(screen: &mut Screen, sequence: CsiSequence<'_>, state: &mut State) -> Csi
                 _ => mouse_mode(&mut state.input, parameter.value.unwrap(), enabled),
             }
         }
-        return CsiResult::Applied;
+        return true;
     }
     if !sequence.private_markers.is_empty() {
-        return CsiResult::Ignored;
+        return false;
     }
     let maximum = if matches!(sequence.final_byte, b'H' | b'f' | b'r') {
         2
@@ -779,7 +783,7 @@ fn csi(screen: &mut Screen, sequence: CsiSequence<'_>, state: &mut State) -> Csi
         1
     };
     if p.len() > maximum {
-        return CsiResult::Ignored;
+        return false;
     }
     let n = count(p);
     match sequence.final_byte {
@@ -816,7 +820,7 @@ fn csi(screen: &mut Screen, sequence: CsiSequence<'_>, state: &mut State) -> Csi
         b'T' => screen.scroll_down(n, style),
         b'J' | b'K' => {
             let Some(mode) = erase_mode(value(p, 0, 0)) else {
-                return CsiResult::Ignored;
+                return false;
             };
             if sequence.final_byte == b'J' {
                 screen.erase_display(mode, style);
@@ -827,7 +831,7 @@ fn csi(screen: &mut Screen, sequence: CsiSequence<'_>, state: &mut State) -> Csi
         b'g' => match value(p, 0, 0) {
             0 => screen.clear_tab_stop(),
             3 => screen.clear_tab_stops(),
-            _ => return CsiResult::Ignored,
+            _ => return false,
         },
         b'r' => {
             let top = value(p, 0, 1).max(1);
@@ -836,12 +840,12 @@ fn csi(screen: &mut Screen, sequence: CsiSequence<'_>, state: &mut State) -> Csi
                 n => n,
             };
             if screen.set_scroll_region(top - 1..bottom).is_err() {
-                return CsiResult::Ignored;
+                return false;
             }
         }
-        _ => return CsiResult::Ignored,
+        _ => return false,
     }
-    CsiResult::Applied
+    true
 }
 
 #[cold]

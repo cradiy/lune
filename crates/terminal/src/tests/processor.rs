@@ -217,20 +217,27 @@ fn failures_preserve_ascii_runs_and_both_events_of_a_reprocessed_byte() {
     let mut screen = Screen::new(8, 4).unwrap();
     let mut processor = Processor::default();
     let before: Snapshot = snapshot(screen.grid());
-    let error = processor
-        .advance(
-            b"abc",
-            &mut screen,
-            &mut |_: &mut Screen, _: &str, _: StyleId| Err("blocked"),
-        )
-        .unwrap_err();
-    assert_eq!(error.consumed, 0);
-    assert!(matches!(error.error, ProcessFailure::Text("blocked")));
-    assert_eq!(snapshot(screen.grid()), before);
-    processor
-        .advance(b"abc", &mut screen, &mut write_text)
-        .unwrap();
-    processor.reset(&mut screen, &mut write_text);
+    for input in [&b"a"[..], &b"abc"[..]] {
+        let error = processor
+            .advance(
+                input,
+                &mut screen,
+                &mut |_: &mut Screen, value: &str, _: StyleId| {
+                    assert_eq!(value.as_bytes(), input);
+                    assert_eq!(value.as_ptr(), input.as_ptr());
+                    Err("blocked")
+                },
+            )
+            .unwrap_err();
+        assert_eq!(error.consumed, 0);
+        assert!(matches!(error.error, ProcessFailure::Text("blocked")));
+        assert_eq!(snapshot(screen.grid()), before);
+        processor
+            .advance(input, &mut screen, &mut write_text)
+            .unwrap();
+        assert_eq!(screen.cursor().column, input.len());
+        processor.reset(&mut screen, &mut write_text);
+    }
     processor
         .advance(b"\xf0\x9f", &mut screen, &mut write_text)
         .unwrap();
