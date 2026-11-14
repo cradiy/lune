@@ -107,6 +107,22 @@ impl ScreenModel {
         self.active == 1
     }
 
+    #[allow(
+        dead_code,
+        reason = "Mode queries are checked by the processor target."
+    )]
+    pub fn mode(&self, private: bool, selector: u16) -> Option<bool> {
+        match (private, selector) {
+            (false, 4) => Some(self.insert_mode),
+            (true, 6) => Some(self.origin_mode),
+            (true, 7) => Some(self.auto_wrap),
+            (true, 12) => Some(self.cursor_appearance.blinking),
+            (true, 25) => Some(self.cursor_appearance.visible),
+            (true, 47 | 1047 | 1049) => Some(self.active == 1),
+            _ => None,
+        }
+    }
+
     pub fn text(&self, range: Range<CellPosition>) -> Result<String, StorageError> {
         self.storage[self.active].text(range)
     }

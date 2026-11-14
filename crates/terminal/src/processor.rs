@@ -3,7 +3,7 @@ use std::{error::Error, fmt};
 use lune_vt::{CsiSequence, EscapeSequence, Event, Parameter, Parser};
 
 use crate::charsets::Charsets;
-use crate::reply::{self, Reply, Report};
+use crate::reply::{self, ModeReport, Reply, Report};
 use crate::{
     CursorShape, EraseMode, InputModes, MAX_STYLES, Screen, ScreenBuffer, StorageError, Style,
     StyleError, StyleId, StyleTable, TextSink,
@@ -75,6 +75,7 @@ enum Pending {
     ScrollUp(usize),
     Rendition(Style),
     Reply(Report),
+    ModeReply(ModeReport),
 }
 
 #[derive(Default)]
@@ -142,7 +143,7 @@ impl Processor {
         self.state.style
     }
 
-    /// Keyboard and paste modes at the end of the accepted input prefix.
+    /// Input modes at the end of the accepted input prefix.
     pub fn input_modes(&self) -> InputModes {
         self.state.input
     }
@@ -355,7 +356,15 @@ impl Processor {
                             false
                         }
                     } else {
-                        csi(screen, sequence, state)
+                        match csi(screen, sequence, state) {
+                            CsiResult::Applied => true,
+                            CsiResult::Ignored => false,
+                            CsiResult::Reply(reply) => {
+                                pending[*end] = Some(Pending::ModeReply(reply));
+                                *end += 1;
+                                true
+                            }
+                        }
                     };
                     if !accepted {
                         *ignored_sequences = ignored_sequences.saturating_add(1);
@@ -474,6 +483,12 @@ impl Processor {
                     self.state.style = self.styles.intern(style).map_err(ProcessFailure::Style)?;
                 }
                 Pending::Reply(reply) => {
+                    if !self.reply.is_empty() {
+                        return Err(ProcessFailure::ReplyPending);
+                    }
+                    self.reply = reply.encode();
+                }
+                Pending::ModeReply(reply) => {
                     if !self.reply.is_empty() {
                         return Err(ProcessFailure::ReplyPending);
                     }
@@ -623,11 +638,21 @@ fn erase_mode(value: usize) -> Option<EraseMode> {
     }
 }
 
-fn csi(screen: &mut Screen, sequence: CsiSequence<'_>, state: &mut State) -> bool {
+enum CsiResult {
+    Applied,
+    Ignored,
+    Reply(ModeReport),
+}
+
+fn csi(screen: &mut Screen, sequence: CsiSequence<'_>, state: &mut State) -> CsiResult {
+    if sequence.final_byte == b'p' {
+        return reply::mode_query(screen, state.input, sequence)
+            .map_or(CsiResult::Ignored, CsiResult::Reply);
+    }
     let style = state.style;
     let p = sequence.parameters;
     if p.iter().any(|p| p.is_subparameter) {
-        return false;
+        return CsiResult::Ignored;
     }
     if !sequence.intermediates.is_empty() {
         if sequence.intermediates != b" "
@@ -635,7 +660,7 @@ fn csi(screen: &mut Screen, sequence: CsiSequence<'_>, state: &mut State) -> boo
             || !sequence.private_markers.is_empty()
             || p.len() > 1
         {
-            return false;
+            return CsiResult::Ignored;
         }
         let (shape, blinking) = match value(p, 0, 0) {
             0 | 1 => (CursorShape::Block, true),
@@ -644,19 +669,19 @@ fn csi(screen: &mut Screen, sequence: CsiSequence<'_>, state: &mut State) -> boo
             4 => (CursorShape::Underline, false),
             5 => (CursorShape::Bar, true),
             6 => (CursorShape::Bar, false),
-            _ => return false,
+            _ => return CsiResult::Ignored,
         };
         let mut appearance = screen.cursor_appearance();
         appearance.shape = shape;
         appearance.blinking = blinking;
         screen.set_cursor_appearance(appearance);
-        return true;
+        return CsiResult::Applied;
     }
     if matches!(sequence.final_byte, b'h' | b'l') {
         let private = match sequence.private_markers {
             [] => false,
             [b'?'] => true,
-            _ => return false,
+            _ => return CsiResult::Ignored,
         };
         if p.is_empty()
             || !p.iter().all(|p| {
@@ -687,7 +712,7 @@ fn csi(screen: &mut Screen, sequence: CsiSequence<'_>, state: &mut State) -> boo
                 )
             })
         {
-            return false;
+            return CsiResult::Ignored;
         }
         let enabled = sequence.final_byte == b'h';
         for parameter in p {
@@ -743,10 +768,10 @@ fn csi(screen: &mut Screen, sequence: CsiSequence<'_>, state: &mut State) -> boo
                 _ => mouse_mode(&mut state.input, parameter.value.unwrap(), enabled),
             }
         }
-        return true;
+        return CsiResult::Applied;
     }
     if !sequence.private_markers.is_empty() {
-        return false;
+        return CsiResult::Ignored;
     }
     let maximum = if matches!(sequence.final_byte, b'H' | b'f' | b'r') {
         2
@@ -754,7 +779,7 @@ fn csi(screen: &mut Screen, sequence: CsiSequence<'_>, state: &mut State) -> boo
         1
     };
     if p.len() > maximum {
-        return false;
+        return CsiResult::Ignored;
     }
     let n = count(p);
     match sequence.final_byte {
@@ -791,7 +816,7 @@ fn csi(screen: &mut Screen, sequence: CsiSequence<'_>, state: &mut State) -> boo
         b'T' => screen.scroll_down(n, style),
         b'J' | b'K' => {
             let Some(mode) = erase_mode(value(p, 0, 0)) else {
-                return false;
+                return CsiResult::Ignored;
             };
             if sequence.final_byte == b'J' {
                 screen.erase_display(mode, style);
@@ -802,7 +827,7 @@ fn csi(screen: &mut Screen, sequence: CsiSequence<'_>, state: &mut State) -> boo
         b'g' => match value(p, 0, 0) {
             0 => screen.clear_tab_stop(),
             3 => screen.clear_tab_stops(),
-            _ => return false,
+            _ => return CsiResult::Ignored,
         },
         b'r' => {
             let top = value(p, 0, 1).max(1);
@@ -811,12 +836,12 @@ fn csi(screen: &mut Screen, sequence: CsiSequence<'_>, state: &mut State) -> boo
                 n => n,
             };
             if screen.set_scroll_region(top - 1..bottom).is_err() {
-                return false;
+                return CsiResult::Ignored;
             }
         }
-        _ => return false,
+        _ => return CsiResult::Ignored,
     }
-    true
+    CsiResult::Applied
 }
 
 #[cold]

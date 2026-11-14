@@ -106,6 +106,9 @@ Unsupported mode lists preserve all screen state.
 Each input runs as one chunk and in chunks of one through seventeen bytes. A text
 callback can fail before mutation; execution retries the reported input suffix.
 Both runs must produce the same modeled screen, saved cursor, and diagnostics.
+ANSI and DEC mode queries append replies from independent input and screen state.
+Checks include unknown selectors, invalid query headers, and captured values under
+reply backpressure alongside status and cursor-position reports.
 SGR commands update an independent rendition value and a vector of reference
 styles. Cell styles are compared by resolved value, allowing actual IDs to change
 as collection runs between chunks and retries. Collection must retain current

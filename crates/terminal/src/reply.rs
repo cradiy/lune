@@ -1,6 +1,6 @@
 use lune_vt::CsiSequence;
 
-use crate::Screen;
+use crate::{InputModes, MouseTracking, Screen, ScreenBuffer};
 
 // ESC [, two five-digit coordinates, a separator, and the final byte.
 const CAPACITY: usize = 14;
@@ -16,6 +16,13 @@ pub(crate) struct Reply {
 pub(crate) enum Report {
     Status,
     Position(u16, u16),
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ModeReport {
+    private: bool,
+    selector: u16,
+    enabled: Option<bool>,
 }
 
 impl Report {
@@ -101,5 +108,77 @@ pub(crate) fn query(screen: &Screen, sequence: CsiSequence<'_>) -> Option<Report
             Some(Report::Position(row, column))
         }
         _ => None,
+    }
+}
+
+#[cold]
+pub(crate) fn mode_query(
+    screen: &Screen,
+    input: InputModes,
+    sequence: CsiSequence<'_>,
+) -> Option<ModeReport> {
+    let private = match sequence.private_markers {
+        [] => false,
+        [b'?'] => true,
+        _ => return None,
+    };
+    if sequence.intermediates != b"$"
+        || sequence.parameters.len() > 1
+        || sequence
+            .parameters
+            .iter()
+            .any(|parameter| parameter.is_subparameter)
+    {
+        return None;
+    }
+    let selector = sequence
+        .parameters
+        .first()
+        .and_then(|parameter| parameter.value)
+        .unwrap_or(0);
+    let enabled = match (private, selector) {
+        (false, 4) => Some(screen.insert_mode()),
+        (false, 20) => Some(input.new_line),
+        (true, 1) => Some(input.application_cursor),
+        (true, 6) => Some(screen.origin_mode()),
+        (true, 7) => Some(screen.auto_wrap()),
+        (true, 12) => Some(screen.cursor_appearance().blinking),
+        (true, 25) => Some(screen.cursor_appearance().visible),
+        (true, 47 | 1047 | 1049) => Some(screen.active_buffer() == ScreenBuffer::Alternate),
+        (true, 66) => Some(input.application_keypad),
+        (true, 67) => Some(input.backarrow),
+        (true, 1000) => Some(input.mouse_tracking == MouseTracking::Buttons),
+        (true, 1002) => Some(input.mouse_tracking == MouseTracking::ButtonMotion),
+        (true, 1003) => Some(input.mouse_tracking == MouseTracking::AnyMotion),
+        (true, 1004) => Some(input.focus_reporting),
+        (true, 1006) => Some(input.sgr_mouse),
+        (true, 2004) => Some(input.bracketed_paste),
+        _ => None,
+    };
+    Some(ModeReport {
+        private,
+        selector,
+        enabled,
+    })
+}
+
+impl ModeReport {
+    #[cold]
+    pub(crate) fn encode(self) -> Reply {
+        let Self {
+            private,
+            selector,
+            enabled,
+        } = self;
+        let mut reply = Reply::default();
+        reply.append(if private { b"\x1b[?" } else { b"\x1b[" });
+        reply.number(selector);
+        let status = match enabled {
+            None => b'0',
+            Some(true) => b'1',
+            Some(false) => b'2',
+        };
+        reply.append(&[b';', status, b'$', b'y']);
+        reply
     }
 }

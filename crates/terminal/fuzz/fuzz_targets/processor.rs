@@ -670,8 +670,37 @@ fuzz_target!(|data: &[u8]| {
                 None
             }
             57 => {
-                wire.extend(b"\x1b[5n");
-                replies.extend(b"\x1b[0n");
+                if bytes[1] & 1 == 0 {
+                    wire.extend(b"\x1b[5n");
+                    replies.extend(b"\x1b[0n");
+                } else {
+                    let private = bytes[1] & 2 != 0;
+                    let selector = [
+                        0, 1, 4, 6, 7, 12, 20, 25, 47, 66, 67, 1000, 1002, 1003, 1004, 1006, 1047,
+                        1048, 1049, 2004, 65535,
+                    ][usize::from(bytes[2] % 21)];
+                    let enabled = match (private, selector) {
+                        (false, 20) => Some(input.new_line),
+                        (true, 1) => Some(input.application_cursor),
+                        (true, 66) => Some(input.application_keypad),
+                        (true, 67) => Some(input.backarrow),
+                        (true, 1000) => Some(input.mouse_tracking == MouseTracking::Buttons),
+                        (true, 1002) => Some(input.mouse_tracking == MouseTracking::ButtonMotion),
+                        (true, 1003) => Some(input.mouse_tracking == MouseTracking::AnyMotion),
+                        (true, 1004) => Some(input.focus_reporting),
+                        (true, 1006) => Some(input.sgr_mouse),
+                        (true, 2004) => Some(input.bracketed_paste),
+                        _ => expected.mode(private, selector),
+                    };
+                    let status = match enabled {
+                        Some(true) => 1,
+                        Some(false) => 2,
+                        None => 0,
+                    };
+                    let marker = if private { "?" } else { "" };
+                    write!(&mut wire, "\x1b[{marker}{selector}$p").unwrap();
+                    write!(&mut replies, "\x1b[{marker}{selector};{status}$y").unwrap();
+                }
                 None
             }
             58 => {
@@ -681,7 +710,7 @@ fuzz_target!(|data: &[u8]| {
                 None
             }
             59 => {
-                let invalid: [&[u8]; 8] = [
+                let invalid: [&[u8]; 14] = [
                     b"\x1b[n",
                     b"\x1b[0n",
                     b"\x1b[?5n",
@@ -690,6 +719,12 @@ fuzz_target!(|data: &[u8]| {
                     b"\x1b[6:0n",
                     b"\x1b[6!n",
                     b"\x1b[>6n",
+                    b"\x1b[?1004;1$p",
+                    b"\x1b[?1004:1$p",
+                    b"\x1b[>1004$p",
+                    b"\x1b[?1004$$p",
+                    b"\x1b[?1004p",
+                    b"\x1b[?1004 $p",
                 ];
                 wire.extend(invalid[bytes[1] as usize % invalid.len()]);
                 diagnostics.1 += 1;

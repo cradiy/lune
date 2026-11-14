@@ -2009,6 +2009,21 @@ fn processor_retries_style_and_text_allocations_without_replaying_accepted_input
                 assert!(processor.consume_reply(1));
             }
         }
+        let mut queries = &b"\x1b[4$p\x1b[20$p\x1b[?7$p\x1b[?1004$p\x1b[?1003$p\x1b[?65535$p"[..];
+        loop {
+            let result = processor.advance(queries, &mut screen, &mut text);
+            while !processor.reply_bytes().is_empty() {
+                black_box(processor.reply_bytes());
+                assert!(processor.consume_reply(1));
+            }
+            match result {
+                Ok(_) => break,
+                Err(error) => {
+                    assert!(matches!(error.error, ProcessFailure::ReplyPending));
+                    queries = &queries[error.consumed..];
+                }
+            }
+        }
         processor
             .advance(
                 b"\x1b[?1;66;67;1003;1004;1006;2004h\x1b[20h",
