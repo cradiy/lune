@@ -111,6 +111,9 @@ coalesced title changes, and diagnostics.
 ANSI and DEC mode queries append replies from independent input and screen state.
 Checks include unknown selectors, invalid query headers, and captured values under
 reply backpressure alongside status and cursor-position reports.
+Dynamic foreground, background, and cursor commands compare numeric RGB updates,
+queries, coalesced notifications, and resets with independent color state. Color
+replies preserve BEL/ST framing while sharing the same output backpressure.
 SGR commands update an independent rendition value and a vector of reference
 styles. Cell styles are compared by resolved value, allowing actual IDs to change
 as collection runs between chunks and retries. Collection must retain current

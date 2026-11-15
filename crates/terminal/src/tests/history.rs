@@ -1,3 +1,5 @@
+use super::support;
+
 use super::{assert_invariants, snapshot};
 use crate::{
     CellText, CellWidth, HistoryLimits, MAX_HISTORY_BYTES, MAX_HISTORY_ROWS, Processor, Screen,
@@ -223,7 +225,7 @@ fn style_collection_retains_history_owners_until_eviction() {
         screen.write_ascii(text.as_bytes(), style)
     }
     let mut screen = Screen::new(4, 2).unwrap();
-    let mut processor = Processor::new(4).unwrap();
+    let mut processor = Processor::new(4, support::palette()).unwrap();
     processor
         .advance(b"\x1b[31mRED", &mut screen, &mut ascii)
         .unwrap();
@@ -253,7 +255,7 @@ fn automatic_capture_preserves_control_boundaries_and_single_row_early_wraps() {
         let mut screen = Screen::new(4, 2).unwrap();
         screen.set_history_limits(limits(4, 4096)).unwrap();
         screen.write_ascii(b"abcdefgh", StyleId(0)).unwrap();
-        let mut processor = Processor::default();
+        let mut processor = support::processor();
         processor
             .advance(control, &mut screen, &mut UnicodeWriter::default())
             .unwrap();
@@ -274,7 +276,7 @@ fn automatic_capture_preserves_control_boundaries_and_single_row_early_wraps() {
     }
     let mut screen = Screen::new(4, 1).unwrap();
     screen.set_history_limits(limits(4, 4096)).unwrap();
-    let mut processor = Processor::default();
+    let mut processor = support::processor();
     let mut writer = UnicodeWriter::default();
     processor
         .advance("abc❤\u{fe0f}X".as_bytes(), &mut screen, &mut writer)
@@ -308,7 +310,7 @@ fn automatic_history_matches_fragmented_unicode_input_and_edits_end_top_adjacenc
             let run = |chunk| {
                 let mut screen = Screen::new(columns, rows).unwrap();
                 screen.set_history_limits(limits(7, 65536)).unwrap();
-                let mut processor = Processor::default();
+                let mut processor = support::processor();
                 let mut writer = UnicodeWriter::default();
                 for part in wire.as_bytes().chunks(chunk) {
                     processor.advance(part, &mut screen, &mut writer).unwrap();

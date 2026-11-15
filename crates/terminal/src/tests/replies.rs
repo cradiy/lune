@@ -1,3 +1,5 @@
+use super::support;
+
 use crate::{CellWidth, ProcessFailure, Processor, Screen, StorageError, StyleId, reply::Reply};
 
 fn text(screen: &mut Screen, value: &str, style: StyleId) -> Result<(), StorageError> {
@@ -38,7 +40,7 @@ fn query_replies_preserve_wire_order_origin_coordinates_and_wrapping_across_spli
     let input = b"\x1b[5nabc\x1b[6n\x1b[2;4r\x1b[?6h\x1b[2;8H!\x1b[6nZ\x1b[6n\x1b[?6l\x1b[4;7H\x1b[6n\x1b[n\x1b[0n\x1b[?5n\x1b[?6n\x1b[6;5n\x1b[6:0n\x1b[6!n\x1b[>6n";
     for split in 0..=input.len() {
         let mut screen = Screen::new(8, 4).unwrap();
-        let mut processor = Processor::default();
+        let mut processor = support::processor();
         let mut output = Vec::new();
         drive(&mut processor, &mut screen, &input[..split], &mut output);
         drive(&mut processor, &mut screen, &input[split..], &mut output);
@@ -67,7 +69,7 @@ fn query_replies_preserve_wire_order_origin_coordinates_and_wrapping_across_spli
 #[test]
 fn blocked_replies_retain_captured_positions_and_partial_delivery_until_retry_or_reset() {
     let mut screen = Screen::new(8, 4).unwrap();
-    let mut processor = Processor::default();
+    let mut processor = support::processor();
     let input = b"\x1b[5nabc\x1b[6nTAIL";
     let error = processor
         .advance(input, &mut screen, &mut text)
@@ -175,7 +177,7 @@ fn mode_queries_report_defaults_changes_and_unknown_selectors_across_splits() {
         );
         for split in 0..=input.len() {
             let mut screen = Screen::new(8, 4).unwrap();
-            let mut processor = Processor::default();
+            let mut processor = support::processor();
             let mut output = Vec::new();
             drive(
                 &mut processor,
@@ -202,7 +204,7 @@ fn mode_queries_report_defaults_changes_and_unknown_selectors_across_splits() {
         screen.write_ascii(b"unchanged", StyleId(0)).unwrap();
         let before = super::snapshot(screen.grid());
         let cursor = screen.cursor();
-        let mut processor = Processor::default();
+        let mut processor = support::processor();
         let mut output = Vec::new();
         drive(&mut processor, &mut screen, &input[..split], &mut output);
         drive(&mut processor, &mut screen, &input[split..], &mut output);
@@ -223,7 +225,7 @@ fn mode_queries_report_defaults_changes_and_unknown_selectors_across_splits() {
 #[test]
 fn mode_replies_capture_state_before_backpressure_and_follow_stream_reset_rules() {
     let mut screen = Screen::new(8, 4).unwrap();
-    let mut processor = Processor::default();
+    let mut processor = support::processor();
     let input = b"\x1b[5n\x1b[?7$p\x1b[?7$pTAIL";
     let error = processor
         .advance(input, &mut screen, &mut text)

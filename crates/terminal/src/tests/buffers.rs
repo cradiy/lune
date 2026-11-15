@@ -1,3 +1,5 @@
+use super::support;
+
 use crate::{
     CellText, CellWidth, Color, CursorAppearance, CursorShape, Processor, Screen, ScreenBuffer,
     StorageError, StyleId,
@@ -97,7 +99,7 @@ fn buffers_keep_contents_wraps_and_save_slots_while_live_state_is_shared() {
 fn alternate_modes_preserve_primary_saves_and_validate_whole_lists_across_splits() {
     let input = b"\x1b[31m\x1b(0q\x1b[2;3H\x1b[?1049h\x1b(B\x1b[34mA\x1b[?1048h\x1b[32m\x1b(0\x1b[?1049hqx\x1b[?1049lq\x1b[?47h\x1b[?1048lq\x1b[?47l\x1b[?1047h\x1b[?1047l\x1b[?47;1048;999h\x1b[?1049lq\x1b[6n";
     for split in 0..=input.len() {
-        let mut processor = Processor::default();
+        let mut processor = support::processor();
         let mut screen = Screen::new(8, 4).unwrap();
         processor
             .advance(&input[..split], &mut screen, &mut text)
@@ -159,7 +161,7 @@ fn alternate_modes_preserve_primary_saves_and_validate_whole_lists_across_splits
 
 #[test]
 fn collection_traces_both_buffer_save_slots_even_without_styled_cells() {
-    let mut processor = Processor::new(4).unwrap();
+    let mut processor = Processor::new(4, support::palette()).unwrap();
     let mut screen = Screen::new(8, 4).unwrap();
     processor
         .advance(

@@ -3,10 +3,10 @@ use std::{error::Error, fmt};
 use lune_vt::{CsiSequence, EscapeSequence, Event, OscEvent, Parameter, Parser};
 
 use crate::charsets::Charsets;
-use crate::osc::Osc;
-use crate::reply::{self, ModeReport, Reply, Report};
+use crate::osc::{Osc, Outcome};
+use crate::reply::{self, ColorReport, ModeReport, Reply, Report};
 use crate::{
-    CursorShape, EraseMode, InputModes, MAX_STYLES, Screen, ScreenBuffer, StorageError, Style,
+    CursorShape, EraseMode, InputModes, Palette, Rgb, Screen, ScreenBuffer, StorageError, Style,
     StyleError, StyleId, StyleTable, TextSink,
 };
 
@@ -77,9 +77,9 @@ enum Pending {
     Rendition(Style),
     Reply(Report),
     ModeReply(ModeReport),
+    ColorReply(ColorReport),
 }
 
-#[derive(Default)]
 struct State {
     style: StyleId,
     saved_style: [StyleId; 2],
@@ -90,6 +90,17 @@ struct State {
 }
 
 impl State {
+    fn new(palette: Palette) -> Self {
+        Self {
+            style: StyleId(0),
+            saved_style: [StyleId(0); 2],
+            charsets: Charsets::default(),
+            saved_charsets: [Charsets::default(); 2],
+            input: InputModes::default(),
+            osc: Osc::new(palette),
+        }
+    }
+
     fn reset(&mut self) {
         self.style = StyleId(0);
         self.saved_style = [StyleId(0); 2];
@@ -112,7 +123,7 @@ impl State {
 /// the fixed-capacity parser. Rendition changes use a bounded, owned style table.
 /// Include retained screen/rendering snapshots when collecting style storage.
 /// Screen edits use keys from this processor's table; callbacks receive the
-/// current key. Default construction permits up to [`MAX_STYLES`] entries.
+/// current key.
 /// G0/G1 designation supports ASCII (`B`) and DEC Special Graphics (`0`), selected
 /// by SI/SO. Graphics bytes map to Unicode scalars before text callbacks; literal
 /// non-ASCII Unicode retains its identity. Cursor saves include both designated
@@ -129,20 +140,14 @@ pub struct Processor {
     ignored_sequences: u64,
 }
 
-impl Default for Processor {
-    fn default() -> Self {
-        Self::new(MAX_STYLES).expect("The default style limit is valid")
-    }
-}
-
 impl Processor {
     /// Starts with default rendition and a bounded style table. Construction
     /// makes no allocation requests; the limit includes permanent default.
-    pub fn new(style_limit: usize) -> Result<Self, StyleError> {
+    pub fn new(style_limit: usize, palette: Palette) -> Result<Self, StyleError> {
         Ok(Self {
             parser: Parser::default(),
             styles: StyleTable::new(style_limit)?,
-            state: State::default(),
+            state: State::new(palette),
             reply: Reply::default(),
             pending: [None; 2],
             head: 0,
@@ -173,8 +178,33 @@ impl Processor {
         self.state.osc.take_title_change()
     }
 
+    /// Current theme and runtime colors. OSC 10/11/12 accepts one numeric RGB
+    /// specification or `?`; OSC 110/111/112 restores the corresponding base.
+    /// Components are stored at eight-bit precision.
+    pub fn palette(&self) -> &Palette {
+        self.state.osc.palette()
+    }
+
+    /// Updates the theme while retaining application color overrides.
+    pub fn set_palette_base(
+        &mut self,
+        indexed: [Rgb; 256],
+        foreground: Rgb,
+        background: Rgb,
+        cursor: Rgb,
+    ) -> bool {
+        self.state
+            .osc
+            .set_base(indexed, foreground, background, cursor)
+    }
+
+    /// Acknowledges coalesced visible palette changes.
+    pub fn take_palette_change(&mut self) -> bool {
+        self.state.osc.take_palette_change()
+    }
+
     /// Unsent bytes from the active reply, in wire order. The fixed output slot
-    /// holds one reply of at most 14 bytes. Bytes remain stable until acknowledged
+    /// holds one reply of at most 25 bytes. Bytes remain stable until acknowledged
     /// or explicitly reset. RIS preserves replies issued before it.
     #[inline]
     pub fn reply_bytes(&self) -> &[u8] {
@@ -412,11 +442,14 @@ impl Processor {
                         *ignored_sequences = ignored_sequences.saturating_add(1);
                     }
                 }
-                Event::Osc(event) => {
-                    if state.osc.event(event) {
-                        *ignored_sequences = ignored_sequences.saturating_add(1);
+                Event::Osc(event) => match state.osc.event(event) {
+                    Outcome::Done => {}
+                    Outcome::Ignored => *ignored_sequences = ignored_sequences.saturating_add(1),
+                    Outcome::Reply(reply) => {
+                        pending[*end] = Some(Pending::ColorReply(reply));
+                        *end += 1;
                     }
-                }
+                },
                 Event::Error(_) => *parse_errors = parse_errors.saturating_add(1),
             });
             if T::STATEFUL && matches!(input[consumed], 0x1b | 0x7f) {
@@ -540,6 +573,12 @@ impl Processor {
                     self.reply = reply.encode();
                 }
                 Pending::ModeReply(reply) => {
+                    if !self.reply.is_empty() {
+                        return Err(ProcessFailure::ReplyPending);
+                    }
+                    self.reply = reply.encode();
+                }
+                Pending::ColorReply(reply) => {
                     if !self.reply.is_empty() {
                         return Err(ProcessFailure::ReplyPending);
                     }

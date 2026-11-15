@@ -1,9 +1,12 @@
+#[path = "../tests/support/processor.rs"]
+mod support;
+
 use std::{
     hint::black_box,
     time::{Duration, Instant},
 };
 
-use lune_terminal::{CellWidth, ProcessFailure, Processor, Screen, StorageError, StyleId};
+use lune_terminal::{CellWidth, ProcessFailure, Screen, StorageError, StyleId};
 
 fn text(screen: &mut Screen, value: &str, style: StyleId) -> Result<(), StorageError> {
     if value.is_ascii() {
@@ -20,7 +23,7 @@ fn text(screen: &mut Screen, value: &str, style: StyleId) -> Result<(), StorageE
 
 fn measure(name: &str, input: &[u8], chunk: usize) {
     let mut screen = Screen::new(120, 24).unwrap();
-    let mut processor = Processor::default();
+    let mut processor = support::processor();
     let mut samples = [0.0_f64; 3];
     for sample in &mut samples {
         let start = Instant::now();
@@ -44,7 +47,7 @@ fn measure(name: &str, input: &[u8], chunk: usize) {
 
 fn measure_replies(name: &str, input: &[u8], chunk: usize, write_chunk: usize) {
     let mut screen = Screen::new(120, 24).unwrap();
-    let mut processor = Processor::default();
+    let mut processor = support::processor();
     let mut samples = [0.0_f64; 3];
     for sample in &mut samples {
         let start = Instant::now();
@@ -97,6 +100,8 @@ fn main() {
     let focus = b"\x1b[?1004;2004h\x1b[?1004;2004l".repeat(1024);
     let mouse = b"\x1b[?1000;1006h\x1b[?1002h\x1b[?1003h\x1b[?1006l\x1b[?1000l".repeat(1024);
     let queries = b"row\r\n\x1b[5n\x1b[6n\x1b[2;8H\x1b[6n\x1b[?6h\x1b[6n\x1b[?6l".repeat(1024);
+    let color_queries =
+        b"\x1b]10;#123456\x07\x1b]10;?\x07\x1b]11;?\x1b\\\x1b]12;?\x1b\\\x1b]110\x07".repeat(512);
     let mode_queries = b"\x1b[4h\x1b[4$p\x1b[4l\x1b[4$p\x1b[?1004;1003;1006h\x1b[?1004$p\x1b[?1003$p\x1b[?65535$p\x1b[?1004;1003;1006l".repeat(512);
     let alternate = b"\x1b[31mprimary\r\n\x1b[?1049h\x1b[34m\x1b[2;3Halternate\r\n\x1b[?1048h\x1b[?47l\x1b[?47h\x1b[?1048l\x1b[?1049l\x1b[0m".repeat(512);
     let mut newlines = Vec::from(&b"\x1b[20h"[..]);
@@ -128,6 +133,14 @@ fn main() {
     measure_replies("queries / bulk", &queries, queries.len(), 14);
     measure_replies("queries / 17-byte", &queries, 17, 3);
     measure_replies("queries / 1-byte", &queries, 1, 1);
+    measure_replies(
+        "color queries / bulk",
+        &color_queries,
+        color_queries.len(),
+        25,
+    );
+    measure_replies("color queries / 17-byte", &color_queries, 17, 3);
+    measure_replies("color queries / 1-byte", &color_queries, 1, 1);
     measure_replies("mode queries / bulk", &mode_queries, mode_queries.len(), 14);
     measure_replies("mode queries / 17-byte", &mode_queries, 17, 3);
     measure_replies("mode queries / 1-byte", &mode_queries, 1, 1);

@@ -1,4 +1,6 @@
-use crate::{InputModes, Key, KeySequence, Modifiers, Processor, Screen, StorageError};
+use super::support;
+
+use crate::{InputModes, Key, KeySequence, Modifiers, Screen, StorageError};
 
 #[test]
 fn character_keys_preserve_ascii_and_encode_control_aliases_with_alt_prefixes() {
@@ -184,7 +186,7 @@ fn output_selected_input_modes_encode_keys_and_survive_as_independent_snapshots(
         screen.set_cursor(2, 3);
         let before = super::snapshot(screen.grid());
         let cursor = screen.cursor();
-        let mut processor = Processor::default();
+        let mut processor = support::processor();
         assert_eq!(encoded(processor.input_modes()), normal);
         processor
             .advance(&program[..split], &mut screen, &mut text)
@@ -261,7 +263,7 @@ fn focus_reporting_validates_modes_across_fragments_and_emits_only_on_request() 
         for &(wire, change) in cases {
             for split in 0..=wire.len() {
                 let mut screen = Screen::new(8, 4).unwrap();
-                let mut processor = Processor::default();
+                let mut processor = support::processor();
                 let mut text = |_: &mut Screen, _: &str, _| Ok::<_, StorageError>(());
                 if initially_enabled {
                     processor
@@ -437,7 +439,7 @@ fn paste_streams_preserve_payloads_and_progress_under_partial_writes() {
 #[test]
 fn cursor_keypad_and_new_line_modes_encode_independently_and_reject_invalid_digits() {
     let mut screen = Screen::new(8, 4).unwrap();
-    let mut processor = Processor::default();
+    let mut processor = support::processor();
     let mut text = |_: &mut Screen, _: &str, _| Ok::<_, StorageError>(());
     processor
         .advance(b"\x1b[?1h", &mut screen, &mut text)

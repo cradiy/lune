@@ -1,7 +1,9 @@
+use super::support;
+
 use super::{assert_invariants, snapshot};
 use crate::{
-    CellText, Cursor, ProcessFailure, Processor, Screen, ScreenBuffer, StorageError, StyleId,
-    TextSink, UnicodeWriter, WidthPolicy,
+    CellText, Cursor, ProcessFailure, Screen, ScreenBuffer, StorageError, StyleId, TextSink,
+    UnicodeWriter, WidthPolicy,
 };
 
 fn text(screen: &Screen, row: usize, column: usize) -> CellText<'_> {
@@ -13,7 +15,7 @@ fn unicode_clusters_and_widths_are_independent_of_byte_chunking() {
     let input = "a\u{301}❤\u{fe0f}👩🏽\u{200d}💻🇺🇸1\u{fe0f}\u{20e3}水".as_bytes();
     for split in 0..=input.len() {
         let mut screen = Screen::new(24, 3).unwrap();
-        let mut processor = Processor::default();
+        let mut processor = support::processor();
         let mut writer = UnicodeWriter::default();
         for part in [&input[..split], &input[split..]] {
             assert_eq!(
@@ -47,7 +49,7 @@ fn unicode_clusters_and_widths_are_independent_of_byte_chunking() {
     for (policy, columns) in [(WidthPolicy::Narrow, 1), (WidthPolicy::Wide, 2)] {
         let mut screen = Screen::new(8, 2).unwrap();
         let mut writer = UnicodeWriter::new(policy);
-        Processor::default()
+        support::processor()
             .advance("·".as_bytes(), &mut screen, &mut writer)
             .unwrap();
         assert_eq!(screen.cursor().column, columns);
@@ -72,7 +74,7 @@ fn protocol_boundaries_finish_and_reset_end_cluster_extension() {
         input.extend("\u{301}".as_bytes());
         for split in 0..=input.len() {
             let mut screen = Screen::new(8, 2).unwrap();
-            let mut processor = Processor::default();
+            let mut processor = support::processor();
             let mut writer = UnicodeWriter::default();
             processor
                 .advance(&input[..split], &mut screen, &mut writer)
@@ -86,7 +88,7 @@ fn protocol_boundaries_finish_and_reset_end_cluster_extension() {
         }
     }
     let mut screen = Screen::new(8, 2).unwrap();
-    let mut processor = Processor::default();
+    let mut processor = support::processor();
     let mut writer = UnicodeWriter::default();
     processor.advance(b"a", &mut screen, &mut writer).unwrap();
     processor.finish(&mut screen, &mut writer).unwrap();
@@ -128,7 +130,7 @@ fn unicode_width_changes_wrap_insert_shrink_and_fit_screen_limits() {
             ("\u{17d8}", 4, 2),
         ] {
             let mut screen = Screen::new(columns, 3).unwrap();
-            let mut processor = Processor::default();
+            let mut processor = support::processor();
             let mut writer = UnicodeWriter::default();
             for bytes in input.as_bytes().chunks(chunk) {
                 processor.advance(bytes, &mut screen, &mut writer).unwrap();
@@ -156,7 +158,7 @@ fn unicode_width_changes_wrap_insert_shrink_and_fit_screen_limits() {
         }
     }
     let mut screen = Screen::new(8, 2).unwrap();
-    let mut processor = Processor::default();
+    let mut processor = support::processor();
     let mut writer = UnicodeWriter::default();
     processor
         .advance(
@@ -207,7 +209,7 @@ fn decoded_replacement_control_order_and_writer_failures_retry_across_chunks() {
     input.extend(b"\xe2\x1b[0m");
     input.extend(b"\xf0\x9f");
     let mut expected = Screen::new(16, 4).unwrap();
-    let mut processor = Processor::default();
+    let mut processor = support::processor();
     let mut writer = UnicodeWriter::default();
     processor
         .advance(&input, &mut expected, &mut writer)
@@ -219,7 +221,7 @@ fn decoded_replacement_control_order_and_writer_failures_retry_across_chunks() {
     for chunk in 1..=17 {
         for fail_at in 0..24 {
             let mut screen = Screen::new(16, 4).unwrap();
-            let mut processor = Processor::default();
+            let mut processor = support::processor();
             let mut sink = FaultSink {
                 writer: UnicodeWriter::default(),
                 calls: 0,
@@ -258,7 +260,7 @@ fn decoded_replacement_control_order_and_writer_failures_retry_across_chunks() {
 #[test]
 fn capacity_errors_and_reply_backpressure_preserve_text_state_for_recovery() {
     let mut screen = Screen::new(8, 2).unwrap();
-    let mut processor = Processor::default();
+    let mut processor = support::processor();
     let mut writer = UnicodeWriter::default();
     let long = String::from("e") + &"\u{301}".repeat(511);
     processor

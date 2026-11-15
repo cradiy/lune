@@ -1,11 +1,12 @@
+#[path = "../tests/support/processor.rs"]
+mod support;
+
 use std::{
     hint::black_box,
     time::{Duration, Instant},
 };
 
-use lune_terminal::{
-    CellWidth, HistoryLimits, MAX_HISTORY_BYTES, Processor, Screen, StyleId, UnicodeWriter,
-};
+use lune_terminal::{CellWidth, HistoryLimits, MAX_HISTORY_BYTES, Screen, StyleId, UnicodeWriter};
 
 fn measure(name: &str, mut operation: impl FnMut()) {
     let mut samples = [0.0_f64; 3];
@@ -34,7 +35,7 @@ fn measure_stream(name: &str, input: &[u8], chunk: usize, enabled: bool) {
             })
             .unwrap();
     }
-    let mut processor = Processor::default();
+    let mut processor = support::processor();
     let mut writer = UnicodeWriter::default();
     let mut samples = [0.0_f64; 3];
     for sample in &mut samples {

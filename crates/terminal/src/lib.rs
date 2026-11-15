@@ -1,5 +1,8 @@
 //! Terminal screen storage and incremental VT execution.
 
+#[cfg(test)]
+extern crate self as lune_terminal;
+
 mod cell;
 mod charsets;
 mod error;

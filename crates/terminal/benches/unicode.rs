@@ -1,11 +1,14 @@
-use lune_terminal::{Processor, Screen, UnicodeWriter};
+#[path = "../tests/support/processor.rs"]
+mod support;
+
+use lune_terminal::{Screen, UnicodeWriter};
 use std::{
     hint::black_box,
     time::{Duration, Instant},
 };
 
 fn measure(name: &str, input: &[u8], chunk: usize) {
-    let mut processor = Processor::default();
+    let mut processor = support::processor();
     let mut screen = Screen::new(120, 24).unwrap();
     let mut writer = UnicodeWriter::default();
     let mut samples = [0.0_f64; 3];

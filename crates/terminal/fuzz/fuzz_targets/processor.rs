@@ -1,5 +1,8 @@
 #![no_main]
 
+#[path = "../../tests/support/processor.rs"]
+mod support;
+
 #[allow(
     dead_code,
     reason = "Shared oracle operations serve different fuzz targets."
@@ -16,8 +19,8 @@ use std::io::Write;
 use libfuzzer_sys::fuzz_target;
 use lune_terminal::{
     CellPosition, CellWidth, Color, CursorShape, EraseMode, InputModes, Key, Modifiers,
-    MouseButton, MouseEvent, MouseTracking, ProcessFailure, Processor, Screen, Style, StyleId,
-    Underline,
+    MouseButton, MouseEvent, MouseTracking, PaletteEntry, ProcessFailure, Processor, Rgb, Screen,
+    Style, StyleId, Underline,
 };
 use screen_model::{Command, ScreenModel};
 
@@ -41,6 +44,8 @@ struct Expected<'a> {
     replies: &'a [u8],
     title: &'a str,
     title_changed: bool,
+    colors: [Rgb; 3],
+    palette_changed: bool,
 }
 
 fn drain_reply(processor: &mut Processor, output: &mut Vec<u8>, count: usize) {
@@ -51,7 +56,7 @@ fn drain_reply(processor: &mut Processor, output: &mut Vec<u8>, count: usize) {
 
 fn drive(wire: &[u8], chunk: usize, fail_at: usize, expected: &Expected<'_>) {
     let mut screen = Screen::new(8, 4).unwrap();
-    let mut processor = Processor::default();
+    let mut processor = support::processor();
     let mut calls = 0;
     let mut available = false;
     let mut replies = Vec::new();
@@ -133,6 +138,17 @@ fn drive(wire: &[u8], chunk: usize, fail_at: usize, expected: &Expected<'_>) {
         expected.title_changed.then_some(expected.title)
     );
     assert_eq!(processor.take_window_title_change(), None);
+    assert_eq!(
+        [
+            PaletteEntry::Foreground,
+            PaletteEntry::Background,
+            PaletteEntry::Cursor
+        ]
+        .map(|entry| processor.palette().color(entry)),
+        expected.colors
+    );
+    assert_eq!(processor.take_palette_change(), expected.palette_changed);
+    assert!(!processor.take_palette_change());
     for (event, normal, sgr, suffix, enabled) in [
         (
             MouseEvent::Release(MouseButton::Right),
@@ -271,6 +287,25 @@ fuzz_target!(|data: &[u8]| {
     let mut replies = Vec::new();
     let mut title = String::new();
     let mut title_changed = false;
+    let base_colors = [
+        Rgb {
+            red: 7,
+            green: 12,
+            blue: 34,
+        },
+        Rgb {
+            red: 0,
+            green: 12,
+            blue: 34,
+        },
+        Rgb {
+            red: 15,
+            green: 12,
+            blue: 34,
+        },
+    ];
+    let mut colors = base_colors;
+    let mut palette_changed = false;
     for bytes in data.as_chunks::<8>().0.iter().take(512) {
         let index = usize::from(expected.is_alternate());
         let command = match bytes[0] % 64 {
@@ -428,6 +463,8 @@ fuzz_target!(|data: &[u8]| {
             }
             32 => {
                 wire.extend(b"\x1bc");
+                palette_changed |= colors != base_colors;
+                colors = base_colors;
                 title_changed |= !title.is_empty();
                 title.clear();
                 current = Style::default();
@@ -454,7 +491,7 @@ fuzz_target!(|data: &[u8]| {
                 None
             }
             37 => {
-                match bytes[1] % 5 {
+                match bytes[1] % 8 {
                     0 => {
                         let next = format!("title-{}-🌙;{}", bytes[2], bytes[3]);
                         let selector = if bytes[4] & 1 == 0 { 0 } else { 2 };
@@ -477,9 +514,49 @@ fuzz_target!(|data: &[u8]| {
                         wire.extend(b"\x1b]8;;link\x07");
                         diagnostics.1 += 1;
                     }
-                    _ => {
+                    4 => {
                         wire.extend(b"\x1b]2;\xff\x1b\\");
                         diagnostics.1 += 1;
+                    }
+                    5 => {
+                        let role = usize::from(bytes[2] % 3);
+                        let next = Rgb {
+                            red: bytes[3],
+                            green: bytes[4],
+                            blue: bytes[5],
+                        };
+                        write!(
+                            &mut wire,
+                            "\x1b]{};rgb:{:02x}/{:02x}/{:02x}\x1b\\",
+                            role + 10,
+                            next.red,
+                            next.green,
+                            next.blue
+                        )
+                        .unwrap();
+                        palette_changed |= colors[role] != next;
+                        colors[role] = next;
+                    }
+                    6 => {
+                        let role = usize::from(bytes[2] % 3);
+                        let terminator = if bytes[3] & 1 == 0 { "\x07" } else { "\x1b\\" };
+                        write!(&mut wire, "\x1b]{};?{terminator}", role + 10).unwrap();
+                        let color = colors[role];
+                        write!(
+                            &mut replies,
+                            "\x1b]{};rgb:{:04x}/{:04x}/{:04x}{terminator}",
+                            role + 10,
+                            u16::from(color.red) * 257,
+                            u16::from(color.green) * 257,
+                            u16::from(color.blue) * 257
+                        )
+                        .unwrap();
+                    }
+                    _ => {
+                        let role = usize::from(bytes[2] % 3);
+                        write!(&mut wire, "\x1b]{}\x07", role + 110).unwrap();
+                        palette_changed |= colors[role] != base_colors[role];
+                        colors[role] = base_colors[role];
                     }
                 }
                 None
@@ -883,6 +960,8 @@ fuzz_target!(|data: &[u8]| {
         diagnostics,
         title: &title,
         title_changed,
+        colors,
+        palette_changed,
         values: &values,
         style: current,
         input,

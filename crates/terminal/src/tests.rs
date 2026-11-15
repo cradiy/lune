@@ -1,6 +1,10 @@
 use std::ops::Range;
 
+#[path = "../tests/support/processor.rs"]
+mod support;
+
 mod buffers;
+mod colors;
 mod erased;
 mod history;
 mod input;

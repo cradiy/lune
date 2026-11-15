@@ -1,4 +1,6 @@
-use crate::{CellPosition, CellText, CellWidth, Grid, Processor, Screen, StyleId};
+use super::support;
+
+use crate::{CellPosition, CellText, CellWidth, Grid, Screen, StyleId};
 
 fn erased(grid: &Grid, row: usize) -> Vec<bool> {
     grid.row(row)
@@ -50,7 +52,7 @@ fn erased_state_survives_cell_edits_cropping_and_scrolling_as_part_of_the_unit()
 #[test]
 fn styled_printed_spaces_and_wide_wrap_gaps_preserve_distinct_erasure_state() {
     let mut screen = Screen::new(4, 3).unwrap();
-    let mut processor = Processor::default();
+    let mut processor = support::processor();
     processor
         .advance(
             b"\x1b[4;31m \x1b[K",

@@ -1,5 +1,8 @@
 #![no_main]
 
+#[path = "../../tests/support/processor.rs"]
+mod support;
+
 #[allow(
     dead_code,
     reason = "Shared screen oracle operations serve several targets."
@@ -13,8 +16,8 @@ mod screen_model;
 
 use libfuzzer_sys::fuzz_target;
 use lune_terminal::{
-    CellPosition, CellWidth, EraseMode, HistoryLimits, MAX_HISTORY_BYTES, ProcessFailure,
-    Processor, Screen, StorageError, StyleId, TextSink, UnicodeWriter, WidthPolicy,
+    CellPosition, CellWidth, EraseMode, HistoryLimits, MAX_HISTORY_BYTES, ProcessFailure, Screen,
+    StorageError, StyleId, TextSink, UnicodeWriter, WidthPolicy,
 };
 use screen_model::{Command, ScreenModel};
 use unicode_segmentation::UnicodeSegmentation;
@@ -118,7 +121,7 @@ fn run(
     fail_at: usize,
     oracle: &ScreenModel,
 ) -> String {
-    let mut processor = Processor::default();
+    let mut processor = support::processor();
     let mut screen = Screen::new(8, 4).unwrap();
     screen
         .set_history_limits(HistoryLimits {

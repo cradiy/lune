@@ -1,6 +1,8 @@
+use super::support;
+
 use crate::{
     CellPosition, InputModes, MAX_DIMENSION, Modifiers, MouseButton, MouseEvent, MouseTracking,
-    Processor, Screen, StorageError,
+    Screen, StorageError,
 };
 
 #[test]
@@ -188,7 +190,7 @@ fn mouse_mode_lists_switch_atomically_and_snapshots_survive_save_and_reset() {
             let mut screen = Screen::new(8, 4).unwrap();
             screen.write_ascii(b"content", crate::StyleId(0)).unwrap();
             screen.set_cursor(2, 3);
-            let mut processor = Processor::default();
+            let mut processor = support::processor();
             let mut text = |_: &mut Screen, _: &str, _| Ok::<_, StorageError>(());
             let before = super::snapshot(screen.grid());
             let cursor = screen.cursor();

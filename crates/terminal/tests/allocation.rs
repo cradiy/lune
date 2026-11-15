@@ -1,3 +1,6 @@
+#[path = "support/processor.rs"]
+mod support;
+
 #[path = "support/allocator.rs"]
 mod allocator;
 
@@ -8,12 +11,53 @@ use std::{
 
 use lune_terminal::{
     CellPosition, CellText, CellWidth, Cursor, EraseMode, Grid, HistoryLimits, Modifiers,
-    ProcessFailure, Processor, ReflowAffinity, Row, RowHistory, Screen, ScreenBuffer, StorageError,
-    Style, StyleError, StyleId, StyleTable, TextSink, UnicodeWriter,
+    ProcessFailure, ReflowAffinity, Row, RowHistory, Screen, ScreenBuffer, StorageError, Style,
+    StyleError, StyleId, StyleTable, TextSink, UnicodeWriter,
 };
 
 #[global_allocator]
 static ALLOCATOR: allocator::TestAllocator = allocator::TestAllocator;
+
+#[test]
+fn dynamic_color_commands_queries_and_resets_allocate_nothing() {
+    let wire = b"\x1b]10;rgb:ffff/0080/1234\x07\x1b]10;?\x1b\\\x1b]11;#123456\x07\x1b]11;?\x07\x1b]12;#abcdef\x07\x1b]12;?\x1b\\\x1b]110\x07\x1b]111\x07\x1b]112\x07";
+    let mut screen = Screen::new(2, 2).unwrap();
+    let ((), stats) = allocator::measure(Some(0), || {
+        let mut text = |_: &mut Screen, _: &str, _: StyleId| Ok::<_, ()>(());
+        for chunk in [1, 17, wire.len()] {
+            let mut processor = support::processor();
+            let mut delivered = 0;
+            for mut bytes in wire.chunks(chunk) {
+                loop {
+                    let result = processor.advance(bytes, &mut screen, &mut text);
+                    while !processor.reply_bytes().is_empty() {
+                        black_box(processor.reply_bytes()[0]);
+                        delivered += 1;
+                        assert!(processor.consume_reply(1));
+                    }
+                    match result {
+                        Ok(count) => {
+                            assert_eq!(count, bytes.len());
+                            break;
+                        }
+                        Err(error) => {
+                            assert!(matches!(error.error, ProcessFailure::ReplyPending));
+                            bytes = &bytes[error.consumed..];
+                        }
+                    }
+                }
+            }
+            assert_eq!(delivered, 74);
+            assert_eq!(
+                (processor.parse_errors(), processor.ignored_sequences()),
+                (0, 0)
+            );
+            processor.finish(&mut screen, &mut text).unwrap();
+            processor.reset(&mut screen, &mut text);
+        }
+    });
+    assert_eq!(stats.attempts, 0);
+}
 
 #[test]
 fn palette_construction_resolution_overrides_and_theme_changes_allocate_nothing() {
@@ -69,7 +113,7 @@ fn title_construction_updates_rejection_and_reset_make_no_allocation_requests() 
     let ((), stats) = allocator::measure(Some(0), || {
         let mut text = |_: &mut Screen, _: &str, _: StyleId| Ok::<_, ()>(());
         for chunk in [1, 17, wire.len()] {
-            let mut processor = Processor::default();
+            let mut processor = support::processor();
             for bytes in wire.chunks(chunk) {
                 processor.advance(bytes, &mut screen, &mut text).unwrap();
             }
@@ -379,7 +423,7 @@ fn history_control_failures_retain_consumed_events_and_retry_without_partial_scr
                 .unwrap();
             screen.set_cursor(1, 3);
             screen.write_ascii(b"x", StyleId(0)).unwrap();
-            let mut processor = Processor::default();
+            let mut processor = support::processor();
             let mut writer = UnicodeWriter::default();
             if new_line {
                 processor
@@ -453,7 +497,7 @@ fn unicode_writer_failures_preserve_clusters_and_retry_processor_owned_bytes() {
     for (index, (prefix, suffix)) in prefixes.into_iter().zip(suffixes).enumerate() {
         let prepare = || {
             let mut screen = Screen::new(if index == 0 || index == 3 { 8 } else { 4 }, 3).unwrap();
-            let mut processor = Processor::default();
+            let mut processor = support::processor();
             let mut writer = UnicodeWriter::default();
             processor
                 .advance(prefix.as_bytes(), &mut screen, &mut writer)
@@ -502,7 +546,7 @@ fn unicode_writer_failures_preserve_clusters_and_retry_processor_owned_bytes() {
     assert_eq!(stats.attempts, 0);
     let mut writer = writer;
     let mut screen = Screen::new(8, 2).unwrap();
-    let mut processor = Processor::default();
+    let mut processor = support::processor();
     let (result, stats) = allocator::measure(Some(0), || {
         processor.advance(&[b'x'; 4096], &mut screen, &mut writer)
     });
@@ -1836,7 +1880,7 @@ fn processor_retries_allocation_failures_from_owned_input_positions() {
     }
     let input = "AB\x1b[2;2H水\nZ".as_bytes();
     let mut expected_screen = Screen::new(8, 4).unwrap();
-    let mut expected_processor = Processor::default();
+    let mut expected_processor = support::processor();
     let (result, stats) = allocator::measure(None, || {
         expected_processor.advance(input, &mut expected_screen, &mut text)
     });
@@ -1846,7 +1890,7 @@ fn processor_retries_allocation_failures_from_owned_input_positions() {
     for split in [0, input.iter().position(|&byte| byte == 0xb0).unwrap() + 1] {
         for point in 0..stats.attempts {
             let mut screen = Screen::new(8, 4).unwrap();
-            let mut processor = Processor::default();
+            let mut processor = support::processor();
             processor
                 .advance(&input[..split], &mut screen, &mut text)
                 .unwrap();
@@ -1877,7 +1921,7 @@ fn processor_retries_allocation_failures_from_owned_input_positions() {
             assert_eq!(screen.cursor(), expected_screen.cursor());
         }
     }
-    let mut processor = Processor::default();
+    let mut processor = support::processor();
     let mut screen = Screen::new(8, 4).unwrap();
     let (result, stats) = allocator::measure(Some(0), || {
         for _ in 0..32 {
@@ -1986,7 +2030,7 @@ fn processor_retries_style_and_text_allocations_without_replaying_accepted_input
     let mut text_failures = 0;
     for split in [0, 4, utf8 + 2] {
         let mut expected_screen = Screen::new(8, 4).unwrap();
-        let mut expected_processor = Processor::default();
+        let mut expected_processor = support::processor();
         expected_processor
             .advance(&input[..split], &mut expected_screen, &mut text)
             .unwrap();
@@ -1997,7 +2041,7 @@ fn processor_retries_style_and_text_allocations_without_replaying_accepted_input
         let expected = snapshot(expected_screen.grid());
         for point in 0..stats.attempts {
             let mut screen = Screen::new(8, 4).unwrap();
-            let mut processor = Processor::default();
+            let mut processor = support::processor();
             processor
                 .advance(&input[..split], &mut screen, &mut text)
                 .unwrap();
@@ -2035,7 +2079,7 @@ fn processor_retries_style_and_text_allocations_without_replaying_accepted_input
     }
     assert!(style_failures > 0 && text_failures > 0);
     let mut screen = Screen::new(8, 4).unwrap();
-    let (processor, stats) = allocator::measure(Some(0), Processor::default);
+    let (processor, stats) = allocator::measure(Some(0), support::processor);
     assert_eq!(stats.attempts, 0);
     let mut processor = processor;
     let warm =

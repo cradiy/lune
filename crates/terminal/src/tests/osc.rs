@@ -1,3 +1,5 @@
+use super::support;
+
 use crate::{MAX_TITLE_BYTES, ProcessFailure, Processor, Screen, StyleId};
 
 fn advance(processor: &mut Processor, screen: &mut Screen, input: &[u8]) {
@@ -14,7 +16,7 @@ fn titles_commit_atomically_across_chunks_and_coalesce_until_acknowledged() {
         let mut wire = "\x1b]2;moon 🌙;水\n\x7f".as_bytes().to_vec();
         wire.extend(terminator);
         for split in 0..=wire.len() {
-            let mut processor = Processor::default();
+            let mut processor = support::processor();
             let mut screen = Screen::new(2, 2).unwrap();
             advance(&mut processor, &mut screen, b"\x1b]0;old\x07");
             assert_eq!(processor.take_window_title_change(), Some("old"));
@@ -70,7 +72,7 @@ fn titles_reject_invalid_and_oversized_commands_without_publishing_prefixes() {
     oversized.extend(std::iter::repeat_n(b'x', MAX_TITLE_BYTES + 1));
     cases.push(oversized);
     for chunk in [1, 17, usize::MAX] {
-        let mut processor = Processor::default();
+        let mut processor = support::processor();
         let mut screen = Screen::new(2, 2).unwrap();
         let title = "🌙".repeat(MAX_TITLE_BYTES / 4);
         let mut full = b"\x1b]2;".to_vec();
@@ -111,7 +113,7 @@ fn titles_reject_invalid_and_oversized_commands_without_publishing_prefixes() {
 
 #[test]
 fn title_updates_follow_text_failures_reply_backpressure_and_resets() {
-    let mut processor = Processor::default();
+    let mut processor = support::processor();
     let mut screen = Screen::new(2, 2).unwrap();
     let wire = b"A\x1b]2;accepted\x07B";
     let error = processor

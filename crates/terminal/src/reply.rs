@@ -1,9 +1,10 @@
 use lune_vt::CsiSequence;
+use lune_vt::OscTerminator;
 
-use crate::{InputModes, MouseTracking, Screen, ScreenBuffer};
+use crate::{InputModes, MouseTracking, Rgb, Screen, ScreenBuffer};
 
-// ESC [, two five-digit coordinates, a separator, and the final byte.
-const CAPACITY: usize = 14;
+// OSC 12;rgb:hhhh/hhhh/hhhh followed by ST.
+const CAPACITY: usize = 25;
 
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Reply {
@@ -23,6 +24,40 @@ pub(crate) struct ModeReport {
     private: bool,
     selector: u16,
     enabled: Option<bool>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ColorReport {
+    pub(crate) selector: u8,
+    pub(crate) color: Rgb,
+    pub(crate) terminator: OscTerminator,
+}
+
+impl ColorReport {
+    #[cold]
+    pub(crate) fn encode(self) -> Reply {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut reply = Reply::default();
+        reply.append(b"\x1b]");
+        reply.number(u16::from(self.selector));
+        reply.append(b";rgb:");
+        for (index, channel) in [self.color.red, self.color.green, self.color.blue]
+            .into_iter()
+            .enumerate()
+        {
+            if index != 0 {
+                reply.append(b"/");
+            }
+            let high = HEX[usize::from(channel >> 4)];
+            let low = HEX[usize::from(channel & 15)];
+            reply.append(&[high, low, high, low]);
+        }
+        reply.append(match self.terminator {
+            OscTerminator::Bell => b"\x07",
+            OscTerminator::St => b"\x1b\\",
+        });
+        reply
+    }
 }
 
 impl Report {

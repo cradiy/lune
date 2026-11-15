@@ -1,3 +1,5 @@
+use super::support;
+
 use super::{Snapshot, snapshot};
 use crate::{
     CellPosition, CellWidth, Color, Cursor, CursorAppearance, CursorShape, ProcessFailure,
@@ -22,7 +24,7 @@ fn cursor_presentation_controls_compose_across_chunks_reject_headers_and_reset()
         input.extend(b"\x1b8");
         for split in 0..=input.len() {
             let mut screen = Screen::new(4, 4).unwrap();
-            let mut processor = Processor::default();
+            let mut processor = support::processor();
             processor
                 .advance(&input[..split], &mut screen, &mut write_text)
                 .unwrap();
@@ -115,7 +117,7 @@ fn write_text(screen: &mut Screen, text: &str, style: StyleId) -> Result<(), Sto
 
 fn run(input: &[u8], cuts: &[usize]) -> (Screen, Processor) {
     let mut screen = Screen::new(8, 4).unwrap();
-    let mut processor = Processor::default();
+    let mut processor = support::processor();
     let mut start = 0;
     for end in cuts.iter().copied().chain([input.len()]) {
         assert_eq!(
@@ -215,7 +217,7 @@ fn byte_stream_controls_compose_with_origin_modes_and_split_input() {
 #[test]
 fn failures_preserve_ascii_runs_and_both_events_of_a_reprocessed_byte() {
     let mut screen = Screen::new(8, 4).unwrap();
-    let mut processor = Processor::default();
+    let mut processor = support::processor();
     let before: Snapshot = snapshot(screen.grid());
     for input in [&b"a"[..], &b"abc"[..]] {
         let error = processor
@@ -302,7 +304,7 @@ fn failures_preserve_ascii_runs_and_both_events_of_a_reprocessed_byte() {
 #[test]
 fn finishing_and_resetting_own_pending_input_without_duplicate_effects() {
     let mut screen = Screen::new(8, 4).unwrap();
-    let mut processor = Processor::default();
+    let mut processor = support::processor();
     processor
         .advance(b"\xe6\xb0", &mut screen, &mut write_text)
         .unwrap();
@@ -416,7 +418,7 @@ fn sgr_styles_follow_saved_cursors_wide_text_erasure_and_input_boundaries() {
 #[test]
 fn full_style_storage_retries_after_tracing_current_saved_and_external_owners() {
     let mut screen = Screen::new(8, 4).unwrap();
-    let mut processor = Processor::new(4).unwrap();
+    let mut processor = Processor::new(4, support::palette()).unwrap();
     processor
         .advance(b"\x1b[31m\x1b7\x1b[34m", &mut screen, &mut write_text)
         .unwrap();
@@ -472,7 +474,7 @@ fn full_style_storage_retries_after_tracing_current_saved_and_external_owners() 
     assert_eq!(processor.collect_styles(&screen, []).unwrap(), 1);
     assert_eq!(processor.styles().get(red), None);
     assert_eq!(processor.styles().style_count(), 1);
-    let mut limited = Processor::new(1).unwrap();
+    let mut limited = Processor::new(1, support::palette()).unwrap();
     assert!(
         limited
             .advance(b"\x1b[31mR", &mut screen, &mut write_text)
@@ -491,7 +493,7 @@ fn designated_charsets_shift_save_restore_and_preserve_unicode_across_chunks() {
     let expected = "A^\u{a0}◆▒␉␌␍␊°±␤␋┘┐┌└┼⎺⎻─⎼⎽├┤┴┬│≤≥π≠£·";
     for split in 0..=input.len() {
         let mut screen = Screen::new(64, 4).unwrap();
-        let mut processor = Processor::default();
+        let mut processor = support::processor();
         processor
             .advance(&input[..split], &mut screen, &mut write_text)
             .unwrap();
@@ -526,7 +528,7 @@ fn designated_charsets_shift_save_restore_and_preserve_unicode_across_chunks() {
 #[test]
 fn mapped_text_retries_once_after_ground_and_reprocessed_utf8_input() {
     let mut screen = Screen::new(8, 4).unwrap();
-    let mut processor = Processor::default();
+    let mut processor = support::processor();
     let input = b"\x1b(0q\x1b(BX";
     let error = processor
         .advance(
@@ -579,7 +581,7 @@ fn new_line_mode_composes_with_mode_lists_saved_cursors_and_explicit_indexing() 
     let input = b"ab\nC\x1b[4;20h\nD\x1b7\x1b[20l\x1b8\nE\x1b[20h\x1bDI\x1bEN\x0bV\x1b[20;999l\x0cF\x1b[4;20l";
     for split in 0..=input.len() {
         let mut screen = Screen::new(8, 8).unwrap();
-        let mut processor = Processor::default();
+        let mut processor = support::processor();
         processor
             .advance(&input[..split], &mut screen, &mut write_text)
             .unwrap();
@@ -618,7 +620,7 @@ fn new_line_mode_composes_with_mode_lists_saved_cursors_and_explicit_indexing() 
 #[test]
 fn new_line_mode_applies_after_a_failed_replacement_before_following_text() {
     let mut screen = Screen::new(8, 4).unwrap();
-    let mut processor = Processor::default();
+    let mut processor = support::processor();
     processor
         .advance(b"ab\x1b[20h\xf0\x9f", &mut screen, &mut write_text)
         .unwrap();
