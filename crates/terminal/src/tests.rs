@@ -6,6 +6,8 @@ mod history;
 mod input;
 mod lines;
 mod mouse;
+mod osc;
+mod palette;
 mod processor;
 mod reflow;
 mod replies;

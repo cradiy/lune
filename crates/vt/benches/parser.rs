@@ -3,7 +3,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use lune_vt::{Event, Parser};
+use lune_vt::{Event, OscEvent, Parser};
 
 fn measure(name: &str, input: &[u8], chunk_size: usize) {
     let mut samples = [0.0_f64; 3];
@@ -21,6 +21,8 @@ fn measure(name: &str, input: &[u8], chunk_size: usize) {
                 Event::Csi(sequence) => {
                     sequence.parameters.len() + usize::from(sequence.final_byte)
                 }
+                Event::Osc(OscEvent::Data(bytes)) => bytes.len(),
+                Event::Osc(_) => 1,
                 Event::Error(_) => 1,
             });
         };
@@ -59,7 +61,9 @@ fn main() {
     measure("ascii", &ascii, ascii.len());
     measure("utf8", &unicode, unicode.len());
     measure("csi", &csi, csi.len());
-    measure("discarded strings", &strings, strings.len());
+    measure("control strings", &strings, strings.len());
+    measure("control strings / 17-byte", &strings, 17);
+    measure("control strings / 1-byte", &strings, 1);
     measure("ascii / 17-byte", &ascii, 17);
     measure("utf8 / 1-byte", &unicode, 1);
 

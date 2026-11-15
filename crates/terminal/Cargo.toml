@@ -33,6 +33,10 @@ name = "input"
 harness = false
 
 [[bench]]
+name = "palette"
+harness = false
+
+[[bench]]
 name = "revision"
 harness = false
 

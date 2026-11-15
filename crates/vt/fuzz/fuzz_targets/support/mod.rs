@@ -1,4 +1,4 @@
-use lune_vt::{Event, Parameter, ParseError, Parser};
+use lune_vt::{Event, OscEvent, OscTerminator, Parameter, ParseError, Parser};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Token {
@@ -6,6 +6,10 @@ pub enum Token {
     Control(u8),
     Escape(Vec<u8>, u8),
     Csi(Vec<u8>, Vec<Parameter>, Vec<u8>, u8),
+    OscStart,
+    OscByte(u8),
+    OscEnd(OscTerminator),
+    OscCancel,
     Error(ParseError),
 }
 
@@ -23,6 +27,12 @@ pub fn capture(tokens: &mut Vec<Token>, budget: usize, event: Event<'_>) {
             sequence.intermediates.to_vec(),
             sequence.final_byte,
         )),
+        Event::Osc(OscEvent::Start) => tokens.push(Token::OscStart),
+        Event::Osc(OscEvent::Data(bytes)) => {
+            tokens.extend(bytes.iter().copied().map(Token::OscByte));
+        }
+        Event::Osc(OscEvent::End(terminator)) => tokens.push(Token::OscEnd(terminator)),
+        Event::Osc(OscEvent::Cancel) => tokens.push(Token::OscCancel),
         Event::Error(error) => tokens.push(Token::Error(error)),
     }
     assert!(tokens.len() <= budget, "Parser exceeded the output budget");

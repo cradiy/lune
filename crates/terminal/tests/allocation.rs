@@ -15,6 +15,81 @@ use lune_terminal::{
 #[global_allocator]
 static ALLOCATOR: allocator::TestAllocator = allocator::TestAllocator;
 
+#[test]
+fn palette_construction_resolution_overrides_and_theme_changes_allocate_nothing() {
+    use lune_terminal::{Color, Palette, PaletteEntry, Rgb};
+
+    let base = std::array::from_fn(|index| Rgb {
+        red: index as u8,
+        green: 12,
+        blue: 34,
+    });
+    let next = Rgb {
+        red: 56,
+        green: 78,
+        blue: 90,
+    };
+    let ((), stats) = allocator::measure(Some(0), || {
+        let mut palette = Palette::new(black_box(base), base[7], base[0], base[15]);
+        for index in 0..=u8::MAX {
+            palette.set_override(PaletteEntry::Indexed(index), next);
+            black_box(palette.resolve(Color::Indexed(index), PaletteEntry::Foreground));
+        }
+        for entry in [
+            PaletteEntry::Foreground,
+            PaletteEntry::Background,
+            PaletteEntry::Cursor,
+        ] {
+            palette.set_override(entry, next);
+            black_box(palette.resolve(Color::Default, entry));
+            black_box(palette.base_color(entry));
+            palette.reset(entry);
+        }
+        palette.set_base(base, next, next, next);
+        palette.reset_indexed();
+        palette.reset_all();
+        black_box(palette);
+    });
+    assert_eq!(stats.attempts, 0);
+}
+
+#[test]
+fn title_construction_updates_rejection_and_reset_make_no_allocation_requests() {
+    let mut wire = b"\x1b]2;".to_vec();
+    wire.extend(std::iter::repeat_n(b'x', lune_terminal::MAX_TITLE_BYTES));
+    wire.extend(b"\x07\x1b]2;");
+    wire.extend(std::iter::repeat_n(
+        b'y',
+        lune_terminal::MAX_TITLE_BYTES + 1,
+    ));
+    wire.extend(b"\x07\x1b]8;");
+    wire.extend(std::iter::repeat_n(b'z', 65536));
+    wire.push(7);
+    let mut screen = Screen::new(2, 2).unwrap();
+    let ((), stats) = allocator::measure(Some(0), || {
+        let mut text = |_: &mut Screen, _: &str, _: StyleId| Ok::<_, ()>(());
+        for chunk in [1, 17, wire.len()] {
+            let mut processor = Processor::default();
+            for bytes in wire.chunks(chunk) {
+                processor.advance(bytes, &mut screen, &mut text).unwrap();
+            }
+            processor.finish(&mut screen, &mut text).unwrap();
+            assert_eq!(
+                processor.window_title().len(),
+                lune_terminal::MAX_TITLE_BYTES
+            );
+            assert_eq!(
+                processor.take_window_title_change().unwrap().len(),
+                lune_terminal::MAX_TITLE_BYTES
+            );
+            assert_eq!(processor.ignored_sequences(), 2);
+            processor.reset(&mut screen, &mut text);
+            assert_eq!(processor.take_window_title_change(), Some(""));
+        }
+    });
+    assert_eq!(stats.attempts, 0);
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct HistorySnapshot {
     rows: Vec<Vec<SnapshotCell>>,

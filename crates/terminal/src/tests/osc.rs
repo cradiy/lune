@@ -1,0 +1,168 @@
+use crate::{MAX_TITLE_BYTES, ProcessFailure, Processor, Screen, StyleId};
+
+fn advance(processor: &mut Processor, screen: &mut Screen, input: &[u8]) {
+    processor
+        .advance(input, screen, &mut |_: &mut Screen, _: &str, _: StyleId| {
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn titles_commit_atomically_across_chunks_and_coalesce_until_acknowledged() {
+    for terminator in [b"\x07".as_slice(), b"\x1b\\"] {
+        let mut wire = "\x1b]2;moon 🌙;水\n\x7f".as_bytes().to_vec();
+        wire.extend(terminator);
+        for split in 0..=wire.len() {
+            let mut processor = Processor::default();
+            let mut screen = Screen::new(2, 2).unwrap();
+            advance(&mut processor, &mut screen, b"\x1b]0;old\x07");
+            assert_eq!(processor.take_window_title_change(), Some("old"));
+            advance(&mut processor, &mut screen, &wire[..split]);
+            assert_eq!(
+                processor.window_title(),
+                if split == wire.len() {
+                    "moon 🌙;水"
+                } else {
+                    "old"
+                }
+            );
+            advance(&mut processor, &mut screen, &wire[split..]);
+            assert_eq!(processor.take_window_title_change(), Some("moon 🌙;水"));
+            assert_eq!(processor.take_window_title_change(), None);
+            advance(&mut processor, &mut screen, &wire);
+            assert_eq!(processor.take_window_title_change(), None);
+            advance(
+                &mut processor,
+                &mut screen,
+                b"\x1b]0;first\x07\x1b]2;last\x07",
+            );
+            assert_eq!(processor.take_window_title_change(), Some("last"));
+            advance(
+                &mut processor,
+                &mut screen,
+                b"\x1b7\x1b[?1049h\x1b[?1049l\x1b8",
+            );
+            assert_eq!(processor.window_title(), "last");
+            advance(&mut processor, &mut screen, b"\x1b];\x07");
+            assert_eq!(processor.take_window_title_change(), Some(""));
+            assert_eq!(
+                (processor.parse_errors(), processor.ignored_sequences()),
+                (0, 0)
+            );
+        }
+    }
+}
+
+#[test]
+fn titles_reject_invalid_and_oversized_commands_without_publishing_prefixes() {
+    let mut cases = vec![
+        b"2".to_vec(),
+        b"1;icon".to_vec(),
+        b"8;;link".to_vec(),
+        b"-2;bad".to_vec(),
+        b"65536;bad".to_vec(),
+        b"000002;bad".to_vec(),
+        b"2;\xff".to_vec(),
+        b"2;\xe2\x82".to_vec(),
+    ];
+    let mut oversized = b"2;".to_vec();
+    oversized.extend(std::iter::repeat_n(b'x', MAX_TITLE_BYTES + 1));
+    cases.push(oversized);
+    for chunk in [1, 17, usize::MAX] {
+        let mut processor = Processor::default();
+        let mut screen = Screen::new(2, 2).unwrap();
+        let title = "🌙".repeat(MAX_TITLE_BYTES / 4);
+        let mut full = b"\x1b]2;".to_vec();
+        full.extend(title.as_bytes());
+        full.push(7);
+        for bytes in full.chunks(chunk) {
+            advance(&mut processor, &mut screen, bytes);
+        }
+        assert_eq!(processor.take_window_title_change(), Some(title.as_str()));
+        for (index, payload) in cases.iter().enumerate() {
+            advance(&mut processor, &mut screen, b"\x1b]");
+            for bytes in payload.chunks(chunk) {
+                advance(&mut processor, &mut screen, bytes);
+            }
+            advance(&mut processor, &mut screen, b"\x07");
+            assert_eq!(processor.window_title(), title);
+            assert_eq!(processor.take_window_title_change(), None);
+            assert_eq!(processor.ignored_sequences(), index as u64 + 1);
+        }
+        for cancel in [b"\x18".as_slice(), b"\x1a", b"\x1b[0m"] {
+            advance(&mut processor, &mut screen, b"\x1b]2;cancelled");
+            advance(&mut processor, &mut screen, cancel);
+            assert_eq!(processor.window_title(), title);
+            assert_eq!(processor.take_window_title_change(), None);
+        }
+        advance(&mut processor, &mut screen, b"\x1b]2;unfinished\x1b");
+        processor
+            .finish(&mut screen, &mut |_: &mut Screen, _: &str, _: StyleId| {
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+        assert_eq!(processor.window_title(), title);
+        assert_eq!(processor.parse_errors(), 1);
+        advance(&mut processor, &mut screen, b"\x1b]2;recovered\x07");
+        assert_eq!(processor.take_window_title_change(), Some("recovered"));
+    }
+}
+
+#[test]
+fn title_updates_follow_text_failures_reply_backpressure_and_resets() {
+    let mut processor = Processor::default();
+    let mut screen = Screen::new(2, 2).unwrap();
+    let wire = b"A\x1b]2;accepted\x07B";
+    let error = processor
+        .advance(
+            wire,
+            &mut screen,
+            &mut |_: &mut Screen, _: &str, _: StyleId| Err(()),
+        )
+        .unwrap_err();
+    assert_eq!(error.consumed, 0);
+    assert_eq!(processor.take_window_title_change(), None);
+    let error = processor
+        .advance(
+            wire,
+            &mut screen,
+            &mut |_: &mut Screen, text: &str, _: StyleId| {
+                if text == "B" { Err(()) } else { Ok(()) }
+            },
+        )
+        .unwrap_err();
+    assert_eq!(error.consumed, wire.len() - 1);
+    assert_eq!(processor.take_window_title_change(), Some("accepted"));
+    advance(&mut processor, &mut screen, &wire[error.consumed..]);
+    assert_eq!(processor.take_window_title_change(), None);
+
+    let wire = b"\x1b[5n\x1b[5n\x1b]0;after reply\x07";
+    let error = processor
+        .advance(
+            wire,
+            &mut screen,
+            &mut |_: &mut Screen, _: &str, _: StyleId| Ok::<_, ()>(()),
+        )
+        .unwrap_err();
+    assert!(matches!(error.error, ProcessFailure::ReplyPending));
+    assert_eq!(processor.window_title(), "accepted");
+    assert!(processor.consume_reply(processor.reply_bytes().len()));
+    advance(&mut processor, &mut screen, &wire[error.consumed..]);
+    assert_eq!(processor.take_window_title_change(), Some("after reply"));
+    advance(&mut processor, &mut screen, b"\x1b]2;aborted\x1bc");
+    assert_eq!(processor.take_window_title_change(), Some(""));
+    advance(
+        &mut processor,
+        &mut screen,
+        b"\x1b]0;reset\x07\x1b]2;partial",
+    );
+    let mut text = |_: &mut Screen, _: &str, _: StyleId| Ok::<_, ()>(());
+    processor.reset(&mut screen, &mut text);
+    processor.reset(&mut screen, &mut text);
+    assert_eq!(processor.take_window_title_change(), Some(""));
+    processor.reset(&mut screen, &mut text);
+    assert_eq!(processor.take_window_title_change(), None);
+    advance(&mut processor, &mut screen, b"\x1b]2;new\x07");
+    assert_eq!(processor.take_window_title_change(), Some("new"));
+}

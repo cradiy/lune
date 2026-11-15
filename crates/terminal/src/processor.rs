@@ -1,8 +1,9 @@
 use std::{error::Error, fmt};
 
-use lune_vt::{CsiSequence, EscapeSequence, Event, Parameter, Parser};
+use lune_vt::{CsiSequence, EscapeSequence, Event, OscEvent, Parameter, Parser};
 
 use crate::charsets::Charsets;
+use crate::osc::Osc;
 use crate::reply::{self, ModeReport, Reply, Report};
 use crate::{
     CursorShape, EraseMode, InputModes, MAX_STYLES, Screen, ScreenBuffer, StorageError, Style,
@@ -85,6 +86,18 @@ struct State {
     charsets: Charsets,
     saved_charsets: [Charsets; 2],
     input: InputModes,
+    osc: Osc,
+}
+
+impl State {
+    fn reset(&mut self) {
+        self.style = StyleId(0);
+        self.saved_style = [StyleId(0); 2];
+        self.charsets = Charsets::default();
+        self.saved_charsets = [Charsets::default(); 2];
+        self.input = InputModes::default();
+        self.osc.reset();
+    }
 }
 
 /// Incremental screen execution with an atomic [`TextSink`]. Pair one processor,
@@ -148,6 +161,18 @@ impl Processor {
         self.state.input
     }
 
+    /// Current OSC 0/2 window title, initially empty. Valid UTF-8 payloads up to
+    /// [`crate::MAX_TITLE_BYTES`] commit at BEL/ST; rejected or cancelled commands
+    /// preserve the current title. RIS and explicit reset clear it.
+    pub fn window_title(&self) -> &str {
+        self.state.osc.title()
+    }
+
+    /// Acknowledges changes and borrows the latest title. Intermediate changes coalesce.
+    pub fn take_window_title_change(&mut self) -> Option<&str> {
+        self.state.osc.take_title_change()
+    }
+
     /// Unsent bytes from the active reply, in wire order. The fixed output slot
     /// holds one reply of at most 14 bytes. Bytes remain stable until acknowledged
     /// or explicitly reset. RIS preserves replies issued before it.
@@ -194,7 +219,7 @@ impl Processor {
         self.parse_errors
     }
 
-    /// Number of ESC/CSI sequences with an unsupported header or parameter form.
+    /// Number of completed ESC/CSI/OSC commands with unsupported or invalid contents.
     pub fn ignored_sequences(&self) -> u64 {
         self.ignored_sequences
     }
@@ -297,6 +322,9 @@ impl Processor {
             }
             let discarded = self.parser.discard_string_payload(&input[consumed..]);
             if discarded != 0 {
+                if self.state.osc.needs_data() {
+                    self.state.osc.data(&input[consumed..consumed + discarded]);
+                }
                 consumed += discarded;
                 continue;
             }
@@ -384,6 +412,11 @@ impl Processor {
                         *ignored_sequences = ignored_sequences.saturating_add(1);
                     }
                 }
+                Event::Osc(event) => {
+                    if state.osc.event(event) {
+                        *ignored_sequences = ignored_sequences.saturating_add(1);
+                    }
+                }
                 Event::Error(_) => *parse_errors = parse_errors.saturating_add(1),
             });
             if T::STATEFUL && matches!(input[consumed], 0x1b | 0x7f) {
@@ -414,6 +447,7 @@ impl Processor {
             pending,
             end,
             parse_errors,
+            state,
             ..
         } = self;
         parser.finish(|event| match event {
@@ -422,7 +456,10 @@ impl Processor {
                 *end += 1;
             }
             Event::Error(_) => *parse_errors = parse_errors.saturating_add(1),
-            _ => unreachable!("Finishing emits text or a lexical error"),
+            Event::Osc(OscEvent::Cancel) => {
+                state.osc.event(OscEvent::Cancel);
+            }
+            _ => unreachable!("Finishing emits text, an OSC cancellation, or a lexical error"),
         });
         self.drain(screen, text)?;
         text.boundary();
@@ -440,7 +477,7 @@ impl Processor {
         self.end = 0;
         self.parse_errors = 0;
         self.ignored_sequences = 0;
-        self.state = State::default();
+        self.state.reset();
         self.reply = Reply::default();
         screen.reset(StyleId(0));
     }
@@ -609,7 +646,7 @@ fn escape(screen: &mut Screen, sequence: EscapeSequence<'_>, state: &mut State) 
         b'>' => state.input.application_keypad = false,
         b'M' => screen.reverse_index(state.style),
         b'c' => {
-            *state = State::default();
+            state.reset();
             screen.reset(state.style);
         }
         _ => return false,

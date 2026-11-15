@@ -39,6 +39,8 @@ struct Expected<'a> {
     style: Style,
     input: InputModes,
     replies: &'a [u8],
+    title: &'a str,
+    title_changed: bool,
 }
 
 fn drain_reply(processor: &mut Processor, output: &mut Vec<u8>, count: usize) {
@@ -125,6 +127,12 @@ fn drive(wire: &[u8], chunk: usize, fail_at: usize, expected: &Expected<'_>) {
         Some(&expected.style)
     );
     assert_eq!(processor.input_modes(), expected.input);
+    assert_eq!(processor.window_title(), expected.title);
+    assert_eq!(
+        processor.take_window_title_change(),
+        expected.title_changed.then_some(expected.title)
+    );
+    assert_eq!(processor.take_window_title_change(), None);
     for (event, normal, sgr, suffix, enabled) in [
         (
             MouseEvent::Release(MouseButton::Right),
@@ -261,6 +269,8 @@ fuzz_target!(|data: &[u8]| {
     let mut saved_charsets = [(charsets, selected); 2];
     let mut input = InputModes::default();
     let mut replies = Vec::new();
+    let mut title = String::new();
+    let mut title_changed = false;
     for bytes in data.as_chunks::<8>().0.iter().take(512) {
         let index = usize::from(expected.is_alternate());
         let command = match bytes[0] % 64 {
@@ -418,6 +428,8 @@ fuzz_target!(|data: &[u8]| {
             }
             32 => {
                 wire.extend(b"\x1bc");
+                title_changed |= !title.is_empty();
+                title.clear();
                 current = Style::default();
                 saved = [current; 2];
                 charsets = [false; 2];
@@ -442,7 +454,34 @@ fuzz_target!(|data: &[u8]| {
                 None
             }
             37 => {
-                wire.extend(b"\x1b]0;synthetic title\x07");
+                match bytes[1] % 5 {
+                    0 => {
+                        let next = format!("title-{}-🌙;{}", bytes[2], bytes[3]);
+                        let selector = if bytes[4] & 1 == 0 { 0 } else { 2 };
+                        write!(&mut wire, "\x1b]{selector};{next}").unwrap();
+                        wire.extend(if bytes[5] & 1 == 0 {
+                            &b"\x07"[..]
+                        } else {
+                            b"\x1b\\"
+                        });
+                        title_changed |= title != next;
+                        title = next;
+                    }
+                    1 => {
+                        wire.extend(b"\x1b]2;\x07");
+                        title_changed |= !title.is_empty();
+                        title.clear();
+                    }
+                    2 => wire.extend(b"\x1b]2;cancelled\x18"),
+                    3 => {
+                        wire.extend(b"\x1b]8;;link\x07");
+                        diagnostics.1 += 1;
+                    }
+                    _ => {
+                        wire.extend(b"\x1b]2;\xff\x1b\\");
+                        diagnostics.1 += 1;
+                    }
+                }
                 None
             }
             38 => {
@@ -842,6 +881,8 @@ fuzz_target!(|data: &[u8]| {
     let oracle = Expected {
         screen: &expected,
         diagnostics,
+        title: &title,
+        title_changed,
         values: &values,
         style: current,
         input,

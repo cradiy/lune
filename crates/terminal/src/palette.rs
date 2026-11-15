@@ -1,0 +1,144 @@
+use crate::Color;
+
+const ENTRIES: usize = 259;
+const WORDS: usize = ENTRIES.div_ceil(64);
+
+/// A resolved color with eight bits per channel.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Rgb {
+    pub red: u8,
+    pub green: u8,
+    pub blue: u8,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PaletteEntry {
+    Indexed(u8),
+    Foreground,
+    Background,
+    Cursor,
+}
+
+impl PaletteEntry {
+    #[inline]
+    const fn index(self) -> usize {
+        match self {
+            Self::Indexed(index) => index as usize,
+            Self::Foreground => 256,
+            Self::Background => 257,
+            Self::Cursor => 258,
+        }
+    }
+}
+
+/// Theme colors and retained runtime overrides in fixed storage. Mutators report
+/// visible color changes; an override equal to its base is still retained.
+#[derive(Clone, Debug)]
+pub struct Palette {
+    base: [Rgb; ENTRIES],
+    current: [Rgb; ENTRIES],
+    overrides: [u64; WORDS],
+}
+
+impl Palette {
+    /// The caller supplies the full indexed palette and default role colors.
+    pub fn new(indexed: [Rgb; 256], foreground: Rgb, background: Rgb, cursor: Rgb) -> Self {
+        let base = colors(indexed, foreground, background, cursor);
+        Self {
+            base,
+            current: base,
+            overrides: [0; WORDS],
+        }
+    }
+
+    #[inline]
+    pub fn color(&self, entry: PaletteEntry) -> Rgb {
+        self.current[entry.index()]
+    }
+
+    pub fn base_color(&self, entry: PaletteEntry) -> Rgb {
+        self.base[entry.index()]
+    }
+
+    pub fn is_overridden(&self, entry: PaletteEntry) -> bool {
+        let index = entry.index();
+        self.overrides[index / 64] & (1 << (index % 64)) != 0
+    }
+
+    #[inline]
+    pub fn resolve(&self, color: Color, default: PaletteEntry) -> Rgb {
+        match color {
+            Color::Default => self.color(default),
+            Color::Indexed(index) => self.current[usize::from(index)],
+            Color::Rgb { red, green, blue } => Rgb { red, green, blue },
+        }
+    }
+
+    pub fn set_override(&mut self, entry: PaletteEntry, color: Rgb) -> bool {
+        let index = entry.index();
+        self.overrides[index / 64] |= 1 << (index % 64);
+        let changed = self.current[index] != color;
+        self.current[index] = color;
+        changed
+    }
+
+    pub fn reset(&mut self, entry: PaletteEntry) -> bool {
+        let index = entry.index();
+        self.overrides[index / 64] &= !(1 << (index % 64));
+        let changed = self.current[index] != self.base[index];
+        self.current[index] = self.base[index];
+        changed
+    }
+
+    /// Restores the indexed table while retaining default role overrides.
+    pub fn reset_indexed(&mut self) -> bool {
+        self.reset_words(4)
+    }
+
+    pub fn reset_all(&mut self) -> bool {
+        self.reset_words(WORDS)
+    }
+
+    /// Replaces theme colors while preserving every runtime override.
+    pub fn set_base(
+        &mut self,
+        indexed: [Rgb; 256],
+        foreground: Rgb,
+        background: Rgb,
+        cursor: Rgb,
+    ) -> bool {
+        let base = colors(indexed, foreground, background, cursor);
+        let mut changed = false;
+        for (index, (&color, current)) in base.iter().zip(&mut self.current).enumerate() {
+            if self.overrides[index / 64] & (1 << (index % 64)) == 0 {
+                changed |= *current != color;
+                *current = color;
+            }
+        }
+        self.base = base;
+        changed
+    }
+
+    fn reset_words(&mut self, end: usize) -> bool {
+        let mut changed = false;
+        for (word_index, word) in self.overrides[..end].iter_mut().enumerate() {
+            let mut bits = std::mem::take(word);
+            while bits != 0 {
+                let index = word_index * 64 + bits.trailing_zeros() as usize;
+                changed |= self.current[index] != self.base[index];
+                self.current[index] = self.base[index];
+                bits &= bits - 1;
+            }
+        }
+        changed
+    }
+}
+
+fn colors(indexed: [Rgb; 256], foreground: Rgb, background: Rgb, cursor: Rgb) -> [Rgb; ENTRIES] {
+    let mut colors = [Rgb::default(); ENTRIES];
+    colors[..256].copy_from_slice(&indexed);
+    colors[256] = foreground;
+    colors[257] = background;
+    colors[258] = cursor;
+    colors
+}

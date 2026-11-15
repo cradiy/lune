@@ -100,12 +100,14 @@ and wide wrapping inside and outside the scrolling region.
 The `processor` target serializes commands into VT bytes and compares execution
 with the complete-unit Screen model. It exercises cursor addressing, scrolling,
 cell and line edits, erasure, tabs, mode changes, saved cursors, and reset, together
-with malformed UTF-8, discarded strings, rejected parameter forms, and diagnostics.
+with malformed UTF-8, OSC window titles, discarded strings, rejected parameter forms,
+and diagnostics.
 Unsupported mode lists preserve all screen state.
 
 Each input runs as one chunk and in chunks of one through seventeen bytes. A text
 callback can fail before mutation; execution retries the reported input suffix.
-Both runs must produce the same modeled screen, saved cursor, and diagnostics.
+Both runs must produce the same modeled screen, saved cursor, window title,
+coalesced title changes, and diagnostics.
 ANSI and DEC mode queries append replies from independent input and screen state.
 Checks include unknown selectors, invalid query headers, and captured values under
 reply backpressure alongside status and cursor-position reports.

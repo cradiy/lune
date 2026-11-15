@@ -49,6 +49,25 @@ pub enum ParseError {
     IncompleteSequence,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OscTerminator {
+    Bell,
+    St,
+}
+
+/// Streaming OSC framing. Consumers bound any payload they retain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OscEvent<'a> {
+    Start,
+    /// Raw payload bytes, including the command selector. C0 and DEL are ignored.
+    /// Spans are valid during the callback and may vary with input chunking.
+    Data(&'a [u8]),
+    /// Terminated by BEL or ST.
+    End(OscTerminator),
+    /// Interrupted by another escape, CAN, SUB, or end of stream.
+    Cancel,
+}
+
 /// A lexical event. Sequence bytes retain their syntax for interpretation by a consumer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Event<'a> {
@@ -57,6 +76,7 @@ pub enum Event<'a> {
     Execute(u8),
     Escape(EscapeSequence<'a>),
     Csi(CsiSequence<'a>),
+    Osc(OscEvent<'a>),
     Error(ParseError),
 }
 
@@ -74,7 +94,9 @@ enum State {
     String {
         osc: bool,
     },
-    StringEscape,
+    StringEscape {
+        osc: bool,
+    },
 }
 
 /// A fixed-capacity parser whose state persists across calls to [`Self::advance`].
@@ -99,8 +121,8 @@ impl Parser {
         self.state == State::Ground && !self.utf8.is_pending()
     }
 
-    /// Consumes a discarded string payload prefix, stopping before a control or
-    /// DEL. Returns zero outside a string payload. This emits no events.
+    /// Discards a string payload prefix without emitting data events, stopping
+    /// before a control or DEL. Returns zero outside a string payload.
     #[inline]
     pub fn discard_string_payload(&mut self, bytes: &[u8]) -> usize {
         if matches!(self.state, State::String { .. }) {
@@ -112,12 +134,19 @@ impl Parser {
 
     /// Consumes a chunk and invokes `emit` synchronously for each lexical event.
     ///
-    /// Invalid UTF-8 uses the Unicode replacement character. Raw eight-bit C1
+    /// Invalid UTF-8 in text uses the replacement character. Raw eight-bit C1
     /// bytes follow the UTF-8 error policy; decoded Unicode is emitted as text.
     /// DEL is ignored. CAN and SUB cancel a pending sequence and emit a control.
     /// Text span boundaries may vary with input chunking.
     pub fn advance(&mut self, bytes: &[u8], mut emit: impl FnMut(Event<'_>)) {
         if let [byte] = bytes {
+            if self.state == State::Ground && *byte >= 0x20 && *byte != 0x7f {
+                if self.decode(*byte, &mut emit) {
+                    // An invalid pending prefix leaves this byte to be decoded again.
+                    self.decode(*byte, &mut emit);
+                }
+                return;
+            }
             self.advance_byte(*byte, &mut emit);
             return;
         }
@@ -133,13 +162,17 @@ impl Parser {
             }
             let first = bytes[offset];
             if first >= 0x20 && first != 0x7f {
-                if matches!(self.state, State::String { .. }) {
-                    offset += text_end(&bytes[offset..]);
-                    continue;
-                }
                 if self.state == State::Ground && !self.utf8.is_pending() {
                     let length = text_end(&bytes[offset..]);
                     self.advance_text(&bytes[offset..offset + length], &mut emit);
+                    offset += length;
+                    continue;
+                }
+                if let State::String { osc } = self.state {
+                    let length = text_end(&bytes[offset..]);
+                    if osc {
+                        emit(Event::Osc(OscEvent::Data(&bytes[offset..offset + length])));
+                    }
                     offset += length;
                     continue;
                 }
@@ -156,6 +189,12 @@ impl Parser {
     pub fn finish(&mut self, mut emit: impl FnMut(Event<'_>)) {
         if self.utf8.finish() {
             emit(Event::Text("\u{fffd}"));
+        }
+        if matches!(
+            self.state,
+            State::String { osc: true } | State::StringEscape { osc: true }
+        ) {
+            emit(Event::Osc(OscEvent::Cancel));
         }
         if !matches!(self.state, State::Ground | State::Ignore { .. }) {
             emit(Event::Error(ParseError::IncompleteSequence));
@@ -232,32 +271,29 @@ impl Parser {
         if self.state == State::Ground && self.utf8.is_pending() && !self.decode(byte, emit) {
             return;
         }
-
-        if self.state == State::StringEscape {
-            if byte == b'\\' {
-                self.state = State::Ground;
+        if matches!(
+            self.state,
+            State::String { .. } | State::StringEscape { .. }
+        ) {
+            if let State::String { osc } = self.state
+                && byte >= 0x20
+                && byte != 0x7f
+            {
+                if osc {
+                    emit(Event::Osc(OscEvent::Data(&[byte])));
+                }
                 return;
             }
-            self.start_escape();
+            self.advance_string(byte, emit);
+            return;
         }
-
         if byte == 0x1b {
-            if matches!(self.state, State::String { .. }) {
-                self.state = State::StringEscape;
-            } else {
-                self.start_escape();
-            }
+            self.start_escape();
             return;
         }
         if matches!(byte, 0x18 | 0x1a) {
             self.state = State::Ground;
             emit(Event::Execute(byte));
-            return;
-        }
-        if let State::String { osc } = self.state {
-            if osc && byte == 0x07 {
-                self.state = State::Ground;
-            }
             return;
         }
 
@@ -272,6 +308,43 @@ impl Parser {
             0x00..=0x1f => emit(Event::Execute(byte)),
             0x7f => {}
             _ => self.dispatch(byte, emit),
+        }
+    }
+
+    #[inline(never)]
+    fn advance_string(&mut self, byte: u8, emit: &mut impl FnMut(Event<'_>)) {
+        if let State::StringEscape { osc } = self.state {
+            if byte == b'\\' {
+                self.state = State::Ground;
+                if osc {
+                    emit(Event::Osc(OscEvent::End(OscTerminator::St)));
+                }
+            } else {
+                if osc {
+                    emit(Event::Osc(OscEvent::Cancel));
+                }
+                self.start_escape();
+                self.advance_byte(byte, emit);
+            }
+            return;
+        }
+        let State::String { osc } = self.state else {
+            unreachable!();
+        };
+        match byte {
+            0x1b => self.state = State::StringEscape { osc },
+            0x18 | 0x1a => {
+                if osc {
+                    emit(Event::Osc(OscEvent::Cancel));
+                }
+                self.state = State::Ground;
+                emit(Event::Execute(byte));
+            }
+            0x07 if osc => {
+                self.state = State::Ground;
+                emit(Event::Osc(OscEvent::End(OscTerminator::Bell)));
+            }
+            _ => {}
         }
     }
 
@@ -324,7 +397,7 @@ impl Parser {
                     self.state = State::Ground;
                 }
             }
-            State::String { .. } | State::StringEscape => unreachable!(),
+            State::String { .. } | State::StringEscape { .. } => unreachable!(),
         }
     }
 
@@ -337,6 +410,9 @@ impl Parser {
                 }
                 b']' | b'P' | b'X' | b'^' | b'_' => {
                     self.state = State::String { osc: byte == b']' };
+                    if byte == b']' {
+                        emit(Event::Osc(OscEvent::Start));
+                    }
                     return;
                 }
                 _ => {}

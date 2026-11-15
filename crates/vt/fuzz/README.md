@@ -11,7 +11,8 @@ and campaign controls.
 - `lifecycle` varies chunk boundaries and `finish`/`reset` operations, compares
   each stream with a fresh parser, and checks reuse after stream termination.
 
-Both targets normalize text spans into scalar events and limit emitted output.
+Both targets normalize text spans into scalar events and OSC spans into byte
+events, preserving OSC framing and limiting emitted output.
 Use libFuzzer's timeout and memory limits to bound individual executions.
 
 Run from `crates/vt` after installing cargo-fuzz:

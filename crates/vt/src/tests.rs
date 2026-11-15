@@ -1,4 +1,7 @@
-use crate::{Event, MAX_PARAMETERS, MAX_SEQUENCE_BYTES, Parameter, ParseError, Parser};
+use crate::{
+    Event, MAX_PARAMETERS, MAX_SEQUENCE_BYTES, OscEvent, OscTerminator, Parameter, ParseError,
+    Parser,
+};
 
 #[derive(Debug, PartialEq, Eq)]
 enum OwnedEvent {
@@ -6,6 +9,10 @@ enum OwnedEvent {
     Execute(u8),
     Escape(Vec<u8>, u8),
     Csi(Vec<u8>, Vec<Parameter>, Vec<u8>, u8),
+    OscStart,
+    OscData(Vec<u8>),
+    OscEnd(OscTerminator),
+    OscCancel,
     Error(ParseError),
 }
 
@@ -25,6 +32,16 @@ fn capture(events: &mut Vec<OwnedEvent>, event: Event<'_>) {
             sequence.intermediates.to_vec(),
             sequence.final_byte,
         ),
+        Event::Osc(OscEvent::Start) => OwnedEvent::OscStart,
+        Event::Osc(OscEvent::Data(bytes)) => {
+            if let Some(OwnedEvent::OscData(data)) = events.last_mut() {
+                data.extend_from_slice(bytes);
+                return;
+            }
+            OwnedEvent::OscData(bytes.to_vec())
+        }
+        Event::Osc(OscEvent::End(terminator)) => OwnedEvent::OscEnd(terminator),
+        Event::Osc(OscEvent::Cancel) => OwnedEvent::OscCancel,
         Event::Error(error) => OwnedEvent::Error(error),
     };
     events.push(owned);
@@ -90,6 +107,9 @@ fn chunk_boundaries_preserve_text_and_parameter_structure() {
             b'p',
         ),
         OwnedEvent::Print('x'),
+        OwnedEvent::OscStart,
+        OwnedEvent::OscData(b"0;hidden".to_vec()),
+        OwnedEvent::OscEnd(OscTerminator::Bell),
         OwnedEvent::Print('Y'),
         OwnedEvent::Print('Z'),
     ];
@@ -174,6 +194,9 @@ fn cancellation_and_escape_restart_preserve_control_order() {
         OwnedEvent::Print('A'),
         csi(2, b'm'),
         OwnedEvent::Print('B'),
+        OwnedEvent::OscStart,
+        OwnedEvent::OscData(b"hidden".to_vec()),
+        OwnedEvent::OscCancel,
         OwnedEvent::Execute(0x1a),
         OwnedEvent::Print('C'),
         csi(1, b'm'),
@@ -253,11 +276,12 @@ fn stream_boundaries_finalize_or_discard_pending_input_explicitly() {
         let mut events = Vec::new();
         parser.advance(prefix, |_| {});
         parser.finish(|event| capture(&mut events, event));
-        assert_eq!(
-            events,
-            [OwnedEvent::Error(ParseError::IncompleteSequence)],
-            "{prefix:?}"
-        );
+        let mut expected = Vec::new();
+        if prefix.starts_with(b"\x1b]") {
+            expected.push(OwnedEvent::OscCancel);
+        }
+        expected.push(OwnedEvent::Error(ParseError::IncompleteSequence));
+        assert_eq!(events, expected, "{prefix:?}");
         parser.finish(|_| panic!("Repeated finish emitted an event"));
         events.clear();
         parser.advance(b"Z", |event| capture(&mut events, event));
@@ -270,4 +294,67 @@ fn stream_boundaries_finalize_or_discard_pending_input_explicitly() {
         parser.advance(b"\x1b[2mZ", |event| capture(&mut events, event));
         assert_eq!(events, [csi(2, b'm'), OwnedEvent::Print('Z')]);
     }
+}
+
+#[test]
+fn osc_framing_preserves_raw_payload_and_cancellation_across_chunks() {
+    let input = b"\x1b]\x07\x1b]2;\xf0\x9f\x8c\x99\xff\0\n\x7f\x1b\\\x1b]8;;link\x18\x1b]cut\x1b[2mZ\x1b]tail\x1b";
+    let expected = vec![
+        OwnedEvent::OscStart,
+        OwnedEvent::OscEnd(OscTerminator::Bell),
+        OwnedEvent::OscStart,
+        OwnedEvent::OscData(b"2;\xf0\x9f\x8c\x99\xff".to_vec()),
+        OwnedEvent::OscEnd(OscTerminator::St),
+        OwnedEvent::OscStart,
+        OwnedEvent::OscData(b"8;;link".to_vec()),
+        OwnedEvent::OscCancel,
+        OwnedEvent::Execute(0x18),
+        OwnedEvent::OscStart,
+        OwnedEvent::OscData(b"cut".to_vec()),
+        OwnedEvent::OscCancel,
+        csi(2, b'm'),
+        OwnedEvent::Print('Z'),
+        OwnedEvent::OscStart,
+        OwnedEvent::OscData(b"tail".to_vec()),
+        OwnedEvent::OscCancel,
+        OwnedEvent::Error(ParseError::IncompleteSequence),
+    ];
+    for split in 0..=input.len() {
+        assert_eq!(parse([&input[..split], &input[split..]]), expected);
+    }
+    for chunk_size in 1..=input.len() {
+        assert_eq!(parse(input.chunks(chunk_size)), expected);
+    }
+}
+
+#[test]
+fn osc_payload_is_borrowed_without_a_length_limit_and_can_be_discarded() {
+    let mut parser = Parser::default();
+    parser.advance(b"\x1b]", |event| {
+        assert_eq!(event, Event::Osc(OscEvent::Start))
+    });
+    let payload = [b'x'; 65536];
+    let mut callbacks = 0;
+    parser.advance(&payload, |event| {
+        let Event::Osc(OscEvent::Data(bytes)) = event else {
+            panic!("Unexpected payload event: {event:?}");
+        };
+        assert_eq!(bytes.as_ptr(), payload.as_ptr());
+        assert_eq!(bytes.len(), payload.len());
+        callbacks += 1;
+    });
+    assert_eq!(callbacks, 1);
+    assert!(!parser.is_ground());
+    assert_eq!(parser.discard_string_payload(b"discard\x07Z"), 7);
+    let mut events = Vec::new();
+    parser.advance(b"\x07Z", |event| capture(&mut events, event));
+    assert_eq!(
+        events,
+        [
+            OwnedEvent::OscEnd(OscTerminator::Bell),
+            OwnedEvent::Print('Z')
+        ]
+    );
+    assert!(parser.is_ground());
+    assert_eq!(parser.discard_string_payload(b"text"), 0);
 }
