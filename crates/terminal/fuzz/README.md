@@ -111,9 +111,10 @@ coalesced title changes, and diagnostics.
 ANSI and DEC mode queries append replies from independent input and screen state.
 Checks include unknown selectors, invalid query headers, and captured values under
 reply backpressure alongside status and cursor-position reports.
-Dynamic foreground, background, and cursor commands compare numeric RGB updates,
-queries, coalesced notifications, and resets with independent color state. Color
-replies preserve BEL/ST framing while sharing the same output backpressure.
+Dynamic foreground, background, and cursor chains compare mixed numeric RGB
+updates, captured queries, coalesced notifications, and resets with independent
+color state. Color replies preserve BEL/ST framing while sharing the same output
+backpressure.
 Indexed OSC 4/104 batches compare ordered sets, captured queries, and selective
 or table resets against an independent 256-color model. Invalid batch tails
 preserve both the palette and reply stream.

@@ -77,7 +77,7 @@ fn indexed_batches_capture_and_deliver_all_queries_without_allocation() {
 
 #[test]
 fn dynamic_color_commands_queries_and_resets_allocate_nothing() {
-    let wire = b"\x1b]10;rgb:ffff/0080/1234\x07\x1b]10;?\x1b\\\x1b]11;#123456\x07\x1b]11;?\x07\x1b]12;#abcdef\x07\x1b]12;?\x1b\\\x1b]110\x07\x1b]111\x07\x1b]112\x07";
+    let wire = b"\x1b]10;rgb:ffff/0080/1234;#123456;#abcdef\x07\x1b]10;?;?;?\x1b\\\x1b]11;?;?\x07\x1b]12;?\x1b\\\x1b]10;?;#010203;?\x07\x1b]110\x07\x1b]111\x07\x1b]112\x07";
     let mut screen = Screen::new(2, 2).unwrap();
     let ((), stats) = allocator::measure(Some(0), || {
         let mut text = |_: &mut Screen, _: &str, _: StyleId| Ok::<_, ()>(());
@@ -104,7 +104,7 @@ fn dynamic_color_commands_queries_and_resets_allocate_nothing() {
                     }
                 }
             }
-            assert_eq!(delivered, 74);
+            assert_eq!(delivered, 196);
             assert_eq!(
                 (processor.parse_errors(), processor.ignored_sequences()),
                 (0, 0)

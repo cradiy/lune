@@ -267,6 +267,18 @@ fn indexed_reply(output: &mut Vec<u8>, index: u8, color: Rgb, terminator: &str) 
     .unwrap();
 }
 
+fn dynamic_reply(output: &mut Vec<u8>, role: usize, color: Rgb, terminator: &str) {
+    write!(
+        output,
+        "\x1b]{};rgb:{:04x}/{:04x}/{:04x}{terminator}",
+        role + 10,
+        u16::from(color.red) * 257,
+        u16::from(color.green) * 257,
+        u16::from(color.blue) * 257
+    )
+    .unwrap();
+}
+
 fn ascii(expected: &mut ScreenModel, bytes: &[u8], style: StyleId, graphics: bool) {
     for &byte in bytes {
         let character = if graphics {
@@ -517,7 +529,7 @@ fuzz_target!(|data: &[u8]| {
                 None
             }
             37 => {
-                match bytes[1] % 12 {
+                match bytes[1] % 14 {
                     0 => {
                         let next = format!("title-{}-🌙;{}", bytes[2], bytes[3]);
                         let selector = if bytes[4] & 1 == 0 { 0 } else { 2 };
@@ -567,16 +579,7 @@ fuzz_target!(|data: &[u8]| {
                         let role = usize::from(bytes[2] % 3);
                         let terminator = if bytes[3] & 1 == 0 { "\x07" } else { "\x1b\\" };
                         write!(&mut wire, "\x1b]{};?{terminator}", role + 10).unwrap();
-                        let color = colors[role];
-                        write!(
-                            &mut replies,
-                            "\x1b]{};rgb:{:04x}/{:04x}/{:04x}{terminator}",
-                            role + 10,
-                            u16::from(color.red) * 257,
-                            u16::from(color.green) * 257,
-                            u16::from(color.blue) * 257
-                        )
-                        .unwrap();
+                        dynamic_reply(&mut replies, role, colors[role], terminator);
                     }
                     7 => {
                         let role = usize::from(bytes[2] % 3);
@@ -613,7 +616,7 @@ fuzz_target!(|data: &[u8]| {
                         palette_changed |= indexed != base_indexed;
                         indexed = base_indexed;
                     }
-                    _ => {
+                    11 => {
                         let terminator = if bytes[7] & 1 == 0 { "\x07" } else { "\x18" };
                         write!(
                             &mut wire,
@@ -622,6 +625,47 @@ fuzz_target!(|data: &[u8]| {
                         )
                         .unwrap();
                         if bytes[7] & 1 == 0 {
+                            diagnostics.1 += 1;
+                        }
+                    }
+                    12 => {
+                        let start = usize::from(bytes[2] % 3);
+                        let terminator = if bytes[7] & 1 == 0 { "\x07" } else { "\x1b\\" };
+                        write!(&mut wire, "\x1b]{}", start + 10).unwrap();
+                        for (role, color) in colors.iter_mut().enumerate().skip(start) {
+                            if bytes[3] & (1 << role) != 0 {
+                                wire.extend(b";?");
+                                dynamic_reply(&mut replies, role, *color, terminator);
+                            } else {
+                                let next = Rgb {
+                                    red: bytes[4].wrapping_add(role as u8),
+                                    green: bytes[5],
+                                    blue: bytes[6],
+                                };
+                                write!(
+                                    &mut wire,
+                                    ";#{:02x}{:02x}{:02x}",
+                                    next.red, next.green, next.blue
+                                )
+                                .unwrap();
+                                palette_changed |= *color != next;
+                                *color = next;
+                            }
+                        }
+                        wire.extend(terminator.as_bytes());
+                    }
+                    _ => {
+                        wire.extend(if bytes[2] & 1 == 0 {
+                            &b"\x1b]10;#123456;?;invalid"[..]
+                        } else {
+                            b"\x1b]11;#123456;?;?"
+                        });
+                        wire.extend(match bytes[7] % 3 {
+                            0 => &b"\x18"[..],
+                            1 => b"\x07",
+                            _ => b"\x1b\\",
+                        });
+                        if bytes[7] % 3 != 0 {
                             diagnostics.1 += 1;
                         }
                     }

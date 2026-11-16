@@ -103,6 +103,7 @@ fn main() {
     let color_queries =
         b"\x1b]10;#123456\x07\x1b]10;?\x07\x1b]11;?\x1b\\\x1b]12;?\x1b\\\x1b]110\x07".repeat(512);
     let indexed = b"\x1b]4;1;?;1;#123456;1;?;255;?\x1b\\\x1b]104;1;255\x07".repeat(512);
+    let dynamic = b"\x1b]10;#123456;#abcdef;#778899\x07\x1b]10;?;?;?\x1b\\\x1b]110\x07\x1b]111\x07\x1b]112\x07".repeat(512);
     let mode_queries = b"\x1b[4h\x1b[4$p\x1b[4l\x1b[4$p\x1b[?1004;1003;1006h\x1b[?1004$p\x1b[?1003$p\x1b[?65535$p\x1b[?1004;1003;1006l".repeat(512);
     let alternate = b"\x1b[31mprimary\r\n\x1b[?1049h\x1b[34m\x1b[2;3Halternate\r\n\x1b[?1048h\x1b[?47l\x1b[?47h\x1b[?1048l\x1b[?1049l\x1b[0m".repeat(512);
     let mut newlines = Vec::from(&b"\x1b[20h"[..]);
@@ -145,6 +146,9 @@ fn main() {
     measure_replies("indexed batches / bulk", &indexed, indexed.len(), 28);
     measure_replies("indexed batches / 17-byte", &indexed, 17, 3);
     measure_replies("indexed batches / 1-byte", &indexed, 1, 1);
+    measure_replies("dynamic batches / bulk", &dynamic, dynamic.len(), 28);
+    measure_replies("dynamic batches / 17-byte", &dynamic, 17, 3);
+    measure_replies("dynamic batches / 1-byte", &dynamic, 1, 1);
     measure_replies("mode queries / bulk", &mode_queries, mode_queries.len(), 14);
     measure_replies("mode queries / 17-byte", &mode_queries, 17, 3);
     measure_replies("mode queries / 1-byte", &mode_queries, 1, 1);

@@ -29,7 +29,7 @@ pub(crate) enum Outcome {
     Done,
     Ignored,
     Reply(ColorReport),
-    PaletteReplies,
+    Replies,
 }
 
 #[derive(Clone, Copy)]
@@ -38,6 +38,9 @@ enum Operation {
     Query(u8),
     Reset(u8),
     Reply(u8, Rgb),
+    SetDynamic(u8, Rgb),
+    QueryDynamic(u8),
+    ReplyDynamic(u8, Rgb),
 }
 
 pub(crate) struct Osc {
@@ -134,9 +137,11 @@ impl Osc {
     #[inline]
     pub(crate) fn data(&mut self, bytes: &[u8]) {
         if matches!(self.phase, Phase::Title) {
-            self.append_data(bytes, MAX_TITLE_BYTES);
-        } else {
+            self.append_title(bytes);
+        } else if matches!(self.phase, Phase::Selector { .. }) {
             self.command_data(bytes);
+        } else {
+            self.batch_data(bytes);
         }
     }
 
@@ -171,26 +176,18 @@ impl Osc {
                 }
             }
         }
-        if matches!(
-            self.phase,
-            Phase::Index | Phase::IndexedColor(_) | Phase::ResetIndex
-        ) {
-            self.indexed_data(bytes);
-            return;
+        if matches!(self.phase, Phase::Title) {
+            self.append_title(bytes);
+        } else {
+            self.batch_data(bytes);
         }
-        let capacity = match self.phase {
-            Phase::Title => MAX_TITLE_BYTES,
-            Phase::Color(_) => MAX_COLOR_BYTES,
-            _ => return,
-        };
-        self.append_data(bytes, capacity);
     }
 
     #[inline]
-    fn append_data(&mut self, bytes: &[u8], capacity: usize) {
+    fn append_title(&mut self, bytes: &[u8]) {
         let candidate = self.active ^ 1;
         let length = self.lengths[candidate];
-        if bytes.len() > capacity - length {
+        if bytes.len() > MAX_TITLE_BYTES - length {
             self.phase = Phase::Discard;
             return;
         }
@@ -230,7 +227,7 @@ impl Osc {
                         }
                         Outcome::Done
                     }
-                    Phase::Color(selector) => {
+                    Phase::Color(selector) if self.operation_count == 0 => {
                         let entry = role(u16::from(selector));
                         if bytes == b"?" {
                             Outcome::Reply(ColorReport {
@@ -245,6 +242,12 @@ impl Osc {
                             Outcome::Ignored
                         }
                     }
+                    Phase::Color(selector) => {
+                        if !self.finish_color(ColorTarget::Dynamic(selector)) {
+                            return Outcome::Ignored;
+                        }
+                        self.execute_operations(terminator)
+                    }
                     Phase::Selector {
                         value: selector @ 110..=112,
                         digits: 1..=5,
@@ -253,7 +256,7 @@ impl Osc {
                         Outcome::Done
                     }
                     Phase::IndexedColor(index) => {
-                        if !self.finish_color(index) {
+                        if !self.finish_color(ColorTarget::Indexed(index)) {
                             return Outcome::Ignored;
                         }
                         self.execute_operations(terminator)
@@ -286,7 +289,7 @@ impl Osc {
     }
 
     #[inline(never)]
-    fn indexed_data(&mut self, mut bytes: &[u8]) {
+    fn batch_data(&mut self, mut bytes: &[u8]) {
         while !bytes.is_empty() {
             match self.phase {
                 Phase::Index | Phase::ResetIndex => {
@@ -324,14 +327,30 @@ impl Osc {
                         }
                     }
                 }
-                Phase::IndexedColor(index) => {
-                    let length = bytes
-                        .iter()
-                        .position(|&byte| byte == b';')
-                        .unwrap_or(bytes.len());
+                phase @ (Phase::IndexedColor(_) | Phase::Color(_)) => {
                     let candidate = self.active ^ 1;
                     let offset = self.lengths[candidate];
-                    if length > MAX_COLOR_BYTES - offset {
+                    if let [byte] = bytes
+                        && *byte != b';'
+                    {
+                        if offset >= MAX_COLOR_BYTES {
+                            self.phase = Phase::Discard;
+                            return;
+                        }
+                        self.buffers[candidate][offset] = *byte;
+                        self.lengths[candidate] += 1;
+                        return;
+                    }
+                    let Some(capacity) = MAX_COLOR_BYTES.checked_sub(offset) else {
+                        self.phase = Phase::Discard;
+                        return;
+                    };
+                    let field = &bytes[..bytes.len().min(capacity + 1)];
+                    let length = field
+                        .iter()
+                        .position(|&byte| byte == b';')
+                        .unwrap_or(field.len());
+                    if length > capacity {
                         self.phase = Phase::Discard;
                         return;
                     }
@@ -341,11 +360,23 @@ impl Osc {
                     if length == bytes.len() {
                         return;
                     }
-                    if !self.finish_color(index) {
+                    let target = match phase {
+                        Phase::IndexedColor(index) => ColorTarget::Indexed(index),
+                        Phase::Color(selector) => ColorTarget::Dynamic(selector),
+                        _ => unreachable!("A color field is present"),
+                    };
+                    if !self.finish_color(target) {
                         self.phase = Phase::Discard;
                         return;
                     }
-                    self.phase = Phase::Index;
+                    self.phase = match target {
+                        ColorTarget::Indexed(_) => Phase::Index,
+                        ColorTarget::Dynamic(selector) if selector < 12 => {
+                            self.lengths[candidate] = 0;
+                            Phase::Color(selector + 1)
+                        }
+                        ColorTarget::Dynamic(_) => Phase::Discard,
+                    };
                     bytes = &bytes[length + 1..];
                 }
                 _ => return,
@@ -366,13 +397,19 @@ impl Osc {
         true
     }
 
-    fn finish_color(&mut self, index: u8) -> bool {
+    fn finish_color(&mut self, target: ColorTarget) -> bool {
         let candidate = self.active ^ 1;
         let bytes = &self.buffers[candidate][..self.lengths[candidate]];
         let operation = if bytes == b"?" {
-            Operation::Query(index)
+            match target {
+                ColorTarget::Indexed(index) => Operation::Query(index),
+                ColorTarget::Dynamic(selector) => Operation::QueryDynamic(selector),
+            }
         } else if let Some(color) = parse_color(bytes) {
-            Operation::Set(index, color)
+            match target {
+                ColorTarget::Indexed(index) => Operation::Set(index, color),
+                ColorTarget::Dynamic(selector) => Operation::SetDynamic(selector, color),
+            }
         } else {
             return false;
         };
@@ -389,6 +426,10 @@ impl Osc {
                         .palette
                         .set_override(PaletteEntry::Indexed(index), color)
                 }
+                Operation::SetDynamic(selector, color) => {
+                    self.palette_changed |=
+                        self.palette.set_override(role(u16::from(selector)), color)
+                }
                 Operation::Reset(index) => {
                     self.palette_changed |= self.palette.reset(PaletteEntry::Indexed(index))
                 }
@@ -398,7 +439,14 @@ impl Osc {
                     self.operations[replies] = Operation::Reply(index, color);
                     replies += 1;
                 }
-                Operation::Reply(..) => unreachable!("A command contains unexecuted operations"),
+                Operation::QueryDynamic(selector) => {
+                    let color = self.palette.color(role(u16::from(selector)));
+                    self.operations[replies] = Operation::ReplyDynamic(selector, color);
+                    replies += 1;
+                }
+                Operation::Reply(..) | Operation::ReplyDynamic(..) => {
+                    unreachable!("A command contains unexecuted operations")
+                }
             }
         }
         self.operation_count = 0;
@@ -406,26 +454,30 @@ impl Osc {
         self.reply_end = replies;
         self.terminator = terminator;
         if replies != 0 {
-            Outcome::PaletteReplies
+            Outcome::Replies
         } else {
             Outcome::Done
         }
     }
 
+    #[inline]
     pub(crate) fn has_replies(&self) -> bool {
         self.reply_head < self.reply_end
     }
 
+    #[inline]
     pub(crate) fn next_reply(&mut self) -> Option<ColorReport> {
         if !self.has_replies() {
             return None;
         }
-        let Operation::Reply(index, color) = self.operations[self.reply_head] else {
-            unreachable!("A captured palette reply is present");
+        let (target, color) = match self.operations[self.reply_head] {
+            Operation::Reply(index, color) => (ColorTarget::Indexed(index), color),
+            Operation::ReplyDynamic(selector, color) => (ColorTarget::Dynamic(selector), color),
+            _ => unreachable!("A captured color reply is present"),
         };
         self.reply_head += 1;
         Some(ColorReport {
-            target: ColorTarget::Indexed(index),
+            target,
             color,
             terminator: self.terminator,
         })

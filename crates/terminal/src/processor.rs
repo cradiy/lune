@@ -78,7 +78,7 @@ enum Pending {
     Reply(Report),
     ModeReply(ModeReport),
     ColorReply(ColorReport),
-    PaletteReplies,
+    OscReplies,
 }
 
 struct State {
@@ -179,8 +179,9 @@ impl Processor {
         self.state.osc.take_title_change()
     }
 
-    /// Current theme and runtime colors. OSC 10/11/12 accepts one numeric RGB
-    /// specification or `?`; OSC 110/111/112 restores the corresponding base.
+    /// Current theme and runtime colors. OSC 10/11/12 accepts consecutive numeric
+    /// RGB specifications or `?` through role 12 (cursor), validated atomically.
+    /// OSC 110/111/112 restores the corresponding base.
     /// OSC 4/104 supports up to [`crate::MAX_OSC_PALETTE_ENTRIES`] indexed operations
     /// per command, validated atomically before execution.
     /// Components are stored at eight-bit precision.
@@ -456,8 +457,8 @@ impl Processor {
                         pending[*end] = Some(Pending::ColorReply(reply));
                         *end += 1;
                     }
-                    Outcome::PaletteReplies => {
-                        pending[*end] = Some(Pending::PaletteReplies);
+                    Outcome::Replies => {
+                        pending[*end] = Some(Pending::OscReplies);
                         *end += 1;
                     }
                 },
@@ -595,14 +596,14 @@ impl Processor {
                     }
                     reply.encode(&mut self.reply);
                 }
-                Pending::PaletteReplies => {
+                Pending::OscReplies => {
                     if !self.reply.is_empty() {
                         return Err(ProcessFailure::ReplyPending);
                     }
                     self.state
                         .osc
                         .next_reply()
-                        .expect("A captured palette reply is pending")
+                        .expect("A captured OSC reply is pending")
                         .encode(&mut self.reply);
                     if self.state.osc.has_replies() {
                         return Err(ProcessFailure::ReplyPending);

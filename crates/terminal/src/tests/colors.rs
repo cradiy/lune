@@ -404,13 +404,96 @@ fn numeric_color_forms_commit_atomically_and_queries_preserve_wire_terminators()
 }
 
 #[test]
+fn dynamic_chains_commit_supported_suffixes_and_query_each_role_across_chunks() {
+    let specs = ["#112233", "rgb:4444/5555/6666", "#778899"];
+    let values = [
+        Rgb {
+            red: 0x11,
+            green: 0x22,
+            blue: 0x33,
+        },
+        Rgb {
+            red: 0x44,
+            green: 0x55,
+            blue: 0x66,
+        },
+        Rgb {
+            red: 0x77,
+            green: 0x88,
+            blue: 0x99,
+        },
+    ];
+    for start in 0..3 {
+        for terminator in ["\x07", "\x1b\\"] {
+            for chunk in [1, 17, usize::MAX] {
+                let mut processor = support::processor();
+                let mut screen = Screen::new(2, 2).unwrap();
+                let base = ROLES.map(|role| processor.palette().color(role));
+                let body = format!("\x1b]{};{}", start + 10, specs[start..].join(";"));
+                assert!(feed(&mut processor, &mut screen, body.as_bytes(), chunk).is_empty());
+                assert_eq!(ROLES.map(|role| processor.palette().color(role)), base);
+                assert!(!processor.take_palette_change());
+                feed(&mut processor, &mut screen, terminator.as_bytes(), chunk);
+                let mut expected = base;
+                expected[start..].copy_from_slice(&values[start..]);
+                assert_eq!(ROLES.map(|role| processor.palette().color(role)), expected);
+                assert!(processor.take_palette_change());
+                let queries = vec!["?"; 3 - start].join(";");
+                let wire = format!("\x1b]{};{queries}{terminator}", start + 10);
+                let expected: Vec<u8> = (start..3)
+                    .flat_map(|role| reply(role + 10, values[role], terminator))
+                    .collect();
+                assert_eq!(
+                    feed(&mut processor, &mut screen, wire.as_bytes(), chunk),
+                    expected
+                );
+                assert!(!processor.take_palette_change());
+                let mixed = format!("\x1b]10;?;#abcdef;?{terminator}");
+                let expected: Vec<u8> = [0, 2]
+                    .into_iter()
+                    .flat_map(|role| {
+                        reply(
+                            role + 10,
+                            processor.palette().color(ROLES[role]),
+                            terminator,
+                        )
+                    })
+                    .collect();
+                assert_eq!(
+                    feed(&mut processor, &mut screen, mixed.as_bytes(), chunk),
+                    expected
+                );
+                assert_eq!(
+                    processor.palette().color(PaletteEntry::Background),
+                    Rgb {
+                        red: 0xab,
+                        green: 0xcd,
+                        blue: 0xef
+                    }
+                );
+                assert!(processor.take_palette_change());
+                assert_eq!(
+                    (processor.parse_errors(), processor.ignored_sequences()),
+                    (0, 0)
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn rejected_cancelled_and_truncated_colors_preserve_titles_and_the_palette() {
     let invalid = [
         "10;",
         "10;rgb:/0/0",
         "11;#1234",
         "12;rgb:10000/0/0",
-        "10;#ffffff;#000000",
+        "10;#ffffff;invalid",
+        "10;?;;?",
+        "10;#112233;?;#445566;?",
+        "11;?;#abcdef;?",
+        "12;#ffffff;?",
+        "10;?;",
         "110;",
         "110;bad",
         "113",
@@ -432,14 +515,14 @@ fn rejected_cancelled_and_truncated_colors_preserve_titles_and_the_palette() {
             assert_eq!(processor.ignored_sequences(), index as u64 + 1);
         }
         for terminator in ["\x18", "\x1a", "\x1b[0m"] {
-            let wire = format!("\x1b]10;#112233{terminator}");
+            let wire = format!("\x1b]10;?;#112233;?{terminator}");
             assert!(feed(&mut processor, &mut screen, wire.as_bytes(), chunk).is_empty());
             assert_eq!(ROLES.map(|role| processor.palette().color(role)), base);
         }
         feed(
             &mut processor,
             &mut screen,
-            b"\x1b]12;rgb:ffff/ffff/ffff\x1b",
+            b"\x1b]10;?;#abcdef;rgb:ffff/ffff/ffff\x1b",
             chunk,
         );
         processor.finish(&mut screen, &mut text).unwrap();
@@ -456,8 +539,9 @@ fn rejected_cancelled_and_truncated_colors_preserve_titles_and_the_palette() {
 fn captured_color_queries_survive_backpressure_theme_changes_and_resets() {
     let mut processor = support::processor();
     let mut screen = Screen::new(2, 2).unwrap();
-    let original = processor.palette().color(PaletteEntry::Foreground);
-    let wire = b"\x1b[5n\x1b]10;?\x1b\\";
+    let originals = ROLES.map(|role| processor.palette().color(role));
+    let original = originals[0];
+    let wire = b"\x1b[5n\x1b]10;?;?;?\x1b\\";
     let error = processor.advance(wire, &mut screen, &mut text).unwrap_err();
     assert_eq!(error.consumed, wire.len());
     assert!(matches!(error.error, ProcessFailure::ReplyPending));
@@ -471,20 +555,40 @@ fn captured_color_queries_survive_backpressure_theme_changes_and_resets() {
             .palette()
             .base_color(PaletteEntry::Indexed(index as u8))
     });
-    let background = processor.palette().base_color(PaletteEntry::Background);
-    let cursor = processor.palette().base_color(PaletteEntry::Cursor);
+    let background = Rgb {
+        red: 210,
+        green: 211,
+        blue: 212,
+    };
+    let cursor = Rgb {
+        red: 220,
+        green: 221,
+        blue: 222,
+    };
     assert!(processor.set_palette_base(indexed, next, background, cursor));
     assert!(processor.take_palette_change());
     assert_eq!(processor.reply_bytes(), b"\x1b[0n");
     assert!(processor.consume_reply(4));
-    processor.advance(&[], &mut screen, &mut text).unwrap();
-    let expected = reply(10, original, "\x1b\\");
-    assert_eq!(processor.reply_bytes(), expected);
-    assert!(processor.consume_reply(3));
-    processor.advance(b"\x1bc", &mut screen, &mut text).unwrap();
-    assert_eq!(processor.reply_bytes(), &expected[3..]);
+    for (index, rgb) in originals.into_iter().enumerate() {
+        let result = processor.advance(&[], &mut screen, &mut text);
+        if index < 2 {
+            assert!(matches!(
+                result.unwrap_err().error,
+                ProcessFailure::ReplyPending
+            ));
+        } else {
+            assert_eq!(result.unwrap(), 0);
+        }
+        let expected = reply(index + 10, rgb, "\x1b\\");
+        assert_eq!(processor.reply_bytes(), expected);
+        assert!(processor.consume_reply(3));
+        if index == 2 {
+            processor.advance(b"\x1bc", &mut screen, &mut text).unwrap();
+            assert_eq!(processor.reply_bytes(), &expected[3..]);
+        }
+        assert!(processor.consume_reply(processor.reply_bytes().len()));
+    }
     assert_eq!(processor.palette().color(PaletteEntry::Foreground), next);
-    assert!(processor.consume_reply(processor.reply_bytes().len()));
     feed(&mut processor, &mut screen, b"\x1b]10;#c8c9ca\x07", 1);
     assert!(!processor.take_palette_change());
     assert!(processor.palette().is_overridden(PaletteEntry::Foreground));
@@ -499,10 +603,17 @@ fn captured_color_queries_survive_backpressure_theme_changes_and_resets() {
     feed(
         &mut processor,
         &mut screen,
-        b"\x1b]11;#123456\x07\x1b]12;#abcdef\x07",
+        b"\x1b]11;#123456;#abcdef\x07",
         17,
     );
     processor.take_palette_change();
+    assert!(matches!(
+        processor
+            .advance(b"\x1b]10;?;?;?\x07", &mut screen, &mut text)
+            .unwrap_err()
+            .error,
+        ProcessFailure::ReplyPending
+    ));
     processor.reset(&mut screen, &mut text);
     assert_eq!(
         processor.palette().color(PaletteEntry::Background),
@@ -510,6 +621,8 @@ fn captured_color_queries_survive_backpressure_theme_changes_and_resets() {
     );
     assert_eq!(processor.palette().color(PaletteEntry::Cursor), cursor);
     assert!(processor.take_palette_change());
+    assert!(processor.reply_bytes().is_empty());
+    assert_eq!(processor.advance(&[], &mut screen, &mut text).unwrap(), 0);
     assert!(processor.reply_bytes().is_empty());
     assert_eq!(processor.ignored_sequences(), 0);
 }
