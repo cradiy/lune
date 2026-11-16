@@ -78,6 +78,7 @@ enum Pending {
     Reply(Report),
     ModeReply(ModeReport),
     ColorReply(ColorReport),
+    PaletteReplies,
 }
 
 struct State {
@@ -180,6 +181,8 @@ impl Processor {
 
     /// Current theme and runtime colors. OSC 10/11/12 accepts one numeric RGB
     /// specification or `?`; OSC 110/111/112 restores the corresponding base.
+    /// OSC 4/104 supports up to [`crate::MAX_OSC_PALETTE_ENTRIES`] indexed operations
+    /// per command, validated atomically before execution.
     /// Components are stored at eight-bit precision.
     pub fn palette(&self) -> &Palette {
         self.state.osc.palette()
@@ -204,7 +207,7 @@ impl Processor {
     }
 
     /// Unsent bytes from the active reply, in wire order. The fixed output slot
-    /// holds one reply of at most 25 bytes. Bytes remain stable until acknowledged
+    /// holds one reply of at most 28 bytes. Bytes remain stable until acknowledged
     /// or explicitly reset. RIS preserves replies issued before it.
     #[inline]
     pub fn reply_bytes(&self) -> &[u8] {
@@ -276,8 +279,12 @@ impl Processor {
             .map_err(|error| ProcessError { consumed: 0, error })?;
         if input.len() == 1 && self.parser.is_ground() {
             let byte = input[0];
-            if (b' '..=b'~').contains(&byte) && (!self.state.charsets.is_graphics() || byte < b'_')
-            {
+            let last = if self.state.charsets.is_graphics() {
+                b'^'
+            } else {
+                b'~'
+            };
+            if byte.wrapping_sub(b' ') <= last - b' ' {
                 // SAFETY: this slice contains exactly one printable ASCII byte.
                 let value = unsafe { std::str::from_utf8_unchecked(input) };
                 text.write(screen, value, self.state.style)
@@ -449,6 +456,10 @@ impl Processor {
                         pending[*end] = Some(Pending::ColorReply(reply));
                         *end += 1;
                     }
+                    Outcome::PaletteReplies => {
+                        pending[*end] = Some(Pending::PaletteReplies);
+                        *end += 1;
+                    }
                 },
                 Event::Error(_) => *parse_errors = parse_errors.saturating_add(1),
             });
@@ -570,19 +581,32 @@ impl Processor {
                     if !self.reply.is_empty() {
                         return Err(ProcessFailure::ReplyPending);
                     }
-                    self.reply = reply.encode();
+                    reply.encode(&mut self.reply);
                 }
                 Pending::ModeReply(reply) => {
                     if !self.reply.is_empty() {
                         return Err(ProcessFailure::ReplyPending);
                     }
-                    self.reply = reply.encode();
+                    reply.encode(&mut self.reply);
                 }
                 Pending::ColorReply(reply) => {
                     if !self.reply.is_empty() {
                         return Err(ProcessFailure::ReplyPending);
                     }
-                    self.reply = reply.encode();
+                    reply.encode(&mut self.reply);
+                }
+                Pending::PaletteReplies => {
+                    if !self.reply.is_empty() {
+                        return Err(ProcessFailure::ReplyPending);
+                    }
+                    self.state
+                        .osc
+                        .next_reply()
+                        .expect("A captured palette reply is pending")
+                        .encode(&mut self.reply);
+                    if self.state.osc.has_replies() {
+                        return Err(ProcessFailure::ReplyPending);
+                    }
                 }
             }
             self.pending[self.head] = None;

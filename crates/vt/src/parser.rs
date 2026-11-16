@@ -84,6 +84,7 @@ pub enum Event<'a> {
 enum State {
     #[default]
     Ground,
+    Utf8Pending,
     Escape,
     CsiEntry,
     CsiParameters,
@@ -118,7 +119,7 @@ impl Parser {
     /// Complete valid text can then be consumed without changing parser state.
     #[inline]
     pub fn is_ground(&self) -> bool {
-        self.state == State::Ground && !self.utf8.is_pending()
+        self.state == State::Ground
     }
 
     /// Discards a string payload prefix without emitting data events, stopping
@@ -138,9 +139,13 @@ impl Parser {
     /// bytes follow the UTF-8 error policy; decoded Unicode is emitted as text.
     /// DEL is ignored. CAN and SUB cancel a pending sequence and emit a control.
     /// Text span boundaries may vary with input chunking.
+    #[inline]
     pub fn advance(&mut self, bytes: &[u8], mut emit: impl FnMut(Event<'_>)) {
         if let [byte] = bytes {
-            if self.state == State::Ground && *byte >= 0x20 && *byte != 0x7f {
+            if matches!(self.state, State::Ground | State::Utf8Pending)
+                && *byte >= 0x20
+                && *byte != 0x7f
+            {
                 if self.decode(*byte, &mut emit) {
                     // An invalid pending prefix leaves this byte to be decoded again.
                     self.decode(*byte, &mut emit);
@@ -151,6 +156,10 @@ impl Parser {
             return;
         }
 
+        self.advance_chunk(bytes, emit);
+    }
+
+    fn advance_chunk(&mut self, bytes: &[u8], mut emit: impl FnMut(Event<'_>)) {
         let mut offset = 0;
         while offset < bytes.len() {
             if matches!(
@@ -162,7 +171,7 @@ impl Parser {
             }
             let first = bytes[offset];
             if first >= 0x20 && first != 0x7f {
-                if self.state == State::Ground && !self.utf8.is_pending() {
+                if self.state == State::Ground {
                     let length = text_end(&bytes[offset..]);
                     self.advance_text(&bytes[offset..offset + length], &mut emit);
                     offset += length;
@@ -175,6 +184,17 @@ impl Parser {
                     }
                     offset += length;
                     continue;
+                }
+                if let State::Ignore { csi } = self.state {
+                    let first_final = if csi { 0x40 } else { 0x30 };
+                    let length = bytes[offset..]
+                        .iter()
+                        .position(|&byte| byte < 0x20 || byte >= first_final)
+                        .unwrap_or(bytes.len() - offset);
+                    if length != 0 {
+                        offset += length;
+                        continue;
+                    }
                 }
             }
             self.advance_byte(first, &mut emit);
@@ -196,7 +216,10 @@ impl Parser {
         ) {
             emit(Event::Osc(OscEvent::Cancel));
         }
-        if !matches!(self.state, State::Ground | State::Ignore { .. }) {
+        if !matches!(
+            self.state,
+            State::Ground | State::Utf8Pending | State::Ignore { .. }
+        ) {
             emit(Event::Error(ParseError::IncompleteSequence));
         }
         self.reset();
@@ -268,7 +291,7 @@ impl Parser {
             return;
         }
 
-        if self.state == State::Ground && self.utf8.is_pending() && !self.decode(byte, emit) {
+        if self.state == State::Utf8Pending && !self.decode(byte, emit) {
             return;
         }
         if matches!(
@@ -297,7 +320,10 @@ impl Parser {
             return;
         }
 
-        if !matches!(self.state, State::Ground | State::Ignore { .. }) {
+        if !matches!(
+            self.state,
+            State::Ground | State::Utf8Pending | State::Ignore { .. }
+        ) {
             self.sequence_bytes += 1;
             if self.sequence_bytes > MAX_SEQUENCE_BYTES {
                 self.reject(ParseError::SequenceTooLong, emit);
@@ -374,9 +400,17 @@ impl Parser {
     /// Returns true when an invalid prefix leaves the current byte to be reprocessed.
     fn decode(&mut self, byte: u8, emit: &mut impl FnMut(Event<'_>)) -> bool {
         match self.utf8.push(byte) {
-            Decoded::Text(text) => emit(Event::Text(text)),
-            Decoded::Pending => {}
+            Decoded::Text(text) => {
+                self.state = State::Ground;
+                emit(Event::Text(text));
+            }
+            Decoded::Pending => {
+                if self.state != State::Utf8Pending {
+                    self.state = State::Utf8Pending;
+                }
+            }
             Decoded::Invalid { retry } => {
+                self.state = State::Ground;
                 emit(Event::Text("\u{fffd}"));
                 return retry;
             }
@@ -397,7 +431,9 @@ impl Parser {
                     self.state = State::Ground;
                 }
             }
-            State::String { .. } | State::StringEscape { .. } => unreachable!(),
+            State::Utf8Pending | State::String { .. } | State::StringEscape { .. } => {
+                unreachable!()
+            }
         }
     }
 

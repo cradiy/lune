@@ -46,6 +46,7 @@ struct Expected<'a> {
     title_changed: bool,
     colors: [Rgb; 3],
     palette_changed: bool,
+    indexed: [Rgb; 256],
 }
 
 fn drain_reply(processor: &mut Processor, output: &mut Vec<u8>, count: usize) {
@@ -149,6 +150,12 @@ fn drive(wire: &[u8], chunk: usize, fail_at: usize, expected: &Expected<'_>) {
     );
     assert_eq!(processor.take_palette_change(), expected.palette_changed);
     assert!(!processor.take_palette_change());
+    for index in 0..=u8::MAX {
+        assert_eq!(
+            processor.palette().color(PaletteEntry::Indexed(index)),
+            expected.indexed[usize::from(index)]
+        );
+    }
     for (event, normal, sgr, suffix, enabled) in [
         (
             MouseEvent::Release(MouseButton::Right),
@@ -249,6 +256,17 @@ fn reference_id(values: &mut Vec<Style>, style: Style) -> StyleId {
     StyleId(index as u32)
 }
 
+fn indexed_reply(output: &mut Vec<u8>, index: u8, color: Rgb, terminator: &str) {
+    write!(
+        output,
+        "\x1b]4;{index};rgb:{:04x}/{:04x}/{:04x}{terminator}",
+        u16::from(color.red) * 257,
+        u16::from(color.green) * 257,
+        u16::from(color.blue) * 257
+    )
+    .unwrap();
+}
+
 fn ascii(expected: &mut ScreenModel, bytes: &[u8], style: StyleId, graphics: bool) {
     for &byte in bytes {
         let character = if graphics {
@@ -306,6 +324,12 @@ fuzz_target!(|data: &[u8]| {
     ];
     let mut colors = base_colors;
     let mut palette_changed = false;
+    let base_indexed: [Rgb; 256] = std::array::from_fn(|index| Rgb {
+        red: index as u8,
+        green: 12,
+        blue: 34,
+    });
+    let mut indexed = base_indexed;
     for bytes in data.as_chunks::<8>().0.iter().take(512) {
         let index = usize::from(expected.is_alternate());
         let command = match bytes[0] % 64 {
@@ -464,6 +488,8 @@ fuzz_target!(|data: &[u8]| {
             32 => {
                 wire.extend(b"\x1bc");
                 palette_changed |= colors != base_colors;
+                palette_changed |= indexed != base_indexed;
+                indexed = base_indexed;
                 colors = base_colors;
                 title_changed |= !title.is_empty();
                 title.clear();
@@ -491,7 +517,7 @@ fuzz_target!(|data: &[u8]| {
                 None
             }
             37 => {
-                match bytes[1] % 8 {
+                match bytes[1] % 12 {
                     0 => {
                         let next = format!("title-{}-🌙;{}", bytes[2], bytes[3]);
                         let selector = if bytes[4] & 1 == 0 { 0 } else { 2 };
@@ -552,11 +578,52 @@ fuzz_target!(|data: &[u8]| {
                         )
                         .unwrap();
                     }
-                    _ => {
+                    7 => {
                         let role = usize::from(bytes[2] % 3);
                         write!(&mut wire, "\x1b]{}\x07", role + 110).unwrap();
                         palette_changed |= colors[role] != base_colors[role];
                         colors[role] = base_colors[role];
+                    }
+                    8 => {
+                        let index = bytes[2];
+                        let other = bytes[6];
+                        let color = Rgb {
+                            red: bytes[3],
+                            green: bytes[4],
+                            blue: bytes[5],
+                        };
+                        let terminator = if bytes[7] & 1 == 0 { "\x07" } else { "\x1b\\" };
+                        write!(&mut wire, "\x1b]4;{index};?;{index};#{:02x}{:02x}{:02x};{index};?;{other};?{terminator}", color.red, color.green, color.blue).unwrap();
+                        indexed_reply(&mut replies, index, indexed[usize::from(index)], terminator);
+                        palette_changed |= indexed[usize::from(index)] != color;
+                        indexed[usize::from(index)] = color;
+                        indexed_reply(&mut replies, index, color, terminator);
+                        indexed_reply(&mut replies, other, indexed[usize::from(other)], terminator);
+                    }
+                    9 => {
+                        write!(&mut wire, "\x1b]104;{};{}\x07", bytes[2], bytes[3]).unwrap();
+                        for index in [bytes[2], bytes[3]] {
+                            let index = usize::from(index);
+                            palette_changed |= indexed[index] != base_indexed[index];
+                            indexed[index] = base_indexed[index];
+                        }
+                    }
+                    10 => {
+                        wire.extend(b"\x1b]104\x1b\\");
+                        palette_changed |= indexed != base_indexed;
+                        indexed = base_indexed;
+                    }
+                    _ => {
+                        let terminator = if bytes[7] & 1 == 0 { "\x07" } else { "\x18" };
+                        write!(
+                            &mut wire,
+                            "\x1b]4;{};?;{};#123456;999;?{terminator}",
+                            bytes[2], bytes[2]
+                        )
+                        .unwrap();
+                        if bytes[7] & 1 == 0 {
+                            diagnostics.1 += 1;
+                        }
                     }
                 }
                 None
@@ -962,6 +1029,7 @@ fuzz_target!(|data: &[u8]| {
         title_changed,
         colors,
         palette_changed,
+        indexed,
         values: &values,
         style: current,
         input,

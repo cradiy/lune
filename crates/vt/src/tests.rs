@@ -186,6 +186,52 @@ fn rejected_sequences_emit_one_error_and_resume_after_the_final_byte() {
 }
 
 #[test]
+fn ignored_headers_preserve_controls_final_bytes_and_escape_restarts() {
+    for (header, error, first_final) in [
+        (
+            b"\x1b[65536".as_slice(),
+            ParseError::ParameterOverflow,
+            0x40,
+        ),
+        (
+            b"\x1b     ".as_slice(),
+            ParseError::TooManyIntermediates,
+            0x30,
+        ),
+    ] {
+        let payload = (0x20..first_final).collect::<Vec<u8>>().repeat(4);
+        let mut wire = Vec::new();
+        for ending in [b"~Z".as_slice(), b"\x18A", b"\x1aB", b"\x1b[31mC"] {
+            wire.extend_from_slice(header);
+            wire.extend_from_slice(&payload);
+            wire.extend_from_slice(b"\x08\x7f\x80\xff");
+            wire.extend_from_slice(&payload);
+            wire.extend_from_slice(ending);
+        }
+        let expected = vec![
+            OwnedEvent::Error(error),
+            OwnedEvent::Execute(0x08),
+            OwnedEvent::Print('Z'),
+            OwnedEvent::Error(error),
+            OwnedEvent::Execute(0x08),
+            OwnedEvent::Execute(0x18),
+            OwnedEvent::Print('A'),
+            OwnedEvent::Error(error),
+            OwnedEvent::Execute(0x08),
+            OwnedEvent::Execute(0x1a),
+            OwnedEvent::Print('B'),
+            OwnedEvent::Error(error),
+            OwnedEvent::Execute(0x08),
+            csi(31, b'm'),
+            OwnedEvent::Print('C'),
+        ];
+        for chunk in [1, 2, 17, wire.len()] {
+            assert_eq!(parse(wire.chunks(chunk)), expected);
+        }
+    }
+}
+
+#[test]
 fn cancellation_and_escape_restart_preserve_control_order() {
     let input = b"\x1b[12\x08;\x18A\x1b[3\x1b[2mB\x1b]hidden\x1aC\x1b_Pignored\x1b[1mD\x7f\x1b_X\x07Y\x1b\\E";
     let expected = vec![
@@ -237,8 +283,16 @@ fn stream_boundaries_finalize_or_discard_pending_input_explicitly() {
     let mut emit = |event: Event<'_>| capture(&mut events, event);
 
     parser.advance(b"\xe2\x82", &mut emit);
+    assert!(!parser.is_ground());
     parser.finish(&mut emit);
+    assert!(parser.is_ground());
     parser.finish(&mut emit);
+    parser.advance(b"\xf0\x9f", &mut emit);
+    assert!(!parser.is_ground());
+    parser.advance(b"\x8c", &mut emit);
+    assert!(!parser.is_ground());
+    parser.advance(b"\x99", &mut emit);
+    assert!(parser.is_ground());
     parser.advance(b"\x1b[12", &mut emit);
     parser.finish(&mut emit);
     parser.advance(b"\x1b[65536", &mut emit);
@@ -254,6 +308,7 @@ fn stream_boundaries_finalize_or_discard_pending_input_explicitly() {
         events,
         vec![
             OwnedEvent::Print(char::REPLACEMENT_CHARACTER),
+            OwnedEvent::Print('🌙'),
             OwnedEvent::Error(ParseError::IncompleteSequence),
             OwnedEvent::Error(ParseError::ParameterOverflow),
             OwnedEvent::Print('Z'),

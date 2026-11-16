@@ -19,6 +19,63 @@ use lune_terminal::{
 static ALLOCATOR: allocator::TestAllocator = allocator::TestAllocator;
 
 #[test]
+fn indexed_batches_capture_and_deliver_all_queries_without_allocation() {
+    let mut wire = String::from("\x1b]4");
+    for index in 0..=u8::MAX {
+        write!(&mut wire, ";{index};rgb:1111/2222/3333").unwrap();
+    }
+    wire.push('\x07');
+    wire.push_str("\x1b]4");
+    for index in 0..=u8::MAX {
+        write!(&mut wire, ";{index};?").unwrap();
+    }
+    wire.push_str("\x1b\\\x1b]104\x07");
+    let mut screen = Screen::new(2, 2).unwrap();
+    let ((), stats) = allocator::measure(Some(0), || {
+        let mut text = |_: &mut Screen, _: &str, _: StyleId| Ok::<_, ()>(());
+        for chunk in [1, 17, wire.len()] {
+            let mut processor = support::processor();
+            let mut delivered = 0;
+            for mut bytes in wire.as_bytes().chunks(chunk) {
+                loop {
+                    let result = processor.advance(bytes, &mut screen, &mut text);
+                    while !processor.reply_bytes().is_empty() {
+                        black_box(processor.reply_bytes()[0]);
+                        delivered += 1;
+                        assert!(processor.consume_reply(1));
+                    }
+                    match result {
+                        Ok(count) => {
+                            assert_eq!(count, bytes.len());
+                            break;
+                        }
+                        Err(error) => {
+                            assert!(matches!(error.error, ProcessFailure::ReplyPending));
+                            bytes = &bytes[error.consumed..];
+                        }
+                    }
+                }
+            }
+            assert_eq!(delivered, 10 * 26 + 90 * 27 + 156 * 28);
+            assert_eq!(
+                (processor.parse_errors(), processor.ignored_sequences()),
+                (0, 0)
+            );
+            for index in 0..=u8::MAX {
+                assert!(
+                    !processor
+                        .palette()
+                        .is_overridden(lune_terminal::PaletteEntry::Indexed(index))
+                );
+            }
+            processor.finish(&mut screen, &mut text).unwrap();
+            processor.reset(&mut screen, &mut text);
+        }
+    });
+    assert_eq!(stats.attempts, 0);
+}
+
+#[test]
 fn dynamic_color_commands_queries_and_resets_allocate_nothing() {
     let wire = b"\x1b]10;rgb:ffff/0080/1234\x07\x1b]10;?\x1b\\\x1b]11;#123456\x07\x1b]11;?\x07\x1b]12;#abcdef\x07\x1b]12;?\x1b\\\x1b]110\x07\x1b]111\x07\x1b]112\x07";
     let mut screen = Screen::new(2, 2).unwrap();

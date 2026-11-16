@@ -114,6 +114,9 @@ reply backpressure alongside status and cursor-position reports.
 Dynamic foreground, background, and cursor commands compare numeric RGB updates,
 queries, coalesced notifications, and resets with independent color state. Color
 replies preserve BEL/ST framing while sharing the same output backpressure.
+Indexed OSC 4/104 batches compare ordered sets, captured queries, and selective
+or table resets against an independent 256-color model. Invalid batch tails
+preserve both the palette and reply stream.
 SGR commands update an independent rendition value and a vector of reference
 styles. Cell styles are compared by resolved value, allowing actual IDs to change
 as collection runs between chunks and retries. Collection must retain current

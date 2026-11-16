@@ -1,10 +1,9 @@
-use lune_vt::CsiSequence;
-use lune_vt::OscTerminator;
+use lune_vt::{CsiSequence, OscTerminator};
 
 use crate::{InputModes, MouseTracking, Rgb, Screen, ScreenBuffer};
 
-// OSC 12;rgb:hhhh/hhhh/hhhh followed by ST.
-const CAPACITY: usize = 25;
+// OSC 4;255;rgb:hhhh/hhhh/hhhh followed by ST.
+const CAPACITY: usize = 28;
 
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Reply {
@@ -27,19 +26,31 @@ pub(crate) struct ModeReport {
 }
 
 #[derive(Clone, Copy)]
+pub(crate) enum ColorTarget {
+    Dynamic(u8),
+    Indexed(u8),
+}
+
+#[derive(Clone, Copy)]
 pub(crate) struct ColorReport {
-    pub(crate) selector: u8,
+    pub(crate) target: ColorTarget,
     pub(crate) color: Rgb,
     pub(crate) terminator: OscTerminator,
 }
 
 impl ColorReport {
     #[cold]
-    pub(crate) fn encode(self) -> Reply {
+    pub(crate) fn encode(self, reply: &mut Reply) {
         const HEX: &[u8; 16] = b"0123456789abcdef";
-        let mut reply = Reply::default();
+        reply.clear();
         reply.append(b"\x1b]");
-        reply.number(u16::from(self.selector));
+        match self.target {
+            ColorTarget::Dynamic(selector) => reply.number(u16::from(selector)),
+            ColorTarget::Indexed(index) => {
+                reply.append(b"4;");
+                reply.number(u16::from(index));
+            }
+        }
         reply.append(b";rgb:");
         for (index, channel) in [self.color.red, self.color.green, self.color.blue]
             .into_iter()
@@ -56,19 +67,17 @@ impl ColorReport {
             OscTerminator::Bell => b"\x07",
             OscTerminator::St => b"\x1b\\",
         });
-        reply
     }
 }
 
 impl Report {
-    pub(crate) fn encode(self) -> Reply {
+    pub(crate) fn encode(self, reply: &mut Reply) {
         match self {
             Self::Status => {
-                let mut reply = Reply::default();
+                reply.clear();
                 reply.append(b"\x1b[0n");
-                reply
             }
-            Self::Position(row, column) => Reply::position(row, column),
+            Self::Position(row, column) => reply.position(row, column),
         }
     }
 }
@@ -90,14 +99,18 @@ impl Reply {
         true
     }
 
-    pub(crate) fn position(row: u16, column: u16) -> Self {
-        let mut reply = Self::default();
-        reply.append(b"\x1b[");
-        reply.number(row);
-        reply.append(b";");
-        reply.number(column);
-        reply.append(b"R");
-        reply
+    fn clear(&mut self) {
+        self.start = 0;
+        self.end = 0;
+    }
+
+    pub(crate) fn position(&mut self, row: u16, column: u16) {
+        self.clear();
+        self.append(b"\x1b[");
+        self.number(row);
+        self.append(b";");
+        self.number(column);
+        self.append(b"R");
     }
 
     fn append(&mut self, bytes: &[u8]) {
@@ -199,13 +212,13 @@ pub(crate) fn mode_query(
 
 impl ModeReport {
     #[cold]
-    pub(crate) fn encode(self) -> Reply {
+    pub(crate) fn encode(self, reply: &mut Reply) {
         let Self {
             private,
             selector,
             enabled,
         } = self;
-        let mut reply = Reply::default();
+        reply.clear();
         reply.append(if private { b"\x1b[?" } else { b"\x1b[" });
         reply.number(selector);
         let status = match enabled {
@@ -214,6 +227,5 @@ impl ModeReport {
             Some(false) => b'2',
         };
         reply.append(&[b';', status, b'$', b'y']);
-        reply
     }
 }
