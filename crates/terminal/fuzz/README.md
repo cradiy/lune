@@ -102,6 +102,8 @@ with the complete-unit Screen model. It exercises cursor addressing, scrolling,
 cell and line edits, erasure, tabs, mode changes, saved cursors, and reset, together
 with malformed UTF-8, OSC window titles, discarded strings, rejected parameter forms,
 and diagnostics.
+HPA preserves the modeled row; HPR and VPR share the independent relative-motion
+oracle with CUF and CUD. Both default and explicit counts are generated.
 Unsupported mode lists preserve all screen state.
 
 Each input runs as one chunk and in chunks of one through seventeen bytes. A text

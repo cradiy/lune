@@ -89,6 +89,7 @@ fn main() {
         b"abcdefghijklmnopqrstuvwxyz 0123456789 ABCDEFGHIJKLMNOPQRSTUVWXYZ\r\n".repeat(1024);
     let unicode = "水🌙é hello\r\n".repeat(2048);
     let controls = b"\x1b[2;4Hword\x1b[0K\x1b[2A\x1b7\x1b[4hXX\x1b[4l\x1b8\r\n".repeat(1024);
+    let positions = b"\x1b[2;20r\x1b[?6h\x1b[4;120Hx\x1b[0`\x1b[a\x1b[2e\x1b[65535`\x1b[65535a\x1b[65535e\x1b[?6l\x1b[r".repeat(1024);
     let strings = b"\x1b]0;synthetic title\x07\x1bPsynthetic payload\x1b\\".repeat(2048);
     let titles = "\x1b]2;synthetic one\x07\x1b]0;synthetic 🌙;two\x1b\\"
         .as_bytes()
@@ -115,6 +116,9 @@ fn main() {
     measure("ASCII / 1-byte", &ascii, 1);
     measure("scalar width fixture", unicode.as_bytes(), unicode.len());
     measure("controls", &controls, controls.len());
+    measure("ANSI positions / bulk", &positions, positions.len());
+    measure("ANSI positions / 17-byte", &positions, 17);
+    measure("ANSI positions / 1-byte", &positions, 1);
     measure("control strings", &strings, strings.len());
     measure("title updates / bulk", &titles, titles.len());
     measure("title updates / 17-byte", &titles, 17);

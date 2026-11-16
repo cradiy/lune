@@ -889,8 +889,8 @@ fn csi(screen: &mut Screen, sequence: CsiSequence<'_>, state: &mut State) -> boo
     let n = count(p);
     match sequence.final_byte {
         b'A' => screen.move_cursor_up(n),
-        b'B' => screen.move_cursor_down(n),
-        b'C' => screen.move_cursor_right(n),
+        b'B' | b'e' => screen.move_cursor_down(n),
+        b'C' | b'a' => screen.move_cursor_right(n),
         b'D' => screen.move_cursor_left(n),
         b'E' => {
             screen.move_cursor_down(n);
@@ -900,7 +900,7 @@ fn csi(screen: &mut Screen, sequence: CsiSequence<'_>, state: &mut State) -> boo
             screen.move_cursor_up(n);
             screen.carriage_return();
         }
-        b'G' => {
+        b'G' | b'`' => {
             let row = screen.cursor().row
                 - if screen.origin_mode() {
                     screen.scroll_region().start

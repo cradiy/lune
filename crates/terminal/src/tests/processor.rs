@@ -146,6 +146,89 @@ fn row_text(screen: &Screen, row: usize) -> String {
 }
 
 #[test]
+fn ansi_positions_preserve_axes_clamp_regions_and_cancel_pending_wrap() {
+    use crate::ScreenBuffer::{Alternate, Primary};
+
+    for chunk in [1, 17, usize::MAX] {
+        let mut screen = Screen::new(8, 5).unwrap();
+        let mut processor = support::processor();
+        for buffer in [Primary, Alternate] {
+            screen.select_buffer(buffer);
+            let inactive = if buffer == Primary {
+                Alternate
+            } else {
+                Primary
+            };
+            let untouched = snapshot(screen.buffer(inactive));
+            let steps: &[(&[u8], usize, usize, bool)] = &[
+                (b"\x1b[2;4r\x1b[?6h\x1b[2;8Hx", 2, 7, true),
+                (b"\x1b[0`", 2, 0, false),
+                (b"\x1b[a", 2, 1, false),
+                (b"\x1b[0e", 3, 1, false),
+                (b"\x1b[65535a", 3, 7, false),
+                (b"\x1b[65535e", 3, 7, false),
+                (b"\x1b[65535`", 3, 7, false),
+                (b"Z\x1b[eW", 3, 7, true),
+                (b"\x1b[`", 3, 0, false),
+                (b"\x1b[0a", 3, 1, false),
+                (b"\x1b[8`W", 3, 7, true),
+            ];
+            for &(wire, row, column, wrap_pending) in steps {
+                for bytes in wire.chunks(chunk) {
+                    processor
+                        .advance(bytes, &mut screen, &mut write_text)
+                        .unwrap();
+                }
+                assert_eq!(
+                    screen.cursor(),
+                    Cursor {
+                        row,
+                        column,
+                        wrap_pending
+                    }
+                );
+            }
+            let before = snapshot(screen.grid());
+            let cursor = screen.cursor();
+            for final_byte in ['`', 'a', 'e'] {
+                for header in ["?2", "2 ", "2:3", "2;3"] {
+                    let wire = format!("\x1b[{header}{final_byte}");
+                    for bytes in wire.as_bytes().chunks(chunk) {
+                        processor
+                            .advance(bytes, &mut screen, &mut write_text)
+                            .unwrap();
+                    }
+                    assert_eq!(screen.cursor(), cursor);
+                    assert_eq!(snapshot(screen.grid()), before);
+                }
+            }
+            for bytes in b"\x1b[?6l\x1b[5;4H\x1b[65535e".chunks(chunk) {
+                processor
+                    .advance(bytes, &mut screen, &mut write_text)
+                    .unwrap();
+            }
+            assert_eq!(
+                screen.cursor(),
+                Cursor {
+                    row: 4,
+                    column: 3,
+                    wrap_pending: false
+                }
+            );
+            assert_eq!(row_text(&screen, 2), "       x");
+            assert_eq!(row_text(&screen, 3), "       W");
+            assert_eq!(row_text(&screen, 4), "        ");
+            assert_eq!(screen.scroll_region(), 1..4);
+            assert_eq!(snapshot(screen.buffer(inactive)), untouched);
+        }
+        assert_eq!(
+            (processor.parse_errors(), processor.ignored_sequences()),
+            (0, 24)
+        );
+    }
+}
+
+#[test]
 fn byte_stream_controls_compose_with_origin_modes_and_split_input() {
     let input = "\x1b[2;4r\x1b[?6habc\x1b[2;3H水\x1b7\x1b[4h\x1b[1;1HXY\x1b[?7l\x1b8!\x1b[0A\x1b[G\x1b[X\x1b[2;8Hyz\x1b[?999h\x1b[?2J\x1b[1:2A\x1b[65536A\x1b]0;synthetic title\x07".as_bytes();
     let (screen, mut processor) = run(input, &[]);

@@ -367,8 +367,14 @@ fuzz_target!(|data: &[u8]| {
             2 => {
                 let row = bytes[1] as usize % 7;
                 let column = bytes[2] as usize % 12;
-                write!(&mut wire, "\x1b[{};{}H", row + 1, column + 1).unwrap();
-                Some(Command::Cursor(row, column))
+                if bytes[5] & 1 == 0 {
+                    write!(&mut wire, "\x1b[{};{}H", row + 1, column + 1).unwrap();
+                    Some(Command::Cursor(row, column))
+                } else {
+                    let column = count(&mut wire, b'`', bytes) - 1;
+                    let (row, _) = expected.report_position();
+                    Some(Command::Cursor(row - 1, column))
+                }
             }
             3 => {
                 let top = bytes[1] as usize % 4;
@@ -447,9 +453,17 @@ fuzz_target!(|data: &[u8]| {
                 Some(Command::LineFeed)
             }
             17 => Some(Command::MoveUp(count(&mut wire, b'A', bytes))),
-            18 => Some(Command::MoveDown(count(&mut wire, b'B', bytes))),
+            18 => Some(Command::MoveDown(count(
+                &mut wire,
+                if bytes[5] & 1 == 0 { b'B' } else { b'e' },
+                bytes,
+            ))),
             19 => Some(Command::MoveLeft(count(&mut wire, b'D', bytes))),
-            20 => Some(Command::MoveRight(count(&mut wire, b'C', bytes))),
+            20 => Some(Command::MoveRight(count(
+                &mut wire,
+                if bytes[5] & 1 == 0 { b'C' } else { b'a' },
+                bytes,
+            ))),
             21 => Some(Command::ScrollUp(count(&mut wire, b'S', bytes))),
             22 => Some(Command::ScrollDown(count(&mut wire, b'T', bytes))),
             23 => Some(Command::TabForward(count(&mut wire, b'I', bytes))),

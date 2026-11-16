@@ -1935,7 +1935,7 @@ fn processor_retries_allocation_failures_from_owned_input_positions() {
             screen.write("水\u{301}", CellWidth::Double, style)
         }
     }
-    let input = "AB\x1b[2;2H水\nZ".as_bytes();
+    let input = "AB\x1b[2;2H\x1b[a水\x1b[0`\x1b[eZ".as_bytes();
     let mut expected_screen = Screen::new(8, 4).unwrap();
     let mut expected_processor = support::processor();
     let (result, stats) = allocator::measure(None, || {
@@ -1983,7 +1983,7 @@ fn processor_retries_allocation_failures_from_owned_input_positions() {
     let (result, stats) = allocator::measure(Some(0), || {
         for _ in 0..32 {
             processor.advance(
-                b"abc\r\n\x1b[2;3H!\x1b[0K",
+                b"abc\r\n\x1b[2;3H!\x1b[0K\x1b[`\x1b[0a\x1b[65535e",
                 &mut screen,
                 &mut |s: &mut Screen, value: &str, style: StyleId| {
                     s.write_ascii(value.as_bytes(), style)
