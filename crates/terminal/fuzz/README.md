@@ -104,6 +104,10 @@ with malformed UTF-8, OSC window titles, discarded strings, rejected parameter f
 and diagnostics.
 HPA preserves the modeled row; HPR and VPR share the independent relative-motion
 oracle with CUF and CUD. Both default and explicit counts are generated.
+Soft resets preserve storage, tabs, and physical placement while restoring
+cursor modes and the active save slot. The processor model also resets current
+and saved rendition/charsets, application keys, and indexed palette overrides;
+window titles, dynamic colors, other input modes, and earlier replies survive.
 Unsupported mode lists preserve all screen state.
 
 Each input runs as one chunk and in chunks of one through seventeen bytes. A text
@@ -192,17 +196,18 @@ columns to exercise bitmap word boundaries. Other valid widths and heights are
 limited to 16. Zero, overlarge, and invalid arguments are included.
 For screen coordinates, bytes `fc`, `fd`, `fe`, and `ff` select the last cell, the
 exclusive bound, zero, and `usize::MAX`; other bytes are reduced by the dimension
-plus two. Screen opcodes modulo 39 select: 0 unit write, 1 ASCII, 2 cursor, 3 region,
+plus two. Screen opcodes modulo 40 select: 0 unit write, 1 ASCII, 2 cursor, 3 region,
 4 resize, 5 carriage return, 6 backspace, 7 line feed, 8 reverse index, 9 line erasure,
 10 display erasure, 11 cell insertion, 12 cell deletion, 13 counted erasure,
 14 line insertion, 15 line deletion, 16 same-size resize, 17 move up, 18 move down,
 19 move left, 20 move right, 21 scroll up, 22 scroll down, 23 tab forward,
 24 tab backward, 25 set current tab, 26 clear current tab, 27 clear all tabs,
 28 set automatic wrapping, 29 set origin mode, 30 save cursor state, 31 restore
-cursor state, 32 reset the screen with the style key, 33 set insertion mode,
+cursor state, 32 reset (byte 5 bit 0 selects soft reset), 33 set insertion mode,
 34 extract a text range, 35 set cursor visibility, 36 set blinking, and 37 set
 shape (byte 1 modulo three selects block, underline, or bar) and blinking,
-38 select primary/alternate storage using the low bit of byte 3.
+38 select primary/alternate storage using the low bit of byte 3, and 39 revise a unit.
+Full reset clears both buffers with the supplied style key.
 Mode settings use the low bit of byte 3.
 Byte 3 selects width, count (`ff` means `usize::MAX`), or erasure mode.
 Byte 4 selects synthetic text;

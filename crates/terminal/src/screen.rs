@@ -347,6 +347,20 @@ impl Screen {
         self.update_history_capture();
     }
 
+    /// Restores cursor modes, appearance, full-screen margins, and the active
+    /// save slot. Keeps physical cursor coordinates, both buffers, history,
+    /// viewport, and tabs; cancels pending wrapping. This does not allocate.
+    pub fn soft_reset(&mut self) {
+        self.cursor.wrap_pending = false;
+        self.saved_cursor = SavedCursor::default();
+        self.scroll_region = 0..self.grid.rows();
+        self.auto_wrap = true;
+        self.origin_mode = false;
+        self.insert_mode = false;
+        self.cursor_appearance = CursorAppearance::default();
+        self.update_history_capture();
+    }
+
     /// Whether writes insert columns and shift the row suffix. Disabled initially.
     pub fn insert_mode(&self) -> bool {
         self.insert_mode

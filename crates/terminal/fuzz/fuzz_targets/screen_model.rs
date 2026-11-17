@@ -41,6 +41,7 @@ pub enum Command<'a> {
     SaveCursor,
     RestoreCursor,
     Reset,
+    SoftReset,
     InsertMode(bool),
     CursorVisible(bool),
     CursorBlink(bool),
@@ -202,6 +203,21 @@ impl ScreenModel {
                 self.cursor_appearance.blinking = *blinking;
             }
             Command::InsertMode(enabled) => self.insert_mode = *enabled,
+            Command::SoftReset => {
+                self.column = self.visible_column();
+                self.region = 0..self.storage[self.active].rows();
+                self.auto_wrap = true;
+                self.origin_mode = false;
+                self.insert_mode = false;
+                self.cursor_appearance = CursorAppearance::default();
+                self.saved[self.active] = SavedCursor {
+                    row: 0,
+                    column: 0,
+                    pending_width: None,
+                    auto_wrap: true,
+                    origin_mode: false,
+                };
+            }
             Command::Reset => {
                 let columns = self.storage[self.active].columns();
                 let rows = self.storage[self.active].rows();

@@ -99,6 +99,7 @@ fn main() {
         b"\x1b)0\x0elqqqqqqqqqqqqk\r\nx            x\r\nmqqqqqqqqqqqqj\x0f plain\r\n".repeat(1024);
     let cursor = b"\x1b[?25l\x1b[6 q\x1b[?12htext\x1b[?25h\x1b[ q\r\n".repeat(1024);
     let focus = b"\x1b[?1004;2004h\x1b[?1004;2004l".repeat(1024);
+    let soft_reset = b"\x1b[31m\x1b[4h\x1b[?1;6;66h\x1b[2;20r\x1b[6 q\x1b[!ptext\r\n".repeat(1024);
     let mouse = b"\x1b[?1000;1006h\x1b[?1002h\x1b[?1003h\x1b[?1006l\x1b[?1000l".repeat(1024);
     let queries = b"row\r\n\x1b[5n\x1b[6n\x1b[2;8H\x1b[6n\x1b[?6h\x1b[6n\x1b[?6l".repeat(1024);
     let color_queries =
@@ -133,6 +134,9 @@ fn main() {
     measure("cursor state / bulk", &cursor, cursor.len());
     measure("cursor state / 1-byte", &cursor, 1);
     measure("focus mode / bulk", &focus, focus.len());
+    measure("soft reset / bulk", &soft_reset, soft_reset.len());
+    measure("soft reset / 17-byte", &soft_reset, 17);
+    measure("soft reset / 1-byte", &soft_reset, 1);
     measure("focus mode / 1-byte", &focus, 1);
     measure("mouse modes / bulk", &mouse, mouse.len());
     measure("mouse modes / 1-byte", &mouse, 1);

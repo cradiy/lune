@@ -512,20 +512,29 @@ fuzz_target!(|data: &[u8]| {
                 Some(Command::RestoreCursor)
             }
             32 => {
-                wire.extend(b"\x1bc");
-                palette_changed |= colors != base_colors;
                 palette_changed |= indexed != base_indexed;
                 indexed = base_indexed;
-                colors = base_colors;
-                title_changed |= !title.is_empty();
-                title.clear();
                 current = Style::default();
-                saved = [current; 2];
                 charsets = [false; 2];
                 selected = 0;
-                saved_charsets = [(charsets, selected); 2];
-                input = InputModes::default();
-                Some(Command::Reset)
+                if bytes[5] & 1 == 0 {
+                    wire.extend(b"\x1bc");
+                    palette_changed |= colors != base_colors;
+                    colors = base_colors;
+                    title_changed |= !title.is_empty();
+                    title.clear();
+                    saved = [current; 2];
+                    saved_charsets = [(charsets, selected); 2];
+                    input = InputModes::default();
+                    Some(Command::Reset)
+                } else {
+                    wire.extend(b"\x1b[!p");
+                    saved[index] = current;
+                    saved_charsets[index] = (charsets, selected);
+                    input.application_cursor = false;
+                    input.application_keypad = false;
+                    Some(Command::SoftReset)
+                }
             }
             34 => {
                 wire.extend(b"\x1b[?6;1003;1004;1006;999h");

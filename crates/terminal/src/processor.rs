@@ -110,6 +110,19 @@ impl State {
         self.input = InputModes::default();
         self.osc.reset();
     }
+
+    #[cold]
+    fn soft_reset(&mut self, screen: &mut Screen) {
+        let index = screen.active_buffer() as usize;
+        self.style = StyleId(0);
+        self.saved_style[index] = StyleId(0);
+        self.charsets = Charsets::default();
+        self.saved_charsets[index] = Charsets::default();
+        self.input.application_cursor = false;
+        self.input.application_keypad = false;
+        self.osc.reset_indexed();
+        screen.soft_reset();
+    }
 }
 
 /// Incremental screen execution with an atomic [`TextSink`]. Pair one processor,
@@ -441,7 +454,7 @@ impl Processor {
                             *end += 1;
                             true
                         } else {
-                            false
+                            csi(screen, sequence, state)
                         }
                     } else {
                         csi(screen, sequence, state)
@@ -760,6 +773,14 @@ fn csi(screen: &mut Screen, sequence: CsiSequence<'_>, state: &mut State) -> boo
         return false;
     }
     if !sequence.intermediates.is_empty() {
+        if sequence.intermediates == b"!"
+            && sequence.final_byte == b'p'
+            && sequence.private_markers.is_empty()
+            && p.is_empty()
+        {
+            state.soft_reset(screen);
+            return true;
+        }
         if sequence.intermediates != b" "
             || sequence.final_byte != b'q'
             || !sequence.private_markers.is_empty()

@@ -15,6 +15,7 @@ mod palette;
 mod processor;
 mod reflow;
 mod replies;
+mod reset;
 mod revision;
 mod screen;
 mod screen_reflow;

@@ -88,6 +88,10 @@ impl Osc {
         std::mem::take(&mut self.palette_changed)
     }
 
+    pub(crate) fn reset_indexed(&mut self) {
+        self.palette_changed |= self.palette.reset_indexed();
+    }
+
     pub(crate) fn set_base(
         &mut self,
         indexed: [Rgb; 256],

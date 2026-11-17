@@ -106,6 +106,7 @@ fn apply(screen: &mut Screen, command: &Command<'_>, style: StyleId) -> Result<(
         Command::SaveCursor => screen.save_cursor(),
         Command::RestoreCursor => screen.restore_cursor(),
         Command::Reset => screen.reset(style),
+        Command::SoftReset => screen.soft_reset(),
         Command::InsertMode(enabled) => screen.set_insert_mode(*enabled),
         Command::SelectBuffer(alternate) => screen.select_buffer(if *alternate {
             ScreenBuffer::Alternate
@@ -225,7 +226,13 @@ fuzz_target!(|data: &[u8]| {
             29 => Command::OriginMode(bytes[3] & 1 != 0),
             30 => Command::SaveCursor,
             31 => Command::RestoreCursor,
-            32 => Command::Reset,
+            32 => {
+                if bytes[5] & 1 == 0 {
+                    Command::Reset
+                } else {
+                    Command::SoftReset
+                }
+            }
             33 => Command::InsertMode(bytes[3] & 1 != 0),
             35 => Command::CursorVisible(bytes[3] & 1 != 0),
             36 => Command::CursorBlink(bytes[3] & 1 != 0),
