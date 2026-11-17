@@ -542,12 +542,17 @@ fuzz_target!(|data: &[u8]| {
                 None
             }
             35 => {
-                wire.extend(b"\x1b[65536A");
+                wire.extend(if bytes[1] & 1 == 0 {
+                    b"\x1b[65536A".as_slice()
+                } else {
+                    b"\x1bP65536qhidden\x07\n\x1b\\"
+                });
                 diagnostics.0 += 1;
                 None
             }
             36 => {
                 wire.extend(b"\x1b[1:2A");
+                wire.extend(b"\x1bP?qraw\x00\x07\n\xc2\x9c\x7f\xff\x1b\\");
                 diagnostics.1 += 1;
                 None
             }

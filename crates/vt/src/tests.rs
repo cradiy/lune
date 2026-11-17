@@ -1,6 +1,6 @@
 use crate::{
-    Event, MAX_PARAMETERS, MAX_SEQUENCE_BYTES, OscEvent, OscTerminator, Parameter, ParseError,
-    Parser,
+    DcsEvent, Event, MAX_PARAMETERS, MAX_SEQUENCE_BYTES, OscEvent, OscTerminator, Parameter,
+    ParseError, Parser,
 };
 
 #[derive(Debug, PartialEq, Eq)]
@@ -13,6 +13,10 @@ enum OwnedEvent {
     OscData(Vec<u8>),
     OscEnd(OscTerminator),
     OscCancel,
+    DcsStart(Vec<u8>, Vec<Parameter>, Vec<u8>, u8),
+    DcsData(Vec<u8>),
+    DcsEnd,
+    DcsCancel,
     Error(ParseError),
 }
 
@@ -42,6 +46,21 @@ fn capture(events: &mut Vec<OwnedEvent>, event: Event<'_>) {
         }
         Event::Osc(OscEvent::End(terminator)) => OwnedEvent::OscEnd(terminator),
         Event::Osc(OscEvent::Cancel) => OwnedEvent::OscCancel,
+        Event::Dcs(DcsEvent::Start(sequence)) => OwnedEvent::DcsStart(
+            sequence.private_markers.to_vec(),
+            sequence.parameters.to_vec(),
+            sequence.intermediates.to_vec(),
+            sequence.final_byte,
+        ),
+        Event::Dcs(DcsEvent::Data(bytes)) => {
+            if let Some(OwnedEvent::DcsData(data)) = events.last_mut() {
+                data.extend_from_slice(bytes);
+                return;
+            }
+            OwnedEvent::DcsData(bytes.to_vec())
+        }
+        Event::Dcs(DcsEvent::End) => OwnedEvent::DcsEnd,
+        Event::Dcs(DcsEvent::Cancel) => OwnedEvent::DcsCancel,
         Event::Error(error) => OwnedEvent::Error(error),
     };
     events.push(owned);
@@ -67,6 +86,116 @@ fn csi(value: u16, final_byte: u8) -> OwnedEvent {
         Vec::new(),
         final_byte,
     )
+}
+
+#[test]
+fn dcs_headers_raw_payload_and_cancellation_survive_all_splits() {
+    let input = b"\x1bP?\x011:2;;0$qA\x00\x07\r\n\x7f\xc2\x9c\xff\x1b\\Z\x1bP+qcut\x18\x1bPqcut\x1b[31mT\x1bP1;";
+    let expected = vec![
+        OwnedEvent::DcsStart(
+            vec![b'?'],
+            vec![
+                Parameter {
+                    value: Some(1),
+                    is_subparameter: false,
+                },
+                Parameter {
+                    value: Some(2),
+                    is_subparameter: true,
+                },
+                Parameter {
+                    value: None,
+                    is_subparameter: false,
+                },
+                Parameter {
+                    value: Some(0),
+                    is_subparameter: false,
+                },
+            ],
+            vec![b'$'],
+            b'q',
+        ),
+        OwnedEvent::DcsData(b"A\x00\x07\r\n\xc2\x9c\xff".to_vec()),
+        OwnedEvent::DcsEnd,
+        OwnedEvent::Print('Z'),
+        OwnedEvent::DcsStart(vec![], vec![], vec![b'+'], b'q'),
+        OwnedEvent::DcsData(b"cut".to_vec()),
+        OwnedEvent::DcsCancel,
+        OwnedEvent::Execute(0x18),
+        OwnedEvent::DcsStart(vec![], vec![], vec![], b'q'),
+        OwnedEvent::DcsData(b"cut".to_vec()),
+        OwnedEvent::DcsCancel,
+        csi(31, b'm'),
+        OwnedEvent::Print('T'),
+        OwnedEvent::Error(ParseError::IncompleteSequence),
+    ];
+    for split in 0..=input.len() {
+        assert_eq!(parse([&input[..split], &input[split..]]), expected);
+    }
+    for chunk in 1..=17 {
+        assert_eq!(parse(input.chunks(chunk)), expected);
+    }
+}
+
+#[test]
+fn dcs_header_limits_reject_the_whole_string_and_recover_at_its_boundary() {
+    for (header, error) in [
+        (b"1$2".to_vec(), ParseError::InvalidSequence),
+        (vec![0xff], ParseError::InvalidSequence),
+        (b"65536".to_vec(), ParseError::ParameterOverflow),
+        (vec![b';'; MAX_PARAMETERS], ParseError::TooManyParameters),
+        (b"!!!!!".to_vec(), ParseError::TooManyIntermediates),
+        (b"?????".to_vec(), ParseError::TooManyPrivateMarkers),
+        (vec![b'0'; MAX_SEQUENCE_BYTES], ParseError::SequenceTooLong),
+        (vec![0; MAX_SEQUENCE_BYTES], ParseError::SequenceTooLong),
+    ] {
+        for terminator in [b"\x1b\\".as_slice(), b"\x18", b"\x1a", b"\x1b[31m", b""] {
+            let mut wire = b"\x1bP".to_vec();
+            wire.extend(&header);
+            wire.extend(b"qhidden\x07\n\r");
+            wire.extend(terminator);
+            let mut expected = vec![OwnedEvent::Error(error)];
+            if terminator == b"\x18" || terminator == b"\x1a" {
+                expected.push(OwnedEvent::Execute(terminator[0]));
+            }
+            if terminator == b"\x1b[31m" {
+                expected.push(csi(31, b'm'));
+            }
+            if !terminator.is_empty() {
+                wire.push(b'Z');
+                expected.push(OwnedEvent::Print('Z'));
+            }
+            for chunk in [1, 17, wire.len()] {
+                assert_eq!(parse(wire.chunks(chunk)), expected);
+            }
+        }
+    }
+    let mut wire = b"\x1bP????".to_vec();
+    wire.extend(vec![b"65535".as_slice(); MAX_PARAMETERS].join(&b';'));
+    wire.extend(b"!!!!q\x1b\\");
+    let events = parse(wire.chunks(1));
+    assert!(
+        matches!(&events[..], [OwnedEvent::DcsStart(private, parameters, intermediates, b'q'), OwnedEvent::DcsEnd]
+        if private.len() == 4 && parameters.len() == MAX_PARAMETERS && intermediates.len() == 4)
+    );
+    let mut wire = b"\x1bP".to_vec();
+    wire.extend(vec![b'0'; MAX_SEQUENCE_BYTES - 2]);
+    wire.extend(b"q\x1b\\");
+    assert_eq!(
+        parse(wire.chunks(17)),
+        vec![
+            OwnedEvent::DcsStart(
+                vec![],
+                vec![Parameter {
+                    value: Some(0),
+                    is_subparameter: false
+                }],
+                vec![],
+                b'q'
+            ),
+            OwnedEvent::DcsEnd,
+        ]
+    );
 }
 
 #[test]
@@ -111,6 +240,9 @@ fn chunk_boundaries_preserve_text_and_parameter_structure() {
         OwnedEvent::OscData(b"0;hidden".to_vec()),
         OwnedEvent::OscEnd(OscTerminator::Bell),
         OwnedEvent::Print('Y'),
+        OwnedEvent::DcsStart(vec![], vec![], vec![], b'i'),
+        OwnedEvent::DcsData(b"gnored".to_vec()),
+        OwnedEvent::DcsEnd,
         OwnedEvent::Print('Z'),
     ];
 
@@ -254,7 +386,15 @@ fn cancellation_and_escape_restart_preserve_control_order() {
     let mut string = b"\x1bP".to_vec();
     string.extend(std::iter::repeat_n(b'x', 65536));
     string.extend_from_slice(b"\x1b\\Z");
-    assert_eq!(parse(string.chunks(17)), vec![OwnedEvent::Print('Z')]);
+    assert_eq!(
+        parse(string.chunks(17)),
+        vec![
+            OwnedEvent::DcsStart(vec![], vec![], vec![], b'x'),
+            OwnedEvent::DcsData(vec![b'x'; 65535]),
+            OwnedEvent::DcsEnd,
+            OwnedEvent::Print('Z'),
+        ]
+    );
 }
 
 #[test]
@@ -334,6 +474,9 @@ fn stream_boundaries_finalize_or_discard_pending_input_explicitly() {
         let mut expected = Vec::new();
         if prefix.starts_with(b"\x1b]") {
             expected.push(OwnedEvent::OscCancel);
+        }
+        if prefix.starts_with(b"\x1bP") {
+            expected.push(OwnedEvent::DcsCancel);
         }
         expected.push(OwnedEvent::Error(ParseError::IncompleteSequence));
         assert_eq!(events, expected, "{prefix:?}");

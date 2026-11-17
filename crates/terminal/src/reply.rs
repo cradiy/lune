@@ -1,4 +1,4 @@
-use lune_vt::{CsiSequence, OscTerminator};
+use lune_vt::{ControlSequence, OscTerminator};
 
 use crate::{InputModes, MouseTracking, Rgb, Screen, ScreenBuffer};
 
@@ -134,7 +134,7 @@ impl Reply {
     }
 }
 
-pub(crate) fn query(screen: &Screen, sequence: CsiSequence<'_>) -> Option<Report> {
+pub(crate) fn query(screen: &Screen, sequence: ControlSequence<'_>) -> Option<Report> {
     if !sequence.private_markers.is_empty()
         || !sequence.intermediates.is_empty()
         || sequence.parameters.len() != 1
@@ -163,7 +163,7 @@ pub(crate) fn query(screen: &Screen, sequence: CsiSequence<'_>) -> Option<Report
 pub(crate) fn mode_query(
     screen: &Screen,
     input: InputModes,
-    sequence: CsiSequence<'_>,
+    sequence: ControlSequence<'_>,
 ) -> Option<ModeReport> {
     let private = match sequence.private_markers {
         [] => false,

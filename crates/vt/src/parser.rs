@@ -2,11 +2,11 @@ use crate::utf8::{Decoded, Decoder};
 
 /// Maximum number of numeric fields, including colon subparameters.
 pub const MAX_PARAMETERS: usize = 32;
-/// Maximum number of intermediate bytes in an ESC or CSI sequence.
+/// Maximum number of intermediate bytes in an ESC, CSI, or DCS header.
 pub const MAX_INTERMEDIATES: usize = 4;
-/// Maximum number of leading private marker bytes in a CSI sequence.
+/// Maximum number of leading private marker bytes in a CSI or DCS header.
 pub const MAX_PRIVATE_MARKERS: usize = 4;
-/// Maximum number of bytes after ESC in an ESC or CSI sequence.
+/// Maximum number of bytes after ESC in an ESC, CSI, or DCS header.
 /// Embedded C0 controls and DEL count toward this wire-byte limit.
 pub const MAX_SEQUENCE_BYTES: usize = 256;
 
@@ -26,9 +26,9 @@ pub struct EscapeSequence<'a> {
     pub final_byte: u8,
 }
 
-/// A CSI sequence borrowed for the duration of its callback.
+/// A CSI or DCS header borrowed for the duration of its callback.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CsiSequence<'a> {
+pub struct ControlSequence<'a> {
     pub private_markers: &'a [u8],
     pub parameters: &'a [Parameter],
     pub intermediates: &'a [u8],
@@ -36,8 +36,8 @@ pub struct CsiSequence<'a> {
 }
 
 /// A framing or capacity error encountered while consuming a stream.
-/// Rejected header bytes are discarded through the final byte; control bytes
-/// remain active and can cancel or restart the sequence.
+/// Rejected ESC/CSI headers are discarded through the final byte. Rejected DCS
+/// strings are discarded through ST; ESC, CAN, and SUB can restart or cancel them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ParseError {
     InvalidSequence,
@@ -68,6 +68,19 @@ pub enum OscEvent<'a> {
     Cancel,
 }
 
+/// Streaming DCS framing. Consumers bound retained payload data.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DcsEvent<'a> {
+    Start(&'a ControlSequence<'a>),
+    /// Raw payload, including C0 except ESC, CAN, and SUB. DEL is ignored.
+    /// Spans are valid during the callback and may vary with input chunking.
+    Data(&'a [u8]),
+    /// Terminated by seven-bit ST.
+    End,
+    /// Interrupted by another escape, CAN, SUB, or end of stream.
+    Cancel,
+}
+
 /// A lexical event. Sequence bytes retain their syntax for interpretation by a consumer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Event<'a> {
@@ -75,8 +88,9 @@ pub enum Event<'a> {
     Text(&'a str),
     Execute(u8),
     Escape(EscapeSequence<'a>),
-    Csi(CsiSequence<'a>),
+    Csi(ControlSequence<'a>),
     Osc(OscEvent<'a>),
+    Dcs(DcsEvent<'a>),
     Error(ParseError),
 }
 
@@ -93,11 +107,22 @@ enum State {
         csi: bool,
     },
     String {
-        osc: bool,
+        kind: StringKind,
     },
     StringEscape {
-        osc: bool,
+        kind: StringKind,
     },
+    DcsEntry,
+    DcsParameters,
+    DcsIntermediate,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StringKind {
+    Discard,
+    Osc,
+    Dcs,
+    Rejected,
 }
 
 /// A fixed-capacity parser whose state persists across calls to [`Self::advance`].
@@ -177,10 +202,16 @@ impl Parser {
                     offset += length;
                     continue;
                 }
-                if let State::String { osc } = self.state {
+                if let State::String { kind } = self.state {
                     let length = text_end(&bytes[offset..]);
-                    if osc {
-                        emit(Event::Osc(OscEvent::Data(&bytes[offset..offset + length])));
+                    match kind {
+                        StringKind::Osc => {
+                            emit(Event::Osc(OscEvent::Data(&bytes[offset..offset + length])))
+                        }
+                        StringKind::Dcs => {
+                            emit(Event::Dcs(DcsEvent::Data(&bytes[offset..offset + length])))
+                        }
+                        _ => {}
                     }
                     offset += length;
                     continue;
@@ -212,13 +243,35 @@ impl Parser {
         }
         if matches!(
             self.state,
-            State::String { osc: true } | State::StringEscape { osc: true }
+            State::String {
+                kind: StringKind::Osc
+            } | State::StringEscape {
+                kind: StringKind::Osc
+            }
         ) {
             emit(Event::Osc(OscEvent::Cancel));
         }
+        if matches!(
+            self.state,
+            State::String {
+                kind: StringKind::Dcs
+            } | State::StringEscape {
+                kind: StringKind::Dcs
+            }
+        ) {
+            emit(Event::Dcs(DcsEvent::Cancel));
+        }
         if !matches!(
             self.state,
-            State::Ground | State::Utf8Pending | State::Ignore { .. }
+            State::Ground
+                | State::Utf8Pending
+                | State::Ignore { .. }
+                | State::String {
+                    kind: StringKind::Rejected
+                }
+                | State::StringEscape {
+                    kind: StringKind::Rejected
+                }
         ) {
             emit(Event::Error(ParseError::IncompleteSequence));
         }
@@ -245,6 +298,11 @@ impl Parser {
     }
 
     fn advance_text(&mut self, mut bytes: &[u8], emit: &mut impl FnMut(Event<'_>)) {
+        if bytes.is_ascii() {
+            // SAFETY: ASCII bytes always form valid UTF-8.
+            emit(Event::Text(unsafe { std::str::from_utf8_unchecked(bytes) }));
+            return;
+        }
         while !bytes.is_empty() {
             match std::str::from_utf8(bytes) {
                 Ok(text) => {
@@ -286,7 +344,7 @@ impl Parser {
                 self.reject(ParseError::SequenceTooLong, emit);
                 self.dispatch(byte, emit);
             } else {
-                self.csi(byte, emit);
+                self.header::<false>(byte, emit);
             }
             return;
         }
@@ -298,12 +356,14 @@ impl Parser {
             self.state,
             State::String { .. } | State::StringEscape { .. }
         ) {
-            if let State::String { osc } = self.state
+            if let State::String { kind } = self.state
                 && byte >= 0x20
                 && byte != 0x7f
             {
-                if osc {
-                    emit(Event::Osc(OscEvent::Data(&[byte])));
+                match kind {
+                    StringKind::Osc => emit(Event::Osc(OscEvent::Data(&[byte]))),
+                    StringKind::Dcs => emit(Event::Dcs(DcsEvent::Data(&[byte]))),
+                    _ => {}
                 }
                 return;
             }
@@ -312,6 +372,16 @@ impl Parser {
         }
         if byte == 0x1b {
             self.start_escape();
+            return;
+        }
+        if self.state == State::Ground {
+            match byte {
+                0x00..=0x1f => emit(Event::Execute(byte)),
+                0x7f => {}
+                _ => {
+                    self.decode(byte, emit);
+                }
+            }
             return;
         }
         if matches!(byte, 0x18 | 0x1a) {
@@ -327,11 +397,24 @@ impl Parser {
             self.sequence_bytes += 1;
             if self.sequence_bytes > MAX_SEQUENCE_BYTES {
                 self.reject(ParseError::SequenceTooLong, emit);
+                if matches!(self.state, State::String { .. }) {
+                    return;
+                }
             }
         }
 
         match byte {
-            0x00..=0x1f => emit(Event::Execute(byte)),
+            b'[' if self.state == State::Escape && self.intermediate_count == 0 => {
+                self.state = State::CsiEntry;
+            }
+            0x00..=0x1f => {
+                if !matches!(
+                    self.state,
+                    State::DcsEntry | State::DcsParameters | State::DcsIntermediate
+                ) {
+                    emit(Event::Execute(byte));
+                }
+            }
             0x7f => {}
             _ => self.dispatch(byte, emit),
         }
@@ -339,37 +422,44 @@ impl Parser {
 
     #[inline(never)]
     fn advance_string(&mut self, byte: u8, emit: &mut impl FnMut(Event<'_>)) {
-        if let State::StringEscape { osc } = self.state {
+        if let State::StringEscape { kind } = self.state {
             if byte == b'\\' {
                 self.state = State::Ground;
-                if osc {
-                    emit(Event::Osc(OscEvent::End(OscTerminator::St)));
+                match kind {
+                    StringKind::Osc => emit(Event::Osc(OscEvent::End(OscTerminator::St))),
+                    StringKind::Dcs => emit(Event::Dcs(DcsEvent::End)),
+                    _ => {}
                 }
             } else {
-                if osc {
-                    emit(Event::Osc(OscEvent::Cancel));
+                match kind {
+                    StringKind::Osc => emit(Event::Osc(OscEvent::Cancel)),
+                    StringKind::Dcs => emit(Event::Dcs(DcsEvent::Cancel)),
+                    _ => {}
                 }
                 self.start_escape();
                 self.advance_byte(byte, emit);
             }
             return;
         }
-        let State::String { osc } = self.state else {
+        let State::String { kind } = self.state else {
             unreachable!();
         };
         match byte {
-            0x1b => self.state = State::StringEscape { osc },
+            0x1b => self.state = State::StringEscape { kind },
             0x18 | 0x1a => {
-                if osc {
-                    emit(Event::Osc(OscEvent::Cancel));
+                match kind {
+                    StringKind::Osc => emit(Event::Osc(OscEvent::Cancel)),
+                    StringKind::Dcs => emit(Event::Dcs(DcsEvent::Cancel)),
+                    _ => {}
                 }
                 self.state = State::Ground;
                 emit(Event::Execute(byte));
             }
-            0x07 if osc => {
+            0x07 if kind == StringKind::Osc => {
                 self.state = State::Ground;
                 emit(Event::Osc(OscEvent::End(OscTerminator::Bell)));
             }
+            0x00..=0x1f if kind == StringKind::Dcs => emit(Event::Dcs(DcsEvent::Data(&[byte]))),
             _ => {}
         }
     }
@@ -386,7 +476,7 @@ impl Parser {
                 self.dispatch(byte, emit);
                 return offset + 1;
             }
-            self.csi(byte, emit);
+            self.header::<false>(byte, emit);
             if !matches!(
                 self.state,
                 State::CsiEntry | State::CsiParameters | State::CsiIntermediate
@@ -424,7 +514,10 @@ impl Parser {
                 self.decode(byte, emit);
             }
             State::Escape => self.escape(byte, emit),
-            State::CsiEntry | State::CsiParameters | State::CsiIntermediate => self.csi(byte, emit),
+            State::CsiEntry | State::CsiParameters | State::CsiIntermediate => {
+                self.header::<false>(byte, emit)
+            }
+            State::DcsEntry | State::DcsParameters | State::DcsIntermediate => self.dcs(byte, emit),
             State::Ignore { csi } => {
                 let first_final = if csi { 0x40 } else { 0x30 };
                 if (first_final..=0x7e).contains(&byte) {
@@ -444,8 +537,18 @@ impl Parser {
                     self.state = State::CsiEntry;
                     return;
                 }
-                b']' | b'P' | b'X' | b'^' | b'_' => {
-                    self.state = State::String { osc: byte == b']' };
+                b'P' => {
+                    self.state = State::DcsEntry;
+                    return;
+                }
+                b']' | b'X' | b'^' | b'_' => {
+                    self.state = State::String {
+                        kind: if byte == b']' {
+                            StringKind::Osc
+                        } else {
+                            StringKind::Discard
+                        },
+                    };
                     if byte == b']' {
                         emit(Event::Osc(OscEvent::Start));
                     }
@@ -469,22 +572,43 @@ impl Parser {
     }
 
     #[inline(always)]
-    fn csi(&mut self, byte: u8, emit: &mut impl FnMut(Event<'_>)) {
+    fn header<const DCS: bool>(&mut self, byte: u8, emit: &mut impl FnMut(Event<'_>)) {
+        let (entry, parameters, intermediate) = if DCS {
+            (
+                State::DcsEntry,
+                State::DcsParameters,
+                State::DcsIntermediate,
+            )
+        } else {
+            (
+                State::CsiEntry,
+                State::CsiParameters,
+                State::CsiIntermediate,
+            )
+        };
         match byte {
             0x40..=0x7e => {
-                emit(Event::Csi(CsiSequence {
+                let sequence = ControlSequence {
                     private_markers: &self.private_markers[..self.private_count],
                     parameters: &self.parameters[..self.parameter_count],
                     intermediates: &self.intermediates[..self.intermediate_count],
                     final_byte: byte,
-                }));
-                self.state = State::Ground;
+                };
+                if DCS {
+                    emit(Event::Dcs(DcsEvent::Start(&sequence)));
+                    self.state = State::String {
+                        kind: StringKind::Dcs,
+                    };
+                } else {
+                    emit(Event::Csi(sequence));
+                    self.state = State::Ground;
+                }
             }
             0x20..=0x2f => {
-                self.state = State::CsiIntermediate;
+                self.state = intermediate;
                 self.collect_intermediate(byte, emit);
             }
-            0x3c..=0x3f if self.state == State::CsiEntry => {
+            0x3c..=0x3f if self.state == entry => {
                 if self.private_count == MAX_PRIVATE_MARKERS {
                     self.reject(ParseError::TooManyPrivateMarkers, emit);
                 } else {
@@ -492,12 +616,17 @@ impl Parser {
                     self.private_count += 1;
                 }
             }
-            b'0'..=b'9' | b';' | b':' if self.state != State::CsiIntermediate => {
-                self.state = State::CsiParameters;
+            b'0'..=b'9' | b';' | b':' if self.state != intermediate => {
+                self.state = parameters;
                 self.parameter(byte, emit);
             }
             _ => self.reject(ParseError::InvalidSequence, emit),
         }
+    }
+
+    #[inline(never)]
+    fn dcs(&mut self, byte: u8, emit: &mut impl FnMut(Event<'_>)) {
+        self.header::<true>(byte, emit);
     }
 
     fn parameter(&mut self, byte: u8, emit: &mut impl FnMut(Event<'_>)) {
@@ -548,7 +677,16 @@ impl Parser {
             self.state,
             State::CsiEntry | State::CsiParameters | State::CsiIntermediate
         );
-        self.state = State::Ignore { csi };
+        self.state = if matches!(
+            self.state,
+            State::DcsEntry | State::DcsParameters | State::DcsIntermediate
+        ) {
+            State::String {
+                kind: StringKind::Rejected,
+            }
+        } else {
+            State::Ignore { csi }
+        };
         emit(Event::Error(error));
     }
 }

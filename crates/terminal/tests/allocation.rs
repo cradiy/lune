@@ -19,6 +19,45 @@ use lune_terminal::{
 static ALLOCATOR: allocator::TestAllocator = allocator::TestAllocator;
 
 #[test]
+fn dcs_headers_and_raw_payloads_stream_without_allocation() {
+    use lune_vt::{DcsEvent, Event, Parser};
+
+    let payload = b"A\0\x07\n\x80\x9c\xff\x7f".repeat(8192);
+    let mut wire = b"\x1bP?1:2;;0$q".to_vec();
+    wire.extend(&payload);
+    wire.extend(b"\x1b\\");
+    let ((), stats) = allocator::measure(Some(0), || {
+        for chunk in [1, 17, wire.len()] {
+            let mut parser = Parser::default();
+            let mut framing = (0, 0);
+            let mut received = 0;
+            let mut emit = |event: Event<'_>| match event {
+                Event::Dcs(DcsEvent::Start(header)) => {
+                    assert_eq!(header.parameters.len(), 4);
+                    framing.0 += 1;
+                }
+                Event::Dcs(DcsEvent::Data(bytes)) => {
+                    received += bytes.len();
+                    if bytes.len() > 1 {
+                        let offset = bytes.as_ptr() as usize - wire.as_ptr() as usize;
+                        assert!(offset + bytes.len() <= wire.len());
+                    }
+                }
+                Event::Dcs(DcsEvent::End) => framing.1 += 1,
+                _ => panic!("Unexpected DCS event"),
+            };
+            for bytes in wire.chunks(chunk) {
+                parser.advance(black_box(bytes), &mut emit);
+            }
+            parser.finish(&mut emit);
+            assert_eq!(framing, (1, 1));
+            assert_eq!(received, 8192 * 7);
+        }
+    });
+    assert_eq!(stats.attempts, 0);
+}
+
+#[test]
 fn indexed_batches_capture_and_deliver_all_queries_without_allocation() {
     let mut wire = String::from("\x1b]4");
     for index in 0..=u8::MAX {

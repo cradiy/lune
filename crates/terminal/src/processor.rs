@@ -1,6 +1,6 @@
 use std::{error::Error, fmt};
 
-use lune_vt::{CsiSequence, EscapeSequence, Event, OscEvent, Parameter, Parser};
+use lune_vt::{ControlSequence, EscapeSequence, Event, OscEvent, Parameter, Parser};
 
 use crate::charsets::Charsets;
 use crate::osc::{Osc, Outcome};
@@ -475,6 +475,7 @@ impl Processor {
                         *end += 1;
                     }
                 },
+                Event::Dcs(_) => {}
                 Event::Error(_) => *parse_errors = parse_errors.saturating_add(1),
             });
             if T::STATEFUL && matches!(input[consumed], 0x1b | 0x7f) {
@@ -517,7 +518,8 @@ impl Processor {
             Event::Osc(OscEvent::Cancel) => {
                 state.osc.event(OscEvent::Cancel);
             }
-            _ => unreachable!("Finishing emits text, an OSC cancellation, or a lexical error"),
+            Event::Dcs(_) => {}
+            _ => unreachable!("Finishing emits text, string cancellation, or a lexical error"),
         });
         self.drain(screen, text)?;
         text.boundary();
@@ -766,7 +768,7 @@ fn erase_mode(value: usize) -> Option<EraseMode> {
     }
 }
 
-fn csi(screen: &mut Screen, sequence: CsiSequence<'_>, state: &mut State) -> bool {
+fn csi(screen: &mut Screen, sequence: ControlSequence<'_>, state: &mut State) -> bool {
     let style = state.style;
     let p = sequence.parameters;
     if p.iter().any(|p| p.is_subparameter) {
