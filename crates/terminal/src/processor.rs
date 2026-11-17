@@ -418,15 +418,26 @@ impl Processor {
                         && sequence.private_markers.is_empty()
                         && sequence.intermediates.is_empty()
                     {
-                        let mut next = *styles
-                            .get(state.style)
-                            .expect("Current rendition is rooted");
-                        if next.apply_sgr(sequence.parameters) {
-                            pending[*end] = Some(Pending::Rendition(next));
-                            *end += 1;
+                        if matches!(
+                            sequence.parameters,
+                            [] | [Parameter {
+                                value: None | Some(0),
+                                is_subparameter: false
+                            }]
+                        ) {
+                            state.style = StyleId(0);
                             true
                         } else {
-                            false
+                            let mut next = *styles
+                                .get(state.style)
+                                .expect("Current rendition is rooted");
+                            if next.apply_sgr(sequence.parameters) {
+                                pending[*end] = Some(Pending::Rendition(next));
+                                *end += 1;
+                                true
+                            } else {
+                                false
+                            }
                         }
                     } else if sequence.final_byte == b'S' {
                         if sequence.private_markers.is_empty()

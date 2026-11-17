@@ -730,7 +730,12 @@ fuzz_target!(|data: &[u8]| {
                 None
             }
             40 => {
-                wire.extend(b"\x1b[0m");
+                wire.extend(match bytes[1] % 4 {
+                    0 => b"\x1b[m".as_slice(),
+                    1 => b"\x1b[0m",
+                    2 => b"\x1b[00m",
+                    _ => b"\x1b[;m",
+                });
                 current = Style::default();
                 None
             }

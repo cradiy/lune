@@ -499,6 +499,52 @@ fn sgr_styles_follow_saved_cursors_wide_text_erasure_and_input_boundaries() {
 }
 
 #[test]
+fn sgr_default_resets_complete_atomically_with_full_style_storage() {
+    for wire in [b"\x1b[m".as_slice(), b"\x1b[0m", b"\x1b[00m", b"\x1b[;m"] {
+        for split in 0..wire.len() {
+            let mut screen = Screen::new(4, 2).unwrap();
+            let mut processor = Processor::new(2, support::palette()).unwrap();
+            processor
+                .advance(b"\x1b[31m\x1b7R", &mut screen, &mut write_text)
+                .unwrap();
+            let red = processor.style_id();
+            let before = snapshot(screen.grid());
+            for rejected in [
+                b"\x1b[?0m".as_slice(),
+                b"\x1b[0$m",
+                b"\x1b[0:0m",
+                b"\x1b[0;999m",
+            ] {
+                processor
+                    .advance(rejected, &mut screen, &mut write_text)
+                    .unwrap();
+                assert_eq!(processor.style_id(), red);
+            }
+            processor
+                .advance(&wire[..split], &mut screen, &mut write_text)
+                .unwrap();
+            assert_eq!(processor.style_id(), red);
+            processor
+                .advance(&wire[split..], &mut screen, &mut write_text)
+                .unwrap();
+            assert_eq!(processor.style_id(), StyleId(0));
+            assert_eq!(processor.styles().style_count(), 2);
+            assert_eq!(snapshot(screen.grid()), before);
+            assert_eq!(processor.collect_styles(&screen, []).unwrap(), 0);
+            processor
+                .advance(b"\x1b8X", &mut screen, &mut write_text)
+                .unwrap();
+            assert_eq!(processor.style_id(), red);
+            assert_eq!(screen.grid().row(0).unwrap().cells()[0].style(), red);
+            assert_eq!(
+                (processor.parse_errors(), processor.ignored_sequences()),
+                (0, 4)
+            );
+        }
+    }
+}
+
+#[test]
 fn full_style_storage_retries_after_tracing_current_saved_and_external_owners() {
     let mut screen = Screen::new(8, 4).unwrap();
     let mut processor = Processor::new(4, support::palette()).unwrap();

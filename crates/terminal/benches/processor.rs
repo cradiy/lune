@@ -95,6 +95,7 @@ fn main() {
         .as_bytes()
         .repeat(1024);
     let rendition = b"\x1b[1;31mred\x1b[38;2;0;128;255;48:5:17mblue\x1b[0mplain\r\n".repeat(1024);
+    let colors = b"\x1b[31mred\x1b[32mgreen\x1b[34mblue\r\n".repeat(1024);
     let graphics =
         b"\x1b)0\x0elqqqqqqqqqqqqk\r\nx            x\r\nmqqqqqqqqqqqqj\x0f plain\r\n".repeat(1024);
     let cursor = b"\x1b[?25l\x1b[6 q\x1b[?12htext\x1b[?25h\x1b[ q\r\n".repeat(1024);
@@ -127,6 +128,9 @@ fn main() {
     measure("SGR / bulk", &rendition, rendition.len());
     measure("SGR / 17-byte", &rendition, 17);
     measure("SGR / 1-byte", &rendition, 1);
+    measure("SGR color changes / bulk", &colors, colors.len());
+    measure("SGR color changes / 17-byte", &colors, 17);
+    measure("SGR color changes / 1-byte", &colors, 1);
     measure("DEC graphics / bulk", &graphics, graphics.len());
     measure("DEC graphics / 1-byte", &graphics, 1);
     measure("new-line mode / bulk", &newlines, newlines.len());
