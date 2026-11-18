@@ -19,6 +19,9 @@ fn style_identity_distinguishes_attribute_combinations_and_color_channels() {
             crate::Underline::None,
             crate::Underline::Single,
             crate::Underline::Double,
+            crate::Underline::Curly,
+            crate::Underline::Dotted,
+            crate::Underline::Dashed,
         ] {
             record(Style {
                 bold: flags & 1 != 0,

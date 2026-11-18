@@ -2293,7 +2293,7 @@ fn processor_retries_allocation_failures_from_owned_input_positions() {
 fn sgr_interpretation_preserves_zero_allocation_for_accepted_and_rejected_groups() {
     let mut parameters = [lune_vt::Parameter::default(); 32];
     let mut length = 0;
-    lune_vt::Parser::default().advance(b"\x1b[1;38;2;0;128;255;48:5:255;21m", |event| {
+    lune_vt::Parser::default().advance(b"\x1b[1;38;2;0;128;255;48:5:255;4:3m", |event| {
         if let lune_vt::Event::Csi(sequence) = event {
             length = sequence.parameters.len();
             parameters[..length].copy_from_slice(sequence.parameters);

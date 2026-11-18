@@ -6,7 +6,7 @@ use crate::{
     StyleTable, Underline,
 };
 
-// A DECRQSS rendition reply with all flags and two RGB colors occupies 60 bytes.
+// A full DECRQSS rendition reply fits in 61 bytes.
 const CAPACITY: usize = 64;
 const VERSION_REPLY: &[u8] = concat!(
     "\x1bP>|",
@@ -99,26 +99,27 @@ impl StatusReport {
         match self {
             Self::Rendition(style) => {
                 reply.append(b"0");
+                let underline: &[u8] = match style.underline {
+                    Underline::None => b"",
+                    Underline::Single => b"4",
+                    Underline::Double => b"21",
+                    Underline::Curly => b"4:3",
+                    Underline::Dotted => b"4:4",
+                    Underline::Dashed => b"4:5",
+                };
                 for (enabled, code) in [
-                    (style.bold, 1),
-                    (style.faint, 2),
-                    (style.italic, 3),
-                    (
-                        style.underline != Underline::None,
-                        if style.underline == Underline::Double {
-                            21
-                        } else {
-                            4
-                        },
-                    ),
-                    (style.blink, 5),
-                    (style.inverse, 7),
-                    (style.hidden, 8),
-                    (style.strikethrough, 9),
+                    (style.bold, b"1".as_slice()),
+                    (style.faint, b"2"),
+                    (style.italic, b"3"),
+                    (!underline.is_empty(), underline),
+                    (style.blink, b"5"),
+                    (style.inverse, b"7"),
+                    (style.hidden, b"8"),
+                    (style.strikethrough, b"9"),
                 ] {
                     if enabled {
                         reply.append(b";");
-                        reply.number(code);
+                        reply.append(code);
                     }
                 }
                 for (selector, color) in [(38, style.foreground), (48, style.background)] {

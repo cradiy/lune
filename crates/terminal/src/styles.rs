@@ -1,6 +1,6 @@
 use std::{collections::HashMap, collections::TryReserveError, error::Error, fmt};
 
-use crate::{Color, Style, StyleId, Underline};
+use crate::{Color, Style, StyleId};
 
 /// Maximum live styles, including the permanent default entry.
 pub const MAX_STYLES: usize = 1 << 16;
@@ -20,11 +20,6 @@ fn color_key(color: Color) -> u64 {
 
 #[inline]
 fn key(style: Style) -> u64 {
-    let underline = match style.underline {
-        Underline::None => 0,
-        Underline::Single => 1,
-        Underline::Double => 2,
-    };
     let attributes = u64::from(style.bold)
         | (u64::from(style.faint) << 1)
         | (u64::from(style.italic) << 2)
@@ -32,8 +27,8 @@ fn key(style: Style) -> u64 {
         | (u64::from(style.inverse) << 4)
         | (u64::from(style.hidden) << 5)
         | (u64::from(style.strikethrough) << 6)
-        | (underline << 7);
-    // Each color occupies 25 bits; rendition occupies the next nine bits.
+        | (u64::from(style.underline as u8) << 7);
+    // Each color occupies 25 bits; rendition occupies the next ten bits.
     color_key(style.foreground) | (color_key(style.background) << 25) | (attributes << 50)
 }
 

@@ -31,13 +31,13 @@ fn rendition_composes_in_order_and_resets_independent_attributes() {
             strikethrough: true,
         }
     );
-    assert!(sgr(&mut style, "22;21;27"));
+    assert!(sgr(&mut style, "22;4:2;27"));
     assert!(!style.bold && !style.faint && !style.inverse);
     assert!(style.italic && style.blink && style.hidden && style.strikethrough);
     assert_eq!(style.underline, Underline::Double);
     assert_eq!(style.foreground, Color::Indexed(1));
     assert_eq!(style.background, Color::Indexed(12));
-    assert!(sgr(&mut style, "23;24;25;28;29"));
+    assert!(sgr(&mut style, "23;4:0;25;28;29"));
     assert_eq!(
         style,
         Style {
@@ -46,7 +46,7 @@ fn rendition_composes_in_order_and_resets_independent_attributes() {
             ..Style::default()
         }
     );
-    assert!(sgr(&mut style, "1;0;2;4;21;4"));
+    assert!(sgr(&mut style, "1;0;2;4:5;21;4:1"));
     assert_eq!(
         style,
         Style {
@@ -154,7 +154,10 @@ fn rejected_groups_preserve_rendition_without_reinterpreting_color_components() 
         "0;38:2;1;2;3",
         "0;38:5:1:2",
         "0;38;5;1:2",
-        "0;4:2",
+        "0;4:",
+        "0;4:6",
+        "0;4:3:0",
+        "0;24:3",
         "0;999",
         "0:1",
     ] {

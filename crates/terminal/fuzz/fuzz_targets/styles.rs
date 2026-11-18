@@ -31,10 +31,13 @@ fuzz_target!(|data: &[u8]| {
                     inverse: bytes[1] & 16 != 0,
                     hidden: bytes[1] & 32 != 0,
                     strikethrough: bytes[1] & 64 != 0,
-                    underline: match bytes[1] % 3 {
+                    underline: match bytes[1] % 6 {
                         0 => Underline::None,
                         1 => Underline::Single,
-                        _ => Underline::Double,
+                        2 => Underline::Double,
+                        3 => Underline::Curly,
+                        4 => Underline::Dotted,
+                        _ => Underline::Dashed,
                     },
                 };
                 let existing = live.iter().find_map(|(&id, &s)| (s == style).then_some(id));

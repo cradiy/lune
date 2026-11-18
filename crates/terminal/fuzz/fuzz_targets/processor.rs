@@ -43,6 +43,9 @@ fn rendition_status(style: Style, output: &mut Vec<u8>) {
         (style.italic, "3"),
         (style.underline == Underline::Single, "4"),
         (style.underline == Underline::Double, "21"),
+        (style.underline == Underline::Curly, "4:3"),
+        (style.underline == Underline::Dotted, "4:4"),
+        (style.underline == Underline::Dashed, "4:5"),
         (style.blink, "5"),
         (style.inverse, "7"),
         (style.hidden, "8"),
@@ -845,6 +848,19 @@ fuzz_target!(|data: &[u8]| {
             41 => {
                 wire.extend(b"\x1b[1;38;5;256m");
                 diagnostics.1 += 1;
+                None
+            }
+            42 if bytes[1] & 2 != 0 => {
+                let (code, underline) = match bytes[2] % 6 {
+                    0 => (0, Underline::None),
+                    1 => (1, Underline::Single),
+                    2 => (2, Underline::Double),
+                    3 => (3, Underline::Curly),
+                    4 => (4, Underline::Dotted),
+                    _ => (5, Underline::Dashed),
+                };
+                write!(&mut wire, "\x1b[4:{code}m").unwrap();
+                current.underline = underline;
                 None
             }
             42 => {

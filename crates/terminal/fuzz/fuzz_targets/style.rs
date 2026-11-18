@@ -53,10 +53,13 @@ fuzz_target!(|data: &[u8]| {
         inverse: seed[0] & 16 != 0,
         hidden: seed[0] & 32 != 0,
         strikethrough: seed[0] & 64 != 0,
-        underline: match seed[1] % 3 {
+        underline: match seed[1] % 6 {
             0 => Underline::None,
             1 => Underline::Single,
-            _ => Underline::Double,
+            2 => Underline::Double,
+            3 => Underline::Curly,
+            4 => Underline::Dotted,
+            _ => Underline::Dashed,
         },
         ..Style::default()
     };
@@ -77,6 +80,9 @@ fuzz_target!(|data: &[u8]| {
         Underline::None => {}
         Underline::Single => wire.extend(b";4"),
         Underline::Double => wire.extend(b";21"),
+        Underline::Curly => wire.extend(b";4:3"),
+        Underline::Dotted => wire.extend(b";4:4"),
+        Underline::Dashed => wire.extend(b";4:5"),
     }
     expected.foreground = color(&mut wire, true, &seed[2..7]);
     expected.background = color(&mut wire, false, &seed[7..12]);
