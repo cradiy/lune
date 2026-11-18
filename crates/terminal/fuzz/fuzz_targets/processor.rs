@@ -356,6 +356,7 @@ fuzz_target!(|data: &[u8]| {
     let mut values = vec![Style::default()];
     let mut current = Style::default();
     let mut saved = [Style::default(); 2];
+    let mut renditions = Vec::new();
     let mut charsets = [false; 2];
     let mut selected = 0;
     let mut saved_charsets = [(charsets, selected); 2];
@@ -603,6 +604,7 @@ fuzz_target!(|data: &[u8]| {
                     title.clear();
                     directory_changed |= directory.take().is_some();
                     saved = [current; 2];
+                    renditions.clear();
                     saved_charsets = [(charsets, selected); 2];
                     input = InputModes::default();
                     auto_repeat = true;
@@ -870,6 +872,37 @@ fuzz_target!(|data: &[u8]| {
             41 => {
                 wire.extend(b"\x1b[1;38;5;256m");
                 diagnostics.1 += 1;
+                None
+            }
+            42 if bytes[1] & 4 != 0 => {
+                match bytes[2] % 4 {
+                    0 => {
+                        wire.extend(b"\x1b[#{");
+                        renditions.push((current, false));
+                    }
+                    1 => {
+                        wire.extend(b"\x1b[3;30#{");
+                        renditions.push((current, true));
+                    }
+                    2 => {
+                        wire.extend(b"\x1b[#}");
+                        let restore = renditions.len() <= 10;
+                        if let Some((saved, partial)) = renditions.pop()
+                            && restore
+                        {
+                            if partial {
+                                current.italic = saved.italic;
+                                current.foreground = saved.foreground;
+                            } else {
+                                current = saved;
+                            }
+                        }
+                    }
+                    _ => {
+                        wire.extend(b"\x1b[1;99#{");
+                        diagnostics.1 += 1;
+                    }
+                }
                 None
             }
             42 if bytes[1] & 2 != 0 => {

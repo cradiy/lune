@@ -5,6 +5,7 @@ use lune_vt::{ControlSequence, EscapeSequence, Event, OscEvent, Parameter, Parse
 use crate::charsets::Charsets;
 use crate::dcs::Dcs;
 use crate::osc::{Osc, Outcome};
+use crate::rendition_stack::RenditionStack;
 use crate::reply::{self, ColorReport, ModeReport, Reply, Report, StatusReport};
 use crate::{
     CursorShape, EraseMode, InputModes, Palette, Rgb, Screen, ScreenBuffer, StorageError, Style,
@@ -76,6 +77,7 @@ enum Pending {
     Index(bool),
     ScrollUp(usize),
     Rendition(Style),
+    PopRendition,
     Reply(Report),
     ModeReply(ModeReport),
     StatusReply(StatusReport),
@@ -86,6 +88,7 @@ enum Pending {
 struct State {
     style: StyleId,
     saved_style: [StyleId; 2],
+    renditions: RenditionStack,
     charsets: Charsets,
     saved_charsets: [Charsets; 2],
     input: InputModes,
@@ -99,6 +102,7 @@ impl State {
         Self {
             style: StyleId(0),
             saved_style: [StyleId(0); 2],
+            renditions: RenditionStack::default(),
             charsets: Charsets::default(),
             saved_charsets: [Charsets::default(); 2],
             input: InputModes::default(),
@@ -111,6 +115,7 @@ impl State {
     fn reset(&mut self) {
         self.style = StyleId(0);
         self.saved_style = [StyleId(0); 2];
+        self.renditions.clear();
         self.charsets = Charsets::default();
         self.saved_charsets = [Charsets::default(); 2];
         self.input = InputModes::default();
@@ -251,7 +256,7 @@ impl Processor {
     }
 
     /// Unsent bytes from the active reply, in wire order. The fixed output slot
-    /// holds one reply of at most 64 bytes. Bytes remain stable until acknowledged
+    /// holds one reply of at most 80 bytes. Bytes remain stable until acknowledged
     /// or explicitly reset. RIS preserves replies issued before it.
     #[inline]
     pub fn reply_bytes(&self) -> &[u8] {
@@ -513,6 +518,9 @@ impl Processor {
                         } else {
                             csi(screen, sequence, state)
                         }
+                    } else if matches!(sequence.final_byte, b'{' | b'}') {
+                        sequence.intermediates == b"#"
+                            && rendition_stack(sequence, state, styles, pending, end)
                     } else {
                         csi(screen, sequence, state)
                     };
@@ -650,6 +658,13 @@ impl Processor {
                 }
                 Pending::Rendition(style) => {
                     self.state.style = self.styles.intern(style).map_err(ProcessFailure::Style)?;
+                }
+                Pending::PopRendition => {
+                    self.state.style = self
+                        .state
+                        .renditions
+                        .pop(&mut self.styles, self.state.style)
+                        .map_err(ProcessFailure::Style)?;
                 }
                 Pending::Reply(reply) => {
                     if !self.reply.is_empty() {
@@ -858,6 +873,33 @@ fn erase_mode(value: usize) -> Option<EraseMode> {
         1 => Some(EraseMode::ToCursor),
         2 => Some(EraseMode::All),
         _ => None,
+    }
+}
+
+#[cold]
+fn rendition_stack(
+    sequence: ControlSequence<'_>,
+    state: &mut State,
+    styles: &StyleTable,
+    pending: &mut [Option<Pending>; 2],
+    end: &mut usize,
+) -> bool {
+    if !sequence.private_markers.is_empty() {
+        return false;
+    }
+    match sequence.final_byte {
+        b'{' => state.renditions.push(
+            sequence.parameters,
+            *styles
+                .get(state.style)
+                .expect("Current rendition is rooted"),
+        ),
+        b'}' if sequence.parameters.is_empty() => {
+            pending[*end] = Some(Pending::PopRendition);
+            *end += 1;
+            true
+        }
+        _ => false,
     }
 }
 

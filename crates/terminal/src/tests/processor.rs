@@ -848,6 +848,108 @@ fn sgr_default_resets_complete_atomically_with_full_style_storage() {
 }
 
 #[test]
+fn rendition_stack_restores_selected_fields_then_the_full_style_across_splits() {
+    let input = b"\x1b[31;1;4:3;58:5:42m\x1b[#{\x1b[30;21#{\x1b[0;34;44;3;58:5:7m\x1b[#}A\x1b[?#{\x1b[1#}\x1b[4:3#{\x1b[!p\x1b[#}B\x1b[#}C";
+    let saved = Style {
+        foreground: Color::Indexed(1),
+        bold: true,
+        underline: crate::Underline::Curly,
+        underline_color: Color::Indexed(42),
+        ..Style::default()
+    };
+    let partial = Style {
+        background: Color::Indexed(4),
+        bold: false,
+        italic: true,
+        underline_color: Color::Indexed(7),
+        ..saved
+    };
+    for split in 0..=input.len() {
+        let (screen, processor) = run(input, &[split]);
+        assert_eq!(row_text(&screen, 0), "ABC     ");
+        let row = screen.grid().row(0).unwrap();
+        for (cell, style) in row.cells().iter().zip([partial, saved, saved]) {
+            assert_eq!(processor.styles().get(cell.style()), Some(&style));
+        }
+        assert_eq!(processor.ignored_sequences(), 3);
+    }
+}
+
+#[test]
+fn rendition_stack_pairs_excess_pushes_and_clears_on_hard_reset() {
+    use std::io::Write;
+
+    let mut input = Vec::new();
+    for index in 0..12 {
+        write!(&mut input, "\x1b[38;5;{index}m\x1b[#{{").unwrap();
+    }
+    input.extend(b"\x1b[0m\x1b[#}A\x1b[#}B\x1b[#}C");
+    let (mut screen, mut processor) = run(&input, &[]);
+    let row = screen.grid().row(0).unwrap();
+    for (cell, color) in row
+        .cells()
+        .iter()
+        .zip([Color::Default, Color::Default, Color::Indexed(9)])
+    {
+        assert_eq!(
+            processor.styles().get(cell.style()).unwrap().foreground,
+            color
+        );
+    }
+    processor
+        .advance(b"\x1bc\x1b[#}X", &mut screen, &mut write_text)
+        .unwrap();
+    assert_eq!(row_text(&screen, 0), "X       ");
+    assert_eq!(processor.style_id(), StyleId(0));
+}
+
+#[test]
+fn blocked_rendition_pop_retries_after_collection_and_consumes_one_frame() {
+    let mut screen = Screen::new(8, 4).unwrap();
+    let mut processor = Processor::new(3, support::palette()).unwrap();
+    processor
+        .advance(b"\x1b[31m\x1b[30#{", &mut screen, &mut write_text)
+        .unwrap();
+    let saved = processor.style_id();
+    processor
+        .advance(b"\x1b[0;44m", &mut screen, &mut write_text)
+        .unwrap();
+    let current = processor.style_id();
+    let input = b"\x1b[#}X";
+    let error = processor
+        .advance(input, &mut screen, &mut write_text)
+        .unwrap_err();
+    assert!(matches!(
+        error.error,
+        ProcessFailure::Style(StyleError::CapacityExceeded)
+    ));
+    assert_eq!(error.consumed, 4);
+    assert_eq!(processor.style_id(), current);
+    assert_eq!(row_text(&screen, 0), "        ");
+    assert_eq!(processor.collect_styles(&screen, []).unwrap(), 1);
+    assert_eq!(processor.styles().get(saved), None);
+
+    processor
+        .advance(&input[error.consumed..], &mut screen, &mut write_text)
+        .unwrap();
+    let merged = processor.style_id();
+    assert_eq!(row_text(&screen, 0), "X       ");
+    assert_eq!(screen.grid().row(0).unwrap().cells()[0].style(), merged);
+    assert_eq!(
+        processor.styles().get(merged),
+        Some(&Style {
+            foreground: Color::Indexed(1),
+            background: Color::Indexed(4),
+            ..Style::default()
+        })
+    );
+    processor
+        .advance(b"\x1b[0m\x1b[#}", &mut screen, &mut write_text)
+        .unwrap();
+    assert_eq!(processor.style_id(), StyleId(0));
+}
+
+#[test]
 fn full_style_storage_retries_after_tracing_current_saved_and_external_owners() {
     let mut screen = Screen::new(8, 4).unwrap();
     let mut processor = Processor::new(4, support::palette()).unwrap();

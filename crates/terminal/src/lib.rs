@@ -17,6 +17,7 @@ mod palette;
 mod paste;
 mod processor;
 mod reflow;
+mod rendition_stack;
 mod reply;
 mod row;
 mod screen;
