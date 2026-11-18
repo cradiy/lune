@@ -7,6 +7,62 @@ use crate::{
 };
 
 #[test]
+fn csi_cursor_save_restore_preserves_rendition_charsets_and_deferred_wrap() {
+    let before_restore =
+        b"\x1b[2;4r\x1b[?6h\x1b[2;8H\x1b[31m\x1b)0\x0eq\x1b[s\x1b[?6;7l\x1b[32m\x0f";
+    let invalid = b"\x1b[0s\x1b[0u\x1b[?s\x1b[?u\x1b[ s\x1b[ u\x1b[1:0s\x1b[1:0u";
+    let restore = b"\x1b[u";
+    for chunk in [1, 3, usize::MAX] {
+        let mut screen = Screen::new(8, 4).unwrap();
+        let mut processor = support::processor();
+        for bytes in before_restore.chunks(chunk) {
+            processor
+                .advance(bytes, &mut screen, &mut write_text)
+                .unwrap();
+        }
+        let cursor = screen.cursor();
+        let style = processor.style_id();
+        for bytes in invalid.chunks(chunk) {
+            processor
+                .advance(bytes, &mut screen, &mut write_text)
+                .unwrap();
+        }
+        assert_eq!(screen.cursor(), cursor);
+        assert_eq!(processor.style_id(), style);
+        assert!(!screen.origin_mode() && !screen.auto_wrap());
+        assert_eq!(processor.ignored_sequences(), 8);
+
+        for bytes in restore.chunks(chunk) {
+            processor
+                .advance(bytes, &mut screen, &mut write_text)
+                .unwrap();
+        }
+        assert_eq!(
+            screen.cursor(),
+            Cursor {
+                row: 2,
+                column: 7,
+                wrap_pending: true
+            }
+        );
+        assert!(screen.origin_mode() && screen.auto_wrap());
+        assert_eq!(screen.scroll_region(), 1..4);
+        assert_eq!(
+            processor
+                .styles()
+                .get(processor.style_id())
+                .unwrap()
+                .foreground,
+            Color::Indexed(1)
+        );
+        processor
+            .advance(b"q", &mut screen, &mut write_text)
+            .unwrap();
+        assert_eq!(row_text(&screen, 3), "─       ");
+    }
+}
+
+#[test]
 fn bell_coalesces_only_executed_controls_and_survives_stream_resets() {
     for chunk in [1, 3, usize::MAX] {
         let mut processor = support::processor();

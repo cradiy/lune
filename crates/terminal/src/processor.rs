@@ -999,6 +999,8 @@ fn csi(screen: &mut Screen, sequence: ControlSequence<'_>, state: &mut State) ->
         b'H' | b'f' => screen.set_cursor(value(p, 0, 1).max(1) - 1, value(p, 1, 1).max(1) - 1),
         b'I' => screen.tab_forward(n),
         b'Z' => screen.tab_backward(n),
+        b's' if p.is_empty() => save_cursor(screen, state),
+        b'u' if p.is_empty() => restore_cursor(screen, state),
         b'@' => screen.insert_cells(n, style),
         b'P' => screen.delete_cells(n, style),
         b'X' => screen.erase_cells(n, style),

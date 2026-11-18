@@ -531,13 +531,21 @@ fuzz_target!(|data: &[u8]| {
                 Some(command)
             }
             30 => {
-                wire.extend(b"\x1b7");
+                wire.extend(if bytes[1] & 1 == 0 {
+                    &b"\x1b7"[..]
+                } else {
+                    b"\x1b[s"
+                });
                 saved[index] = current;
                 saved_charsets[index] = (charsets, selected);
                 Some(Command::SaveCursor)
             }
             31 => {
-                wire.extend(b"\x1b8");
+                wire.extend(if bytes[1] & 1 == 0 {
+                    &b"\x1b8"[..]
+                } else {
+                    b"\x1b[u"
+                });
                 current = saved[index];
                 (charsets, selected) = saved_charsets[index];
                 Some(Command::RestoreCursor)

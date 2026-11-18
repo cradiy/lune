@@ -165,7 +165,7 @@ fn collection_traces_both_buffer_save_slots_even_without_styled_cells() {
     let mut screen = Screen::new(8, 4).unwrap();
     processor
         .advance(
-            b"\x1b[31m\x1b7\x1b[0m\x1b[?47h\x1b[34m\x1b7\x1b[0m\x1b[32mG\x1b[0m\x1b[2J",
+            b"\x1b[31m\x1b[s\x1b[0m\x1b[?47h\x1b[34m\x1b7\x1b[0m\x1b[32mG\x1b[0m\x1b[2J",
             &mut screen,
             &mut text,
         )
@@ -181,7 +181,7 @@ fn collection_traces_both_buffer_save_slots_even_without_styled_cells() {
         Color::Indexed(1)
     );
     processor
-        .advance(b"\x1b[?47h\x1b8a", &mut screen, &mut text)
+        .advance(b"\x1b[?47h\x1b[ua", &mut screen, &mut text)
         .unwrap();
     let alternate = screen.grid().row(0).unwrap().cells()[0].style();
     assert_eq!(
