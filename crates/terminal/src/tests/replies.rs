@@ -36,6 +36,43 @@ fn drive(processor: &mut Processor, screen: &mut Screen, mut input: &[u8], outpu
 }
 
 #[test]
+fn text_area_query_reports_grid_dimensions_across_splits() {
+    let wire = b"\x1b[2;4r\x1b[?6h\x1b[18t\x1b[?47h\x1b[18t\x1b[17t\x1b[19t\x1b[?18t\x1b[18;0t\x1b[18:0t\x1b[18 t\x1b[18n\x1b[6t";
+    for split in 0..=wire.len() {
+        let mut screen = Screen::new(12, 5).unwrap();
+        let mut processor = support::processor();
+        let mut output = Vec::new();
+        drive(&mut processor, &mut screen, &wire[..split], &mut output);
+        drive(&mut processor, &mut screen, &wire[split..], &mut output);
+        assert_eq!(output, b"\x1b[8;5;12t\x1b[8;5;12t");
+        assert_eq!(processor.ignored_sequences(), 8);
+    }
+}
+
+#[test]
+fn blocked_text_area_query_retains_dimensions_at_query_time() {
+    let mut screen = Screen::new(12, 5).unwrap();
+    let mut processor = support::processor();
+    let wire = b"\x1b[5n\x1b[18t\x1b[18t";
+    let error = processor.advance(wire, &mut screen, &mut text).unwrap_err();
+    assert!(matches!(error.error, ProcessFailure::ReplyPending));
+    assert_eq!(error.consumed, 9);
+    assert_eq!(processor.reply_bytes(), b"\x1b[0n");
+    screen.resize(131, 26, StyleId(0)).unwrap();
+    assert!(processor.consume_reply(2));
+    let remaining = &wire[error.consumed..];
+    let error = processor
+        .advance(remaining, &mut screen, &mut text)
+        .unwrap_err();
+    assert!(matches!(error.error, ProcessFailure::ReplyPending));
+    assert_eq!(error.consumed, 0);
+    let mut output = b"\x1b[".to_vec();
+    drain(&mut processor, &mut output);
+    drive(&mut processor, &mut screen, remaining, &mut output);
+    assert_eq!(output, b"\x1b[0n\x1b[8;5;12t\x1b[8;26;131t");
+}
+
+#[test]
 fn status_strings_capture_rendition_margins_and_cursor_style_across_chunks() {
     for (rendition, report) in [
         (b"".as_slice(), b"0m".as_slice()),

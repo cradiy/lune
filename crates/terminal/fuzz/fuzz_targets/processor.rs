@@ -1026,10 +1026,16 @@ fuzz_target!(|data: &[u8]| {
                 None
             }
             58 => {
-                let marker = if bytes[1] & 1 == 0 { "" } else { "?" };
-                write!(&mut wire, "\x1b[{marker}6n").unwrap();
-                let (row, column) = expected.report_position();
-                write!(&mut replies, "\x1b[{marker}{row};{column}R").unwrap();
+                if bytes[1] & 2 == 0 {
+                    let marker = if bytes[1] & 1 == 0 { "" } else { "?" };
+                    write!(&mut wire, "\x1b[{marker}6n").unwrap();
+                    let (row, column) = expected.report_position();
+                    write!(&mut replies, "\x1b[{marker}{row};{column}R").unwrap();
+                } else {
+                    wire.extend(b"\x1b[18t");
+                    let (rows, columns) = expected.text_area_size();
+                    write!(&mut replies, "\x1b[8;{rows};{columns}t").unwrap();
+                }
                 None
             }
             59 => {

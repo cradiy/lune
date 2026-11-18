@@ -34,6 +34,10 @@ pub(crate) enum Report {
         column: u16,
         private: bool,
     },
+    TextAreaSize {
+        rows: u16,
+        columns: u16,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -209,6 +213,7 @@ impl Report {
                 column,
                 private,
             } => reply.position(row, column, private),
+            Self::TextAreaSize { rows, columns } => reply.text_area_size(rows, columns),
         }
     }
 }
@@ -245,6 +250,16 @@ impl Reply {
         self.append(b";");
         self.number(column);
         self.append(b"R");
+    }
+
+    #[cold]
+    fn text_area_size(&mut self, rows: u16, columns: u16) {
+        self.clear();
+        self.append(b"\x1b[8;");
+        self.number(rows);
+        self.append(b";");
+        self.number(columns);
+        self.append(b"t");
     }
 
     fn append(&mut self, bytes: &[u8]) {
@@ -294,6 +309,27 @@ pub(crate) fn query(screen: &Screen, sequence: ControlSequence<'_>) -> Option<Re
         }
         _ => None,
     }
+}
+
+#[cold]
+pub(crate) fn text_area_query(screen: &Screen, sequence: ControlSequence<'_>) -> Option<Report> {
+    if !sequence.private_markers.is_empty()
+        || !sequence.intermediates.is_empty()
+        || !matches!(
+            sequence.parameters,
+            [lune_vt::Parameter {
+                value: Some(18),
+                is_subparameter: false
+            }]
+        )
+    {
+        return None;
+    }
+    let grid = screen.grid();
+    Some(Report::TextAreaSize {
+        rows: u16::try_from(grid.rows()).expect("Rows fit the protocol bounds"),
+        columns: u16::try_from(grid.columns()).expect("Columns fit the protocol bounds"),
+    })
 }
 
 #[cold]

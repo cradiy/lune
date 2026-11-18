@@ -110,6 +110,15 @@ impl ScreenModel {
 
     #[allow(
         dead_code,
+        reason = "Text area reports are checked by the processor target."
+    )]
+    pub fn text_area_size(&self) -> (usize, usize) {
+        let grid = &self.storage[self.active];
+        (grid.rows(), grid.columns())
+    }
+
+    #[allow(
+        dead_code,
         reason = "Status strings are checked by the processor target."
     )]
     pub fn status_margins(&self) -> (usize, usize) {

@@ -481,6 +481,14 @@ impl Processor {
                         } else {
                             csi(screen, sequence, state)
                         }
+                    } else if sequence.final_byte == b't' {
+                        if let Some(reply) = reply::text_area_query(screen, sequence) {
+                            pending[*end] = Some(Pending::Reply(reply));
+                            *end += 1;
+                            true
+                        } else {
+                            false
+                        }
                     } else {
                         csi(screen, sequence, state)
                     };
