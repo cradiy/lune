@@ -36,6 +36,23 @@ fn drive(processor: &mut Processor, screen: &mut Screen, mut input: &[u8], outpu
 }
 
 #[test]
+fn version_query_reports_the_component_build_and_shares_reply_order() {
+    let wire = b"\x1b[>q\x1b[5n\x1b[>0q\x1b[>1q\x1b[>0;0q\x1b[>0:0q\x1b[>0 q\x1b[?0q\x1b[5 q";
+    let identity = format!("lune-terminal({})", env!("CARGO_PKG_VERSION"));
+    let expected = format!("\x1bP>|{identity}\x1b\\\x1b[0n\x1bP>|{identity}\x1b\\");
+    for split in 0..=wire.len() {
+        let mut screen = Screen::new(8, 4).unwrap();
+        let mut processor = support::processor();
+        let mut output = Vec::new();
+        drive(&mut processor, &mut screen, &wire[..split], &mut output);
+        drive(&mut processor, &mut screen, &wire[split..], &mut output);
+        assert_eq!(output, expected.as_bytes());
+        assert_eq!(processor.ignored_sequences(), 5);
+        assert_eq!(screen.cursor_appearance().shape, crate::CursorShape::Bar);
+    }
+}
+
+#[test]
 fn text_area_query_reports_grid_dimensions_across_splits() {
     let wire = b"\x1b[2;4r\x1b[?6h\x1b[18t\x1b[?47h\x1b[18t\x1b[17t\x1b[19t\x1b[?18t\x1b[18;0t\x1b[18:0t\x1b[18 t\x1b[18n\x1b[6t";
     for split in 0..=wire.len() {

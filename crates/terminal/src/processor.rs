@@ -489,6 +489,14 @@ impl Processor {
                         } else {
                             false
                         }
+                    } else if sequence.final_byte == b'q' && sequence.private_markers == b">" {
+                        if let Some(reply) = reply::version_query(sequence) {
+                            pending[*end] = Some(Pending::Reply(reply));
+                            *end += 1;
+                            true
+                        } else {
+                            false
+                        }
                     } else {
                         csi(screen, sequence, state)
                     };

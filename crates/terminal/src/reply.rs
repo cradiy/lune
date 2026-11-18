@@ -1,4 +1,4 @@
-use lune_vt::{ControlSequence, OscTerminator};
+use lune_vt::{ControlSequence, OscTerminator, Parameter};
 
 use crate::dcs::StatusQuery;
 use crate::{
@@ -8,6 +8,15 @@ use crate::{
 
 // A DECRQSS rendition reply with all flags and two RGB colors occupies 60 bytes.
 const CAPACITY: usize = 64;
+const VERSION_REPLY: &[u8] = concat!(
+    "\x1bP>|",
+    env!("CARGO_PKG_NAME"),
+    "(",
+    env!("CARGO_PKG_VERSION"),
+    ")\x1b\\"
+)
+.as_bytes();
+const _: () = assert!(VERSION_REPLY.len() <= CAPACITY);
 
 #[derive(Clone, Copy)]
 pub(crate) struct Reply {
@@ -38,6 +47,7 @@ pub(crate) enum Report {
         rows: u16,
         columns: u16,
     },
+    Version,
 }
 
 #[derive(Clone, Copy)]
@@ -208,6 +218,7 @@ impl Report {
                 reply.clear();
                 reply.append(b"\x1b[0n");
             }
+            Self::Version => reply.version(),
             Self::Position {
                 row,
                 column,
@@ -250,6 +261,12 @@ impl Reply {
         self.append(b";");
         self.number(column);
         self.append(b"R");
+    }
+
+    #[cold]
+    fn version(&mut self) {
+        self.clear();
+        self.append(VERSION_REPLY);
     }
 
     #[cold]
@@ -309,6 +326,19 @@ pub(crate) fn query(screen: &Screen, sequence: ControlSequence<'_>) -> Option<Re
         }
         _ => None,
     }
+}
+
+#[cold]
+pub(crate) fn version_query(sequence: ControlSequence<'_>) -> Option<Report> {
+    (sequence.intermediates.is_empty()
+        && matches!(
+            sequence.parameters,
+            [] | [Parameter {
+                value: Some(0),
+                is_subparameter: false,
+            }]
+        ))
+    .then_some(Report::Version)
 }
 
 #[cold]
