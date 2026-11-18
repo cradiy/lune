@@ -6,8 +6,7 @@ use libfuzzer_sys::fuzz_target;
 use lune_terminal::{Color, Style, Underline};
 use lune_vt::{Event, MAX_PARAMETERS, Parameter, Parser};
 
-fn color(wire: &mut Vec<u8>, foreground: bool, bytes: &[u8]) -> Color {
-    let code = if foreground { 38 } else { 48 };
+fn color(wire: &mut Vec<u8>, code: u8, bytes: &[u8]) -> Color {
     let colon = bytes[4] & 1 != 0;
     match bytes[0] % 3 {
         0 => {
@@ -15,8 +14,8 @@ fn color(wire: &mut Vec<u8>, foreground: bool, bytes: &[u8]) -> Color {
             Color::Default
         }
         1 => {
-            if bytes[1] < 16 && bytes[4] & 2 != 0 {
-                let base = if foreground { 30 } else { 40 };
+            if code != 58 && bytes[1] < 16 && bytes[4] & 2 != 0 {
+                let base = code - 8;
                 let n = bytes[1];
                 let code = if n < 8 { base + n } else { base + 60 + n - 8 };
                 write!(wire, ";{code}").unwrap();
@@ -41,7 +40,7 @@ fn color(wire: &mut Vec<u8>, foreground: bool, bytes: &[u8]) -> Color {
 }
 
 fuzz_target!(|data: &[u8]| {
-    let mut seed = [0_u8; 12];
+    let mut seed = [0_u8; 17];
     let count = data.len().min(seed.len());
     seed[..count].copy_from_slice(&data[..count]);
     let mut wire = Vec::from(&b"\x1b[0"[..]);
@@ -84,8 +83,9 @@ fuzz_target!(|data: &[u8]| {
         Underline::Dotted => wire.extend(b";4:4"),
         Underline::Dashed => wire.extend(b";4:5"),
     }
-    expected.foreground = color(&mut wire, true, &seed[2..7]);
-    expected.background = color(&mut wire, false, &seed[7..12]);
+    expected.foreground = color(&mut wire, 38, &seed[2..7]);
+    expected.background = color(&mut wire, 48, &seed[7..12]);
+    expected.underline_color = color(&mut wire, 58, &seed[12..17]);
     wire.push(b'm');
     for chunk in [wire.len(), seed[1] as usize % 17 + 1] {
         let mut parser = Parser::default();

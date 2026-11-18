@@ -21,6 +21,7 @@ fn rendition_composes_in_order_and_resets_independent_attributes() {
         Style {
             foreground: Color::Indexed(1),
             background: Color::Indexed(12),
+            underline_color: Color::Default,
             bold: true,
             faint: true,
             italic: true,
@@ -84,14 +85,18 @@ fn colors_preserve_palette_identity_and_decode_both_extended_forms() {
     }
     for index in 0..=255 {
         let mut style = Style::default();
-        assert!(sgr(&mut style, &format!("38;5;{index};48:5:{index}")));
+        assert!(sgr(
+            &mut style,
+            &format!("38;5;{index};48:5:{index};58:5:{index}")
+        ));
         assert_eq!(style.foreground, Color::Indexed(index));
         assert_eq!(style.background, Color::Indexed(index));
+        assert_eq!(style.underline_color, Color::Indexed(index));
     }
     for parameters in [
-        "38;2;0;128;255;48:2::255:0:1;1",
-        "38:2::0:128:255;48;2;255;0;1;1",
-        "38:2:0:0:128:255;48:2:0:255:0:1;1",
+        "38;2;0;128;255;48:2::255:0:1;58;2;2;3;4;4:3;1",
+        "38:2::0:128:255;48;2;255;0;1;58:2::2:3:4;4:3;1",
+        "38:2:0:0:128:255;48:2:0:255:0:1;58:2:0:2:3:4;4:3;1",
     ] {
         let mut style = Style::default();
         assert!(sgr(&mut style, parameters));
@@ -108,12 +113,26 @@ fn colors_preserve_palette_identity_and_decode_both_extended_forms() {
                     green: 0,
                     blue: 1
                 },
+                underline_color: Color::Rgb {
+                    red: 2,
+                    green: 3,
+                    blue: 4,
+                },
+                underline: Underline::Curly,
                 bold: true,
                 ..Style::default()
             }
         );
-        assert!(sgr(&mut style, "39"));
+        assert!(sgr(&mut style, "24;39"));
         assert_eq!(style.foreground, Color::Default);
+        assert_eq!(
+            style.underline_color,
+            Color::Rgb {
+                red: 2,
+                green: 3,
+                blue: 4
+            }
+        );
         assert_eq!(
             style.background,
             Color::Rgb {
@@ -122,7 +141,10 @@ fn colors_preserve_palette_identity_and_decode_both_extended_forms() {
                 blue: 1
             }
         );
-        assert!(sgr(&mut style, "49"));
+        assert!(sgr(&mut style, "59;4:3"));
+        assert_eq!(style.underline_color, Color::Default);
+        assert_eq!(style.underline, Underline::Curly);
+        assert!(sgr(&mut style, "24;49"));
         assert_eq!(
             style,
             Style {
@@ -136,7 +158,10 @@ fn colors_preserve_palette_identity_and_decode_both_extended_forms() {
 #[test]
 fn rejected_groups_preserve_rendition_without_reinterpreting_color_components() {
     let mut style = Style::default();
-    assert!(sgr(&mut style, "1;2;3;21;5;7;8;9;38;2;7;8;9;48;5;255"));
+    assert!(sgr(
+        &mut style,
+        "1;2;3;21;5;7;8;9;38;2;7;8;9;48;5;255;58:5:2"
+    ));
     let original = style;
     for parameters in [
         "0;38",
@@ -154,6 +179,10 @@ fn rejected_groups_preserve_rendition_without_reinterpreting_color_components() 
         "0;38:2;1;2;3",
         "0;38:5:1:2",
         "0;38;5;1:2",
+        "0;58:5:256",
+        "0;58;2;1;2",
+        "0;58;5;1:2",
+        "0;59:0",
         "0;4:",
         "0;4:6",
         "0;4:3:0",

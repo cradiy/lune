@@ -18,8 +18,18 @@ fn color_key(color: Color) -> u64 {
     }
 }
 
+#[derive(Default, PartialEq, Eq)]
+struct StyleKey([u8; 12]);
+
+impl std::hash::Hash for StyleKey {
+    #[inline]
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        state.write(&self.0);
+    }
+}
+
 #[inline]
-fn key(style: Style) -> u64 {
+fn key(style: Style) -> StyleKey {
     let attributes = u64::from(style.bold)
         | (u64::from(style.faint) << 1)
         | (u64::from(style.italic) << 2)
@@ -28,8 +38,12 @@ fn key(style: Style) -> u64 {
         | (u64::from(style.hidden) << 5)
         | (u64::from(style.strikethrough) << 6)
         | (u64::from(style.underline as u8) << 7);
-    // Each color occupies 25 bits; rendition occupies the next ten bits.
-    color_key(style.foreground) | (color_key(style.background) << 25) | (attributes << 50)
+    let base =
+        color_key(style.foreground) | (color_key(style.background) << 25) | (attributes << 50);
+    let mut bytes = [0; 12];
+    bytes[..8].copy_from_slice(&base.to_ne_bytes());
+    bytes[8..].copy_from_slice(&(color_key(style.underline_color) as u32).to_ne_bytes());
+    StyleKey(bytes)
 }
 
 #[derive(Debug)]
@@ -88,7 +102,7 @@ struct Slot {
 /// error and is retained for subsequent operations.
 pub struct StyleTable {
     default: Style,
-    styles: HashMap<u64, StyleId>,
+    styles: HashMap<StyleKey, StyleId>,
     slots: Vec<Slot>,
     free: u32,
     limit: usize,
@@ -134,7 +148,7 @@ impl StyleTable {
     #[inline]
     pub fn intern(&mut self, style: Style) -> Result<StyleId, StyleError> {
         let key = key(style);
-        if key == 0 {
+        if key == StyleKey::default() {
             return Ok(StyleId(0));
         }
         if let Some(&id) = self.styles.get(&key) {
@@ -144,7 +158,7 @@ impl StyleTable {
     }
 
     #[inline(never)]
-    fn insert(&mut self, style: Style, key: u64) -> Result<StyleId, StyleError> {
+    fn insert(&mut self, style: Style, key: StyleKey) -> Result<StyleId, StyleError> {
         let index = if self.free != FREE_END {
             self.free as usize
         } else if self.slots.len() < self.limit - 1 {

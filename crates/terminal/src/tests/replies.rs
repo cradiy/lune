@@ -119,13 +119,14 @@ fn status_strings_capture_rendition_margins_and_cursor_style_across_chunks() {
     for (rendition, report) in [
         (b"".as_slice(), b"0m".as_slice()),
         (
-            b"\x1b[1;2;3;4:3;5;7;8;9;38;2;255;255;255;48;2;255;255;255m",
-            b"0;1;2;3;4:3;5;7;8;9;38;2;255;255;255;48;2;255;255;255m",
+            b"\x1b[1;2;3;4:3;5;7;8;9;38;2;255;255;255;48;2;255;255;255;58;2;255;255;255m",
+            b"0;1;2;3;4:3;5;7;8;9;38;2;255;255;255;48;2;255;255;255;58;2;255;255;255m",
         ),
         (b"\x1b[4;38:5:255;48:5:0m", b"0;4;38;5;255;48;5;0m"),
         (b"\x1b[4:2m", b"0;21m"),
-        (b"\x1b[4:4m", b"0;4:4m"),
+        (b"\x1b[4:4;58:5:42m\x1b[59m", b"0;4:4m"),
         (b"\x1b[4:5m", b"0;4:5m"),
+        (b"\x1b[58:5:42m", b"0;58;5;42m"),
     ] {
         let mut wire = rendition.to_vec();
         wire.extend(b"\x1bP$qm\x1b\\\x1b[2;4r\x1b[?6h\x1bP$qr\x1b\\\x1b[?25l\x1b[6 q\x1bP$q q\x1b\\\x1b[!p\x1bP$qm\x1b\\\x1bP$qr\x1b\\\x1bP$q q\x1b\\");

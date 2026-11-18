@@ -24,6 +24,7 @@ fuzz_target!(|data: &[u8]| {
                 let style = Style {
                     foreground: color(bytes[2], bytes[1], bytes[2], bytes[3]),
                     background: color(bytes[3], bytes[3], bytes[2], bytes[1]),
+                    underline_color: color(bytes[0] / 3, bytes[2], bytes[1], bytes[3]),
                     bold: bytes[1] & 1 != 0,
                     faint: bytes[1] & 2 != 0,
                     italic: bytes[1] & 4 != 0,

@@ -55,7 +55,11 @@ fn rendition_status(style: Style, output: &mut Vec<u8>) {
             fields.push(code.to_owned());
         }
     }
-    for (code, color) in [(38, style.foreground), (48, style.background)] {
+    for (code, color) in [
+        (38, style.foreground),
+        (48, style.background),
+        (58, style.underline_color),
+    ] {
         match color {
             Color::Default => {}
             Color::Indexed(index) => fields.push(format!("{code};5;{index}")),
@@ -821,6 +825,24 @@ fuzz_target!(|data: &[u8]| {
                 if !bold {
                     current.faint = false;
                 }
+                None
+            }
+            39 if bytes[5] & 2 != 0 => {
+                let [red, green, blue] = [bytes[1], bytes[2], bytes[3]];
+                current.underline_color = match bytes[5] % 3 {
+                    0 => {
+                        wire.extend(b"\x1b[59m");
+                        Color::Default
+                    }
+                    1 => {
+                        write!(&mut wire, "\x1b[58;5;{red}m").unwrap();
+                        Color::Indexed(red)
+                    }
+                    _ => {
+                        write!(&mut wire, "\x1b[58:2::{red}:{green}:{blue}m").unwrap();
+                        Color::Rgb { red, green, blue }
+                    }
+                };
                 None
             }
             39 => {

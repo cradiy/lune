@@ -33,6 +33,8 @@ pub enum Underline {
 pub struct Style {
     pub foreground: Color,
     pub background: Color,
+    /// Default follows the displayed foreground. Explicit colors are independent of inverse video.
+    pub underline_color: Color,
     pub bold: bool,
     pub faint: bool,
     pub italic: bool,
@@ -48,11 +50,11 @@ impl Style {
     /// omitted top-level values reset rendition. Returns false for an unsupported
     /// value or malformed group, preserving the complete original style.
     ///
-    /// Supports 0-5, 7-9, 21-25, 27-29, 30-37, 39, 40-47, 49, 90-97,
-    /// 100-107, and extended colors through 38/48. Indexed colors accept
+    /// Supports 0-5, 7-9, 21-25, 27-29, 30-37, 39, 40-47, 49, 59, 90-97,
+    /// 100-107, and extended colors through 38/48/58. Indexed colors accept
     /// `38;5;n` or `38:5:n`; RGB accepts `38;2;r;g;b` or
     /// `38:2:space:r:g:b`, with an omitted or zero color-space identifier.
-    /// The same forms apply to background color through 48. All indices and RGB
+    /// The same forms apply to background and underline colors. All indices and RGB
     /// components must be explicit values through 255. `4:0` through `4:5`
     /// select underline styles. The caller validates the CSI header.
     #[inline]
@@ -69,36 +71,14 @@ impl Style {
             }
             let code = parameter.value.unwrap_or(0);
             let tail = &parameters[offset + 1..];
-            if matches!(code, 38 | 48) {
-                let color = if tail.first().is_some_and(|mode| mode.is_subparameter) {
-                    let length = tail.iter().take_while(|mode| mode.is_subparameter).count();
-                    let group = &tail[..length];
-                    offset += length + 1;
-                    colon_color(group)
-                } else {
-                    offset += 1;
-                    semicolon_color(parameters, &mut offset)
-                };
-                let Some(color) = color else {
+            if tail.first().is_some_and(|mode| mode.is_subparameter) {
+                let Some(consumed) = next.apply_colon_group(code, tail) else {
                     return false;
                 };
-                if code == 38 {
-                    next.foreground = color;
-                } else {
-                    next.background = color;
-                }
+                offset += consumed + 1;
                 continue;
             }
-            if let [mode, ..] = tail
-                && mode.is_subparameter
-            {
-                let Some(underline) = colon_underline(code, *mode) else {
-                    return false;
-                };
-                next.underline = underline;
-                offset += 2;
-                continue;
-            }
+            offset += 1;
             match code {
                 0 => next = Self::default(),
                 1 => next.bold = true,
@@ -121,29 +101,55 @@ impl Style {
                 28 => next.hidden = false,
                 29 => next.strikethrough = false,
                 30..=37 => next.foreground = Color::Indexed((code - 30) as u8),
+                38 | 48 | 58 => {
+                    let Some(color) = semicolon_color(parameters, &mut offset) else {
+                        return false;
+                    };
+                    *next.extended_color(code) = color;
+                }
                 39 => next.foreground = Color::Default,
                 40..=47 => next.background = Color::Indexed((code - 40) as u8),
                 49 => next.background = Color::Default,
+                59 => next.underline_color = Color::Default,
                 90..=97 => next.foreground = Color::Indexed((code - 90 + 8) as u8),
                 100..=107 => next.background = Color::Indexed((code - 100 + 8) as u8),
                 _ => return false,
             }
-            offset += 1;
         }
         *self = next;
         true
     }
-}
 
-fn colon_underline(code: u16, mode: Parameter) -> Option<Underline> {
-    match (code, mode.value) {
-        (4, Some(0)) => Some(Underline::None),
-        (4, Some(1)) => Some(Underline::Single),
-        (4, Some(2)) => Some(Underline::Double),
-        (4, Some(3)) => Some(Underline::Curly),
-        (4, Some(4)) => Some(Underline::Dotted),
-        (4, Some(5)) => Some(Underline::Dashed),
-        _ => None,
+    fn apply_colon_group(&mut self, code: u16, tail: &[Parameter]) -> Option<usize> {
+        match code {
+            4 => {
+                self.underline = match tail[0].value? {
+                    0 => Underline::None,
+                    1 => Underline::Single,
+                    2 => Underline::Double,
+                    3 => Underline::Curly,
+                    4 => Underline::Dotted,
+                    5 => Underline::Dashed,
+                    _ => return None,
+                };
+                Some(1)
+            }
+            38 | 48 | 58 => {
+                let length = tail.iter().take_while(|mode| mode.is_subparameter).count();
+                *self.extended_color(code) = colon_color(&tail[..length])?;
+                Some(length)
+            }
+            _ => None,
+        }
+    }
+
+    fn extended_color(&mut self, code: u16) -> &mut Color {
+        match code {
+            38 => &mut self.foreground,
+            48 => &mut self.background,
+            58 => &mut self.underline_color,
+            _ => unreachable!(),
+        }
     }
 }
 

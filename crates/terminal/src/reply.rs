@@ -6,8 +6,8 @@ use crate::{
     StyleTable, Underline,
 };
 
-// A full DECRQSS rendition reply fits in 61 bytes.
-const CAPACITY: usize = 64;
+// A full DECRQSS rendition reply fits in 78 bytes.
+const CAPACITY: usize = 80;
 const VERSION_REPLY: &[u8] = concat!(
     "\x1bP>|",
     env!("CARGO_PKG_NAME"),
@@ -122,7 +122,11 @@ impl StatusReport {
                         reply.append(code);
                     }
                 }
-                for (selector, color) in [(38, style.foreground), (48, style.background)] {
+                for (selector, color) in [
+                    (38, style.foreground),
+                    (48, style.background),
+                    (58, style.underline_color),
+                ] {
                     if color == Color::Default {
                         continue;
                     }

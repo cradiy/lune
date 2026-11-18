@@ -735,10 +735,12 @@ fn finishing_and_resetting_own_pending_input_without_duplicate_effects() {
 
 #[test]
 fn sgr_styles_follow_saved_cursors_wide_text_erasure_and_input_boundaries() {
-    let input = "\x1b[31mR\x1b7\x1b[1;48;5;17m\x1b[1;5HB\x1b8S\x1b[0mN\x1b[48:2::1:2:3m\x1b[3;1H\x1b[K\x1b[4;1H\x1b[38;2;0;255;1m水\x1b[38;5;256m!\x1b[?31m\x1b[1 m".as_bytes();
+    let input = "\x1b[31;4:3;58:5:42mR\x1b7\x1b[1;48;5;17;59m\x1b[1;5HB\x1b8S\x1b[0mN\x1b[48:2::1:2:3m\x1b[3;1H\x1b[K\x1b[4;1H\x1b[38;2;0;255;1m水\x1b[38;5;256m!\x1b[?31m\x1b[1 m".as_bytes();
     let (screen, processor) = run(input, &[]);
     let red = Style {
         foreground: Color::Indexed(1),
+        underline: crate::Underline::Curly,
+        underline_color: Color::Indexed(42),
         ..Style::default()
     };
     let background = Color::Rgb {
@@ -768,6 +770,7 @@ fn sgr_styles_follow_saved_cursors_wide_text_erasure_and_input_boundaries() {
         Style {
             bold: true,
             background: Color::Indexed(17),
+            underline_color: Color::Default,
             ..red
         }
     );

@@ -63,6 +63,10 @@ fn style_identity_distinguishes_attribute_combinations_and_color_channels() {
                 background: color,
                 ..Style::default()
             });
+            record(Style {
+                underline_color: color,
+                ..Style::default()
+            });
         }
     }
     assert_eq!(table.style_count(), values.len());
@@ -71,6 +75,7 @@ fn style_identity_distinguishes_attribute_combinations_and_color_channels() {
 const BOLD: Style = Style {
     foreground: Color::Default,
     background: Color::Default,
+    underline_color: Color::Default,
     bold: true,
     faint: false,
     italic: false,
