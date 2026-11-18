@@ -465,7 +465,9 @@ fuzz_target!(|data: &[u8]| {
                         Command::EraseDisplay(mode)
                     })
                 } else {
-                    diagnostics.1 += 1;
+                    if final_byte == 'K' {
+                        diagnostics.1 += 1;
+                    }
                     None
                 }
             }

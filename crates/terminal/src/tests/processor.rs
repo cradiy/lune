@@ -7,6 +7,116 @@ use crate::{
 };
 
 #[test]
+fn erase_saved_lines_preserves_live_buffers_modes_and_saved_cursors_across_chunks() {
+    use crate::{HistoryLimits, ScreenBuffer, TextSink, UnicodeWriter};
+    use ScreenBuffer::{Alternate, Primary};
+
+    for active in [Primary, Alternate] {
+        for chunk in [1, 17, usize::MAX] {
+            let mut processor = support::processor();
+            let mut screen = Screen::new(8, 3).unwrap();
+            let limits = HistoryLimits {
+                max_rows: 4,
+                max_bytes: 8192,
+            };
+            screen.set_history_limits(limits).unwrap();
+            let mut writer = UnicodeWriter::default();
+            let seed = format!("\x1b[31m{}", "e\u{301}水 old\r\n".repeat(6));
+            processor
+                .advance(seed.as_bytes(), &mut screen, &mut writer)
+                .unwrap();
+            let old_style = processor.style_id();
+            processor
+                .advance(
+                    "\x1b[0m\x1b[2J\x1b[Hlive e\u{301}\x1b[3;8HX\x1b7".as_bytes(),
+                    &mut screen,
+                    &mut writer,
+                )
+                .unwrap();
+            let saved_primary = screen.cursor();
+            screen.scroll_viewport_up(2);
+            assert_eq!(screen.viewport_offset(), 2);
+            processor
+                .advance(
+                    "\x1b[?47h\x1b[Halt 水\x1b[2;8HY\x1b7".as_bytes(),
+                    &mut screen,
+                    &mut writer,
+                )
+                .unwrap();
+            let saved_alternate = screen.cursor();
+            if active == Primary {
+                processor
+                    .advance(b"\x1b[?47l", &mut screen, &mut writer)
+                    .unwrap();
+            }
+            processor
+                .advance(
+                    b"\x1b[2;3r\x1b[?6;2004h\x1b[4;20h\x1b[3g\x1b[1;3H\x1bH\x1b[34m\x1b[6 q\x1b[1;8HZ",
+                    &mut screen,
+                    &mut writer,
+                )
+                .unwrap();
+            let primary = snapshot(screen.buffer(Primary));
+            let alternate = snapshot(screen.buffer(Alternate));
+            let cursor = screen.cursor();
+            assert!(cursor.wrap_pending);
+            let appearance = screen.cursor_appearance();
+            let style = processor.style_id();
+            let input = processor.input_modes();
+            let history = format!("{:?}", screen.history());
+            for rejected in [
+                b"\x1b[3K".as_slice(),
+                b"\x1b[3;0J",
+                b"\x1b[3:0J",
+                b"\x1b[?3J",
+                b"\x1b[3 J",
+                b"\x1b[4J",
+            ] {
+                for bytes in rejected.chunks(chunk) {
+                    processor.advance(bytes, &mut screen, &mut writer).unwrap();
+                }
+            }
+            assert_eq!(format!("{:?}", screen.history()), history);
+            assert_eq!(processor.ignored_sequences(), 6);
+            processor.collect_styles(&screen, []).unwrap();
+            assert!(processor.styles().get(old_style).is_some());
+            for bytes in b"\x1b[3J\x1b[03J".chunks(chunk) {
+                processor.advance(bytes, &mut screen, &mut writer).unwrap();
+            }
+            assert!(screen.history().is_empty());
+            assert_eq!(screen.history().retained_bytes(), 0);
+            assert_eq!(screen.history().limits(), limits);
+            assert_eq!(screen.viewport_offset(), 0);
+            assert_eq!(screen.active_buffer(), active);
+            assert_eq!(snapshot(screen.buffer(Primary)), primary);
+            assert_eq!(snapshot(screen.buffer(Alternate)), alternate);
+            assert_eq!(screen.cursor(), cursor);
+            assert_eq!(screen.cursor_appearance(), appearance);
+            assert_eq!(screen.scroll_region(), 1..3);
+            assert!(screen.origin_mode() && screen.auto_wrap() && screen.insert_mode());
+            assert_eq!(screen.is_tab_stop(2), Some(true));
+            assert_eq!(screen.is_tab_stop(0), Some(false));
+            assert_eq!(processor.style_id(), style);
+            assert_eq!(processor.input_modes(), input);
+            assert_eq!(processor.ignored_sequences(), 6);
+            processor.collect_styles(&screen, []).unwrap();
+            assert!(processor.styles().get(old_style).is_none());
+            writer.boundary();
+            for (buffer, saved) in [(Alternate, saved_alternate), (Primary, saved_primary)] {
+                screen.select_buffer(buffer);
+                screen.restore_cursor();
+                assert_eq!(screen.cursor(), saved);
+            }
+            assert_eq!(screen.viewport_offset(), 0);
+            screen.set_scroll_region(0..3).unwrap();
+            screen.set_cursor(2, 0);
+            screen.line_feed(StyleId(0)).unwrap();
+            assert_eq!(screen.history().len(), 1);
+        }
+    }
+}
+
+#[test]
 fn cursor_presentation_controls_compose_across_chunks_reject_headers_and_reset() {
     use CursorShape::{Bar, Block, Underline};
     for (wire, shape, blinking) in [

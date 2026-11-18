@@ -990,6 +990,7 @@ fn csi(screen: &mut Screen, sequence: ControlSequence<'_>, state: &mut State) ->
         b'L' => screen.insert_lines(n, style),
         b'M' => screen.delete_lines(n, style),
         b'T' => screen.scroll_down(n, style),
+        b'J' if value(p, 0, 0) == 3 => screen.clear_history(),
         b'J' | b'K' => {
             let Some(mode) = erase_mode(value(p, 0, 0)) else {
                 return false;

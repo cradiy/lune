@@ -19,6 +19,53 @@ use lune_terminal::{
 static ALLOCATOR: allocator::TestAllocator = allocator::TestAllocator;
 
 #[test]
+fn erase_saved_lines_waits_for_prior_replies_and_releases_history_without_allocation() {
+    let mut screen = Screen::new(4, 2).unwrap();
+    screen
+        .set_history_limits(HistoryLimits {
+            max_rows: 3,
+            max_bytes: 4096,
+        })
+        .unwrap();
+    let mut processor = support::processor();
+    let mut writer = UnicodeWriter::default();
+    let seed = "e\u{301}水\r\n".repeat(4);
+    processor
+        .advance(seed.as_bytes(), &mut screen, &mut writer)
+        .unwrap();
+    let bytes = screen.history().retained_bytes();
+    assert!(bytes > 0);
+    screen.scroll_viewport_up(1);
+    let cursor = screen.cursor();
+    let before = snapshot(screen.grid());
+    let wire = b"\x1b[5n\x1b[6n\x1b[3J";
+    let ((), stats) = allocator::measure(Some(0), || {
+        let error = processor
+            .advance(wire, &mut screen, &mut writer)
+            .unwrap_err();
+        assert!(matches!(error.error, ProcessFailure::ReplyPending));
+        assert_eq!(error.consumed, 8);
+        assert_eq!(screen.history().retained_bytes(), bytes);
+        assert_eq!(screen.viewport_offset(), 1);
+        assert!(processor.consume_reply(4));
+        processor
+            .advance(&wire[error.consumed..], &mut screen, &mut writer)
+            .unwrap();
+        assert_eq!(processor.reply_bytes(), b"\x1b[2;1R");
+        assert!(screen.history().is_empty());
+        assert_eq!(screen.viewport_offset(), 0);
+        processor
+            .advance(b"\x1b[3J", &mut screen, &mut writer)
+            .unwrap();
+        assert_eq!(processor.reply_bytes(), b"\x1b[2;1R");
+    });
+    assert_eq!(stats.attempts, 0);
+    assert_eq!(stats.live_bytes, -(bytes as i128));
+    assert_eq!(snapshot(screen.grid()), before);
+    assert_eq!(screen.cursor(), cursor);
+}
+
+#[test]
 fn status_string_queries_capture_and_drain_without_allocation() {
     let wire = b"\x1b[1;2;3;21;5;7;8;9;38;2;255;255;255;48;2;255;255;255m\x1bP$qm\x1b\\\x1b[2;4r\x1bP$qr\x1b\\\x1b[6 q\x1bP$q q\x1b\\\x1bP$qinvalid\x1b\\";
     let mut screen = Screen::new(8, 4).unwrap();
