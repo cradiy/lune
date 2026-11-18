@@ -157,6 +157,7 @@ pub struct Processor {
     end: usize,
     parse_errors: u64,
     ignored_sequences: u64,
+    bell_pending: bool,
 }
 
 impl Processor {
@@ -173,6 +174,7 @@ impl Processor {
             end: 0,
             parse_errors: 0,
             ignored_sequences: 0,
+            bell_pending: false,
         })
     }
 
@@ -223,6 +225,11 @@ impl Processor {
     /// Acknowledges coalesced visible palette changes.
     pub fn take_palette_change(&mut self) -> bool {
         self.state.osc.take_palette_change()
+    }
+
+    /// Takes the coalesced BEL notification. Finish and in-band resets preserve it.
+    pub fn take_bell(&mut self) -> bool {
+        std::mem::take(&mut self.bell_pending)
     }
 
     /// Unsent bytes from the active reply, in wire order. The fixed output slot
@@ -559,6 +566,7 @@ impl Processor {
         self.end = 0;
         self.parse_errors = 0;
         self.ignored_sequences = 0;
+        self.bell_pending = false;
         self.state.reset();
         self.reply = Reply::default();
         screen.reset(StyleId(0));
@@ -590,12 +598,8 @@ impl Processor {
                 Pending::Boundary => text.boundary(),
                 Pending::Execute(control) => {
                     text.boundary();
-                    match control {
-                        0x0e => self.state.charsets.shift(true),
-                        0x0f => self.state.charsets.shift(false),
-                        _ => execute(screen, control, self.state.style, self.state.input.new_line)
-                            .map_err(ProcessFailure::Screen)?,
-                    }
+                    execute(screen, control, &mut self.state, &mut self.bell_pending)
+                        .map_err(ProcessFailure::Screen)?;
                 }
                 Pending::Index(carriage) => {
                     text.boundary();
@@ -734,19 +738,22 @@ fn ascii_prefix<const LAST: u8>(input: &[u8]) -> usize {
 fn execute(
     screen: &mut Screen,
     control: u8,
-    style: StyleId,
-    new_line_mode: bool,
+    state: &mut State,
+    bell_pending: &mut bool,
 ) -> Result<(), StorageError> {
     match control {
+        0x07 => *bell_pending = true,
         0x08 => screen.backspace(),
         0x09 => screen.tab_forward(1),
         0x0a..=0x0c => {
-            screen.line_feed(style)?;
-            if new_line_mode {
+            screen.line_feed(state.style)?;
+            if state.input.new_line {
                 screen.carriage_return();
             }
         }
         0x0d => screen.carriage_return(),
+        0x0e => state.charsets.shift(true),
+        0x0f => state.charsets.shift(false),
         _ => {}
     }
     Ok(())

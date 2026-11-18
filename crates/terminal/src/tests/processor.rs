@@ -7,6 +7,90 @@ use crate::{
 };
 
 #[test]
+fn bell_coalesces_only_executed_controls_and_survives_stream_resets() {
+    for chunk in [1, 3, usize::MAX] {
+        let mut processor = support::processor();
+        let mut screen = Screen::new(4, 2).unwrap();
+        processor
+            .advance(b"abcd", &mut screen, &mut write_text)
+            .unwrap();
+        let cursor = screen.cursor();
+        let cells = snapshot(screen.grid());
+        let strings = b"\x1b]2;synthetic\x07\x1bPq\x07\x1b\\\x1b_\x07\x1b\\";
+        for bytes in strings.chunks(chunk) {
+            processor
+                .advance(bytes, &mut screen, &mut write_text)
+                .unwrap();
+        }
+        assert_eq!(processor.window_title(), "synthetic");
+        assert!(!processor.take_bell());
+        processor
+            .advance(b"\x07\x07", &mut screen, &mut write_text)
+            .unwrap();
+        assert_eq!(screen.cursor(), cursor);
+        assert_eq!(snapshot(screen.grid()), cells);
+        assert!(processor.take_bell());
+        assert!(!processor.take_bell());
+
+        for bytes in b"\x1b[3\x071m\x1b[!p\x1bc".chunks(chunk) {
+            processor
+                .advance(bytes, &mut screen, &mut write_text)
+                .unwrap();
+        }
+        processor.finish(&mut screen, &mut write_text).unwrap();
+        assert!(processor.take_bell());
+        assert!(!processor.take_bell());
+        processor
+            .advance(b"\x07", &mut screen, &mut write_text)
+            .unwrap();
+        processor.reset(&mut screen, &mut write_text);
+        assert!(!processor.take_bell());
+    }
+}
+
+#[test]
+fn bell_waits_for_pending_text_and_reply_before_becoming_visible() {
+    let mut processor = support::processor();
+    let mut screen = Screen::new(4, 2).unwrap();
+    let wire = b"\xc2\x07\x1b[5n\x1b[5n\x07";
+    let error = processor
+        .advance(wire, &mut screen, &mut |_: &mut Screen, text: &str, _| {
+            assert_eq!(text, "\u{fffd}");
+            Err(())
+        })
+        .unwrap_err();
+    assert!(matches!(error.error, ProcessFailure::Text(())));
+    assert_eq!(error.consumed, 2);
+    assert!(!processor.take_bell());
+
+    let remaining = &wire[error.consumed..];
+    let error = processor
+        .advance(remaining, &mut screen, &mut write_text)
+        .unwrap_err();
+    assert!(matches!(error.error, ProcessFailure::ReplyPending));
+    assert_eq!(error.consumed, 8);
+    assert!(processor.take_bell());
+    assert!(!processor.take_bell());
+    assert_eq!(row_text(&screen, 0), "\u{fffd}   ");
+
+    let remaining = &remaining[error.consumed..];
+    assert!(processor.consume_reply(2));
+    let error = processor
+        .advance(remaining, &mut screen, &mut write_text)
+        .unwrap_err();
+    assert!(matches!(error.error, ProcessFailure::ReplyPending));
+    assert_eq!(error.consumed, 0);
+    assert!(!processor.take_bell());
+    assert!(processor.consume_reply(2));
+    processor
+        .advance(remaining, &mut screen, &mut write_text)
+        .unwrap();
+    assert_eq!(processor.reply_bytes(), b"\x1b[0n");
+    assert!(processor.take_bell());
+    assert!(!processor.take_bell());
+}
+
+#[test]
 fn erase_saved_lines_preserves_live_buffers_modes_and_saved_cursors_across_chunks() {
     use crate::{HistoryLimits, ScreenBuffer, TextSink, UnicodeWriter};
     use ScreenBuffer::{Alternate, Primary};
