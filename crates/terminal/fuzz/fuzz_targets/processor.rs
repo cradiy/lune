@@ -35,6 +35,35 @@ fn count(wire: &mut Vec<u8>, final_byte: u8, bytes: &[u8; 8]) -> usize {
     }
 }
 
+fn rendition_status(style: Style, output: &mut Vec<u8>) {
+    let mut fields = vec!["0".to_owned()];
+    for (enabled, code) in [
+        (style.bold, "1"),
+        (style.faint, "2"),
+        (style.italic, "3"),
+        (style.underline == Underline::Single, "4"),
+        (style.underline == Underline::Double, "21"),
+        (style.blink, "5"),
+        (style.inverse, "7"),
+        (style.hidden, "8"),
+        (style.strikethrough, "9"),
+    ] {
+        if enabled {
+            fields.push(code.to_owned());
+        }
+    }
+    for (code, color) in [(38, style.foreground), (48, style.background)] {
+        match color {
+            Color::Default => {}
+            Color::Indexed(index) => fields.push(format!("{code};5;{index}")),
+            Color::Rgb { red, green, blue } => {
+                fields.push(format!("{code};2;{red};{green};{blue}"))
+            }
+        }
+    }
+    write!(output, "\x1bP1$r{}m\x1b\\", fields.join(";")).unwrap();
+}
+
 struct Expected<'a> {
     screen: &'a ScreenModel,
     diagnostics: (u64, u64),
@@ -927,6 +956,37 @@ fuzz_target!(|data: &[u8]| {
                     2004
                 };
                 write!(&mut wire, "\x1b[?{mode}{}", if enabled { 'h' } else { 'l' }).unwrap();
+                None
+            }
+            57 if bytes[7] & 1 != 0 => {
+                let selector =
+                    [b"m".as_slice(), b"r", b" q", b"invalid"][usize::from(bytes[1] % 4)];
+                wire.extend(b"\x1bP$q");
+                wire.extend(selector);
+                if bytes[2] & 3 == 3 {
+                    wire.push(0x18);
+                } else {
+                    wire.extend(b"\x1b\\");
+                    match selector {
+                        b"m" => rendition_status(current, &mut replies),
+                        b"r" => {
+                            let (top, bottom) = expected.status_margins();
+                            write!(&mut replies, "\x1bP1$r{top};{bottom}r\x1b\\").unwrap();
+                        }
+                        b" q" => {
+                            let appearance = expected.cursor_appearance();
+                            let shape = match appearance.shape {
+                                CursorShape::Block => 0,
+                                CursorShape::Underline => 1,
+                                CursorShape::Bar => 2,
+                            };
+                            let selector =
+                                [[2, 1], [4, 3], [6, 5]][shape][usize::from(appearance.blinking)];
+                            write!(&mut replies, "\x1bP1$r{selector} q\x1b\\").unwrap();
+                        }
+                        _ => replies.extend(b"\x1bP0$r\x1b\\"),
+                    }
+                }
                 None
             }
             57 => {

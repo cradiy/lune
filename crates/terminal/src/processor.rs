@@ -3,8 +3,9 @@ use std::{error::Error, fmt};
 use lune_vt::{ControlSequence, EscapeSequence, Event, OscEvent, Parameter, Parser};
 
 use crate::charsets::Charsets;
+use crate::dcs::Dcs;
 use crate::osc::{Osc, Outcome};
-use crate::reply::{self, ColorReport, ModeReport, Reply, Report};
+use crate::reply::{self, ColorReport, ModeReport, Reply, Report, StatusReport};
 use crate::{
     CursorShape, EraseMode, InputModes, Palette, Rgb, Screen, ScreenBuffer, StorageError, Style,
     StyleError, StyleId, StyleTable, TextSink,
@@ -77,6 +78,7 @@ enum Pending {
     Rendition(Style),
     Reply(Report),
     ModeReply(ModeReport),
+    StatusReply(StatusReport),
     ColorReply(ColorReport),
     OscReplies,
 }
@@ -88,6 +90,7 @@ struct State {
     saved_charsets: [Charsets; 2],
     input: InputModes,
     osc: Osc,
+    dcs: Dcs,
 }
 
 impl State {
@@ -99,6 +102,7 @@ impl State {
             saved_charsets: [Charsets::default(); 2],
             input: InputModes::default(),
             osc: Osc::new(palette),
+            dcs: Dcs::default(),
         }
     }
 
@@ -109,6 +113,7 @@ impl State {
         self.saved_charsets = [Charsets::default(); 2];
         self.input = InputModes::default();
         self.osc.reset();
+        self.dcs = Dcs::default();
     }
 
     #[cold]
@@ -221,7 +226,7 @@ impl Processor {
     }
 
     /// Unsent bytes from the active reply, in wire order. The fixed output slot
-    /// holds one reply of at most 28 bytes. Bytes remain stable until acknowledged
+    /// holds one reply of at most 64 bytes. Bytes remain stable until acknowledged
     /// or explicitly reset. RIS preserves replies issued before it.
     #[inline]
     pub fn reply_bytes(&self) -> &[u8] {
@@ -375,6 +380,8 @@ impl Processor {
             if discarded != 0 {
                 if self.state.osc.needs_data() {
                     self.state.osc.data(&input[consumed..consumed + discarded]);
+                } else if self.state.dcs.needs_data() {
+                    self.state.dcs.data(&input[consumed..consumed + discarded]);
                 }
                 consumed += discarded;
                 continue;
@@ -486,7 +493,9 @@ impl Processor {
                         *end += 1;
                     }
                 },
-                Event::Dcs(_) => {}
+                Event::Dcs(event) => {
+                    dcs_event(event, screen, styles, state, pending, end);
+                }
                 Event::Error(_) => *parse_errors = parse_errors.saturating_add(1),
             });
             if T::STATEFUL && matches!(input[consumed], 0x1b | 0x7f) {
@@ -529,7 +538,9 @@ impl Processor {
             Event::Osc(OscEvent::Cancel) => {
                 state.osc.event(OscEvent::Cancel);
             }
-            Event::Dcs(_) => {}
+            Event::Dcs(event) => {
+                state.dcs.event(event);
+            }
             _ => unreachable!("Finishing emits text, string cancellation, or a lexical error"),
         });
         self.drain(screen, text)?;
@@ -616,6 +627,12 @@ impl Processor {
                     }
                     reply.encode(&mut self.reply);
                 }
+                Pending::StatusReply(reply) => {
+                    if !self.reply.is_empty() {
+                        return Err(ProcessFailure::ReplyPending);
+                    }
+                    reply.encode(&mut self.reply);
+                }
                 Pending::ColorReply(reply) => {
                     if !self.reply.is_empty() {
                         return Err(ProcessFailure::ReplyPending);
@@ -646,6 +663,26 @@ impl Processor {
 }
 
 #[inline]
+fn dcs_event(
+    event: lune_vt::DcsEvent<'_>,
+    screen: &Screen,
+    styles: &StyleTable,
+    state: &mut State,
+    pending: &mut [Option<Pending>; 2],
+    end: &mut usize,
+) {
+    if let Some(query) = state.dcs.event(event) {
+        pending[*end] = Some(Pending::StatusReply(StatusReport::capture(
+            query,
+            screen,
+            styles,
+            state.style,
+        )));
+        *end += 1;
+    }
+}
+
+#[inline]
 fn ascii_range_mask<const LAST: u8>(word: u64) -> u64 {
     const ONES: u64 = u64::MAX / 255;
     const HIGH: u64 = ONES * 128;
@@ -654,7 +691,7 @@ fn ascii_range_mask<const LAST: u8>(word: u64) -> u64 {
     (below | above) & HIGH
 }
 
-#[inline]
+#[inline(always)]
 fn ascii_prefix<const LAST: u8>(input: &[u8]) -> usize {
     let mut offset = 0;
     // Block-sized inputs enter scanning before short-input dispatch.

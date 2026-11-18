@@ -36,6 +36,131 @@ fn drive(processor: &mut Processor, screen: &mut Screen, mut input: &[u8], outpu
 }
 
 #[test]
+fn status_strings_capture_rendition_margins_and_cursor_style_across_chunks() {
+    for (rendition, report) in [
+        (b"".as_slice(), b"0m".as_slice()),
+        (
+            b"\x1b[1;2;3;21;5;7;8;9;38;2;255;255;255;48;2;255;255;255m",
+            b"0;1;2;3;21;5;7;8;9;38;2;255;255;255;48;2;255;255;255m",
+        ),
+        (b"\x1b[4;38:5:255;48:5:0m", b"0;4;38;5;255;48;5;0m"),
+    ] {
+        let mut wire = rendition.to_vec();
+        wire.extend(b"\x1bP$qm\x1b\\\x1b[2;4r\x1b[?6h\x1bP$qr\x1b\\\x1b[?25l\x1b[6 q\x1bP$q q\x1b\\\x1b[!p\x1bP$qm\x1b\\\x1bP$qr\x1b\\\x1bP$q q\x1b\\");
+        let mut expected = b"\x1bP1$r".to_vec();
+        expected.extend(report);
+        expected.extend(b"\x1b\\\x1bP1$r2;4r\x1b\\\x1bP1$r6 q\x1b\\\x1bP1$r0m\x1b\\\x1bP1$r1;4r\x1b\\\x1bP1$r1 q\x1b\\");
+        for chunk in [1, 2, 17, wire.len()] {
+            let mut processor = support::processor();
+            let mut screen = Screen::new(8, 4).unwrap();
+            let before = super::snapshot(screen.grid());
+            let mut output = Vec::new();
+            for bytes in wire.chunks(chunk) {
+                drive(&mut processor, &mut screen, bytes, &mut output);
+            }
+            assert_eq!(output, expected);
+            assert_eq!(super::snapshot(screen.grid()), before);
+            assert_eq!(
+                (processor.parse_errors(), processor.ignored_sequences()),
+                (0, 0)
+            );
+        }
+    }
+}
+
+#[test]
+fn status_string_rejections_cancellation_and_finish_preserve_request_boundaries() {
+    let mut wire = b"\x1bP$q\x1b\\\x1bP$qxyz\x1b\\\x1bP$qm\x07\x1b\\\x1bP$qm\x18\x1bP1$qm\x1b\\\x1bP?$qm\x1b\\\x1bP$qm\x1b[31m\x1bP$qm".to_vec();
+    wire.extend(vec![b'x'; 4096]);
+    wire.extend(b"\x1b\\\x1bP$q qx\x1b\\\x1bP$q r\x1b\\\x1bP$qm");
+    for chunk in [1, 17, wire.len()] {
+        let mut processor = support::processor();
+        let mut screen = Screen::new(8, 4).unwrap();
+        let mut output = Vec::new();
+        for bytes in wire.chunks(chunk) {
+            drive(&mut processor, &mut screen, bytes, &mut output);
+        }
+        processor.finish(&mut screen, &mut text).unwrap();
+        processor.finish(&mut screen, &mut text).unwrap();
+        drain(&mut processor, &mut output);
+        assert_eq!(output, b"\x1bP0$r\x1b\\".repeat(6));
+        assert_eq!(
+            (processor.parse_errors(), processor.ignored_sequences()),
+            (1, 0)
+        );
+        drive(&mut processor, &mut screen, b"\x1bP$qm\x1b\\", &mut output);
+        assert!(output.ends_with(b"\x1bP1$r0;38;5;1m\x1b\\"));
+        processor
+            .advance(b"\x1bP$q ", &mut screen, &mut text)
+            .unwrap();
+        processor.reset(&mut screen, &mut text);
+        let mut output = Vec::new();
+        drive(&mut processor, &mut screen, b"\x1bP$qm\x1b\\", &mut output);
+        assert_eq!(output, b"\x1bP1$r0m\x1b\\");
+    }
+}
+
+#[test]
+fn status_strings_freeze_values_and_share_the_reply_slot_with_prior_queries() {
+    use crate::{CursorAppearance, CursorShape};
+    let mut processor = Processor::new(2, support::palette()).unwrap();
+    let mut screen = Screen::new(8, 4).unwrap();
+    processor
+        .advance(b"\x1b[31m\x1b[2;4r\x1b[5n", &mut screen, &mut text)
+        .unwrap();
+    let red = processor.style_id();
+    let wire = b"\x1bP$qr\x1b\\TAIL";
+    let failure = processor.advance(wire, &mut screen, &mut text).unwrap_err();
+    assert!(matches!(failure.error, ProcessFailure::ReplyPending));
+    assert_eq!(failure.consumed, wire.len() - 4);
+    screen.set_scroll_region(0..2).unwrap();
+    screen.resize(8, 3, StyleId(0)).unwrap();
+    assert!(processor.consume_reply(2));
+    assert_eq!(processor.reply_bytes(), b"0n");
+    let failure = processor.advance(&[], &mut screen, &mut text).unwrap_err();
+    assert_eq!(failure.consumed, 0);
+    assert!(processor.consume_reply(2));
+    processor.advance(&[], &mut screen, &mut text).unwrap();
+    assert_eq!(processor.reply_bytes(), b"\x1bP1$r2;4r\x1b\\");
+    screen.set_cursor_appearance(CursorAppearance {
+        visible: false,
+        blinking: false,
+        shape: CursorShape::Bar,
+    });
+    assert!(
+        processor
+            .advance(b"\x1bP$q q\x1b\\", &mut screen, &mut text)
+            .is_err()
+    );
+    screen.set_cursor_appearance(CursorAppearance::default());
+    let mut output = Vec::new();
+    drain(&mut processor, &mut output);
+    processor.advance(&[], &mut screen, &mut text).unwrap();
+    assert_eq!(processor.reply_bytes(), b"\x1bP1$r6 q\x1b\\");
+    assert!(
+        processor
+            .advance(b"\x1bP$qm\x1b\\", &mut screen, &mut text)
+            .is_err()
+    );
+    drain(&mut processor, &mut output);
+    processor.advance(&[], &mut screen, &mut text).unwrap();
+    let captured = processor.reply_bytes().to_vec();
+    assert_eq!(captured, b"\x1bP1$r0;38;5;1m\x1b\\");
+    processor.advance(b"\x1bc", &mut screen, &mut text).unwrap();
+    assert_eq!(processor.collect_styles(&screen, []).unwrap(), 1);
+    assert!(processor.styles().get(red).is_none());
+    assert_eq!(processor.reply_bytes(), captured);
+    processor
+        .advance(&wire[wire.len() - 4..], &mut screen, &mut text)
+        .unwrap();
+    drain(&mut processor, &mut output);
+    assert_eq!(
+        output,
+        b"\x1bP1$r2;4r\x1b\\\x1bP1$r6 q\x1b\\\x1bP1$r0;38;5;1m\x1b\\"
+    );
+}
+
+#[test]
 fn query_replies_preserve_wire_order_origin_coordinates_and_wrapping_across_splits() {
     let input = b"\x1b[5nabc\x1b[6n\x1b[2;4r\x1b[?6h\x1b[2;8H!\x1b[6nZ\x1b[6n\x1b[?6l\x1b[4;7H\x1b[6n\x1b[n\x1b[0n\x1b[?5n\x1b[?6n\x1b[6;5n\x1b[6:0n\x1b[6!n\x1b[>6n";
     for split in 0..=input.len() {

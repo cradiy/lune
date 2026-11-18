@@ -1,21 +1,144 @@
 use lune_vt::{ControlSequence, OscTerminator};
 
-use crate::{InputModes, MouseTracking, Rgb, Screen, ScreenBuffer};
+use crate::dcs::StatusQuery;
+use crate::{
+    Color, CursorShape, InputModes, MouseTracking, Rgb, Screen, ScreenBuffer, Style, StyleId,
+    StyleTable, Underline,
+};
 
-// OSC 4;255;rgb:hhhh/hhhh/hhhh followed by ST.
-const CAPACITY: usize = 28;
+// A DECRQSS rendition reply with all flags and two RGB colors occupies 60 bytes.
+const CAPACITY: usize = 64;
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 pub(crate) struct Reply {
     bytes: [u8; CAPACITY],
     start: u8,
     end: u8,
 }
 
+impl Default for Reply {
+    fn default() -> Self {
+        Self {
+            bytes: [0; CAPACITY],
+            start: 0,
+            end: 0,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum Report {
     Status,
     Position(u16, u16),
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum StatusReport {
+    Rendition(Style),
+    Margins(u16, u16),
+    CursorStyle(u8),
+    Unsupported,
+}
+
+impl StatusReport {
+    #[cold]
+    pub(crate) fn capture(
+        query: StatusQuery,
+        screen: &Screen,
+        styles: &StyleTable,
+        current: StyleId,
+    ) -> Self {
+        match query {
+            StatusQuery::Rendition => {
+                Self::Rendition(*styles.get(current).expect("Current rendition is rooted"))
+            }
+            StatusQuery::Margins => {
+                let region = screen.scroll_region();
+                Self::Margins((region.start + 1) as u16, region.end as u16)
+            }
+            StatusQuery::CursorStyle => {
+                let appearance = screen.cursor_appearance();
+                let shape = match appearance.shape {
+                    CursorShape::Block => 1,
+                    CursorShape::Underline => 3,
+                    CursorShape::Bar => 5,
+                };
+                Self::CursorStyle(shape + u8::from(!appearance.blinking))
+            }
+            StatusQuery::Unsupported => Self::Unsupported,
+        }
+    }
+
+    #[cold]
+    pub(crate) fn encode(self, reply: &mut Reply) {
+        reply.clear();
+        if matches!(self, Self::Unsupported) {
+            reply.append(b"\x1bP0$r\x1b\\");
+            return;
+        }
+        reply.append(b"\x1bP1$r");
+        match self {
+            Self::Rendition(style) => {
+                reply.append(b"0");
+                for (enabled, code) in [
+                    (style.bold, 1),
+                    (style.faint, 2),
+                    (style.italic, 3),
+                    (
+                        style.underline != Underline::None,
+                        if style.underline == Underline::Double {
+                            21
+                        } else {
+                            4
+                        },
+                    ),
+                    (style.blink, 5),
+                    (style.inverse, 7),
+                    (style.hidden, 8),
+                    (style.strikethrough, 9),
+                ] {
+                    if enabled {
+                        reply.append(b";");
+                        reply.number(code);
+                    }
+                }
+                for (selector, color) in [(38, style.foreground), (48, style.background)] {
+                    if color == Color::Default {
+                        continue;
+                    }
+                    reply.append(b";");
+                    reply.number(selector);
+                    match color {
+                        Color::Default => unreachable!(),
+                        Color::Indexed(index) => {
+                            reply.append(b";5;");
+                            reply.number(u16::from(index));
+                        }
+                        Color::Rgb { red, green, blue } => {
+                            reply.append(b";2");
+                            for channel in [red, green, blue] {
+                                reply.append(b";");
+                                reply.number(u16::from(channel));
+                            }
+                        }
+                    }
+                }
+                reply.append(b"m");
+            }
+            Self::Margins(top, bottom) => {
+                reply.number(top);
+                reply.append(b";");
+                reply.number(bottom);
+                reply.append(b"r");
+            }
+            Self::CursorStyle(style) => {
+                reply.number(u16::from(style));
+                reply.append(b" q");
+            }
+            Self::Unsupported => unreachable!(),
+        }
+        reply.append(b"\x1b\\");
+    }
 }
 
 #[derive(Clone, Copy)]

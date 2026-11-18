@@ -5,6 +5,7 @@ extern crate self as lune_terminal;
 
 mod cell;
 mod charsets;
+mod dcs;
 mod error;
 mod grid;
 mod history;

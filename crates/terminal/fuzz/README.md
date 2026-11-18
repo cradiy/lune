@@ -117,6 +117,10 @@ coalesced title changes, and diagnostics.
 ANSI and DEC mode queries append replies from independent input and screen state.
 Checks include unknown selectors, invalid query headers, and captured values under
 reply backpressure alongside status and cursor-position reports.
+DECRQSS queries compare canonical SGR strings, absolute scrolling margins, and
+cursor style with independent model values. Unknown selectors produce failure
+replies; cancellation produces none. These replies share partial-write and
+failure-retry checks with CSI and OSC reports.
 Dynamic foreground, background, and cursor chains compare mixed numeric RGB
 updates, captured queries, coalesced notifications, and resets with independent
 color state. Color replies preserve BEL/ST framing while sharing the same output

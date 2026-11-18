@@ -110,6 +110,22 @@ impl ScreenModel {
 
     #[allow(
         dead_code,
+        reason = "Status strings are checked by the processor target."
+    )]
+    pub fn status_margins(&self) -> (usize, usize) {
+        (self.region.start + 1, self.region.end)
+    }
+
+    #[allow(
+        dead_code,
+        reason = "Status strings are checked by the processor target."
+    )]
+    pub fn cursor_appearance(&self) -> CursorAppearance {
+        self.cursor_appearance
+    }
+
+    #[allow(
+        dead_code,
         reason = "Mode queries are checked by the processor target."
     )]
     pub fn mode(&self, private: bool, selector: u16) -> Option<bool> {

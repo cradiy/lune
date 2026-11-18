@@ -108,6 +108,9 @@ fn main() {
     let indexed = b"\x1b]4;1;?;1;#123456;1;?;255;?\x1b\\\x1b]104;1;255\x07".repeat(512);
     let dynamic = b"\x1b]10;#123456;#abcdef;#778899\x07\x1b]10;?;?;?\x1b\\\x1b]110\x07\x1b]111\x07\x1b]112\x07".repeat(512);
     let mode_queries = b"\x1b[4h\x1b[4$p\x1b[4l\x1b[4$p\x1b[?1004;1003;1006h\x1b[?1004$p\x1b[?1003$p\x1b[?65535$p\x1b[?1004;1003;1006l".repeat(512);
+    let status_strings =
+        b"\x1b[1;38;2;12;34;56m\x1bP$qm\x1b\\\x1bP$qr\x1b\\\x1bP$q q\x1b\\\x1bP$qinvalid\x1b\\"
+            .repeat(512);
     let alternate = b"\x1b[31mprimary\r\n\x1b[?1049h\x1b[34m\x1b[2;3Halternate\r\n\x1b[?1048h\x1b[?47l\x1b[?47h\x1b[?1048l\x1b[?1049l\x1b[0m".repeat(512);
     let mut newlines = Vec::from(&b"\x1b[20h"[..]);
     newlines
@@ -122,6 +125,8 @@ fn main() {
     measure("ANSI positions / 17-byte", &positions, 17);
     measure("ANSI positions / 1-byte", &positions, 1);
     measure("control strings", &strings, strings.len());
+    measure("control strings / 17-byte", &strings, 17);
+    measure("control strings / 1-byte", &strings, 1);
     measure("title updates / bulk", &titles, titles.len());
     measure("title updates / 17-byte", &titles, 17);
     measure("title updates / 1-byte", &titles, 1);
@@ -147,6 +152,14 @@ fn main() {
     measure_replies("queries / bulk", &queries, queries.len(), 14);
     measure_replies("queries / 17-byte", &queries, 17, 3);
     measure_replies("queries / 1-byte", &queries, 1, 1);
+    measure_replies(
+        "status strings / bulk",
+        &status_strings,
+        status_strings.len(),
+        64,
+    );
+    measure_replies("status strings / 17-byte", &status_strings, 17, 3);
+    measure_replies("status strings / 1-byte", &status_strings, 1, 1);
     measure_replies(
         "color queries / bulk",
         &color_queries,

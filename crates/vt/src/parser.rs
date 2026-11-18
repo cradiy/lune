@@ -151,11 +151,19 @@ impl Parser {
     /// before a control or DEL. Returns zero outside a string payload.
     #[inline]
     pub fn discard_string_payload(&mut self, bytes: &[u8]) -> usize {
-        if matches!(self.state, State::String { .. }) {
-            text_end(bytes)
-        } else {
-            0
+        if !matches!(self.state, State::String { .. }) {
+            return 0;
         }
+        let Some(&first) = bytes.first() else {
+            return 0;
+        };
+        if first < 0x20 || first == 0x7f {
+            return 0;
+        }
+        if bytes.len() == 1 {
+            return 1;
+        }
+        text_end(bytes)
     }
 
     /// Consumes a chunk and invokes `emit` synchronously for each lexical event.
@@ -722,12 +730,15 @@ fn text_end(bytes: &[u8]) -> usize {
 
 #[cfg(test)]
 mod scan_tests {
-    use super::text_end;
+    use super::{Parser, text_end};
 
     #[test]
     fn word_scan_matches_scalar_control_detection_at_all_alignments() {
         let mut bytes = [b'A'; 64];
+        let mut parser = Parser::default();
+        parser.advance(b"\x1b]", |_| {});
         for value in 0..=u8::MAX {
+            assert_eq!(parser.discard_string_payload(&[value]), text_end(&[value]));
             for position in 0..bytes.len() {
                 bytes[position] = value;
                 for alignment in 0..size_of::<usize>() {
