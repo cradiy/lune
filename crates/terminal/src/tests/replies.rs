@@ -36,6 +36,31 @@ fn drive(processor: &mut Processor, screen: &mut Screen, mut input: &[u8], outpu
 }
 
 #[test]
+fn primary_device_attributes_share_reply_order_and_preserve_screen_state() {
+    let wire = b"\x1b[c\x1b[6n\x1b[0c\x1b[1c\x1b[0;c\x1b[0:0c\x1b[ c\x1b[?0c\x1b[>0c\x1b[=0c";
+    for split in 0..=wire.len() {
+        let mut screen = Screen::new(8, 4).unwrap();
+        let mut processor = support::processor();
+        processor
+            .advance(b"\x1b[31m\x1b[3;8Hx", &mut screen, &mut text)
+            .unwrap();
+        let cells = super::snapshot(screen.grid());
+        let cursor = screen.cursor();
+        let style = processor.style_id();
+        assert!(cursor.wrap_pending);
+
+        let mut output = Vec::new();
+        drive(&mut processor, &mut screen, &wire[..split], &mut output);
+        drive(&mut processor, &mut screen, &wire[split..], &mut output);
+        assert_eq!(output, b"\x1b[?6c\x1b[3;8R\x1b[?6c");
+        assert_eq!(processor.ignored_sequences(), 7);
+        assert_eq!(processor.style_id(), style);
+        assert_eq!(screen.cursor(), cursor);
+        assert_eq!(super::snapshot(screen.grid()), cells);
+    }
+}
+
+#[test]
 fn version_query_reports_the_component_build_and_shares_reply_order() {
     let wire = b"\x1b[>q\x1b[5n\x1b[>0q\x1b[>1q\x1b[>0;0q\x1b[>0:0q\x1b[>0 q\x1b[?0q\x1b[5 q";
     let identity = format!("lune-terminal({})", env!("CARGO_PKG_VERSION"));

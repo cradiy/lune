@@ -47,6 +47,7 @@ pub(crate) enum Report {
         rows: u16,
         columns: u16,
     },
+    PrimaryDeviceAttributes,
     Version,
 }
 
@@ -218,6 +219,10 @@ impl Report {
                 reply.clear();
                 reply.append(b"\x1b[0n");
             }
+            Self::PrimaryDeviceAttributes => {
+                reply.clear();
+                reply.append(b"\x1b[?6c");
+            }
             Self::Version => reply.version(),
             Self::Position {
                 row,
@@ -329,16 +334,23 @@ pub(crate) fn query(screen: &Screen, sequence: ControlSequence<'_>) -> Option<Re
 }
 
 #[cold]
-pub(crate) fn version_query(sequence: ControlSequence<'_>) -> Option<Report> {
-    (sequence.intermediates.is_empty()
-        && matches!(
+pub(crate) fn identity_query(sequence: ControlSequence<'_>) -> Option<Report> {
+    if !sequence.intermediates.is_empty()
+        || !matches!(
             sequence.parameters,
             [] | [Parameter {
                 value: Some(0),
                 is_subparameter: false,
             }]
-        ))
-    .then_some(Report::Version)
+        )
+    {
+        return None;
+    }
+    match (sequence.final_byte, sequence.private_markers) {
+        (b'c', []) => Some(Report::PrimaryDeviceAttributes),
+        (b'q', [b'>']) => Some(Report::Version),
+        _ => None,
+    }
 }
 
 #[cold]

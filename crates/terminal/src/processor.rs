@@ -491,21 +491,17 @@ impl Processor {
                         } else {
                             csi(screen, sequence, state)
                         }
-                    } else if sequence.final_byte == b't' {
-                        if let Some(reply) = reply::text_area_query(screen, sequence) {
+                    } else if matches!(sequence.final_byte, b'c' | b'q' | b't') {
+                        let response = match sequence.final_byte {
+                            b't' => reply::text_area_query(screen, sequence),
+                            _ => reply::identity_query(sequence),
+                        };
+                        if let Some(reply) = response {
                             pending[*end] = Some(Pending::Reply(reply));
                             *end += 1;
                             true
                         } else {
-                            false
-                        }
-                    } else if sequence.final_byte == b'q' && sequence.private_markers == b">" {
-                        if let Some(reply) = reply::version_query(sequence) {
-                            pending[*end] = Some(Pending::Reply(reply));
-                            *end += 1;
-                            true
-                        } else {
-                            false
+                            csi(screen, sequence, state)
                         }
                     } else {
                         csi(screen, sequence, state)

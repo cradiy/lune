@@ -1063,6 +1063,15 @@ fuzz_target!(|data: &[u8]| {
                 }
                 None
             }
+            58 if bytes[1] & 4 != 0 => {
+                wire.extend(if bytes[1] & 1 == 0 {
+                    b"\x1b[c".as_slice()
+                } else {
+                    b"\x1b[0c"
+                });
+                replies.extend_from_slice(b"\x1b[?6c");
+                None
+            }
             58 => {
                 if bytes[1] & 2 == 0 {
                     let marker = if bytes[1] & 1 == 0 { "" } else { "?" };
