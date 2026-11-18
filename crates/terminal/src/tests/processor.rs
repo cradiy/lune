@@ -7,6 +7,56 @@ use crate::{
 };
 
 #[test]
+fn reverse_video_tracks_display_state_without_mutating_cells_or_palette() {
+    use crate::{PaletteEntry, ScreenBuffer};
+
+    let mut screen = Screen::new(4, 3).unwrap();
+    let mut processor = support::processor();
+    processor
+        .advance(b"\x1b[31;7mabcd\x1b7", &mut screen, &mut write_text)
+        .unwrap();
+    let grid = snapshot(screen.grid());
+    let cursor = screen.cursor();
+    let style = processor.style_id();
+    let entries = [
+        PaletteEntry::Foreground,
+        PaletteEntry::Background,
+        PaletteEntry::Indexed(1),
+    ];
+    let colors = entries.map(|entry| processor.palette().color(entry));
+    processor
+        .advance(b"\x1b[?5;999h\x1b[5h", &mut screen, &mut write_text)
+        .unwrap();
+    assert!(!screen.reverse_video());
+    assert_eq!(processor.ignored_sequences(), 2);
+
+    processor
+        .advance(b"\x1b[?5;25h", &mut screen, &mut write_text)
+        .unwrap();
+    assert!(screen.reverse_video());
+    assert_eq!(snapshot(screen.grid()), grid);
+    assert_eq!(screen.cursor(), cursor);
+    assert_eq!(processor.style_id(), style);
+    assert_eq!(
+        entries.map(|entry| processor.palette().color(entry)),
+        colors
+    );
+    assert!(!processor.take_palette_change());
+
+    processor
+        .advance(b"\x1b8\x1b[?47h\x1b[!p", &mut screen, &mut write_text)
+        .unwrap();
+    assert!(screen.reverse_video());
+    assert_eq!(screen.active_buffer(), ScreenBuffer::Alternate);
+    screen.resize(5, 4, StyleId(0)).unwrap();
+    assert!(screen.reverse_video());
+    processor
+        .advance(b"\x1b[?47l\x1bc", &mut screen, &mut write_text)
+        .unwrap();
+    assert!(!screen.reverse_video());
+}
+
+#[test]
 fn csi_cursor_save_restore_preserves_rendition_charsets_and_deferred_wrap() {
     let before_restore =
         b"\x1b[2;4r\x1b[?6h\x1b[2;8H\x1b[31m\x1b)0\x0eq\x1b[s\x1b[?6;7l\x1b[32m\x0f";

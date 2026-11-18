@@ -361,6 +361,7 @@ pub(crate) fn mode_query(
         (false, 4) => Some(screen.insert_mode()),
         (false, 20) => Some(input.new_line),
         (true, 1) => Some(input.application_cursor),
+        (true, 5) => Some(screen.reverse_video()),
         (true, 6) => Some(screen.origin_mode()),
         (true, 7) => Some(screen.auto_wrap()),
         (true, 12) => Some(screen.cursor_appearance().blinking),

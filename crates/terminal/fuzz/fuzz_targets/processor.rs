@@ -511,6 +511,12 @@ fuzz_target!(|data: &[u8]| {
                 wire.extend(b"\x1b[3g");
                 Some(Command::ClearTabs)
             }
+            28 if bytes[1] & 1 != 0 => {
+                let enabled = bytes[3] & 1 != 0;
+                wire.extend(if enabled { b"\x1b[?5h" } else { b"\x1b[?5l" });
+                expected.set_reverse_video(enabled);
+                None
+            }
             28 | 29 | 33 => {
                 let enabled = bytes[3] & 1 != 0;
                 let final_byte = if enabled { 'h' } else { 'l' };
@@ -1012,9 +1018,9 @@ fuzz_target!(|data: &[u8]| {
                 } else {
                     let private = bytes[1] & 2 != 0;
                     let selector = [
-                        0, 1, 4, 6, 7, 12, 20, 25, 47, 66, 67, 1000, 1002, 1003, 1004, 1006, 1047,
-                        1048, 1049, 2004, 65535,
-                    ][usize::from(bytes[2] % 21)];
+                        0, 1, 4, 5, 6, 7, 12, 20, 25, 47, 66, 67, 1000, 1002, 1003, 1004, 1006,
+                        1047, 1048, 1049, 2004, 65535,
+                    ][usize::from(bytes[2] % 22)];
                     let enabled = match (private, selector) {
                         (false, 20) => Some(input.new_line),
                         (true, 1) => Some(input.application_cursor),

@@ -888,7 +888,8 @@ fn csi(screen: &mut Screen, sequence: ControlSequence<'_>, state: &mut State) ->
                         | (
                             true,
                             Some(
-                                1 | 6
+                                1 | 5
+                                    | 6
                                     | 7
                                     | 12
                                     | 25
@@ -921,6 +922,7 @@ fn csi(screen: &mut Screen, sequence: ControlSequence<'_>, state: &mut State) ->
                 (true, Some(67)) => state.input.backarrow = enabled,
                 (true, Some(2004)) => state.input.bracketed_paste = enabled,
                 (true, Some(1004)) => state.input.focus_reporting = enabled,
+                (true, Some(5)) => screen.set_reverse_video(enabled),
                 (true, Some(6)) => screen.set_origin_mode(enabled),
                 (true, Some(7)) => screen.set_auto_wrap(enabled),
                 (true, Some(47 | 1047 | 1049)) => {

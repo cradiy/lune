@@ -81,6 +81,7 @@ pub struct Screen {
     origin_mode: bool,
     insert_mode: bool,
     cursor_appearance: CursorAppearance,
+    reverse_video: bool,
 }
 
 #[derive(Debug)]
@@ -262,6 +263,7 @@ impl Screen {
             origin_mode: false,
             insert_mode: false,
             cursor_appearance: CursorAppearance::default(),
+            reverse_video: false,
         })
     }
 
@@ -322,6 +324,16 @@ impl Screen {
         self.cursor_appearance = appearance;
     }
 
+    /// Whether DECSCNM requests reverse video for the entire display.
+    /// This presentation flag is shared by both buffers.
+    pub fn reverse_video(&self) -> bool {
+        self.reverse_video
+    }
+
+    pub(crate) fn set_reverse_video(&mut self, enabled: bool) {
+        self.reverse_video = enabled;
+    }
+
     /// Clears both buffers to spaces with `style`, selects the primary, and
     /// preserves dimensions and row buffers. Homes the cursor, clears pending
     /// wrapping, restores the full-screen scrolling region and default tab stops,
@@ -344,6 +356,7 @@ impl Screen {
         self.origin_mode = false;
         self.insert_mode = false;
         self.cursor_appearance = CursorAppearance::default();
+        self.reverse_video = false;
         self.update_history_capture();
     }
 

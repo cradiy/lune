@@ -72,6 +72,7 @@ pub struct ScreenModel {
     saved: [SavedCursor; 2],
     insert_mode: bool,
     cursor_appearance: CursorAppearance,
+    reverse_video: bool,
 }
 
 impl ScreenModel {
@@ -106,6 +107,14 @@ impl ScreenModel {
 
     pub fn is_alternate(&self) -> bool {
         self.active == 1
+    }
+
+    #[allow(
+        dead_code,
+        reason = "Reverse video is checked by the processor target."
+    )]
+    pub fn set_reverse_video(&mut self, enabled: bool) {
+        self.reverse_video = enabled;
     }
 
     #[allow(
@@ -160,6 +169,7 @@ impl ScreenModel {
     pub fn mode(&self, private: bool, selector: u16) -> Option<bool> {
         match (private, selector) {
             (false, 4) => Some(self.insert_mode),
+            (true, 5) => Some(self.reverse_video),
             (true, 6) => Some(self.origin_mode),
             (true, 7) => Some(self.auto_wrap),
             (true, 12) => Some(self.cursor_appearance.blinking),
@@ -184,6 +194,7 @@ impl ScreenModel {
             auto_wrap: true,
             origin_mode: false,
             insert_mode: false,
+            reverse_video: false,
             cursor_appearance: CursorAppearance {
                 visible: true,
                 blinking: true,
@@ -204,6 +215,7 @@ impl ScreenModel {
     }
 
     pub fn check_styles(&self, screen: &Screen, mut check: impl FnMut(StyleId, StyleId)) {
+        assert_eq!(screen.reverse_video(), self.reverse_video);
         self.storage[0].check_styles(screen.buffer(ScreenBuffer::Primary), &mut check);
         self.storage[1].check_styles(screen.buffer(ScreenBuffer::Alternate), &mut check);
         assert_eq!(
