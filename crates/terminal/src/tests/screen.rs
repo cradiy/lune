@@ -304,7 +304,10 @@ fn reset_clears_owned_units_restores_state_and_reuses_wrapped_row_buffers() {
                     }
                 }
                 for column in 0..columns {
-                    assert_eq!(screen.is_tab_stop(column), Some(column % 8 == 0));
+                    assert_eq!(
+                        screen.is_tab_stop(column),
+                        Some(column != 0 && column % 8 == 0)
+                    );
                 }
                 screen.tab_forward(columns.div_ceil(8));
                 assert_eq!(screen.cursor().column, columns - 1);
@@ -1582,7 +1585,10 @@ fn tabs_cross_word_boundaries_preserve_contents_and_follow_width_changes() {
     let pending = screen.cursor();
     let contents = snapshot(screen.grid());
     for column in 0_usize..130 {
-        assert_eq!(screen.is_tab_stop(column), Some(column.is_multiple_of(8)));
+        assert_eq!(
+            screen.is_tab_stop(column),
+            Some(column != 0 && column.is_multiple_of(8))
+        );
     }
     assert_eq!(screen.is_tab_stop(130), None);
     assert_eq!(screen.is_tab_stop(usize::MAX), None);

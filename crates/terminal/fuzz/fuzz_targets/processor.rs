@@ -510,6 +510,10 @@ fuzz_target!(|data: &[u8]| {
                 wire.extend(b"\x1b[g");
                 Some(Command::ClearTab)
             }
+            27 if bytes[1] & 1 != 0 => {
+                wire.extend(b"\x1b[?5W");
+                Some(Command::ResetTabs)
+            }
             27 => {
                 wire.extend(b"\x1b[3g");
                 Some(Command::ClearTabs)

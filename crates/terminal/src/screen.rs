@@ -351,7 +351,7 @@ impl Screen {
         self.cursor = Cursor::default();
         self.saved_cursor = SavedCursor::default();
         self.scroll_region = 0..self.grid.rows();
-        self.tabs.reset(self.grid.columns());
+        self.reset_tab_stops();
         self.auto_wrap = true;
         self.origin_mode = false;
         self.insert_mode = false;
@@ -483,6 +483,11 @@ impl Screen {
     /// Clears all active tab stops, preserving all other state.
     pub fn clear_tab_stops(&mut self) {
         self.tabs.clear_all();
+    }
+
+    /// Restores the default stops at columns 9, 17, 25, and so on.
+    pub fn reset_tab_stops(&mut self) {
+        self.tabs.reset(self.grid.columns());
     }
 
     /// Advances across `count` tab stops strictly after the cursor, stopping at

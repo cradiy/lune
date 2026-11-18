@@ -990,7 +990,13 @@ fn csi(screen: &mut Screen, sequence: ControlSequence<'_>, state: &mut State) ->
         return true;
     }
     if !sequence.private_markers.is_empty() {
-        return false;
+        return match (sequence.final_byte, sequence.private_markers, p) {
+            (b'W', [b'?'], [Parameter { value: Some(5), .. }]) => {
+                screen.reset_tab_stops();
+                true
+            }
+            _ => false,
+        };
     }
     let maximum = if matches!(sequence.final_byte, b'H' | b'f' | b'r') {
         2

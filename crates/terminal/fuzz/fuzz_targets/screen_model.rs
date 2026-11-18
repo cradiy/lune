@@ -36,6 +36,7 @@ pub enum Command<'a> {
     SetTab,
     ClearTab,
     ClearTabs,
+    ResetTabs,
     AutoWrap(bool),
     OriginMode(bool),
     SaveCursor,
@@ -190,7 +191,7 @@ impl ScreenModel {
             row: 0,
             column: 0,
             region: 0..rows,
-            tabs: (0..columns).step_by(8).collect(),
+            tabs: (8..columns).step_by(8).collect(),
             auto_wrap: true,
             origin_mode: false,
             insert_mode: false,
@@ -432,6 +433,11 @@ impl ScreenModel {
                 self.tabs.remove(&self.visible_column());
             }
             Command::ClearTabs => self.tabs.clear(),
+            Command::ResetTabs => {
+                self.tabs = (8..self.storage[self.active].columns())
+                    .step_by(8)
+                    .collect()
+            }
             Command::TabForward(count) | Command::TabBackward(count) => {
                 if *count != 0 {
                     let column = self.visible_column();

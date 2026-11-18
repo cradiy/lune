@@ -46,7 +46,9 @@ impl TabStops {
             return;
         }
         self.words.resize(columns.div_ceil(64), DEFAULT_STOPS);
-        if columns > old && !old.is_multiple_of(64) {
+        if old == 0 {
+            self.words[0] &= !1;
+        } else if columns > old && !old.is_multiple_of(64) {
             self.words[old / 64] |= DEFAULT_STOPS & (u64::MAX << (old % 64));
         }
         if !columns.is_multiple_of(64) {
@@ -85,10 +87,11 @@ impl TabStops {
     /// Restores default stops within the current logical width, retaining capacity.
     pub(crate) fn reset(&mut self, columns: usize) {
         self.words.fill(DEFAULT_STOPS);
+        self.words[0] &= !1;
         if !columns.is_multiple_of(64) {
             *self.words.last_mut().unwrap() &= (1_u64 << (columns % 64)) - 1;
         }
-        self.total = columns.div_ceil(8);
+        self.total = (columns - 1) / 8;
     }
 
     pub(crate) fn forward(&self, column: usize, count: usize, columns: usize) -> usize {

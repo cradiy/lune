@@ -19,6 +19,60 @@ use lune_terminal::{
 static ALLOCATOR: allocator::TestAllocator = allocator::TestAllocator;
 
 #[test]
+fn decst8c_replaces_custom_stops_without_touching_screen_state_or_allocating() {
+    for columns in [1, 8, 9, 64, 65, 130] {
+        let mut screen = Screen::new(130, 3).unwrap();
+        screen.resize(columns, 3, StyleId(0)).unwrap();
+        let mut processor = support::processor();
+        let mut writer = UnicodeWriter::default();
+        processor
+            .advance(
+                b"\x1b[?47h\x1b[2;3r\x1b[?6h\x1b[3g\x1bH",
+                &mut screen,
+                &mut writer,
+            )
+            .unwrap();
+        screen.set_cursor(1, columns - 1);
+        processor.advance(b"x", &mut screen, &mut writer).unwrap();
+        let cursor = screen.cursor();
+        let before = snapshot(screen.grid());
+        assert!(cursor.wrap_pending);
+        processor
+            .advance(
+                b"\x1b[5W\x1b[?W\x1b[?5;0W\x1b[?5:0W\x1b[?5 W",
+                &mut screen,
+                &mut writer,
+            )
+            .unwrap();
+        assert_eq!(processor.ignored_sequences(), 5);
+        assert_eq!(screen.is_tab_stop(0), Some(true));
+        let ((), stats) = allocator::measure(Some(0), || {
+            for byte in b"\x1b[?5W" {
+                processor
+                    .advance(std::slice::from_ref(byte), &mut screen, &mut writer)
+                    .unwrap();
+            }
+        });
+        assert_eq!(stats.attempts, 0);
+        assert_eq!(processor.ignored_sequences(), 5);
+        assert_eq!(screen.cursor(), cursor);
+        assert_eq!(screen.scroll_region(), 1..3);
+        assert!(screen.origin_mode());
+        assert_eq!(snapshot(screen.grid()), before);
+        screen.select_buffer(ScreenBuffer::Primary);
+        assert_eq!(
+            (0..columns)
+                .filter(|&column| screen.is_tab_stop(column) == Some(true))
+                .collect::<Vec<_>>(),
+            (8..columns).step_by(8).collect::<Vec<_>>()
+        );
+        screen.set_cursor(0, 0);
+        screen.tab_forward(1);
+        assert_eq!(screen.cursor().column, 8.min(columns - 1));
+    }
+}
+
+#[test]
 fn alignment_test_reuses_screen_storage_and_detaches_old_wraps() {
     use ScreenBuffer::{Alternate, Primary};
 
