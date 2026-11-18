@@ -5,6 +5,8 @@ use crate::{Palette, PaletteEntry, Rgb};
 
 /// Maximum UTF-8 byte length of an OSC 0/2 window title.
 pub const MAX_TITLE_BYTES: usize = 4096;
+/// Maximum encoded byte length of an OSC 7 working directory URI.
+pub const MAX_WORKING_DIRECTORY_URI_BYTES: usize = MAX_TITLE_BYTES;
 const MAX_COLOR_BYTES: usize = 18;
 /// Maximum number of indexed operations in one OSC 4/104 command.
 pub const MAX_OSC_PALETTE_ENTRIES: usize = 256;
@@ -18,6 +20,7 @@ enum Phase {
         digits: u8,
     },
     Title,
+    WorkingDirectory,
     Color(u8),
     Index,
     IndexedColor(u8),
@@ -58,6 +61,9 @@ pub(crate) struct Osc {
     terminator: OscTerminator,
     index: u16,
     index_digits: u8,
+    directory: [u8; MAX_WORKING_DIRECTORY_URI_BYTES],
+    directory_length: usize,
+    directory_changed: bool,
 }
 
 impl Osc {
@@ -77,6 +83,9 @@ impl Osc {
             terminator: OscTerminator::St,
             index: 0,
             index_digits: 0,
+            directory: [0; MAX_WORKING_DIRECTORY_URI_BYTES],
+            directory_length: 0,
+            directory_changed: false,
         }
     }
 
@@ -115,7 +124,20 @@ impl Osc {
         std::mem::take(&mut self.changed).then(|| self.title())
     }
 
+    pub(crate) fn working_directory_uri(&self) -> Option<&str> {
+        (self.directory_length != 0).then(|| {
+            std::str::from_utf8(&self.directory[..self.directory_length])
+                .expect("Committed directory URIs are valid ASCII")
+        })
+    }
+
+    pub(crate) fn take_working_directory_change(&mut self) -> bool {
+        std::mem::take(&mut self.directory_changed)
+    }
+
     pub(crate) fn reset(&mut self) {
+        self.directory_changed |= self.directory_length != 0;
+        self.directory_length = 0;
         self.changed |= self.lengths[self.active] != 0;
         self.lengths = [0; 2];
         self.phase = Phase::Idle;
@@ -131,6 +153,7 @@ impl Osc {
             self.phase,
             Phase::Selector { .. }
                 | Phase::Title
+                | Phase::WorkingDirectory
                 | Phase::Color(_)
                 | Phase::Index
                 | Phase::IndexedColor(_)
@@ -141,7 +164,7 @@ impl Osc {
     #[inline]
     pub(crate) fn data(&mut self, bytes: &[u8]) {
         if matches!(self.phase, Phase::Title) {
-            self.append_title(bytes);
+            self.append_text(bytes);
         } else if matches!(self.phase, Phase::Selector { .. }) {
             self.command_data(bytes);
         } else {
@@ -158,6 +181,7 @@ impl Osc {
             bytes = rest;
             match byte {
                 b';' if matches!(value, 0 | 2) => self.phase = Phase::Title,
+                b';' if value == 7 => self.phase = Phase::WorkingDirectory,
                 b';' if matches!(value, 10..=12) => self.phase = Phase::Color(value as u8),
                 b';' if value == 4 => self.phase = Phase::Index,
                 b';' if value == 104 => self.phase = Phase::ResetIndex,
@@ -181,14 +205,14 @@ impl Osc {
             }
         }
         if matches!(self.phase, Phase::Title) {
-            self.append_title(bytes);
+            self.append_text(bytes);
         } else {
             self.batch_data(bytes);
         }
     }
 
     #[inline]
-    fn append_title(&mut self, bytes: &[u8]) {
+    fn append_text(&mut self, bytes: &[u8]) {
         let candidate = self.active ^ 1;
         let length = self.lengths[candidate];
         if bytes.len() > MAX_TITLE_BYTES - length {
@@ -231,6 +255,7 @@ impl Osc {
                         }
                         Outcome::Done
                     }
+                    Phase::WorkingDirectory => self.commit_directory(candidate),
                     Phase::Color(selector) if self.operation_count == 0 => {
                         let entry = role(u16::from(selector));
                         if bytes == b"?" {
@@ -292,10 +317,29 @@ impl Osc {
         Outcome::Done
     }
 
+    #[cold]
+    fn commit_directory(&mut self, candidate: usize) -> Outcome {
+        let length = self.lengths[candidate];
+        let bytes = &self.buffers[candidate][..length];
+        if !bytes.is_empty() && !valid_directory_uri(bytes) {
+            return Outcome::Ignored;
+        }
+        if bytes != &self.directory[..self.directory_length] {
+            self.directory[..length].copy_from_slice(bytes);
+            self.directory_length = length;
+            self.directory_changed = true;
+        }
+        Outcome::Done
+    }
+
     #[inline(never)]
     fn batch_data(&mut self, mut bytes: &[u8]) {
         while !bytes.is_empty() {
             match self.phase {
+                Phase::WorkingDirectory => {
+                    self.append_text(bytes);
+                    return;
+                }
                 Phase::Index | Phase::ResetIndex => {
                     let byte = bytes[0];
                     bytes = &bytes[1..];
@@ -495,6 +539,66 @@ fn role(selector: u16) -> PaletteEntry {
         12 => PaletteEntry::Cursor,
         _ => unreachable!("A supported dynamic color selector is present"),
     }
+}
+
+fn valid_directory_uri(bytes: &[u8]) -> bool {
+    let Some((prefix, rest)) = bytes.split_at_checked(b"file://".len()) else {
+        return false;
+    };
+    if !prefix.eq_ignore_ascii_case(b"file://") {
+        return false;
+    }
+    let Some(path_start) = rest.iter().position(|&byte| byte == b'/') else {
+        return false;
+    };
+    let (host, path) = rest.split_at(path_start);
+    let valid_host = if let Some(address) = host.strip_prefix(b"[") {
+        address
+            .strip_suffix(b"]")
+            .and_then(|address| std::str::from_utf8(address).ok())
+            .is_some_and(|address| address.parse::<std::net::Ipv6Addr>().is_ok())
+    } else {
+        valid_uri_component(host, false)
+    };
+    valid_host && valid_uri_component(path, true)
+}
+
+fn valid_uri_component(mut bytes: &[u8], path: bool) -> bool {
+    while let Some((&byte, rest)) = bytes.split_first() {
+        bytes = match byte {
+            b'%' => match rest {
+                [high, low, remaining @ ..]
+                    if high.is_ascii_hexdigit()
+                        && low.is_ascii_hexdigit()
+                        && (*high, *low) != (b'0', b'0') =>
+                {
+                    remaining
+                }
+                _ => return false,
+            },
+            b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'-'
+            | b'.'
+            | b'_'
+            | b'~'
+            | b'!'
+            | b'$'
+            | b'&'
+            | b'\''
+            | b'('
+            | b')'
+            | b'*'
+            | b'+'
+            | b','
+            | b';'
+            | b'=' => rest,
+            b'/' | b':' | b'@' if path => rest,
+            _ => return false,
+        };
+    }
+    true
 }
 
 fn parse_color(bytes: &[u8]) -> Option<Rgb> {

@@ -207,6 +207,16 @@ impl Processor {
         self.state.osc.take_title_change()
     }
 
+    /// Most recent OSC 7 `file://` URI supplied by the input stream.
+    pub fn working_directory_uri(&self) -> Option<&str> {
+        self.state.osc.working_directory_uri()
+    }
+
+    /// Acknowledges coalesced OSC 7 changes, including clears.
+    pub fn take_working_directory_change(&mut self) -> bool {
+        self.state.osc.take_working_directory_change()
+    }
+
     /// Current theme and runtime colors. OSC 10/11/12 accepts consecutive numeric
     /// RGB specifications or `?` through role 12 (cursor), validated atomically.
     /// OSC 110/111/112 restores the corresponding base.

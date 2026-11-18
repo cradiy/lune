@@ -431,9 +431,20 @@ fn palette_construction_resolution_overrides_and_theme_changes_allocate_nothing(
 }
 
 #[test]
-fn title_construction_updates_rejection_and_reset_make_no_allocation_requests() {
+fn osc_text_updates_rejection_and_reset_make_no_allocation_requests() {
     let mut wire = b"\x1b]2;".to_vec();
     wire.extend(std::iter::repeat_n(b'x', lune_terminal::MAX_TITLE_BYTES));
+    let directory_limit = lune_terminal::MAX_WORKING_DIRECTORY_URI_BYTES;
+    wire.extend(b"\x07\x1b]7;file:///");
+    wire.extend(std::iter::repeat_n(
+        b'd',
+        directory_limit - b"file:///".len(),
+    ));
+    wire.extend(b"\x07\x1b]7;file:///");
+    wire.extend(std::iter::repeat_n(
+        b'e',
+        directory_limit + 1 - b"file:///".len(),
+    ));
     wire.extend(b"\x07\x1b]2;");
     wire.extend(std::iter::repeat_n(
         b'y',
@@ -459,9 +470,15 @@ fn title_construction_updates_rejection_and_reset_make_no_allocation_requests() 
                 processor.take_window_title_change().unwrap().len(),
                 lune_terminal::MAX_TITLE_BYTES
             );
-            assert_eq!(processor.ignored_sequences(), 2);
+            let uri = processor.working_directory_uri().unwrap();
+            assert_eq!(uri.len(), directory_limit);
+            assert!(uri.ends_with('d'));
+            assert!(processor.take_working_directory_change());
+            assert_eq!(processor.ignored_sequences(), 3);
             processor.reset(&mut screen, &mut text);
             assert_eq!(processor.take_window_title_change(), Some(""));
+            assert_eq!(processor.working_directory_uri(), None);
+            assert!(processor.take_working_directory_change());
         }
     });
     assert_eq!(stats.attempts, 0);

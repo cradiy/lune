@@ -11,6 +11,62 @@ fn advance(processor: &mut Processor, screen: &mut Screen, input: &[u8]) {
 }
 
 #[test]
+fn working_directory_reports_commit_only_valid_complete_uris() {
+    const OLD: &str = "file:///work";
+    const NEW: &str = "FILE://shell.example.test/build%20output/%E2%98%BE";
+    let wire = format!("\x1b]7;{NEW}\x1b");
+    let wire = wire.as_bytes();
+    for split in 0..=wire.len() {
+        let mut processor = support::processor();
+        let mut screen = Screen::new(2, 2).unwrap();
+        advance(
+            &mut processor,
+            &mut screen,
+            b"\x1b]2;title\x07\x1b]7;file:///work\x07",
+        );
+        assert!(processor.take_working_directory_change());
+        advance(&mut processor, &mut screen, &wire[..split]);
+        advance(&mut processor, &mut screen, &wire[split..]);
+        assert_eq!(processor.working_directory_uri(), Some(OLD));
+        assert!(!processor.take_working_directory_change());
+        advance(&mut processor, &mut screen, b"\\");
+        assert_eq!(processor.working_directory_uri(), Some(NEW));
+        assert!(processor.take_working_directory_change());
+        assert_eq!(processor.take_window_title_change(), Some("title"));
+
+        advance(&mut processor, &mut screen, wire);
+        advance(&mut processor, &mut screen, b"\\");
+        advance(
+            &mut processor,
+            &mut screen,
+            b"\x1b]7;file:///cancelled\x18\x1b[!p\x1b]7;https://example.test/path\x07\x1b]7;file://example.test\x07\x1b]7;file://user@example.test/path\x07\x1b]7;file:///bad%2\x07\x1b]7;file:///bad%00\x07\x1b]7;file:///bad#fragment\x07",
+        );
+        assert_eq!(processor.ignored_sequences(), 6);
+        assert_eq!(processor.working_directory_uri(), Some(NEW));
+        assert!(!processor.take_working_directory_change());
+
+        advance(
+            &mut processor,
+            &mut screen,
+            b"\x1b]7;file://[2001:db8::1]/work\x07",
+        );
+        assert_eq!(
+            processor.working_directory_uri(),
+            Some("file://[2001:db8::1]/work")
+        );
+        advance(&mut processor, &mut screen, b"\x1b]7;\x07");
+        assert_eq!(processor.working_directory_uri(), None);
+        assert!(processor.take_working_directory_change());
+        advance(&mut processor, &mut screen, b"\x1b]7;\x07");
+        assert!(!processor.take_working_directory_change());
+        assert_eq!(processor.window_title(), "title");
+        advance(&mut processor, &mut screen, b"\x1b]7;file:///work\x07\x1bc");
+        assert_eq!(processor.working_directory_uri(), None);
+        assert!(processor.take_working_directory_change());
+    }
+}
+
+#[test]
 fn titles_commit_atomically_across_chunks_and_coalesce_until_acknowledged() {
     for terminator in [b"\x07".as_slice(), b"\x1b\\"] {
         let mut wire = "\x1b]2;moon 🌙;水\n\x7f".as_bytes().to_vec();

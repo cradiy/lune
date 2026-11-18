@@ -74,6 +74,8 @@ struct Expected<'a> {
     replies: &'a [u8],
     title: &'a str,
     title_changed: bool,
+    directory: Option<&'static str>,
+    directory_changed: bool,
     colors: [Rgb; 3],
     palette_changed: bool,
     indexed: [Rgb; 256],
@@ -170,6 +172,12 @@ fn drive(wire: &[u8], chunk: usize, fail_at: usize, expected: &Expected<'_>) {
         expected.title_changed.then_some(expected.title)
     );
     assert_eq!(processor.take_window_title_change(), None);
+    assert_eq!(processor.working_directory_uri(), expected.directory);
+    assert_eq!(
+        processor.take_working_directory_change(),
+        expected.directory_changed
+    );
+    assert!(!processor.take_working_directory_change());
     assert_eq!(
         [
             PaletteEntry::Foreground,
@@ -349,6 +357,8 @@ fuzz_target!(|data: &[u8]| {
     let mut replies = Vec::new();
     let mut title = String::new();
     let mut title_changed = false;
+    let mut directory = None;
+    let mut directory_changed = false;
     let base_colors = [
         Rgb {
             red: 7,
@@ -584,6 +594,7 @@ fuzz_target!(|data: &[u8]| {
                     colors = base_colors;
                     title_changed |= !title.is_empty();
                     title.clear();
+                    directory_changed |= directory.take().is_some();
                     saved = [current; 2];
                     saved_charsets = [(charsets, selected); 2];
                     input = InputModes::default();
@@ -622,6 +633,30 @@ fuzz_target!(|data: &[u8]| {
                 wire.extend(b"\x1b[1:2A");
                 wire.extend(b"\x1bP?qraw\x00\x07\n\xc2\x9c\x7f\xff\x1b\\");
                 diagnostics.1 += 1;
+                None
+            }
+            37 if bytes[1] & 16 != 0 => {
+                match bytes[2] % 4 {
+                    0 => {
+                        let next = if bytes[3] & 1 == 0 {
+                            "file:///work"
+                        } else {
+                            "file://shell.example.test/build%20output"
+                        };
+                        write!(&mut wire, "\x1b]7;{next}\x1b\\").unwrap();
+                        directory_changed |= directory != Some(next);
+                        directory = Some(next);
+                    }
+                    1 => {
+                        wire.extend(b"\x1b]7;\x07");
+                        directory_changed |= directory.take().is_some();
+                    }
+                    2 => wire.extend(b"\x1b]7;file:///cancelled\x18"),
+                    _ => {
+                        wire.extend(b"\x1b]7;file:///invalid%2x\x07");
+                        diagnostics.1 += 1;
+                    }
+                }
                 None
             }
             37 => {
@@ -1220,6 +1255,8 @@ fuzz_target!(|data: &[u8]| {
         diagnostics,
         title: &title,
         title_changed,
+        directory,
+        directory_changed,
         colors,
         palette_changed,
         indexed,
