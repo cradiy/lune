@@ -2301,10 +2301,10 @@ fn processor_retries_style_and_text_allocations_without_replaying_accepted_input
         for _ in 0..32 {
             processor.advance(b"x", &mut screen, &mut text).unwrap();
             let error = processor
-                .advance(b"\x1b[5n\x1b[6n", &mut screen, &mut text)
+                .advance(b"\x1b[5n\x1b[?6n", &mut screen, &mut text)
                 .unwrap_err();
             assert!(matches!(error.error, ProcessFailure::ReplyPending));
-            assert_eq!(error.consumed, 8);
+            assert_eq!(error.consumed, 9);
             while !processor.reply_bytes().is_empty() {
                 black_box(processor.reply_bytes());
                 assert!(processor.consume_reply(1));

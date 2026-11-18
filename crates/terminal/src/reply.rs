@@ -29,7 +29,11 @@ impl Default for Reply {
 #[derive(Clone, Copy)]
 pub(crate) enum Report {
     Status,
-    Position(u16, u16),
+    Position {
+        row: u16,
+        column: u16,
+        private: bool,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -200,7 +204,11 @@ impl Report {
                 reply.clear();
                 reply.append(b"\x1b[0n");
             }
-            Self::Position(row, column) => reply.position(row, column),
+            Self::Position {
+                row,
+                column,
+                private,
+            } => reply.position(row, column, private),
         }
     }
 }
@@ -227,9 +235,12 @@ impl Reply {
         self.end = 0;
     }
 
-    pub(crate) fn position(&mut self, row: u16, column: u16) {
+    pub(crate) fn position(&mut self, row: u16, column: u16, private: bool) {
         self.clear();
         self.append(b"\x1b[");
+        if private {
+            self.append(b"?");
+        }
         self.number(row);
         self.append(b";");
         self.number(column);
@@ -258,16 +269,15 @@ impl Reply {
 }
 
 pub(crate) fn query(screen: &Screen, sequence: ControlSequence<'_>) -> Option<Report> {
-    if !sequence.private_markers.is_empty()
-        || !sequence.intermediates.is_empty()
+    if !sequence.intermediates.is_empty()
         || sequence.parameters.len() != 1
         || sequence.parameters[0].is_subparameter
     {
         return None;
     }
-    match sequence.parameters[0].value? {
-        5 => Some(Report::Status),
-        6 => {
+    match (sequence.parameters[0].value?, sequence.private_markers) {
+        (5, []) => Some(Report::Status),
+        (6, [] | [b'?']) => {
             let cursor = screen.cursor();
             let origin = if screen.origin_mode() {
                 screen.scroll_region().start
@@ -276,7 +286,11 @@ pub(crate) fn query(screen: &Screen, sequence: ControlSequence<'_>) -> Option<Re
             };
             let row = u16::try_from(cursor.row - origin + 1).expect("Rows fit the protocol bounds");
             let column = u16::try_from(cursor.column + 1).expect("Columns fit the protocol bounds");
-            Some(Report::Position(row, column))
+            Some(Report::Position {
+                row,
+                column,
+                private: !sequence.private_markers.is_empty(),
+            })
         }
         _ => None,
     }

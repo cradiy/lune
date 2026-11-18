@@ -162,7 +162,7 @@ fn status_strings_freeze_values_and_share_the_reply_slot_with_prior_queries() {
 
 #[test]
 fn query_replies_preserve_wire_order_origin_coordinates_and_wrapping_across_splits() {
-    let input = b"\x1b[5nabc\x1b[6n\x1b[2;4r\x1b[?6h\x1b[2;8H!\x1b[6nZ\x1b[6n\x1b[?6l\x1b[4;7H\x1b[6n\x1b[n\x1b[0n\x1b[?5n\x1b[?6n\x1b[6;5n\x1b[6:0n\x1b[6!n\x1b[>6n";
+    let input = b"\x1b[5nabc\x1b[6n\x1b[2;4r\x1b[?6h\x1b[2;8H!\x1b[?6nZ\x1b[6n\x1b[?6l\x1b[4;7H\x1b[?6n\x1b[n\x1b[0n\x1b[?5n\x1b[?6;1n\x1b[?6:0n\x1b[?6!n\x1b[6;5n\x1b[6:0n\x1b[6!n\x1b[>6n";
     for split in 0..=input.len() {
         let mut screen = Screen::new(8, 4).unwrap();
         let mut processor = support::processor();
@@ -172,10 +172,10 @@ fn query_replies_preserve_wire_order_origin_coordinates_and_wrapping_across_spli
         processor.finish(&mut screen, &mut text).unwrap();
         processor.finish(&mut screen, &mut text).unwrap();
         drain(&mut processor, &mut output);
-        assert_eq!(output, b"\x1b[0n\x1b[1;4R\x1b[2;8R\x1b[3;2R\x1b[4;7R");
+        assert_eq!(output, b"\x1b[0n\x1b[1;4R\x1b[?2;8R\x1b[3;2R\x1b[?4;7R");
         assert_eq!(
             (processor.parse_errors(), processor.ignored_sequences()),
-            (0, 8)
+            (0, 10)
         );
         assert_eq!(screen.cursor().row, 3);
         assert_eq!(screen.cursor().column, 6);
@@ -195,12 +195,12 @@ fn query_replies_preserve_wire_order_origin_coordinates_and_wrapping_across_spli
 fn blocked_replies_retain_captured_positions_and_partial_delivery_until_retry_or_reset() {
     let mut screen = Screen::new(8, 4).unwrap();
     let mut processor = support::processor();
-    let input = b"\x1b[5nabc\x1b[6nTAIL";
+    let input = b"\x1b[5nabc\x1b[?6nTAIL";
     let error = processor
         .advance(input, &mut screen, &mut text)
         .unwrap_err();
     assert!(matches!(error.error, ProcessFailure::ReplyPending));
-    assert_eq!(error.consumed, 11);
+    assert_eq!(error.consumed, 12);
     let suffix = &input[error.consumed..];
     assert_eq!(processor.reply_bytes(), b"\x1b[0n");
     assert!(!processor.consume_reply(usize::MAX));
@@ -229,9 +229,9 @@ fn blocked_replies_retain_captured_positions_and_partial_delivery_until_retry_or
     assert!(processor.consume_reply(2));
     assert!(processor.reply_bytes().is_empty());
     assert_eq!(processor.advance(&[], &mut screen, &mut text).unwrap(), 0);
-    assert_eq!(processor.reply_bytes(), b"\x1b[1;4R");
+    assert_eq!(processor.reply_bytes(), b"\x1b[?1;4R");
     processor.finish(&mut screen, &mut text).unwrap();
-    assert_eq!(processor.reply_bytes(), b"\x1b[1;4R");
+    assert_eq!(processor.reply_bytes(), b"\x1b[?1;4R");
     processor.advance(suffix, &mut screen, &mut text).unwrap();
     assert_eq!(
         screen.grid().row(0).unwrap().text(3),
@@ -266,8 +266,13 @@ fn fixed_reply_storage_encodes_coordinate_digit_boundaries() {
     let mut reply = Reply::default();
     for row in bounds {
         for column in bounds {
-            reply.position(row, column);
-            assert_eq!(reply.bytes(), format!("\x1b[{row};{column}R").as_bytes());
+            for (private, marker) in [(false, ""), (true, "?")] {
+                reply.position(row, column, private);
+                assert_eq!(
+                    reply.bytes(),
+                    format!("\x1b[{marker}{row};{column}R").as_bytes()
+                );
+            }
         }
     }
 }
