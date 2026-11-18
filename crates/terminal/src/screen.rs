@@ -361,6 +361,16 @@ impl Screen {
         self.update_history_capture();
     }
 
+    #[cold]
+    pub(crate) fn alignment_test(&mut self) {
+        self.disconnect_top(0);
+        self.grid.fill_scalar('E', StyleId(0));
+        self.cursor = Cursor::default();
+        self.origin_mode = false;
+        self.scroll_region = 0..self.grid.rows();
+        self.update_history_capture();
+    }
+
     /// Whether writes insert columns and shift the row suffix. Disabled initially.
     pub fn insert_mode(&self) -> bool {
         self.insert_mode

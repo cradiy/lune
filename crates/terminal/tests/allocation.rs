@@ -19,6 +19,99 @@ use lune_terminal::{
 static ALLOCATOR: allocator::TestAllocator = allocator::TestAllocator;
 
 #[test]
+fn alignment_test_reuses_screen_storage_and_detaches_old_wraps() {
+    use ScreenBuffer::{Alternate, Primary};
+
+    for active in [Primary, Alternate] {
+        let mut screen = Screen::new(4, 3).unwrap();
+        screen
+            .set_history_limits(HistoryLimits {
+                max_rows: 3,
+                max_bytes: 4096,
+            })
+            .unwrap();
+        let mut processor = support::processor();
+        let mut writer = UnicodeWriter::default();
+        processor
+            .advance(b"abcdefghijklmnop", &mut screen, &mut writer)
+            .unwrap();
+        screen.scroll_viewport_up(1);
+        let history_bytes = screen.history().retained_bytes();
+        assert_eq!(screen.history().row(0).unwrap().wrap_end(), Some(4));
+        processor
+            .advance(b"\x1b[?47h\x1b[Halt", &mut screen, &mut writer)
+            .unwrap();
+        if active == Primary {
+            processor
+                .advance(b"\x1b[?47l", &mut screen, &mut writer)
+                .unwrap();
+        }
+        processor
+            .advance(
+                "\x1b[2;3r\x1b[?6h\x1b[31m\x1b[2;1He\u{301}水x\x1b7\x1b[4h".as_bytes(),
+                &mut screen,
+                &mut writer,
+            )
+            .unwrap();
+        let saved_style = processor.style_id();
+        let cursor = screen.cursor();
+        assert!(cursor.wrap_pending);
+        let inactive = if active == Primary {
+            Alternate
+        } else {
+            Primary
+        };
+        let other_grid = snapshot(screen.buffer(inactive));
+        processor
+            .advance(b"\x1b##8\x1b#7", &mut screen, &mut writer)
+            .unwrap();
+        assert_eq!(processor.ignored_sequences(), 2);
+        assert_eq!(screen.cursor(), cursor);
+        assert_eq!(processor.style_id(), saved_style);
+
+        let ((), stats) = allocator::measure(Some(0), || {
+            for byte in b"\x1b#8" {
+                processor
+                    .advance(std::slice::from_ref(byte), &mut screen, &mut writer)
+                    .unwrap();
+            }
+        });
+        assert_eq!(stats.attempts, 0);
+        assert!(stats.live_bytes < 0);
+        assert_eq!(processor.ignored_sequences(), 2);
+        assert_eq!(processor.style_id(), StyleId(0));
+        assert_eq!(screen.active_buffer(), active);
+        assert_eq!(snapshot(screen.buffer(inactive)), other_grid);
+        assert_eq!(screen.cursor(), Cursor::default());
+        assert_eq!(screen.scroll_region(), 0..3);
+        assert!(!screen.origin_mode() && screen.auto_wrap() && screen.insert_mode());
+        for row in screen.grid().iter_rows() {
+            assert_eq!(row.wrap_end(), None);
+            for column in 0..4 {
+                assert_eq!(row.text(column), Some(CellText::Scalar('E')));
+                assert_eq!(row.cells()[column].style(), StyleId(0));
+            }
+        }
+        assert_eq!(screen.history().len(), 1);
+        assert_eq!(screen.history().retained_bytes(), history_bytes);
+        let history_row = screen.history().row(0).unwrap();
+        assert_eq!(history_row.text(0), Some(CellText::Scalar('a')));
+        assert_eq!(history_row.wrap_end(), (active == Alternate).then_some(4));
+
+        processor
+            .advance(b"\x1b8", &mut screen, &mut writer)
+            .unwrap();
+        assert_eq!(processor.style_id(), saved_style);
+        assert_eq!(screen.cursor(), Cursor { row: 1, ..cursor });
+        assert!(screen.origin_mode());
+        screen.select_buffer(Primary);
+        assert_eq!(screen.viewport_offset(), 1);
+        screen.scroll_up(1, StyleId(0)).unwrap();
+        assert_eq!(screen.history().len(), 2);
+    }
+}
+
+#[test]
 fn erase_saved_lines_waits_for_prior_replies_and_releases_history_without_allocation() {
     let mut screen = Screen::new(4, 2).unwrap();
     screen

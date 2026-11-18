@@ -575,6 +575,12 @@ fuzz_target!(|data: &[u8]| {
                     Some(Command::SoftReset)
                 }
             }
+            34 if bytes[1] & 1 != 0 => {
+                wire.extend(b"\x1b#8");
+                current = Style::default();
+                expected.alignment_test(reference_id(&mut values, current));
+                None
+            }
             34 => {
                 wire.extend(b"\x1b[?6;1003;1004;1006;999h");
                 diagnostics.1 += 1;

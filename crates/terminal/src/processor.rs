@@ -768,13 +768,19 @@ fn execute(
 }
 
 fn escape(screen: &mut Screen, sequence: EscapeSequence<'_>, state: &mut State) -> bool {
-    if let [designation @ (b'(' | b')')] = sequence.intermediates {
-        return state
-            .charsets
-            .designate(*designation == b')', sequence.final_byte);
-    }
-    if !sequence.intermediates.is_empty() {
-        return false;
+    match sequence.intermediates {
+        [] => {}
+        [designation @ (b'(' | b')')] => {
+            return state
+                .charsets
+                .designate(*designation == b')', sequence.final_byte);
+        }
+        [b'#'] if sequence.final_byte == b'8' => {
+            screen.alignment_test();
+            state.style = StyleId(0);
+            return true;
+        }
+        _ => return false,
     }
     match sequence.final_byte {
         b'7' => {

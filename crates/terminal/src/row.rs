@@ -589,6 +589,12 @@ impl Row {
         self.cells.fill(Cell::blank(style));
     }
 
+    pub(crate) fn fill_scalar(&mut self, character: char, style: StyleId) {
+        self.extended.clear();
+        self.cells
+            .fill(Cell::scalar(character, CellWidth::Single, style));
+    }
+
     /// Replaces a recycled row with validated ASCII of exactly the row width.
     #[inline]
     pub(crate) fn reset_ascii(&mut self, bytes: &[u8], style: StyleId) {

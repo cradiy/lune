@@ -110,6 +110,26 @@ impl ScreenModel {
 
     #[allow(
         dead_code,
+        reason = "Screen alignment is checked by the processor target."
+    )]
+    pub fn alignment_test(&mut self, style: StyleId) {
+        let grid = &mut self.storage[self.active];
+        let (columns, rows) = (grid.columns(), grid.rows());
+        *grid = Model::new(columns, rows);
+        for row in 0..rows {
+            for column in 0..columns {
+                grid.write(row, column, "E", CellWidth::Single, style)
+                    .unwrap();
+            }
+        }
+        self.origin_mode = false;
+        self.region = 0..rows;
+        self.row = 0;
+        self.column = 0;
+    }
+
+    #[allow(
+        dead_code,
         reason = "Text area reports are checked by the processor target."
     )]
     pub fn text_area_size(&self) -> (usize, usize) {

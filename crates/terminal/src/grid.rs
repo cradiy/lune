@@ -253,6 +253,12 @@ impl Grid {
         }
     }
 
+    pub(crate) fn fill_scalar(&mut self, character: char, style: StyleId) {
+        for row in &mut self.rows {
+            row.fill_scalar(character, style);
+        }
+    }
+
     #[inline]
     pub(crate) fn write_scrolling(
         &mut self,
