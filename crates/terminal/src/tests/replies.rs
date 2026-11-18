@@ -340,6 +340,7 @@ fn mode_queries_report_defaults_changes_and_unknown_selectors_across_splits() {
         (true, 5, 2),
         (true, 6, 2),
         (true, 7, 1),
+        (true, 8, 1),
         (true, 12, 1),
         (true, 25, 1),
         (true, 47, 2),

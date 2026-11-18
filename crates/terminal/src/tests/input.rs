@@ -3,6 +3,40 @@ use super::support;
 use crate::{InputModes, Key, KeySequence, Modifiers, Screen, StorageError};
 
 #[test]
+fn auto_repeat_is_session_state_with_a_hard_reset_default() {
+    let mut processor = support::processor();
+    let mut screen = Screen::new(4, 3).unwrap();
+    let mut sink = |_: &mut Screen, _: &str, _| Ok::<_, StorageError>(());
+    assert!(processor.auto_repeat_enabled());
+    processor
+        .advance(b"\x1b[?8;999l\x1b[8l", &mut screen, &mut sink)
+        .unwrap();
+    assert!(processor.auto_repeat_enabled());
+    assert_eq!(processor.ignored_sequences(), 2);
+
+    processor
+        .advance(
+            b"\x1b7\x1b[?8;1l\x1b8\x1b[?47h\x1b[!p",
+            &mut screen,
+            &mut sink,
+        )
+        .unwrap();
+    let disabled = processor.input_modes();
+    assert!(!processor.auto_repeat_enabled());
+    assert_eq!(
+        disabled
+            .encode_key(Key::Up, Modifiers::default())
+            .unwrap()
+            .as_bytes(),
+        b"\x1b[A"
+    );
+    processor
+        .advance(b"\x1b[?47l\x1bc", &mut screen, &mut sink)
+        .unwrap();
+    assert!(processor.auto_repeat_enabled());
+}
+
+#[test]
 fn character_keys_preserve_ascii_and_encode_control_aliases_with_alt_prefixes() {
     let controls = [
         ("\0 @`2", 0),

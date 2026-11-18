@@ -89,6 +89,7 @@ struct State {
     charsets: Charsets,
     saved_charsets: [Charsets; 2],
     input: InputModes,
+    auto_repeat: bool,
     osc: Osc,
     dcs: Dcs,
 }
@@ -101,6 +102,7 @@ impl State {
             charsets: Charsets::default(),
             saved_charsets: [Charsets::default(); 2],
             input: InputModes::default(),
+            auto_repeat: true,
             osc: Osc::new(palette),
             dcs: Dcs::default(),
         }
@@ -112,6 +114,7 @@ impl State {
         self.charsets = Charsets::default();
         self.saved_charsets = [Charsets::default(); 2];
         self.input = InputModes::default();
+        self.auto_repeat = true;
         self.osc.reset();
         self.dcs = Dcs::default();
     }
@@ -185,6 +188,11 @@ impl Processor {
     /// Input modes at the end of the accepted input prefix.
     pub fn input_modes(&self) -> InputModes {
         self.state.input
+    }
+
+    /// Whether the input source may deliver repeated keypresses (DECARM).
+    pub fn auto_repeat_enabled(&self) -> bool {
+        self.state.auto_repeat
     }
 
     /// Current OSC 0/2 window title, initially empty. Valid UTF-8 payloads up to
@@ -474,7 +482,9 @@ impl Processor {
                             false
                         }
                     } else if sequence.final_byte == b'p' {
-                        if let Some(reply) = reply::mode_query(screen, state.input, sequence) {
+                        if let Some(reply) =
+                            reply::mode_query(screen, state.input, state.auto_repeat, sequence)
+                        {
                             pending[*end] = Some(Pending::ModeReply(reply));
                             *end += 1;
                             true
@@ -899,6 +909,7 @@ fn csi(screen: &mut Screen, sequence: ControlSequence<'_>, state: &mut State) ->
                                 1 | 5
                                     | 6
                                     | 7
+                                    | 8
                                     | 12
                                     | 25
                                     | 47
@@ -933,6 +944,7 @@ fn csi(screen: &mut Screen, sequence: ControlSequence<'_>, state: &mut State) ->
                 (true, Some(5)) => screen.set_reverse_video(enabled),
                 (true, Some(6)) => screen.set_origin_mode(enabled),
                 (true, Some(7)) => screen.set_auto_wrap(enabled),
+                (true, Some(8)) => state.auto_repeat = enabled,
                 (true, Some(47 | 1047 | 1049)) => {
                     if parameter.value == Some(1049) && enabled {
                         save_cursor(screen, state);

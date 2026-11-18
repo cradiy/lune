@@ -366,6 +366,7 @@ pub(crate) fn text_area_query(screen: &Screen, sequence: ControlSequence<'_>) ->
 pub(crate) fn mode_query(
     screen: &Screen,
     input: InputModes,
+    auto_repeat: bool,
     sequence: ControlSequence<'_>,
 ) -> Option<ModeReport> {
     let private = match sequence.private_markers {
@@ -394,6 +395,7 @@ pub(crate) fn mode_query(
         (true, 5) => Some(screen.reverse_video()),
         (true, 6) => Some(screen.origin_mode()),
         (true, 7) => Some(screen.auto_wrap()),
+        (true, 8) => Some(auto_repeat),
         (true, 12) => Some(screen.cursor_appearance().blinking),
         (true, 25) => Some(screen.cursor_appearance().visible),
         (true, 47 | 1047 | 1049) => Some(screen.active_buffer() == ScreenBuffer::Alternate),

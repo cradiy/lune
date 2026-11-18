@@ -70,6 +70,7 @@ struct Expected<'a> {
     values: &'a [Style],
     style: Style,
     input: InputModes,
+    auto_repeat: bool,
     replies: &'a [u8],
     title: &'a str,
     title_changed: bool,
@@ -162,6 +163,7 @@ fn drive(wire: &[u8], chunk: usize, fail_at: usize, expected: &Expected<'_>) {
         Some(&expected.style)
     );
     assert_eq!(processor.input_modes(), expected.input);
+    assert_eq!(processor.auto_repeat_enabled(), expected.auto_repeat);
     assert_eq!(processor.window_title(), expected.title);
     assert_eq!(
         processor.take_window_title_change(),
@@ -343,6 +345,7 @@ fuzz_target!(|data: &[u8]| {
     let mut selected = 0;
     let mut saved_charsets = [(charsets, selected); 2];
     let mut input = InputModes::default();
+    let mut auto_repeat = true;
     let mut replies = Vec::new();
     let mut title = String::new();
     let mut title_changed = false;
@@ -517,6 +520,15 @@ fuzz_target!(|data: &[u8]| {
                 expected.set_reverse_video(enabled);
                 None
             }
+            29 if bytes[1] & 1 != 0 => {
+                auto_repeat = bytes[3] & 1 != 0;
+                wire.extend(if auto_repeat {
+                    b"\x1b[?8h"
+                } else {
+                    b"\x1b[?8l"
+                });
+                None
+            }
             28 | 29 | 33 => {
                 let enabled = bytes[3] & 1 != 0;
                 let final_byte = if enabled { 'h' } else { 'l' };
@@ -571,6 +583,7 @@ fuzz_target!(|data: &[u8]| {
                     saved = [current; 2];
                     saved_charsets = [(charsets, selected); 2];
                     input = InputModes::default();
+                    auto_repeat = true;
                     Some(Command::Reset)
                 } else {
                     wire.extend(b"\x1b[!p");
@@ -1018,12 +1031,13 @@ fuzz_target!(|data: &[u8]| {
                 } else {
                     let private = bytes[1] & 2 != 0;
                     let selector = [
-                        0, 1, 4, 5, 6, 7, 12, 20, 25, 47, 66, 67, 1000, 1002, 1003, 1004, 1006,
+                        0, 1, 4, 5, 6, 7, 8, 12, 20, 25, 47, 66, 67, 1000, 1002, 1003, 1004, 1006,
                         1047, 1048, 1049, 2004, 65535,
-                    ][usize::from(bytes[2] % 22)];
+                    ][usize::from(bytes[2] % 23)];
                     let enabled = match (private, selector) {
                         (false, 20) => Some(input.new_line),
                         (true, 1) => Some(input.application_cursor),
+                        (true, 8) => Some(auto_repeat),
                         (true, 66) => Some(input.application_keypad),
                         (true, 67) => Some(input.backarrow),
                         (true, 1000) => Some(input.mouse_tracking == MouseTracking::Buttons),
@@ -1199,6 +1213,7 @@ fuzz_target!(|data: &[u8]| {
         values: &values,
         style: current,
         input,
+        auto_repeat,
         replies: &replies,
     };
     drive(&wire, wire.len(), usize::MAX, &oracle);
