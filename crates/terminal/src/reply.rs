@@ -404,6 +404,7 @@ pub(crate) fn mode_query(
     screen: &Screen,
     input: InputModes,
     auto_repeat: bool,
+    color_scheme_notifications: bool,
     sequence: ControlSequence<'_>,
 ) -> Option<ModeReport> {
     let private = match sequence.private_markers {
@@ -444,6 +445,7 @@ pub(crate) fn mode_query(
         (true, 1004) => Some(input.focus_reporting),
         (true, 1006) => Some(input.sgr_mouse),
         (true, 2004) => Some(input.bracketed_paste),
+        (true, 2031) => Some(color_scheme_notifications),
         _ => None,
     };
     Some(ModeReport {

@@ -258,6 +258,31 @@ fn decoded_replacement_control_order_and_writer_failures_retry_across_chunks() {
 }
 
 #[test]
+fn host_notice_waits_for_both_pending_input_events() {
+    let mut screen = Screen::new(8, 2).unwrap();
+    let mut processor = support::processor();
+    let mut sink = FaultSink {
+        writer: UnicodeWriter::default(),
+        calls: 0,
+        fail_at: 0,
+    };
+    processor
+        .advance(b"\x1b[?2031h", &mut screen, &mut sink)
+        .unwrap();
+    let error = processor
+        .advance(b"\xc2\x1b", &mut screen, &mut sink)
+        .unwrap_err();
+    assert_eq!(error.consumed, 2);
+    assert!(matches!(error.error, ProcessFailure::Text(None)));
+    processor.set_color_scheme(Some(crate::ColorScheme::Light));
+    assert!(processor.reply_bytes().is_empty());
+
+    processor.advance(&[], &mut screen, &mut sink).unwrap();
+    assert_eq!(text(&screen, 0, 0), CellText::Scalar('�'));
+    assert_eq!(processor.reply_bytes(), b"\x1b[?997;2n");
+}
+
+#[test]
 fn capacity_errors_and_reply_backpressure_preserve_text_state_for_recovery() {
     let mut screen = Screen::new(8, 2).unwrap();
     let mut processor = support::processor();

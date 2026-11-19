@@ -86,6 +86,92 @@ fn blocked_color_scheme_reply_keeps_its_value_across_host_updates() {
 }
 
 #[test]
+fn subscribed_color_scheme_reports_follow_host_changes_and_terminal_resets() {
+    let mut screen = Screen::new(8, 4).unwrap();
+    let mut processor = support::processor();
+    processor.set_color_scheme(Some(ColorScheme::Dark));
+    let mut output = Vec::new();
+    drive(
+        &mut processor,
+        &mut screen,
+        b"\x1b[?2031;65535h\x1b[?2031$p\x1b[?2031h\x1b[?2031$p",
+        &mut output,
+    );
+    assert_eq!(output, b"\x1b[?2031;2$y\x1b[?2031;1$y");
+    assert_eq!(processor.ignored_sequences(), 1);
+
+    output.clear();
+    drive(
+        &mut processor,
+        &mut screen,
+        b"\x1b]11;#ffffff\x07",
+        &mut output,
+    );
+    assert!(output.is_empty());
+    processor.set_color_scheme(Some(ColorScheme::Light));
+    drain(&mut processor, &mut output);
+    processor.set_color_scheme(Some(ColorScheme::Light));
+    assert!(processor.reply_bytes().is_empty());
+    let color = crate::Rgb {
+        red: 128,
+        green: 240,
+        blue: 19,
+    };
+    assert!(processor.set_palette_base([crate::Rgb::default(); 256], color, color, color));
+    drain(&mut processor, &mut output);
+    assert_eq!(output, b"\x1b[?997;2n\x1b[?997;2n");
+
+    output.clear();
+    drive(
+        &mut processor,
+        &mut screen,
+        b"\x1b[?2031l\x1b[?2031$p",
+        &mut output,
+    );
+    processor.set_color_scheme(Some(ColorScheme::Dark));
+    assert!(processor.reply_bytes().is_empty());
+    drive(
+        &mut processor,
+        &mut screen,
+        b"\x1b[?2031h\x1bc\x1b[?2031$p\x1b[?996n",
+        &mut output,
+    );
+    assert_eq!(output, b"\x1b[?2031;2$y\x1b[?2031;2$y\x1b[?997;1n");
+}
+
+#[test]
+fn deferred_color_scheme_notices_coalesce_after_older_replies() {
+    let mut screen = Screen::new(8, 4).unwrap();
+    let mut processor = support::processor();
+    processor.set_color_scheme(Some(ColorScheme::Dark));
+    let wire = b"\x1b[?2031h\x1b[5n\x1b[?996nX";
+    let error = processor.advance(wire, &mut screen, &mut text).unwrap_err();
+    assert!(matches!(error.error, ProcessFailure::ReplyPending));
+    assert_eq!(error.consumed, wire.len() - 1);
+    assert!(processor.consume_reply(2));
+    processor.set_color_scheme(Some(ColorScheme::Light));
+    processor.set_color_scheme(Some(ColorScheme::Dark));
+    processor.set_color_scheme(Some(ColorScheme::Light));
+
+    let mut output = b"\x1b[".to_vec();
+    drain(&mut processor, &mut output);
+    let error = processor.advance(b"X", &mut screen, &mut text).unwrap_err();
+    assert!(matches!(error.error, ProcessFailure::ReplyPending));
+    assert_eq!(error.consumed, 0);
+    drain(&mut processor, &mut output);
+    assert_eq!(output, b"\x1b[0n\x1b[?997;1n\x1b[?997;2n");
+    assert_eq!(processor.advance(b"X", &mut screen, &mut text).unwrap(), 1);
+    assert_eq!(screen.cursor().column, 1);
+
+    processor.set_color_scheme(Some(ColorScheme::Dark));
+    processor.set_color_scheme(Some(ColorScheme::Light));
+    processor.set_color_scheme(None);
+    output.clear();
+    drain(&mut processor, &mut output);
+    assert_eq!(output, b"\x1b[?997;1n");
+}
+
+#[test]
 fn primary_device_attributes_share_reply_order_and_preserve_screen_state() {
     let wire = b"\x1b[c\x1b[6n\x1b[0c\x1b[1c\x1b[0;c\x1b[0:0c\x1b[ c\x1b[?0c\x1b[>0c\x1b[=0c";
     for split in 0..=wire.len() {

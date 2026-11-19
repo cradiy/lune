@@ -12,6 +12,8 @@ use crate::{
     StorageError, Style, StyleError, StyleId, StyleTable, TextSink,
 };
 
+const PENDING_CAPACITY: usize = 3;
+
 /// A failure while applying a completed text, screen, rendition, or reply event.
 #[derive(Debug)]
 pub enum ProcessFailure<E> {
@@ -80,6 +82,7 @@ enum Pending {
     Rendition(Style),
     PopRendition,
     Reply(Report),
+    ColorSchemeNotice(Report),
     ModeReply(ModeReport),
     StatusReply(StatusReport),
     ColorReply(ColorReport),
@@ -97,6 +100,7 @@ struct State {
     input: InputModes,
     auto_repeat: bool,
     color_scheme: Option<ColorScheme>,
+    color_scheme_notifications: bool,
     osc: Osc,
     dcs: Dcs,
 }
@@ -113,6 +117,7 @@ impl State {
             input: InputModes::default(),
             auto_repeat: true,
             color_scheme: None,
+            color_scheme_notifications: false,
             osc: Osc::new(palette),
             dcs: Dcs::default(),
         }
@@ -127,6 +132,7 @@ impl State {
         self.saved_charsets = [Charsets::default(); 2];
         self.input = InputModes::default();
         self.auto_repeat = true;
+        self.color_scheme_notifications = false;
         self.osc.reset();
         self.dcs = Dcs::default();
     }
@@ -153,8 +159,8 @@ impl State {
 /// closures supply complete units through the same sink contract.
 ///
 /// A byte can complete a replacement and a second text/control/boundary event.
-/// Two fixed slots retain these events across writer failures; sequence headers remain in
-/// the fixed-capacity parser. Rendition changes use a bounded, owned style table.
+/// Two slots retain input events across writer failures. A third can hold a host
+/// color scheme notification. Rendition changes use a bounded, owned style table.
 /// Include retained screen/rendering snapshots when collecting style storage.
 /// Screen edits use keys from this processor's table; callbacks receive the
 /// current key.
@@ -167,7 +173,7 @@ pub struct Processor {
     styles: StyleTable,
     state: State,
     reply: Reply,
-    pending: [Option<Pending>; 2],
+    pending: [Option<Pending>; PENDING_CAPACITY],
     head: usize,
     end: usize,
     parse_errors: u64,
@@ -184,7 +190,7 @@ impl Processor {
             styles: StyleTable::new(style_limit)?,
             state: State::new(palette),
             reply: Reply::default(),
-            pending: [None; 2],
+            pending: [None; PENDING_CAPACITY],
             head: 0,
             end: 0,
             parse_errors: 0,
@@ -229,10 +235,17 @@ impl Processor {
         self.state.osc.take_working_directory_change()
     }
 
-    /// Sets the preference reported by `CSI ? 996 n`. `None` disables replies.
+    /// Sets the preference reported by `CSI ? 996 n`. When subscribed, changes
+    /// queue a notification. `None` clears the preference and any queued notice.
     /// The host preference survives terminal resets.
     pub fn set_color_scheme(&mut self, scheme: Option<ColorScheme>) {
+        if scheme == self.state.color_scheme {
+            return;
+        }
         self.state.color_scheme = scheme;
+        if self.state.color_scheme_notifications {
+            self.queue_color_scheme_notice(scheme);
+        }
     }
 
     /// Current theme and runtime colors. OSC 10/11/12 accepts consecutive numeric
@@ -245,7 +258,8 @@ impl Processor {
         self.state.osc.palette()
     }
 
-    /// Updates the theme while retaining application color overrides.
+    /// Updates the theme while retaining application color overrides. Visible
+    /// changes queue the known color scheme when subscribed.
     pub fn set_palette_base(
         &mut self,
         indexed: [Rgb; 256],
@@ -253,9 +267,41 @@ impl Processor {
         background: Rgb,
         cursor: Rgb,
     ) -> bool {
-        self.state
+        let changed = self
+            .state
             .osc
-            .set_base(indexed, foreground, background, cursor)
+            .set_base(indexed, foreground, background, cursor);
+        if changed && self.state.color_scheme_notifications {
+            self.queue_color_scheme_notice(self.state.color_scheme);
+        }
+        changed
+    }
+
+    #[cold]
+    fn queue_color_scheme_notice(&mut self, scheme: Option<ColorScheme>) {
+        let notice = scheme.map(Report::ColorScheme);
+        if self.head < self.end
+            && matches!(
+                self.pending[self.end - 1],
+                Some(Pending::ColorSchemeNotice(_))
+            )
+        {
+            self.pending[self.end - 1] = notice.map(Pending::ColorSchemeNotice);
+            if notice.is_none() {
+                self.end -= 1;
+                if self.head == self.end {
+                    self.head = 0;
+                    self.end = 0;
+                }
+            }
+        } else if let Some(notice) = notice {
+            if self.head == self.end && self.reply.is_empty() {
+                notice.encode(&mut self.reply);
+            } else {
+                self.pending[self.end] = Some(Pending::ColorSchemeNotice(notice));
+                self.end += 1;
+            }
+        }
     }
 
     /// Acknowledges coalesced visible palette changes.
@@ -279,10 +325,24 @@ impl Processor {
     /// Acknowledges exactly the prefix accepted by the transport. Partial writes
     /// retain the remaining suffix. Returns false without changing state if
     /// `count` exceeds the unsent length; zero is accepted. After clearing a slot,
-    /// retry processing, including an empty suffix, to publish a blocked reply.
+    /// retry processing to publish a blocked input reply. A queued host notice
+    /// becomes readable immediately if it is next in order.
     #[inline]
     pub fn consume_reply(&mut self, count: usize) -> bool {
-        self.reply.consume(count)
+        if !self.reply.consume(count) {
+            return false;
+        }
+        if self.reply.is_empty()
+            && self.head < self.end
+            && let Some(Pending::ColorSchemeNotice(notice)) = self.pending[self.head]
+        {
+            debug_assert_eq!(self.head + 1, self.end);
+            notice.encode(&mut self.reply);
+            self.pending[self.head] = None;
+            self.head = 0;
+            self.end = 0;
+        }
+        true
     }
 
     /// Resolves keys issued for this processor's screen and retained snapshots.
@@ -522,9 +582,13 @@ impl Processor {
                             false
                         }
                     } else if sequence.final_byte == b'p' {
-                        if let Some(reply) =
-                            reply::mode_query(screen, state.input, state.auto_repeat, sequence)
-                        {
+                        if let Some(reply) = reply::mode_query(
+                            screen,
+                            state.input,
+                            state.auto_repeat,
+                            state.color_scheme_notifications,
+                            sequence,
+                        ) {
                             pending[*end] = Some(Pending::ModeReply(reply));
                             *end += 1;
                             true
@@ -588,7 +652,7 @@ impl Processor {
                     state.last_graphic = '\0';
                 }
                 if T::STATEFUL {
-                    debug_assert!(self.end < self.pending.len());
+                    debug_assert!(self.end < PENDING_CAPACITY - 1);
                     self.pending[self.end] = Some(Pending::Boundary);
                     self.end += 1;
                 }
@@ -643,7 +707,7 @@ impl Processor {
     pub fn reset(&mut self, screen: &mut Screen, text: &mut impl TextSink) {
         text.boundary();
         self.parser.reset();
-        self.pending = [None; 2];
+        self.pending = [None; PENDING_CAPACITY];
         self.head = 0;
         self.end = 0;
         self.parse_errors = 0;
@@ -722,7 +786,7 @@ impl Processor {
                         .pop(&mut self.styles, self.state.style)
                         .map_err(ProcessFailure::Style)?;
                 }
-                Pending::Reply(reply) => {
+                Pending::Reply(reply) | Pending::ColorSchemeNotice(reply) => {
                     if !self.reply.is_empty() {
                         return Err(ProcessFailure::ReplyPending);
                     }
@@ -773,7 +837,7 @@ impl Processor {
 fn repeat_sequence(
     sequence: ControlSequence<'_>,
     previous: char,
-    pending: &mut [Option<Pending>; 2],
+    pending: &mut [Option<Pending>; PENDING_CAPACITY],
     end: &mut usize,
 ) -> bool {
     if !sequence.private_markers.is_empty()
@@ -832,7 +896,7 @@ fn dcs_event(
     screen: &Screen,
     styles: &StyleTable,
     state: &mut State,
-    pending: &mut [Option<Pending>; 2],
+    pending: &mut [Option<Pending>; PENDING_CAPACITY],
     end: &mut usize,
 ) {
     if let Some(query) = state.dcs.event(event) {
@@ -994,7 +1058,7 @@ fn rendition_stack(
     sequence: ControlSequence<'_>,
     state: &mut State,
     styles: &StyleTable,
-    pending: &mut [Option<Pending>; 2],
+    pending: &mut [Option<Pending>; PENDING_CAPACITY],
     end: &mut usize,
 ) -> bool {
     if !sequence.private_markers.is_empty() {
@@ -1085,6 +1149,7 @@ fn csi(screen: &mut Screen, sequence: ControlSequence<'_>, state: &mut State) ->
                                     | 1048
                                     | 1049
                                     | 2004
+                                    | 2031
                             )
                         )
                 )
@@ -1101,6 +1166,7 @@ fn csi(screen: &mut Screen, sequence: ControlSequence<'_>, state: &mut State) ->
                 (true, Some(66)) => state.input.application_keypad = enabled,
                 (true, Some(67)) => state.input.backarrow = enabled,
                 (true, Some(2004)) => state.input.bracketed_paste = enabled,
+                (true, Some(2031)) => state.color_scheme_notifications = enabled,
                 (true, Some(1004)) => state.input.focus_reporting = enabled,
                 (true, Some(5)) => screen.set_reverse_video(enabled),
                 (true, Some(6)) => screen.set_origin_mode(enabled),

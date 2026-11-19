@@ -364,6 +364,7 @@ fuzz_target!(|data: &[u8]| {
     let mut saved_charsets = [(charsets, selected); 2];
     let mut input = InputModes::default();
     let mut auto_repeat = true;
+    let mut color_scheme_notifications = false;
     let color_scheme = match data.first().copied().unwrap_or(0) % 3 {
         0 => None,
         1 => Some(ColorScheme::Dark),
@@ -627,6 +628,7 @@ fuzz_target!(|data: &[u8]| {
                     saved_charsets = [(charsets, selected); 2];
                     input = InputModes::default();
                     auto_repeat = true;
+                    color_scheme_notifications = false;
                     Some(Command::Reset)
                 } else {
                     wire.extend(b"\x1b[!p");
@@ -1075,7 +1077,10 @@ fuzz_target!(|data: &[u8]| {
             }
             55 | 56 => {
                 let enabled = bytes[1] & 1 != 0;
-                let mode = if bytes[1] & 8 != 0 {
+                let mode = if bytes[1] & 16 != 0 {
+                    color_scheme_notifications = enabled;
+                    2031
+                } else if bytes[1] & 8 != 0 {
                     match bytes[2] % 4 {
                         0 => {
                             input.mouse_tracking = if enabled {
@@ -1161,8 +1166,8 @@ fuzz_target!(|data: &[u8]| {
                     let private = bytes[1] & 2 != 0;
                     let selector = [
                         0, 1, 4, 5, 6, 7, 8, 12, 20, 25, 47, 66, 67, 1000, 1002, 1003, 1004, 1006,
-                        1047, 1048, 1049, 2004, 65535,
-                    ][usize::from(bytes[2] % 23)];
+                        1047, 1048, 1049, 2004, 2031, 65535,
+                    ][usize::from(bytes[2] % 24)];
                     let enabled = match (private, selector) {
                         (false, 20) => Some(input.new_line),
                         (true, 1) => Some(input.application_cursor),
@@ -1175,6 +1180,7 @@ fuzz_target!(|data: &[u8]| {
                         (true, 1004) => Some(input.focus_reporting),
                         (true, 1006) => Some(input.sgr_mouse),
                         (true, 2004) => Some(input.bracketed_paste),
+                        (true, 2031) => Some(color_scheme_notifications),
                         _ => expected.mode(private, selector),
                     };
                     let status = match enabled {
