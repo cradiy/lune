@@ -35,6 +35,13 @@ impl Default for Reply {
     }
 }
 
+/// The host color preference reported to terminal applications.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ColorScheme {
+    Dark,
+    Light,
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum Report {
     Status,
@@ -49,6 +56,7 @@ pub(crate) enum Report {
     },
     PrimaryDeviceAttributes,
     Version,
+    ColorScheme(ColorScheme),
 }
 
 #[derive(Clone, Copy)]
@@ -235,6 +243,13 @@ impl Report {
                 private,
             } => reply.position(row, column, private),
             Self::TextAreaSize { rows, columns } => reply.text_area_size(rows, columns),
+            Self::ColorScheme(scheme) => {
+                reply.clear();
+                reply.append(match scheme {
+                    ColorScheme::Dark => b"\x1b[?997;1n",
+                    ColorScheme::Light => b"\x1b[?997;2n",
+                });
+            }
         }
     }
 }
@@ -310,7 +325,11 @@ impl Reply {
     }
 }
 
-pub(crate) fn query(screen: &Screen, sequence: ControlSequence<'_>) -> Option<Report> {
+pub(crate) fn query(
+    screen: &Screen,
+    sequence: ControlSequence<'_>,
+    color_scheme: Option<ColorScheme>,
+) -> Option<Report> {
     if !sequence.intermediates.is_empty()
         || sequence.parameters.len() != 1
         || sequence.parameters[0].is_subparameter
@@ -334,6 +353,7 @@ pub(crate) fn query(screen: &Screen, sequence: ControlSequence<'_>) -> Option<Re
                 private: !sequence.private_markers.is_empty(),
             })
         }
+        (996, [b'?']) => color_scheme.map(Report::ColorScheme),
         _ => None,
     }
 }

@@ -18,9 +18,9 @@ use std::io::Write;
 
 use libfuzzer_sys::fuzz_target;
 use lune_terminal::{
-    CellPosition, CellWidth, Color, CursorShape, EraseMode, InputModes, Key, Modifiers,
-    MouseButton, MouseEvent, MouseTracking, PaletteEntry, ProcessFailure, Processor, Rgb, Screen,
-    Style, StyleId, Underline,
+    CellPosition, CellWidth, Color, ColorScheme, CursorShape, EraseMode, InputModes, Key,
+    Modifiers, MouseButton, MouseEvent, MouseTracking, PaletteEntry, ProcessFailure, Processor,
+    Rgb, Screen, Style, StyleId, Underline,
 };
 use screen_model::{Command, ScreenModel};
 
@@ -78,6 +78,7 @@ struct Expected<'a> {
     style: Style,
     input: InputModes,
     auto_repeat: bool,
+    color_scheme: Option<ColorScheme>,
     replies: &'a [u8],
     title: &'a str,
     title_changed: bool,
@@ -97,6 +98,7 @@ fn drain_reply(processor: &mut Processor, output: &mut Vec<u8>, count: usize) {
 fn drive(wire: &[u8], chunk: usize, fail_at: usize, expected: &Expected<'_>) {
     let mut screen = Screen::new(8, 4).unwrap();
     let mut processor = support::processor();
+    processor.set_color_scheme(expected.color_scheme);
     let mut calls = 0;
     let mut available = false;
     let mut replies = Vec::new();
@@ -362,6 +364,11 @@ fuzz_target!(|data: &[u8]| {
     let mut saved_charsets = [(charsets, selected); 2];
     let mut input = InputModes::default();
     let mut auto_repeat = true;
+    let color_scheme = match data.first().copied().unwrap_or(0) % 3 {
+        0 => None,
+        1 => Some(ColorScheme::Dark),
+        _ => Some(ColorScheme::Light),
+    };
     let mut replies = Vec::new();
     let mut title = String::new();
     let mut title_changed = false;
@@ -1181,6 +1188,15 @@ fuzz_target!(|data: &[u8]| {
                 }
                 None
             }
+            58 if bytes[1] & 8 != 0 => {
+                wire.extend(b"\x1b[?996n");
+                match color_scheme {
+                    Some(ColorScheme::Dark) => replies.extend_from_slice(b"\x1b[?997;1n"),
+                    Some(ColorScheme::Light) => replies.extend_from_slice(b"\x1b[?997;2n"),
+                    None => diagnostics.1 += 1,
+                }
+                None
+            }
             58 if bytes[1] & 4 != 0 => {
                 wire.extend(if bytes[1] & 1 == 0 {
                     b"\x1b[c".as_slice()
@@ -1347,6 +1363,7 @@ fuzz_target!(|data: &[u8]| {
         style: current,
         input,
         auto_repeat,
+        color_scheme,
         replies: &replies,
     };
     drive(&wire, wire.len(), usize::MAX, &oracle);

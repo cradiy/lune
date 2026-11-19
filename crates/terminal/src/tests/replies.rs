@@ -1,6 +1,8 @@
 use super::support;
 
-use crate::{CellWidth, ProcessFailure, Processor, Screen, StorageError, StyleId, reply::Reply};
+use crate::{
+    CellWidth, ColorScheme, ProcessFailure, Processor, Screen, StorageError, StyleId, reply::Reply,
+};
 
 fn text(screen: &mut Screen, value: &str, style: StyleId) -> Result<(), StorageError> {
     if value.is_ascii() {
@@ -33,6 +35,54 @@ fn drive(processor: &mut Processor, screen: &mut Screen, mut input: &[u8], outpu
             }
         }
     }
+}
+
+#[test]
+fn color_scheme_queries_validate_the_header_and_use_the_host_preference() {
+    let wire = b"\x1b[?996n\x1b[6n\x1b]11;#ffffff\x07\x1b[?996n\x1b[996n\x1b[>996n\x1b[?996;0n\x1b[?996:0n\x1b[?996 n\x1b[?997;1n";
+    for split in 0..=wire.len() {
+        let mut screen = Screen::new(8, 4).unwrap();
+        screen.set_cursor(1, 2);
+        let mut processor = support::processor();
+        processor.set_color_scheme(Some(ColorScheme::Dark));
+        let mut output = Vec::new();
+        drive(&mut processor, &mut screen, &wire[..split], &mut output);
+        drive(&mut processor, &mut screen, &wire[split..], &mut output);
+        assert_eq!(output, b"\x1b[?997;1n\x1b[2;3R\x1b[?997;1n");
+        assert_eq!(processor.ignored_sequences(), 6);
+    }
+}
+
+#[test]
+fn blocked_color_scheme_reply_keeps_its_value_across_host_updates() {
+    let mut screen = Screen::new(8, 4).unwrap();
+    let mut processor = support::processor();
+    processor
+        .advance(b"\x1b[?996n", &mut screen, &mut text)
+        .unwrap();
+    assert!(processor.reply_bytes().is_empty());
+    processor.set_color_scheme(Some(ColorScheme::Dark));
+    let wire = b"\x1b[5n\x1b[?996n\x1bc\x1b[?996n";
+    let error = processor.advance(wire, &mut screen, &mut text).unwrap_err();
+    assert!(matches!(error.error, ProcessFailure::ReplyPending));
+    assert_eq!(error.consumed, b"\x1b[5n\x1b[?996n".len());
+    let remaining = &wire[error.consumed..];
+    assert!(processor.consume_reply(2));
+    processor.set_color_scheme(Some(ColorScheme::Light));
+    let error = processor
+        .advance(remaining, &mut screen, &mut text)
+        .unwrap_err();
+    assert!(matches!(error.error, ProcessFailure::ReplyPending));
+    assert_eq!(error.consumed, 0);
+    let mut output = b"\x1b[".to_vec();
+    drain(&mut processor, &mut output);
+    drive(&mut processor, &mut screen, remaining, &mut output);
+    assert_eq!(output, b"\x1b[0n\x1b[?997;1n\x1b[?997;2n");
+
+    processor.set_color_scheme(None);
+    output.clear();
+    drive(&mut processor, &mut screen, b"\x1b[?996n", &mut output);
+    assert!(output.is_empty());
 }
 
 #[test]

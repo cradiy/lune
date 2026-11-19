@@ -8,8 +8,8 @@ use crate::osc::{Osc, Outcome};
 use crate::rendition_stack::RenditionStack;
 use crate::reply::{self, ColorReport, ModeReport, Reply, Report, StatusReport};
 use crate::{
-    CursorShape, EraseMode, InputModes, Palette, Rgb, Screen, ScreenBuffer, StorageError, Style,
-    StyleError, StyleId, StyleTable, TextSink,
+    ColorScheme, CursorShape, EraseMode, InputModes, Palette, Rgb, Screen, ScreenBuffer,
+    StorageError, Style, StyleError, StyleId, StyleTable, TextSink,
 };
 
 /// A failure while applying a completed text, screen, rendition, or reply event.
@@ -96,6 +96,7 @@ struct State {
     saved_charsets: [Charsets; 2],
     input: InputModes,
     auto_repeat: bool,
+    color_scheme: Option<ColorScheme>,
     osc: Osc,
     dcs: Dcs,
 }
@@ -111,6 +112,7 @@ impl State {
             saved_charsets: [Charsets::default(); 2],
             input: InputModes::default(),
             auto_repeat: true,
+            color_scheme: None,
             osc: Osc::new(palette),
             dcs: Dcs::default(),
         }
@@ -225,6 +227,12 @@ impl Processor {
     /// Acknowledges coalesced OSC 7 changes, including clears.
     pub fn take_working_directory_change(&mut self) -> bool {
         self.state.osc.take_working_directory_change()
+    }
+
+    /// Sets the preference reported by `CSI ? 996 n`. `None` disables replies.
+    /// The host preference survives terminal resets.
+    pub fn set_color_scheme(&mut self, scheme: Option<ColorScheme>) {
+        self.state.color_scheme = scheme;
     }
 
     /// Current theme and runtime colors. OSC 10/11/12 accepts consecutive numeric
@@ -506,7 +514,7 @@ impl Processor {
                             false
                         }
                     } else if sequence.final_byte == b'n' {
-                        if let Some(reply) = reply::query(screen, sequence) {
+                        if let Some(reply) = reply::query(screen, sequence, state.color_scheme) {
                             pending[*end] = Some(Pending::Reply(reply));
                             *end += 1;
                             true
