@@ -408,6 +408,18 @@ fuzz_target!(|data: &[u8]| {
                     reference_id(&mut values, current),
                     charsets[selected],
                 );
+                if bytes[2] & 1 != 0 {
+                    let repeats = count(&mut wire, b'b', bytes);
+                    let style = reference_id(&mut values, current);
+                    for _ in 0..repeats {
+                        ascii(
+                            &mut expected,
+                            &run[run.len() - 1..],
+                            style,
+                            charsets[selected],
+                        );
+                    }
+                }
                 None
             }
             1 => {

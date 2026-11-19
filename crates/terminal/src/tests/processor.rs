@@ -446,6 +446,92 @@ fn row_text(screen: &Screen, row: usize) -> String {
 }
 
 #[test]
+fn repeat_uses_only_adjacent_graphic_input_across_splits() {
+    let input = b"\x1b[3babc\x1b[2b\x1b[b!\x1b[0b\r\nZ\x1b[31m\x1b[2bD\x7f\x1b[bE\x1b\x1b[bF\x1bXignored\x1b\\\x1b[bG\x1b[?2b\x1b[bH\x1b[1;2b\x1b[bJ\x1b(0q\x1b[b";
+    for split in 0..=input.len() {
+        let (screen, processor) = run(input, &[split]);
+        assert_eq!(row_text(&screen, 0), "abccc!! ");
+        assert_eq!(row_text(&screen, 1), "ZDEFGHJ─");
+        assert_eq!(row_text(&screen, 2), "─       ");
+        assert_eq!(processor.ignored_sequences(), 2);
+    }
+}
+
+#[test]
+fn repeated_wide_scalars_use_normal_styled_text_placement() {
+    let run = |wire: &[u8], chunk| {
+        let mut screen = Screen::new(3, 2).unwrap();
+        let mut processor = support::processor();
+        let mut writer = crate::UnicodeWriter::default();
+        screen
+            .set_history_limits(crate::HistoryLimits {
+                max_rows: 4,
+                max_bytes: 8192,
+            })
+            .unwrap();
+        for bytes in wire.chunks(chunk) {
+            processor.advance(bytes, &mut screen, &mut writer).unwrap();
+        }
+        (screen, processor)
+    };
+    let (literal, literal_processor) = run("\x1b[31m水水水".as_bytes(), 1);
+    for chunk in [1, 3, usize::MAX] {
+        let (screen, processor) = run("\x1b[31m水\x1b[2b".as_bytes(), chunk);
+        assert_eq!(snapshot(screen.grid()), snapshot(literal.grid()));
+        assert_eq!(screen.cursor(), literal.cursor());
+        assert_eq!(
+            screen.grid().row(0).unwrap().cells()[0].style(),
+            processor.style_id()
+        );
+        assert_eq!(processor.style_id(), literal_processor.style_id());
+        assert_eq!(screen.history().len(), 1);
+        let retained = screen.history().iter_rows().next().unwrap();
+        assert_eq!(retained.text(0), Some(crate::CellText::Scalar('水')));
+        assert_eq!(retained.cells()[0].style(), processor.style_id());
+    }
+}
+
+#[test]
+fn rejected_repeat_write_retries_only_the_remaining_characters() {
+    let mut screen = Screen::new(8, 4).unwrap();
+    let mut processor = support::processor();
+    let mut output = String::new();
+    let mut writes = 0;
+    let input = b"X\x1b[65535b!";
+    let fail = &mut |_: &mut Screen, text: &str, _: StyleId| {
+        writes += 1;
+        if writes == 3 {
+            return Err(());
+        }
+        output.push_str(text);
+        Ok(())
+    };
+    let error = processor.advance(input, &mut screen, fail).unwrap_err();
+    assert!(matches!(error.error, ProcessFailure::Text(())));
+    assert_eq!(error.consumed, input.len() - 1);
+    assert!((2..65536).contains(&output.len()));
+    assert!(output.bytes().all(|byte| byte == b'X'));
+    let suffix = &input[error.consumed..];
+    let error = processor
+        .advance(
+            suffix,
+            &mut screen,
+            &mut |_: &mut Screen, _: &str, _: StyleId| Err(()),
+        )
+        .unwrap_err();
+    assert!(matches!(error.error, ProcessFailure::Text(())));
+    assert_eq!(error.consumed, 0);
+    let accepted = &mut |_: &mut Screen, text: &str, _: StyleId| {
+        output.push_str(text);
+        Ok::<_, ()>(())
+    };
+    processor.advance(suffix, &mut screen, accepted).unwrap();
+    assert_eq!(output.as_bytes().last(), Some(&b'!'));
+    assert_eq!(output.len(), 65537);
+    assert!(output.as_bytes()[..65536].iter().all(|&byte| byte == b'X'));
+}
+
+#[test]
 fn ansi_positions_preserve_axes_clamp_regions_and_cancel_pending_wrap() {
     use crate::ScreenBuffer::{Alternate, Primary};
 

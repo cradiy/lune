@@ -72,6 +72,7 @@ impl<E: Error + 'static> Error for ProcessError<E> {
 #[derive(Clone, Copy)]
 enum Pending {
     Text(char),
+    Repeat { character: char, remaining: usize },
     Boundary,
     Execute(u8),
     Index(bool),
@@ -87,6 +88,8 @@ enum Pending {
 
 struct State {
     style: StyleId,
+    // NUL marks an empty REP source.
+    last_graphic: char,
     saved_style: [StyleId; 2],
     renditions: RenditionStack,
     charsets: Charsets,
@@ -101,6 +104,7 @@ impl State {
     fn new(palette: Palette) -> Self {
         Self {
             style: StyleId(0),
+            last_graphic: '\0',
             saved_style: [StyleId(0); 2],
             renditions: RenditionStack::default(),
             charsets: Charsets::default(),
@@ -114,6 +118,7 @@ impl State {
 
     fn reset(&mut self) {
         self.style = StyleId(0);
+        self.last_graphic = '\0';
         self.saved_style = [StyleId(0); 2];
         self.renditions.clear();
         self.charsets = Charsets::default();
@@ -312,6 +317,7 @@ impl Processor {
     /// On error, `consumed` includes bytes buffered in the parser or retained as
     /// events. An ASCII run rejected by the writer remains unconsumed. A failed
     /// decoded scalar is retained, including any following event from its byte.
+    /// REP retains its unwritten characters when a repeated write fails.
     /// A rendition storage failure retains the complete candidate style and
     /// consumes its sequence, leaving current rendition unchanged until retry.
     /// Retry the suffix even when empty. Repeated failures consume zero new bytes.
@@ -341,17 +347,20 @@ impl Processor {
                         consumed: 0,
                         error: ProcessFailure::Text(error),
                     })?;
+                self.state.last_graphic = char::from(byte);
                 return Ok(1);
             }
         }
         let mut consumed = 0;
         while consumed < input.len() {
-            if self.parser.is_ground() {
+            let ground = self.parser.is_ground();
+            if ground {
                 let first = input[consumed];
                 if (b' '..=b'~').contains(&first) {
                     let length = if self.state.charsets.is_graphics() {
                         if first >= b'_' {
                             let character = self.state.charsets.map(char::from(first));
+                            self.state.last_graphic = character;
                             consumed += 1;
                             if let Err(error) = text.write(
                                 screen,
@@ -382,6 +391,7 @@ impl Processor {
                             error: ProcessFailure::Text(error),
                         })?;
                     consumed += length;
+                    self.state.last_graphic = char::from(input[consumed - 1]);
                     continue;
                 }
                 let scalar_bytes = match first {
@@ -394,9 +404,11 @@ impl Processor {
                     && let Some(bytes) = input[consumed..].get(..scalar_bytes)
                     && let Ok(value) = std::str::from_utf8(bytes)
                 {
+                    let character = value.chars().next().expect("One UTF-8 scalar is present");
+                    self.state.last_graphic = character;
                     consumed += scalar_bytes;
                     if let Err(error) = text.write(screen, value, self.state.style) {
-                        self.pending[0] = Some(Pending::Text(value.chars().next().unwrap()));
+                        self.pending[0] = Some(Pending::Text(character));
                         self.end = 1;
                         return Err(ProcessError {
                             consumed,
@@ -426,19 +438,24 @@ impl Processor {
                 state,
                 ..
             } = self;
+            let byte = input[consumed];
             parser.advance(&input[consumed..consumed + 1], |event| match event {
                 Event::Text(value) => {
                     let mut characters = value.chars();
                     let character = characters.next().expect("A decoded scalar is present");
                     debug_assert!(characters.next().is_none());
-                    pending[*end] = Some(Pending::Text(state.charsets.map(character)));
+                    let character = state.charsets.map(character);
+                    state.last_graphic = character;
+                    pending[*end] = Some(Pending::Text(character));
                     *end += 1;
                 }
                 Event::Execute(control) => {
+                    state.last_graphic = '\0';
                     pending[*end] = Some(Pending::Execute(control));
                     *end += 1;
                 }
                 Event::Escape(sequence) => {
+                    state.last_graphic = '\0';
                     debug_assert_eq!(*end, 0);
                     if sequence.intermediates.is_empty()
                         && matches!(sequence.final_byte, b'D' | b'E')
@@ -518,39 +535,55 @@ impl Processor {
                         } else {
                             csi(screen, sequence, state)
                         }
+                    } else if sequence.final_byte == b'b' {
+                        repeat_sequence(sequence, state.last_graphic, pending, end)
                     } else if matches!(sequence.final_byte, b'{' | b'}') {
                         sequence.intermediates == b"#"
                             && rendition_stack(sequence, state, styles, pending, end)
                     } else {
                         csi(screen, sequence, state)
                     };
+                    state.last_graphic = '\0';
                     if !accepted {
                         *ignored_sequences = ignored_sequences.saturating_add(1);
                     }
                 }
-                Event::Osc(event) => match state.osc.event(event) {
-                    Outcome::Done => {}
-                    Outcome::Ignored => *ignored_sequences = ignored_sequences.saturating_add(1),
-                    Outcome::Reply(reply) => {
-                        pending[*end] = Some(Pending::ColorReply(reply));
-                        *end += 1;
+                Event::Osc(event) => {
+                    state.last_graphic = '\0';
+                    match state.osc.event(event) {
+                        Outcome::Done => {}
+                        Outcome::Ignored => {
+                            *ignored_sequences = ignored_sequences.saturating_add(1)
+                        }
+                        Outcome::Reply(reply) => {
+                            pending[*end] = Some(Pending::ColorReply(reply));
+                            *end += 1;
+                        }
+                        Outcome::Replies => {
+                            pending[*end] = Some(Pending::OscReplies);
+                            *end += 1;
+                        }
                     }
-                    Outcome::Replies => {
-                        pending[*end] = Some(Pending::OscReplies);
-                        *end += 1;
-                    }
-                },
+                }
                 Event::Dcs(event) => {
+                    state.last_graphic = '\0';
                     dcs_event(event, screen, styles, state, pending, end);
                 }
-                Event::Error(_) => *parse_errors = parse_errors.saturating_add(1),
+                Event::Error(_) => {
+                    state.last_graphic = '\0';
+                    *parse_errors = parse_errors.saturating_add(1);
+                }
             });
-            if T::STATEFUL && matches!(input[consumed], 0x1b | 0x7f) {
-                // These bytes emit no Execute event. A replacement from a broken
-                // UTF-8 prefix belongs before their boundary, including on retry.
-                debug_assert!(self.end < self.pending.len());
-                self.pending[self.end] = Some(Pending::Boundary);
-                self.end += 1;
+            if matches!(byte, 0x1b | 0x7f) {
+                // An interrupted UTF-8 scalar is emitted before this boundary.
+                if byte == 0x7f || !ground {
+                    state.last_graphic = '\0';
+                }
+                if T::STATEFUL {
+                    debug_assert!(self.end < self.pending.len());
+                    self.pending[self.end] = Some(Pending::Boundary);
+                    self.end += 1;
+                }
             }
             consumed += 1;
             self.drain(screen, text)
@@ -590,6 +623,7 @@ impl Processor {
             }
             _ => unreachable!("Finishing emits text, string cancellation, or a lexical error"),
         });
+        state.last_graphic = '\0';
         self.drain(screen, text)?;
         text.boundary();
         Ok(())
@@ -635,6 +669,20 @@ impl Processor {
                 Pending::Text(character) => text
                     .write(screen, character.encode_utf8(&mut [0; 4]), self.state.style)
                     .map_err(ProcessFailure::Text)?,
+                Pending::Repeat {
+                    character,
+                    mut remaining,
+                } => {
+                    if let Err(error) =
+                        repeat(character, &mut remaining, screen, text, self.state.style)
+                    {
+                        self.pending[self.head] = Some(Pending::Repeat {
+                            character,
+                            remaining,
+                        });
+                        return Err(ProcessFailure::Text(error));
+                    }
+                }
                 Pending::Boundary => text.boundary(),
                 Pending::Execute(control) => {
                     text.boundary();
@@ -711,6 +759,64 @@ impl Processor {
         self.end = 0;
         Ok(())
     }
+}
+
+#[cold]
+fn repeat_sequence(
+    sequence: ControlSequence<'_>,
+    previous: char,
+    pending: &mut [Option<Pending>; 2],
+    end: &mut usize,
+) -> bool {
+    if !sequence.private_markers.is_empty()
+        || !sequence.intermediates.is_empty()
+        || !matches!(
+            sequence.parameters,
+            [] | [Parameter {
+                is_subparameter: false,
+                ..
+            }]
+        )
+    {
+        return false;
+    }
+    if !previous.is_control() {
+        pending[*end] = Some(Pending::Repeat {
+            character: previous,
+            remaining: count(sequence.parameters),
+        });
+        *end += 1;
+    }
+    true
+}
+
+#[cold]
+fn repeat<E>(
+    character: char,
+    remaining: &mut usize,
+    screen: &mut Screen,
+    sink: &mut impl TextSink<Error = E>,
+    style: StyleId,
+) -> Result<(), E> {
+    let mut ascii = [0; 128];
+    let mut scalar = [0; 4];
+    let (run, unit_bytes) = if character.is_ascii() {
+        ascii.fill(character as u8);
+        (
+            std::str::from_utf8(&ascii).expect("The run contains only ASCII"),
+            1,
+        )
+    } else {
+        let encoded = character.encode_utf8(&mut scalar);
+        (&*encoded, encoded.len())
+    };
+    let capacity = run.len() / unit_bytes;
+    while *remaining != 0 {
+        let count = (*remaining).min(capacity);
+        sink.write(screen, &run[..count * unit_bytes], style)?;
+        *remaining -= count;
+    }
+    Ok(())
 }
 
 #[inline]
