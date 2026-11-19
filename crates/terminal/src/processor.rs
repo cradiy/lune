@@ -798,23 +798,22 @@ fn repeat<E>(
     sink: &mut impl TextSink<Error = E>,
     style: StyleId,
 ) -> Result<(), E> {
-    let mut ascii = [0; 128];
-    let mut scalar = [0; 4];
-    let (run, unit_bytes) = if character.is_ascii() {
-        ascii.fill(character as u8);
-        (
-            std::str::from_utf8(&ascii).expect("The run contains only ASCII"),
-            1,
-        )
+    if character.is_ascii() && *remaining > 1 {
+        let bytes = [character as u8; 128];
+        // SAFETY: each byte was filled with a single ASCII scalar.
+        let run = unsafe { std::str::from_utf8_unchecked(&bytes) };
+        while *remaining != 0 {
+            let count = (*remaining).min(run.len());
+            sink.write(screen, &run[..count], style)?;
+            *remaining -= count;
+        }
     } else {
-        let encoded = character.encode_utf8(&mut scalar);
-        (&*encoded, encoded.len())
-    };
-    let capacity = run.len() / unit_bytes;
-    while *remaining != 0 {
-        let count = (*remaining).min(capacity);
-        sink.write(screen, &run[..count * unit_bytes], style)?;
-        *remaining -= count;
+        let mut buffer = [0; 4];
+        let scalar = character.encode_utf8(&mut buffer);
+        while *remaining != 0 {
+            sink.write(screen, scalar, style)?;
+            *remaining -= 1;
+        }
     }
     Ok(())
 }
