@@ -7,9 +7,9 @@ use lune_terminal::{
 
 fuzz_target!(|data: &[u8]| {
     for record in data.as_chunks::<8>().0 {
-        use MouseButton::{Left, Middle, Right};
-        use MouseEvent::{Motion, Press, Release, WheelDown, WheelUp};
-        let (event, normal, sgr, suffix, allowed) = [
+        use MouseButton::{Button8, Button9, Button10, Button11, Left, Middle, Right};
+        use MouseEvent::{Motion, Press, Release, WheelDown, WheelLeft, WheelRight, WheelUp};
+        let cases = [
             (Press(Left), 0, 0, 'M', 0b1110),
             (Press(Middle), 1, 1, 'M', 0b1110),
             (Press(Right), 2, 2, 'M', 0b1110),
@@ -22,7 +22,22 @@ fuzz_target!(|data: &[u8]| {
             (Motion(None), 35, 35, 'M', 0b1000),
             (WheelUp, 64, 64, 'M', 0b1110),
             (WheelDown, 65, 65, 'M', 0b1110),
-        ][usize::from(record[5] % 12)];
+            (WheelLeft, 66, 66, 'M', 0b1110),
+            (WheelRight, 67, 67, 'M', 0b1110),
+            (Press(Button8), 128, 128, 'M', 0b1110),
+            (Press(Button9), 129, 129, 'M', 0b1110),
+            (Press(Button10), 130, 130, 'M', 0b1110),
+            (Press(Button11), 131, 131, 'M', 0b1110),
+            (Release(Button8), 3, 128, 'm', 0b1110),
+            (Release(Button9), 3, 129, 'm', 0b1110),
+            (Release(Button10), 3, 130, 'm', 0b1110),
+            (Release(Button11), 3, 131, 'm', 0b1110),
+            (Motion(Some(Button8)), 160, 160, 'M', 0b1100),
+            (Motion(Some(Button9)), 161, 161, 'M', 0b1100),
+            (Motion(Some(Button10)), 162, 162, 'M', 0b1100),
+            (Motion(Some(Button11)), 163, 163, 'M', 0b1100),
+        ];
+        let (event, normal, sgr, suffix, allowed) = cases[usize::from(record[5]) % cases.len()];
         let tracking = usize::from(record[6] % 4);
         let modes = InputModes {
             mouse_tracking: [
@@ -56,7 +71,7 @@ fuzz_target!(|data: &[u8]| {
                 position.row + 1
             );
             let encoded = encoded.unwrap();
-            assert!(encoded.as_bytes().len() <= 18);
+            assert!(encoded.as_bytes().len() <= 19);
             assert_eq!(encoded.as_bytes(), expected.as_bytes());
         } else {
             assert_eq!(

@@ -2,6 +2,8 @@ use std::num::NonZeroU8;
 
 use crate::{CellPosition, InputModes, Key, KeySequence, MAX_DIMENSION, Modifiers, ScreenBuffer};
 
+const REPORT_CAPACITY: usize = b"\x1b[<191;65535;65535M".len();
+
 /// Mouse events selected by DEC modes 1000, 1002 and 1003.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum MouseTracking {
@@ -17,6 +19,10 @@ pub enum MouseButton {
     Left = 0,
     Middle = 1,
     Right = 2,
+    Button8 = 128,
+    Button9 = 129,
+    Button10 = 130,
+    Button11 = 131,
 }
 
 /// Motion events carry one held button, or `None` when no button is held.
@@ -27,13 +33,15 @@ pub enum MouseEvent {
     Motion(Option<MouseButton>),
     WheelUp,
     WheelDown,
+    WheelLeft,
+    WheelRight,
 }
 
 /// Owned mouse report bytes, retained by the caller across partial writes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[must_use]
 pub struct MouseSequence {
-    bytes: [u8; 18],
+    bytes: [u8; REPORT_CAPACITY],
     len: NonZeroU8,
 }
 
@@ -105,6 +113,8 @@ impl InputModes {
             MouseEvent::Press(button) | MouseEvent::Release(button) => button as u8,
             MouseEvent::WheelUp => 64,
             MouseEvent::WheelDown => 65,
+            MouseEvent::WheelLeft => 66,
+            MouseEvent::WheelRight => 67,
             MouseEvent::Motion(button) => {
                 if self.mouse_tracking != MouseTracking::AnyMotion
                     && (self.mouse_tracking != MouseTracking::ButtonMotion || button.is_none())
@@ -122,7 +132,7 @@ impl InputModes {
             + 8 * u8::from(modifiers.alt)
             + 16 * u8::from(modifiers.control);
         let mut sequence = MouseSequence {
-            bytes: [0; 18],
+            bytes: [0; REPORT_CAPACITY],
             len: NonZeroU8::new(3).unwrap(),
         };
         if self.sgr_mouse {

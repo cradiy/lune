@@ -7,8 +7,8 @@ use crate::{
 
 #[test]
 fn mouse_reports_match_button_motion_wheel_and_modifier_wire_codes() {
-    use MouseButton::{Left, Middle, Right};
-    use MouseEvent::{Motion, Press, Release, WheelDown, WheelUp};
+    use MouseButton::{Button8, Button9, Button10, Button11, Left, Middle, Right};
+    use MouseEvent::{Motion, Press, Release, WheelDown, WheelLeft, WheelRight, WheelUp};
     let events = [
         (Press(Left), 0, 0, 'M', [false, true, true, true]),
         (Press(Middle), 1, 1, 'M', [false, true, true, true]),
@@ -28,6 +28,18 @@ fn mouse_reports_match_button_motion_wheel_and_modifier_wire_codes() {
         (Motion(None), 35, 35, 'M', [false, false, false, true]),
         (WheelUp, 64, 64, 'M', [false, true, true, true]),
         (WheelDown, 65, 65, 'M', [false, true, true, true]),
+        (WheelLeft, 66, 66, 'M', [false, true, true, true]),
+        (WheelRight, 67, 67, 'M', [false, true, true, true]),
+        (Press(Button8), 128, 128, 'M', [false, true, true, true]),
+        (Release(Button9), 3, 129, 'm', [false, true, true, true]),
+        (Press(Button10), 130, 130, 'M', [false, true, true, true]),
+        (
+            Motion(Some(Button11)),
+            163,
+            163,
+            'M',
+            [false, false, true, true],
+        ),
     ];
     for (index, mouse_tracking) in [
         MouseTracking::Disabled,
@@ -112,7 +124,7 @@ fn mouse_coordinates_obey_wire_and_grid_bounds_without_truncation() {
                 usize::MAX,
             ] {
                 let actual = modes.encode_mouse(
-                    MouseEvent::WheelDown,
+                    MouseEvent::Motion(Some(MouseButton::Button11)),
                     CellPosition { row, column },
                     Modifiers {
                         shift: true,
@@ -126,12 +138,12 @@ fn mouse_coordinates_obey_wire_and_grid_bounds_without_truncation() {
                 } else if sgr_mouse {
                     assert_eq!(
                         actual.unwrap().as_bytes(),
-                        format!("\x1b[<93;{};{}M", column + 1, row + 1).as_bytes()
+                        format!("\x1b[<191;{};{}M", column + 1, row + 1).as_bytes()
                     );
                 } else {
                     assert_eq!(
                         actual.unwrap().as_bytes(),
-                        &[27, 91, 77, 125, column as u8 + 33, row as u8 + 33]
+                        &[27, 91, 77, 223, column as u8 + 33, row as u8 + 33]
                     );
                 }
             }
@@ -167,7 +179,7 @@ fn alternate_scroll_routes_vertical_wheel_steps_only_without_mouse_tracking() {
     assert_eq!(up.as_bytes(), b"\x1b[A");
     assert!(
         normal
-            .encode_alternate_scroll(MouseEvent::Motion(None), screen.active_buffer())
+            .encode_alternate_scroll(MouseEvent::WheelLeft, screen.active_buffer())
             .is_none()
     );
     processor
