@@ -1,7 +1,6 @@
 use std::io::Cursor;
-use std::time::{Duration, Instant};
 
-use lune_terminal::{CellText, Rgb};
+use lune_terminal::{CellText, MouseButton, Rgb};
 
 use super::*;
 
@@ -108,6 +107,71 @@ fn hangup_drains_child_output_and_finalizes_an_incomplete_scalar() {
 }
 
 #[test]
+fn synchronized_output_replies_while_held_and_releases_at_the_original_deadline() {
+    let start = Instant::now();
+    let mut session = session(b"\x1b[?20");
+    session
+        .pump_with_clock(|| panic!("inactive presentation read the clock"))
+        .unwrap();
+    assert!(session.presentation_screen().is_some());
+
+    session.transport.source = Cursor::new(b"26hframe\x1b[?2026$p");
+    session.transport.write_budget = usize::MAX;
+    session.pump_with_clock(|| start).unwrap();
+    let deadline = start + SYNCHRONIZED_OUTPUT_TIMEOUT;
+    assert_eq!(session.presentation_deadline(), Some(deadline));
+    assert!(session.presentation_screen().is_none());
+    assert_eq!(session.transport.written, b"\x1b[?2026;1$y");
+
+    session.transport.source = Cursor::new(b"\x1b[?2026h\x1b[?2026l\x1b[?2026h");
+    session
+        .pump_with_clock(|| deadline - Duration::from_millis(1))
+        .unwrap();
+    assert_eq!(session.presentation_deadline(), Some(deadline));
+
+    session.transport.source = Cursor::new(b"\x1b[?2026$p");
+    session.pump_with_clock(|| deadline).unwrap();
+    assert!(session.presentation_deadline().is_none());
+    let screen = session.presentation_screen().unwrap();
+    assert_eq!(
+        screen.grid().row(0).unwrap().text(4),
+        Some(CellText::Scalar('e'))
+    );
+    assert_eq!(session.transport.source.position(), 0);
+    session.pump_with_clock(|| deadline).unwrap();
+    assert_eq!(session.transport.written, b"\x1b[?2026;1$y\x1b[?2026;2$y");
+}
+
+#[test]
+fn synchronized_output_releases_on_explicit_end_and_pty_eof() {
+    let now = Instant::now();
+    let mut session = session(b"\x1b[?2026ha");
+    session.pump_with_clock(|| now).unwrap();
+    assert!(session.presentation_screen().is_none());
+    session.transport.source = Cursor::new(b"b\x1b[?2026l");
+    session.pump_with_clock(|| now).unwrap();
+    assert!(session.presentation_deadline().is_none());
+    let screen = session.presentation_screen().unwrap();
+    assert_eq!(
+        screen.grid().row(0).unwrap().text(1),
+        Some(CellText::Scalar('b'))
+    );
+
+    session.transport.source = Cursor::new(b"\x1b[?2026h\xc2");
+    session.transport.hung_up = true;
+    session.pump_with_clock(|| now).unwrap();
+    assert!(session.presentation_screen().is_none());
+    session.pump_with_clock(|| now).unwrap();
+    assert!(session.is_finished());
+    assert!(!session.processor().synchronized_output());
+    let screen = session.presentation_screen().unwrap();
+    assert_eq!(
+        screen.grid().row(0).unwrap().text(2),
+        Some(CellText::Scalar('\u{fffd}'))
+    );
+}
+
+#[test]
 fn queued_key_keeps_its_encoding_across_a_mode_change() {
     let mut session = session(b"\x1b[?1h");
     session.pump().unwrap();
@@ -145,6 +209,108 @@ fn queued_key_keeps_its_encoding_across_a_mode_change() {
     );
     session.pump().unwrap();
     assert_eq!(session.transport.written, b"\x1bOA\x1b[A\x1b\x03");
+}
+
+#[test]
+fn queued_mouse_report_finishes_before_a_reply_from_new_modes() {
+    let mut session = session(b"\x1b[?1000;1004;1006h");
+    assert!(!session.queue_focus(true).unwrap());
+    session.pump().unwrap();
+    session.transport.write_budget = usize::MAX;
+    assert!(session.queue_focus(true).unwrap());
+    session.pump().unwrap();
+
+    let cell = CellPosition { row: 1, column: 2 };
+    let shift = Modifiers {
+        shift: true,
+        ..Modifiers::default()
+    };
+    assert!(
+        session
+            .queue_mouse(MouseEvent::Press(MouseButton::Left), cell, None, shift)
+            .unwrap()
+    );
+    session.transport.source = Cursor::new(b"\x1b[?1004;1006l\x1b[6n");
+    session.transport.write_budget = 1;
+    session.pump().unwrap();
+    assert_eq!(session.transport.written, b"\x1b[I\x1b");
+    assert_eq!(
+        session.queue_focus(false).unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
+
+    session.transport.write_budget = usize::MAX;
+    session.pump().unwrap();
+    assert!(!session.queue_focus(false).unwrap());
+    assert!(
+        session
+            .queue_mouse(
+                MouseEvent::Release(MouseButton::Left),
+                cell,
+                None,
+                Modifiers::default()
+            )
+            .unwrap()
+    );
+    session.pump().unwrap();
+    assert_eq!(
+        session.transport.written,
+        b"\x1b[I\x1b[<4;3;2M\x1b[1;1R\x1b[M##\""
+    );
+}
+
+#[test]
+fn pixel_mouse_uses_content_bounds_and_tracking_takes_precedence_over_alternate_scroll() {
+    let mut session = session(b"\x1b[?1;1007;1016h");
+    session.size.pixel_width = 64;
+    session.size.pixel_height = 48;
+    session.transport.write_budget = usize::MAX;
+    session.pump().unwrap();
+    let cell = CellPosition { row: 2, column: 7 };
+    let modifiers = Modifiers::default();
+    assert!(
+        !session
+            .queue_mouse(MouseEvent::WheelUp, cell, None, modifiers)
+            .unwrap()
+    );
+
+    session.transport.source = Cursor::new(b"\x1b[?1049h");
+    session.pump().unwrap();
+    assert!(
+        session
+            .queue_mouse(MouseEvent::WheelUp, cell, None, modifiers)
+            .unwrap()
+    );
+    session.pump().unwrap();
+
+    session.transport.source = Cursor::new(b"\x1b[?1000h");
+    session.pump().unwrap();
+    for (cell, pixel) in [
+        (cell, None),
+        (cell, Some(PixelPosition { x: 64, y: 47 })),
+        (
+            CellPosition { row: 2, column: 8 },
+            Some(PixelPosition { x: 63, y: 47 }),
+        ),
+    ] {
+        assert!(
+            !session
+                .queue_mouse(MouseEvent::WheelDown, cell, pixel, modifiers)
+                .unwrap()
+        );
+    }
+    assert!(
+        session
+            .queue_mouse(
+                MouseEvent::WheelDown,
+                cell,
+                Some(PixelPosition { x: 63, y: 47 }),
+                modifiers
+            )
+            .unwrap()
+    );
+    session.pump().unwrap();
+    assert_eq!(session.transport.written, b"\x1bOA\x1b[<65;64;48M");
 }
 
 #[test]

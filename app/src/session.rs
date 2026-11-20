@@ -3,14 +3,17 @@ use std::num::NonZeroU32;
 use std::ops::Range;
 use std::os::fd::{AsFd, BorrowedFd};
 use std::process::{Command, ExitStatus};
+use std::time::{Duration, Instant};
 
 use lune_pty::{Pty, PtySize};
 use lune_terminal::{
-    Key, KeySequence, MAX_STYLES, Modifiers, Palette, PixelSize, ProcessFailure, Processor, Screen,
+    CellPosition, Key, KeySequence, MAX_STYLES, Modifiers, MouseEvent, MouseFormat, MouseSequence,
+    MouseTracking, Palette, PixelPosition, PixelSize, ProcessFailure, Processor, Screen,
     StorageError, StyleError, StyleId, TextSink, UnicodeWriter,
 };
 
 const READ_BYTES: usize = 16 * 1024;
+const SYNCHRONIZED_OUTPUT_TIMEOUT: Duration = Duration::from_millis(150);
 pub const MAX_INPUT_BYTES: usize = 16 * 1024;
 const PASTE_WRITE_BYTES: usize = MAX_INPUT_BYTES;
 pub const MAX_PASTE_BYTES: usize = 1024 * 1024;
@@ -47,6 +50,7 @@ pub struct Session<T = Pty> {
     write_closed: bool,
     read_closed: bool,
     finished: bool,
+    presentation_deadline: Option<Instant>,
 }
 
 impl Session<Pty> {
@@ -128,11 +132,22 @@ impl<T: Read + Write> Session<T> {
             write_closed: false,
             read_closed: false,
             finished: false,
+            presentation_deadline: None,
         }
     }
 
     pub fn screen(&self) -> &Screen {
         &self.screen
+    }
+
+    /// The live screen when it is ready for presentation.
+    pub fn presentation_screen(&self) -> Option<&Screen> {
+        self.presentation_deadline.is_none().then_some(&self.screen)
+    }
+
+    /// When to pump again to release a synchronized frame, even if the PTY is idle.
+    pub fn presentation_deadline(&self) -> Option<Instant> {
+        self.presentation_deadline
     }
 
     pub fn processor(&self) -> &Processor {
@@ -167,8 +182,7 @@ impl<T: Read + Write> Session<T> {
             return Err(io::ErrorKind::InvalidInput.into());
         }
         self.check_input_ready()?;
-        self.outgoing[..bytes.len()].copy_from_slice(bytes);
-        self.outgoing_bytes = 0..bytes.len();
+        self.stage_input(bytes);
         Ok(())
     }
 
@@ -203,6 +217,60 @@ impl<T: Read + Write> Session<T> {
         }
         self.queue_input(sequence.as_bytes())?;
         Ok(true)
+    }
+
+    /// Queues a focus transition when focus reporting is enabled.
+    pub fn queue_focus(&mut self, focused: bool) -> io::Result<bool> {
+        self.check_input_ready()?;
+        Ok(self.stage_report(self.processor.input_modes().encode_focus(focused)))
+    }
+
+    /// Queues a pointer report or an alternate-screen wheel key.
+    /// Pixel reports require a position inside the committed content size.
+    /// Returns false when the event produces no report.
+    pub fn queue_mouse(
+        &mut self,
+        event: MouseEvent,
+        cell: CellPosition,
+        pixel: Option<PixelPosition>,
+        modifiers: Modifiers,
+    ) -> io::Result<bool> {
+        self.check_input_ready()?;
+        if cell.row >= usize::from(self.size.rows) || cell.column >= usize::from(self.size.columns)
+        {
+            return Ok(false);
+        }
+        let modes = self.processor.input_modes();
+        if modes.mouse_tracking == MouseTracking::Disabled {
+            let key = modes.encode_alternate_scroll(event, self.screen.active_buffer());
+            return Ok(self.stage_report(key.as_ref().map(KeySequence::as_bytes)));
+        }
+        let report = if modes.mouse_format == MouseFormat::SgrPixels {
+            let Some(pixel) = pixel.filter(|position| {
+                position.x < u32::from(self.size.pixel_width)
+                    && position.y < u32::from(self.size.pixel_height)
+            }) else {
+                return Ok(false);
+            };
+            modes.encode_pixel_mouse(event, pixel, modifiers)
+        } else {
+            modes.encode_mouse(event, cell, modifiers)
+        };
+        Ok(self.stage_report(report.as_ref().map(MouseSequence::as_bytes)))
+    }
+
+    fn stage_report(&mut self, report: Option<&[u8]>) -> bool {
+        if let Some(bytes) = report {
+            self.stage_input(bytes);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn stage_input(&mut self, bytes: &[u8]) {
+        self.outgoing[..bytes.len()].copy_from_slice(bytes);
+        self.outgoing_bytes = 0..bytes.len();
     }
 
     /// Queues up to `MAX_PASTE_BYTES` of text with the current framing.
@@ -254,10 +322,33 @@ impl<T: Read + Write> Session<T> {
     /// Writes at most 16 KiB of paste data and reads at most one chunk.
     /// Use level-triggered notifications and also pump on hangup.
     pub fn pump(&mut self) -> io::Result<()> {
+        self.pump_with_clock(Instant::now)
+    }
+
+    fn pump_with_clock(&mut self, now: impl Fn() -> Instant) -> io::Result<()> {
         if self.finished {
             return Ok(());
         }
+        if self
+            .presentation_deadline
+            .is_some_and(|deadline| now() >= deadline)
+        {
+            self.processor.end_synchronized_output();
+            self.presentation_deadline = None;
+            return Ok(());
+        }
 
+        let result = self.pump_pty();
+        if self.processor.synchronized_output() {
+            self.presentation_deadline
+                .get_or_insert_with(|| now() + SYNCHRONIZED_OUTPUT_TIMEOUT);
+        } else {
+            self.presentation_deadline = None;
+        }
+        result
+    }
+
+    fn pump_pty(&mut self) -> io::Result<()> {
         let mut writable = self.flush_output()?;
         self.apply_input(&mut writable)?;
         if self.incoming_bytes.is_some() {
@@ -279,6 +370,7 @@ impl<T: Read + Write> Session<T> {
             }
             self.read_closed = true;
             self.write_closed = true;
+            self.processor.end_synchronized_output();
             self.flush_output()?;
         }
 
