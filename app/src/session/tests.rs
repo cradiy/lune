@@ -108,6 +108,78 @@ fn hangup_drains_child_output_and_finalizes_an_incomplete_scalar() {
 }
 
 #[test]
+fn queued_key_keeps_its_encoding_across_a_mode_change() {
+    let mut session = session(b"\x1b[?1h");
+    session.pump().unwrap();
+    let modifiers = Modifiers::default();
+    assert!(session.queue_key(Key::Up, modifiers, false).unwrap());
+
+    session.transport.source = Cursor::new(b"\x1b[?1;8l");
+    session.pump().unwrap();
+    assert_eq!(session.transport.written, b"\x1b");
+    assert!(!session.queue_key(Key::Up, modifiers, true).unwrap());
+    assert_eq!(
+        session
+            .queue_key(Key::Up, modifiers, false)
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::WouldBlock
+    );
+
+    session.transport.write_budget = usize::MAX;
+    session.pump().unwrap();
+    assert!(session.queue_key(Key::Up, modifiers, false).unwrap());
+    session.pump().unwrap();
+    assert!(
+        session
+            .queue_character(
+                'c',
+                Modifiers {
+                    alt: true,
+                    control: true,
+                    ..modifiers
+                },
+                false
+            )
+            .unwrap()
+    );
+    session.pump().unwrap();
+    assert_eq!(session.transport.written, b"\x1bOA\x1b[A\x1b\x03");
+}
+
+#[test]
+fn large_bracketed_paste_spans_pumps_without_interleaving_replies() {
+    let mut session = session(b"\x1b[?2004h");
+    session.pump().unwrap();
+    let payload = "水\r\n".repeat(PASTE_WRITE_BYTES / 5 + 4);
+    session.queue_paste(&payload).unwrap();
+    session.transport.source = Cursor::new(b"\x1b[?2004l\x1b[6n\x1b[6n");
+    session.pump().unwrap();
+    assert_eq!(session.transport.written, b"\x1b");
+    assert!(!session.wants_read());
+    assert_eq!(
+        session.queue_paste("next").unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
+
+    session.transport.write_budget = usize::MAX;
+    session.pump().unwrap();
+    assert_eq!(session.transport.written.len(), 1 + PASTE_WRITE_BYTES);
+    assert!(session.wants_write());
+    session.pump().unwrap();
+    assert!(session.wants_read());
+    assert!(!session.wants_write());
+
+    session.queue_paste("水").unwrap();
+    session.pump().unwrap();
+    let mut expected = b"\x1b[200~".to_vec();
+    expected.extend_from_slice(payload.as_bytes());
+    expected.extend_from_slice(b"\x1b[201~\x1b[1;1R\x1b[1;1R");
+    expected.extend_from_slice("水".as_bytes());
+    assert_eq!(session.transport.written, expected);
+}
+
+#[test]
 fn child_observes_committed_grid_and_pixel_resizes() {
     let mut child = Command::new("sh");
     child.args([

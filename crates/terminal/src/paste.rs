@@ -56,6 +56,19 @@ impl<'a> Paste<'a> {
         matches!(self.stage, Stage::Done)
     }
 
+    /// Unsent byte count across the payload and any remaining markers.
+    #[inline]
+    pub fn remaining_bytes(&self) -> usize {
+        match self.stage {
+            Stage::Start => START.len() - self.offset + self.payload.len() + END.len(),
+            Stage::Payload => {
+                self.payload.len() - self.offset + if self.bracketed { END.len() } else { 0 }
+            }
+            Stage::End => END.len() - self.offset,
+            Stage::Done => 0,
+        }
+    }
+
     /// Acknowledges current-chunk bytes, including partial UTF-8 scalars.
     /// Oversized counts fail unchanged; zero succeeds without advancing.
     #[inline]
