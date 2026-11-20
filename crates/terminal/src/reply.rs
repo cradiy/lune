@@ -401,6 +401,7 @@ pub(crate) enum SizeReport {
     TextArea { rows: u16, columns: u16 },
     TextAreaPixels(PixelSize),
     CellPixels(PixelSize),
+    Resize(ResizeReport),
 }
 
 impl SizeReport {
@@ -410,7 +411,43 @@ impl SizeReport {
             Self::TextArea { rows, columns } => reply.text_area_size(rows, columns),
             Self::TextAreaPixels(size) => reply.pixel_size(b"\x1b[4;", size),
             Self::CellPixels(size) => reply.pixel_size(b"\x1b[6;", size),
+            Self::Resize(size) => size.encode(reply),
         }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ResizeReport {
+    rows: u16,
+    columns: u16,
+    pixels: Option<PixelSize>,
+}
+
+impl ResizeReport {
+    pub(crate) fn capture(screen: &Screen, pixels: Option<PixelSize>) -> Self {
+        let grid = screen.grid();
+        Self {
+            rows: u16::try_from(grid.rows()).expect("Rows fit the protocol bounds"),
+            columns: u16::try_from(grid.columns()).expect("Columns fit the protocol bounds"),
+            pixels,
+        }
+    }
+
+    #[cold]
+    pub(crate) fn encode(self, reply: &mut Reply) {
+        let (height, width) = self
+            .pixels
+            .map_or((0, 0), |size| (size.height.get(), size.width.get()));
+        reply.clear();
+        reply.append(b"\x1b[48;");
+        reply.number(self.rows);
+        reply.append(b";");
+        reply.number(self.columns);
+        reply.append(b";");
+        reply.decimal::<10>(height);
+        reply.append(b";");
+        reply.decimal::<10>(width);
+        reply.append(b"t");
     }
 }
 
@@ -454,6 +491,7 @@ pub(crate) fn mode_query(
     auto_repeat: bool,
     synchronized_output: bool,
     color_scheme_notifications: bool,
+    resize_reporting: bool,
     sequence: ControlSequence<'_>,
 ) -> Option<ModeReport> {
     let private = match sequence.private_markers {
@@ -498,6 +536,7 @@ pub(crate) fn mode_query(
         (true, 2004) => Some(input.bracketed_paste),
         (true, 2026) => Some(synchronized_output),
         (true, 2031) => Some(color_scheme_notifications),
+        (true, 2048) => Some(resize_reporting),
         _ => None,
     };
     Some(ModeReport {

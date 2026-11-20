@@ -102,7 +102,7 @@ fn drive(wire: &[u8], chunk: usize, fail_at: usize, expected: &Expected<'_>) {
     let mut screen = Screen::new(8, 4).unwrap();
     let mut processor = support::processor();
     processor.set_color_scheme(expected.color_scheme);
-    processor.set_pixel_sizes(expected.pixel_sizes[0], expected.pixel_sizes[1]);
+    processor.update_geometry(&screen, expected.pixel_sizes[0], expected.pixel_sizes[1]);
     let mut calls = 0;
     let mut available = false;
     let mut replies = Vec::new();
@@ -380,6 +380,7 @@ fuzz_target!(|data: &[u8]| {
     let mut auto_repeat = true;
     let mut synchronized_output = false;
     let mut color_scheme_notifications = false;
+    let mut resize_reporting = false;
     let color_scheme = match data.first().copied().unwrap_or(0) % 3 {
         0 => None,
         1 => Some(ColorScheme::Dark),
@@ -656,6 +657,7 @@ fuzz_target!(|data: &[u8]| {
                     auto_repeat = true;
                     synchronized_output = false;
                     color_scheme_notifications = false;
+                    resize_reporting = false;
                     Some(Command::Reset)
                 } else {
                     wire.extend(b"\x1b[!p");
@@ -1104,7 +1106,16 @@ fuzz_target!(|data: &[u8]| {
             }
             55 | 56 => {
                 let enabled = bytes[1] & 1 != 0;
-                let mode = if bytes[1] & 32 != 0 {
+                let mode = if bytes[1] & 64 != 0 {
+                    resize_reporting = enabled;
+                    if enabled {
+                        let (rows, columns) = expected.text_area_size();
+                        let (height, width) = pixel_sizes[0]
+                            .map_or((0, 0), |size| (size.height.get(), size.width.get()));
+                        write!(&mut replies, "\x1b[48;{rows};{columns};{height};{width}t").unwrap();
+                    }
+                    2048
+                } else if bytes[1] & 32 != 0 {
                     synchronized_output = enabled;
                     2026
                 } else if bytes[1] & 16 != 0 {
@@ -1212,8 +1223,8 @@ fuzz_target!(|data: &[u8]| {
                     let private = bytes[1] & 2 != 0;
                     let selector = [
                         0, 1, 4, 5, 6, 7, 8, 12, 20, 25, 47, 66, 67, 1000, 1002, 1003, 1004, 1006,
-                        1007, 1016, 1047, 1048, 1049, 2004, 2026, 2031, 65535,
-                    ][usize::from(bytes[2] % 27)];
+                        1007, 1016, 1047, 1048, 1049, 2004, 2026, 2031, 2048, 65535,
+                    ][usize::from(bytes[2] % 28)];
                     let enabled = match (private, selector) {
                         (false, 20) => Some(input.new_line),
                         (true, 1) => Some(input.application_cursor),
@@ -1230,6 +1241,7 @@ fuzz_target!(|data: &[u8]| {
                         (true, 2004) => Some(input.bracketed_paste),
                         (true, 2026) => Some(synchronized_output),
                         (true, 2031) => Some(color_scheme_notifications),
+                        (true, 2048) => Some(resize_reporting),
                         _ => expected.mode(private, selector),
                     };
                     let status = match enabled {

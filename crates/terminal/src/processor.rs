@@ -6,13 +6,16 @@ use crate::charsets::Charsets;
 use crate::dcs::Dcs;
 use crate::osc::{Osc, Outcome};
 use crate::rendition_stack::RenditionStack;
-use crate::reply::{self, ColorReport, ModeReport, Reply, Report, SizeReport, StatusReport};
+use crate::reply::{
+    self, ColorReport, ModeReport, Reply, Report, ResizeReport, SizeReport, StatusReport,
+};
 use crate::{
     ColorScheme, CursorShape, EraseMode, InputModes, MouseFormat, Palette, PixelSize, Rgb, Screen,
     ScreenBuffer, StorageError, Style, StyleError, StyleId, StyleTable, TextSink,
 };
 
-const PENDING_CAPACITY: usize = 3;
+const INPUT_PENDING_CAPACITY: usize = 2;
+const PENDING_CAPACITY: usize = INPUT_PENDING_CAPACITY + 2;
 
 /// A failure while applying a completed text, screen, rendition, or reply event.
 #[derive(Debug)]
@@ -82,12 +85,27 @@ enum Pending {
     Rendition(Style),
     PopRendition,
     Reply(Report),
-    ColorSchemeNotice(Report),
+    HostNotice(HostNotice),
     ModeReply(ModeReport),
     StatusReply(StatusReport),
     ColorReply(ColorReport),
     OscReplies,
     SizeReply(SizeReport),
+}
+
+#[derive(Clone, Copy)]
+enum HostNotice {
+    ColorScheme(ColorScheme),
+    Resize(ResizeReport),
+}
+
+impl HostNotice {
+    fn encode(self, reply: &mut Reply) {
+        match self {
+            Self::ColorScheme(scheme) => Report::ColorScheme(scheme).encode(reply),
+            Self::Resize(size) => size.encode(reply),
+        }
+    }
 }
 
 struct State {
@@ -107,6 +125,7 @@ struct State {
     dcs: Dcs,
     text_area_pixels: Option<PixelSize>,
     cell_pixels: Option<PixelSize>,
+    resize_reporting: Option<ResizeReport>,
 }
 
 impl State {
@@ -127,6 +146,7 @@ impl State {
             dcs: Dcs::default(),
             text_area_pixels: None,
             cell_pixels: None,
+            resize_reporting: None,
         }
     }
 
@@ -141,6 +161,7 @@ impl State {
         self.auto_repeat = true;
         self.synchronized_output = false;
         self.color_scheme_notifications = false;
+        self.resize_reporting = None;
         self.osc.reset();
         self.dcs = Dcs::default();
     }
@@ -167,8 +188,8 @@ impl State {
 /// closures supply complete units through the same sink contract.
 ///
 /// A byte can complete a replacement and a second text/control/boundary event.
-/// Two slots retain input events across writer failures. A third can hold a host
-/// color scheme notification. Rendition changes use a bounded, owned style table.
+/// Two slots retain input events across writer failures. Two more retain the
+/// latest pending host color scheme and resize notices.
 /// Include retained screen/rendering snapshots when collecting style storage.
 /// Screen edits use keys from this processor's table; callbacks receive the
 /// current key.
@@ -233,11 +254,24 @@ impl Processor {
         self.state.synchronized_output = false;
     }
 
-    /// Supplies the text-area and character-cell sizes for CSI 14 t and CSI 16 t.
-    /// Each `None` suppresses its reply. Host sizes persist across terminal resets.
-    pub fn set_pixel_sizes(&mut self, text_area: Option<PixelSize>, cell: Option<PixelSize>) {
+    /// Publishes committed screen dimensions and optional pixel sizes.
+    /// Call after the host has applied a resize. Size queries read these pixel
+    /// sizes, and subscribed applications receive changes to the text area.
+    pub fn update_geometry(
+        &mut self,
+        screen: &Screen,
+        text_area: Option<PixelSize>,
+        cell: Option<PixelSize>,
+    ) {
         self.state.text_area_pixels = text_area;
         self.state.cell_pixels = cell;
+        if let Some(previous) = self.state.resize_reporting {
+            let size = ResizeReport::capture(screen, text_area);
+            if size != previous {
+                self.state.resize_reporting = Some(size);
+                self.queue_host_notice(HostNotice::Resize(size));
+            }
+        }
     }
 
     /// Current OSC 0/2 window title, initially empty. Valid UTF-8 payloads up to
@@ -306,27 +340,43 @@ impl Processor {
 
     #[cold]
     fn queue_color_scheme_notice(&mut self, scheme: Option<ColorScheme>) {
-        let notice = scheme.map(Report::ColorScheme);
-        if self.head < self.end
-            && matches!(
-                self.pending[self.end - 1],
-                Some(Pending::ColorSchemeNotice(_))
-            )
-        {
-            self.pending[self.end - 1] = notice.map(Pending::ColorSchemeNotice);
-            if notice.is_none() {
-                self.end -= 1;
-                if self.head == self.end {
-                    self.head = 0;
-                    self.end = 0;
-                }
-            }
-        } else if let Some(notice) = notice {
-            if self.head == self.end && self.reply.is_empty() {
-                notice.encode(&mut self.reply);
-            } else {
-                self.pending[self.end] = Some(Pending::ColorSchemeNotice(notice));
-                self.end += 1;
+        if let Some(scheme) = scheme {
+            self.queue_host_notice(HostNotice::ColorScheme(scheme));
+        } else {
+            self.remove_host_notice(|notice| matches!(notice, HostNotice::ColorScheme(_)));
+        }
+    }
+
+    #[cold]
+    fn queue_host_notice(&mut self, notice: HostNotice) {
+        self.remove_host_notice(|queued| {
+            std::mem::discriminant(&queued) == std::mem::discriminant(&notice)
+        });
+        if self.head == self.end && self.reply.is_empty() {
+            notice.encode(&mut self.reply);
+            return;
+        }
+        if self.end == PENDING_CAPACITY {
+            debug_assert!(self.head > 0);
+            self.pending.copy_within(self.head..self.end, 0);
+            self.end -= self.head;
+            self.head = 0;
+            self.pending[self.end..].fill(None);
+        }
+        self.pending[self.end] = Some(Pending::HostNotice(notice));
+        self.end += 1;
+    }
+
+    fn remove_host_notice(&mut self, matches: impl Fn(HostNotice) -> bool) {
+        if let Some(index) = (self.head..self.end).find(|&index| {
+            matches!(self.pending[index], Some(Pending::HostNotice(notice)) if matches(notice))
+        }) {
+            self.pending.copy_within(index + 1..self.end, index);
+            self.end -= 1;
+            self.pending[self.end] = None;
+            if self.head == self.end {
+                self.head = 0;
+                self.end = 0;
             }
         }
     }
@@ -361,15 +411,22 @@ impl Processor {
         }
         if self.reply.is_empty()
             && self.head < self.end
-            && let Some(Pending::ColorSchemeNotice(notice)) = self.pending[self.head]
+            && let Some(Pending::HostNotice(notice)) = self.pending[self.head]
         {
-            debug_assert_eq!(self.head + 1, self.end);
-            notice.encode(&mut self.reply);
-            self.pending[self.head] = None;
+            self.publish_host_notice(notice);
+        }
+        true
+    }
+
+    #[cold]
+    fn publish_host_notice(&mut self, notice: HostNotice) {
+        notice.encode(&mut self.reply);
+        self.pending[self.head] = None;
+        self.head += 1;
+        if self.head == self.end {
             self.head = 0;
             self.end = 0;
         }
-        true
     }
 
     /// Resolves keys issued for this processor's screen and retained snapshots.
@@ -615,13 +672,14 @@ impl Processor {
                             state.auto_repeat,
                             state.synchronized_output,
                             state.color_scheme_notifications,
+                            state.resize_reporting.is_some(),
                             sequence,
                         ) {
                             pending[*end] = Some(Pending::ModeReply(reply));
                             *end += 1;
                             true
                         } else {
-                            csi(screen, sequence, state)
+                            execute_csi(screen, sequence, state, pending, end)
                         }
                     } else if matches!(sequence.final_byte, b'c' | b'q' | b't') {
                         if let Some(reply) = size_or_identity_query(screen, state, sequence) {
@@ -629,7 +687,7 @@ impl Processor {
                             *end += 1;
                             true
                         } else {
-                            csi(screen, sequence, state)
+                            execute_csi(screen, sequence, state, pending, end)
                         }
                     } else if sequence.final_byte == b'b' {
                         repeat_sequence(sequence, state.last_graphic, pending, end)
@@ -637,7 +695,7 @@ impl Processor {
                         sequence.intermediates == b"#"
                             && rendition_stack(sequence, state, styles, pending, end)
                     } else {
-                        csi(screen, sequence, state)
+                        execute_csi(screen, sequence, state, pending, end)
                     };
                     state.last_graphic = '\0';
                     if !accepted {
@@ -676,7 +734,7 @@ impl Processor {
                     state.last_graphic = '\0';
                 }
                 if T::STATEFUL {
-                    debug_assert!(self.end < PENDING_CAPACITY - 1);
+                    debug_assert!(self.end < INPUT_PENDING_CAPACITY);
                     self.pending[self.end] = Some(Pending::Boundary);
                     self.end += 1;
                 }
@@ -810,11 +868,17 @@ impl Processor {
                         .pop(&mut self.styles, self.state.style)
                         .map_err(ProcessFailure::Style)?;
                 }
-                Pending::Reply(reply) | Pending::ColorSchemeNotice(reply) => {
+                Pending::Reply(reply) => {
                     if !self.reply.is_empty() {
                         return Err(ProcessFailure::ReplyPending);
                     }
                     reply.encode(&mut self.reply);
+                }
+                Pending::HostNotice(notice) => {
+                    if !self.reply.is_empty() {
+                        return Err(ProcessFailure::ReplyPending);
+                    }
+                    notice.encode(&mut self.reply);
                 }
                 Pending::ModeReply(reply) => {
                     if !self.reply.is_empty() {
@@ -1123,6 +1187,165 @@ fn size_or_identity_query(
     }
 }
 
+#[inline]
+fn execute_csi(
+    screen: &mut Screen,
+    sequence: ControlSequence<'_>,
+    state: &mut State,
+    pending: &mut [Option<Pending>; PENDING_CAPACITY],
+    end: &mut usize,
+) -> bool {
+    if matches!(sequence.final_byte, b'h' | b'l') && sequence.intermediates.is_empty() {
+        set_modes(screen, sequence, state, pending, end)
+    } else {
+        csi(screen, sequence, state)
+    }
+}
+
+fn set_modes(
+    screen: &mut Screen,
+    sequence: ControlSequence<'_>,
+    state: &mut State,
+    pending: &mut [Option<Pending>; PENDING_CAPACITY],
+    end: &mut usize,
+) -> bool {
+    let p = sequence.parameters;
+    if p.iter().any(|p| p.is_subparameter) {
+        return false;
+    }
+    let private = match sequence.private_markers {
+        [] => false,
+        [b'?'] => true,
+        _ => return false,
+    };
+    if p.is_empty()
+        || !p.iter().all(|p| {
+            matches!(
+                (private, p.value),
+                (false, Some(4 | 20))
+                    | (
+                        true,
+                        Some(
+                            1 | 5
+                                | 6
+                                | 7
+                                | 8
+                                | 12
+                                | 25
+                                | 47
+                                | 66
+                                | 67
+                                | 1000
+                                | 1002
+                                | 1003
+                                | 1004
+                                | 1006
+                                | 1007
+                                | 1016
+                                | 1047
+                                | 1048
+                                | 1049
+                                | 2004
+                                | 2026
+                                | 2031
+                                | 2048
+                        )
+                    )
+            )
+        })
+    {
+        return false;
+    }
+    let enabled = sequence.final_byte == b'h';
+    let mut report_resize = false;
+    for parameter in p {
+        match (private, parameter.value) {
+            (false, Some(4)) => screen.set_insert_mode(enabled),
+            (false, Some(20)) => state.input.new_line = enabled,
+            (true, Some(1)) => state.input.application_cursor = enabled,
+            (true, Some(66)) => state.input.application_keypad = enabled,
+            (true, Some(67)) => state.input.backarrow = enabled,
+            (true, Some(2004)) => state.input.bracketed_paste = enabled,
+            (true, Some(2026)) => state.synchronized_output = enabled,
+            (true, Some(2031)) => state.color_scheme_notifications = enabled,
+            (true, Some(2048)) => {
+                if enabled {
+                    report_resize = true;
+                } else {
+                    state.resize_reporting = None;
+                }
+            }
+            (true, Some(1004)) => state.input.focus_reporting = enabled,
+            (true, Some(1007)) => state.input.alternate_scroll = enabled,
+            (true, Some(1006)) => {
+                state.input.mouse_format = if enabled {
+                    MouseFormat::Sgr
+                } else {
+                    MouseFormat::Legacy
+                };
+            }
+            (true, Some(1016)) => {
+                state.input.mouse_format = if enabled {
+                    MouseFormat::SgrPixels
+                } else {
+                    MouseFormat::Legacy
+                };
+            }
+            (true, Some(5)) => screen.set_reverse_video(enabled),
+            (true, Some(6)) => screen.set_origin_mode(enabled),
+            (true, Some(7)) => screen.set_auto_wrap(enabled),
+            (true, Some(8)) => state.auto_repeat = enabled,
+            (true, Some(47 | 1047 | 1049)) => {
+                if parameter.value == Some(1049) && enabled {
+                    save_cursor(screen, state);
+                }
+                if parameter.value == Some(1047)
+                    && !enabled
+                    && screen.active_buffer() == ScreenBuffer::Alternate
+                {
+                    screen.erase_display(EraseMode::All, state.style);
+                }
+                screen.select_buffer(if enabled {
+                    ScreenBuffer::Alternate
+                } else {
+                    ScreenBuffer::Primary
+                });
+                if parameter.value == Some(1049) {
+                    if enabled {
+                        screen.erase_display(EraseMode::All, state.style);
+                    } else {
+                        restore_cursor(screen, state);
+                    }
+                }
+            }
+            (true, Some(1048)) => {
+                if enabled {
+                    save_cursor(screen, state);
+                } else {
+                    restore_cursor(screen, state);
+                }
+            }
+            (true, Some(12 | 25)) => {
+                let mut appearance = screen.cursor_appearance();
+                if parameter.value == Some(12) {
+                    appearance.blinking = enabled;
+                } else {
+                    appearance.visible = enabled;
+                }
+                screen.set_cursor_appearance(appearance);
+            }
+            _ => mouse_mode(&mut state.input, parameter.value.unwrap(), enabled),
+        }
+    }
+    if report_resize {
+        let size = ResizeReport::capture(screen, state.text_area_pixels);
+        state.resize_reporting = Some(size);
+        pending[*end] = Some(Pending::SizeReply(SizeReport::Resize(size)));
+        *end += 1;
+    }
+    true
+}
+
 fn csi(screen: &mut Screen, sequence: ControlSequence<'_>, state: &mut State) -> bool {
     let style = state.style;
     let p = sequence.parameters;
@@ -1158,124 +1381,6 @@ fn csi(screen: &mut Screen, sequence: ControlSequence<'_>, state: &mut State) ->
         appearance.shape = shape;
         appearance.blinking = blinking;
         screen.set_cursor_appearance(appearance);
-        return true;
-    }
-    if matches!(sequence.final_byte, b'h' | b'l') {
-        let private = match sequence.private_markers {
-            [] => false,
-            [b'?'] => true,
-            _ => return false,
-        };
-        if p.is_empty()
-            || !p.iter().all(|p| {
-                matches!(
-                    (private, p.value),
-                    (false, Some(4 | 20))
-                        | (
-                            true,
-                            Some(
-                                1 | 5
-                                    | 6
-                                    | 7
-                                    | 8
-                                    | 12
-                                    | 25
-                                    | 47
-                                    | 66
-                                    | 67
-                                    | 1000
-                                    | 1002
-                                    | 1003
-                                    | 1004
-                                    | 1006
-                                    | 1007
-                                    | 1016
-                                    | 1047
-                                    | 1048
-                                    | 1049
-                                    | 2004
-                                    | 2026
-                                    | 2031
-                            )
-                        )
-                )
-            })
-        {
-            return false;
-        }
-        let enabled = sequence.final_byte == b'h';
-        for parameter in p {
-            match (private, parameter.value) {
-                (false, Some(4)) => screen.set_insert_mode(enabled),
-                (false, Some(20)) => state.input.new_line = enabled,
-                (true, Some(1)) => state.input.application_cursor = enabled,
-                (true, Some(66)) => state.input.application_keypad = enabled,
-                (true, Some(67)) => state.input.backarrow = enabled,
-                (true, Some(2004)) => state.input.bracketed_paste = enabled,
-                (true, Some(2026)) => state.synchronized_output = enabled,
-                (true, Some(2031)) => state.color_scheme_notifications = enabled,
-                (true, Some(1004)) => state.input.focus_reporting = enabled,
-                (true, Some(1007)) => state.input.alternate_scroll = enabled,
-                (true, Some(1006)) => {
-                    state.input.mouse_format = if enabled {
-                        MouseFormat::Sgr
-                    } else {
-                        MouseFormat::Legacy
-                    };
-                }
-                (true, Some(1016)) => {
-                    state.input.mouse_format = if enabled {
-                        MouseFormat::SgrPixels
-                    } else {
-                        MouseFormat::Legacy
-                    };
-                }
-                (true, Some(5)) => screen.set_reverse_video(enabled),
-                (true, Some(6)) => screen.set_origin_mode(enabled),
-                (true, Some(7)) => screen.set_auto_wrap(enabled),
-                (true, Some(8)) => state.auto_repeat = enabled,
-                (true, Some(47 | 1047 | 1049)) => {
-                    if parameter.value == Some(1049) && enabled {
-                        save_cursor(screen, state);
-                    }
-                    if parameter.value == Some(1047)
-                        && !enabled
-                        && screen.active_buffer() == ScreenBuffer::Alternate
-                    {
-                        screen.erase_display(EraseMode::All, state.style);
-                    }
-                    screen.select_buffer(if enabled {
-                        ScreenBuffer::Alternate
-                    } else {
-                        ScreenBuffer::Primary
-                    });
-                    if parameter.value == Some(1049) {
-                        if enabled {
-                            screen.erase_display(EraseMode::All, state.style);
-                        } else {
-                            restore_cursor(screen, state);
-                        }
-                    }
-                }
-                (true, Some(1048)) => {
-                    if enabled {
-                        save_cursor(screen, state);
-                    } else {
-                        restore_cursor(screen, state);
-                    }
-                }
-                (true, Some(12 | 25)) => {
-                    let mut appearance = screen.cursor_appearance();
-                    if parameter.value == Some(12) {
-                        appearance.blinking = enabled;
-                    } else {
-                        appearance.visible = enabled;
-                    }
-                    screen.set_cursor_appearance(appearance);
-                }
-                _ => mouse_mode(&mut state.input, parameter.value.unwrap(), enabled),
-            }
-        }
         return true;
     }
     if !sequence.private_markers.is_empty() {

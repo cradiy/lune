@@ -258,7 +258,7 @@ fn decoded_replacement_control_order_and_writer_failures_retry_across_chunks() {
 }
 
 #[test]
-fn host_notice_waits_for_both_pending_input_events() {
+fn host_notices_wait_for_both_pending_input_events_and_reuse_drained_slots() {
     let mut screen = Screen::new(8, 2).unwrap();
     let mut processor = support::processor();
     let mut sink = FaultSink {
@@ -267,19 +267,30 @@ fn host_notice_waits_for_both_pending_input_events() {
         fail_at: 0,
     };
     processor
-        .advance(b"\x1b[?2031h", &mut screen, &mut sink)
+        .advance(b"\x1b[?2031;2048h", &mut screen, &mut sink)
         .unwrap();
+    assert!(processor.consume_reply(processor.reply_bytes().len()));
     let error = processor
         .advance(b"\xc2\x1b", &mut screen, &mut sink)
         .unwrap_err();
     assert_eq!(error.consumed, 2);
     assert!(matches!(error.error, ProcessFailure::Text(None)));
+    screen.resize(10, 3, StyleId(0)).unwrap();
+    processor.update_geometry(&screen, None, None);
     processor.set_color_scheme(Some(crate::ColorScheme::Light));
     assert!(processor.reply_bytes().is_empty());
 
-    processor.advance(&[], &mut screen, &mut sink).unwrap();
+    let error = processor.advance(&[], &mut screen, &mut sink).unwrap_err();
+    assert!(matches!(error.error, ProcessFailure::ReplyPending));
+    assert_eq!(error.consumed, 0);
     assert_eq!(text(&screen, 0, 0), CellText::Scalar('�'));
+    assert_eq!(processor.reply_bytes(), b"\x1b[48;3;10;0;0t");
+    screen.resize(12, 4, StyleId(0)).unwrap();
+    processor.update_geometry(&screen, None, None);
+    assert!(processor.consume_reply(processor.reply_bytes().len()));
     assert_eq!(processor.reply_bytes(), b"\x1b[?997;2n");
+    assert!(processor.consume_reply(processor.reply_bytes().len()));
+    assert_eq!(processor.reply_bytes(), b"\x1b[48;4;12;0;0t");
 }
 
 #[test]

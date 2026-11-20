@@ -260,7 +260,8 @@ fn pixel_size_queries_capture_host_metrics_and_validate_headers_across_splits() 
     for split in 0..=wire.len() {
         let mut screen = Screen::new(12, 5).unwrap();
         let mut processor = support::processor();
-        processor.set_pixel_sizes(
+        processor.update_geometry(
+            &screen,
             Some(PixelSize {
                 width: NonZeroU32::MAX,
                 height: 65_536.try_into().unwrap(),
@@ -289,14 +290,14 @@ fn blocked_pixel_report_keeps_captured_size_across_host_updates() {
         width: NonZeroU32::new(width).unwrap(),
         height: NonZeroU32::new(height).unwrap(),
     };
-    processor.set_pixel_sizes(Some(size(110, 90)), Some(size(9, 17)));
+    processor.update_geometry(&screen, Some(size(110, 90)), Some(size(9, 17)));
     let wire = b"\x1b[16t\x1b[14t\x1b[14t\x1b[16t";
     let error = processor.advance(wire, &mut screen, &mut text).unwrap_err();
     assert!(matches!(error.error, ProcessFailure::ReplyPending));
     assert_eq!(error.consumed, b"\x1b[16t\x1b[14t".len());
     assert_eq!(processor.reply_bytes(), b"\x1b[6;17;9t");
     assert!(processor.consume_reply(2));
-    processor.set_pixel_sizes(Some(size(120, 100)), None);
+    processor.update_geometry(&screen, Some(size(120, 100)), None);
     let mut output = b"\x1b[".to_vec();
     drain(&mut processor, &mut output);
     drive(
@@ -316,6 +317,93 @@ fn blocked_pixel_report_keeps_captured_size_across_host_updates() {
         &mut output,
     );
     assert_eq!(output, b"\x1b[4;100;120t");
+}
+
+#[test]
+fn resize_subscription_reports_current_size_on_enable_and_committed_changes() {
+    let mut screen = Screen::new(12, 5).unwrap();
+    let mut processor = support::processor();
+    let mut output = Vec::new();
+    let wire = b"\x1b[?2048;65535h\x1b[?2048$p\x1b[?2048h\x1b[?2048h\x1b[?2048$p";
+    for byte in wire {
+        drive(
+            &mut processor,
+            &mut screen,
+            std::slice::from_ref(byte),
+            &mut output,
+        );
+    }
+    assert_eq!(
+        output,
+        b"\x1b[?2048;2$y\x1b[48;5;12;0;0t\x1b[48;5;12;0;0t\x1b[?2048;1$y"
+    );
+    assert_eq!(processor.ignored_sequences(), 1);
+
+    output.clear();
+    let pixels = Some(PixelSize {
+        width: NonZeroU32::new(120).unwrap(),
+        height: NonZeroU32::new(80).unwrap(),
+    });
+    processor.update_geometry(&screen, pixels, None);
+    drain(&mut processor, &mut output);
+    processor.update_geometry(&screen, pixels, pixels);
+    assert!(processor.reply_bytes().is_empty());
+    screen.resize(10, 4, StyleId(0)).unwrap();
+    processor.update_geometry(&screen, pixels, pixels);
+    drain(&mut processor, &mut output);
+    assert_eq!(output, b"\x1b[48;5;12;80;120t\x1b[48;4;10;80;120t");
+
+    output.clear();
+    drive(
+        &mut processor,
+        &mut screen,
+        b"\x1b[?2048l\x1b[?2048$p",
+        &mut output,
+    );
+    processor.update_geometry(&screen, None, None);
+    assert_eq!(output, b"\x1b[?2048;2$y");
+    assert!(processor.reply_bytes().is_empty());
+    output.clear();
+    drive(
+        &mut processor,
+        &mut screen,
+        b"\x1b[?2048h\x1bc\x1b[?2048$p",
+        &mut output,
+    );
+    assert_eq!(output, b"\x1b[48;4;10;0;0t\x1b[?2048;2$y");
+}
+
+#[test]
+fn pending_input_resize_report_precedes_coalesced_host_notices() {
+    let mut screen = Screen::new(12, 5).unwrap();
+    let mut processor = support::processor();
+    let wire = b"\x1b[5n\x1b[?2031;2048h";
+    let error = processor.advance(wire, &mut screen, &mut text).unwrap_err();
+    assert!(matches!(error.error, ProcessFailure::ReplyPending));
+    assert_eq!(error.consumed, wire.len());
+    screen.resize(13, 6, StyleId(0)).unwrap();
+    processor.update_geometry(&screen, None, None);
+    processor.set_color_scheme(Some(ColorScheme::Light));
+    screen.resize(14, 7, StyleId(0)).unwrap();
+    processor.update_geometry(&screen, None, None);
+
+    assert!(processor.consume_reply(2));
+    let mut output = b"\x1b[".to_vec();
+    drain(&mut processor, &mut output);
+    drive(&mut processor, &mut screen, b"", &mut output);
+    assert_eq!(
+        output,
+        b"\x1b[0n\x1b[48;5;12;0;0t\x1b[?997;2n\x1b[48;7;14;0;0t"
+    );
+
+    processor.set_color_scheme(Some(ColorScheme::Dark));
+    processor.set_color_scheme(Some(ColorScheme::Light));
+    screen.resize(15, 8, StyleId(0)).unwrap();
+    processor.update_geometry(&screen, None, None);
+    processor.set_color_scheme(None);
+    output.clear();
+    drain(&mut processor, &mut output);
+    assert_eq!(output, b"\x1b[?997;1n\x1b[48;8;15;0;0t");
 }
 
 #[test]
