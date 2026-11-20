@@ -1,4 +1,4 @@
-use std::{error::Error, fmt};
+use std::{collections::TryReserveError, error::Error, fmt};
 
 use lune_vt::{ControlSequence, EscapeSequence, Event, OscEvent, Parameter, Parser};
 
@@ -17,12 +17,14 @@ use crate::{
 const INPUT_PENDING_CAPACITY: usize = 2;
 const PENDING_CAPACITY: usize = INPUT_PENDING_CAPACITY + 2;
 
-/// A failure while applying a completed text, screen, rendition, or reply event.
+/// A failure while applying a completed terminal event.
 #[derive(Debug)]
 pub enum ProcessFailure<E> {
     Text(E),
     Screen(StorageError),
     Style(StyleError),
+    /// A window title push is waiting for storage.
+    Title(TryReserveError),
     /// A completed reply is waiting for the occupied output slot. Drain
     /// [`Processor::reply_bytes`] and confirm delivery with [`Processor::consume_reply`].
     ReplyPending,
@@ -34,6 +36,7 @@ impl<E: fmt::Display> fmt::Display for ProcessFailure<E> {
             Self::Text(error) => write!(f, "Text processing failed: {error}"),
             Self::Screen(error) => error.fmt(f),
             Self::Style(error) => error.fmt(f),
+            Self::Title(error) => write!(f, "Title storage allocation failed: {error}"),
             Self::ReplyPending => f.write_str("Reply output requires draining"),
         }
     }
@@ -45,6 +48,7 @@ impl<E: Error + 'static> Error for ProcessFailure<E> {
             Self::Text(error) => Some(error),
             Self::Screen(error) => Some(error),
             Self::Style(error) => Some(error),
+            Self::Title(error) => Some(error),
             Self::ReplyPending => None,
         }
     }
@@ -91,6 +95,8 @@ enum Pending {
     ColorReply(ColorReport),
     OscReplies,
     SizeReply(SizeReport),
+    PushTitle,
+    PopTitle,
 }
 
 #[derive(Clone, Copy)]
@@ -682,8 +688,8 @@ impl Processor {
                             execute_csi(screen, sequence, state, pending, end)
                         }
                     } else if matches!(sequence.final_byte, b'c' | b'q' | b't') {
-                        if let Some(reply) = size_or_identity_query(screen, state, sequence) {
-                            pending[*end] = Some(reply);
+                        if let Some(action) = window_or_identity_action(screen, state, sequence) {
+                            pending[*end] = Some(action);
                             *end += 1;
                             true
                         } else {
@@ -904,6 +910,8 @@ impl Processor {
                     }
                     reply.encode(&mut self.reply);
                 }
+                Pending::PushTitle => self.state.osc.push_title().map_err(ProcessFailure::Title)?,
+                Pending::PopTitle => self.state.osc.pop_title(),
                 Pending::OscReplies => {
                     if !self.reply.is_empty() {
                         return Err(ProcessFailure::ReplyPending);
@@ -1175,15 +1183,34 @@ fn rendition_stack(
 }
 
 #[cold]
-fn size_or_identity_query(
+fn window_or_identity_action(
     screen: &Screen,
     state: &State,
     sequence: ControlSequence<'_>,
 ) -> Option<Pending> {
     match sequence.final_byte {
         b't' => reply::size_query(screen, sequence, state.text_area_pixels, state.cell_pixels)
-            .map(Pending::SizeReply),
+            .map(Pending::SizeReply)
+            .or_else(|| title_stack_action(sequence)),
         _ => reply::identity_query(sequence).map(Pending::Reply),
+    }
+}
+
+fn title_stack_action(sequence: ControlSequence<'_>) -> Option<Pending> {
+    let parameters = sequence.parameters;
+    if !sequence.private_markers.is_empty()
+        || !sequence.intermediates.is_empty()
+        || parameters.len() > 3
+        || parameters.iter().any(|parameter| parameter.is_subparameter)
+        || !matches!(value(parameters, 1, 0), 0 | 2)
+        || value(parameters, 2, 0) != 0
+    {
+        return None;
+    }
+    match value(parameters, 0, 0) {
+        22 => Some(Pending::PushTitle),
+        23 => Some(Pending::PopTitle),
+        _ => None,
     }
 }
 

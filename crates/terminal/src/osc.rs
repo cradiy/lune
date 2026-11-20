@@ -1,3 +1,5 @@
+use std::collections::{TryReserveError, VecDeque};
+
 use lune_vt::{OscEvent, OscTerminator};
 
 use crate::reply::{ColorReport, ColorTarget};
@@ -5,6 +7,7 @@ use crate::{Palette, PaletteEntry, Rgb};
 
 /// Maximum UTF-8 byte length of an OSC 0/2 window title.
 pub const MAX_TITLE_BYTES: usize = 4096;
+pub(crate) const MAX_SAVED_TITLES: usize = 10;
 /// Maximum encoded byte length of an OSC 7 working directory URI.
 pub const MAX_WORKING_DIRECTORY_URI_BYTES: usize = MAX_TITLE_BYTES;
 const MAX_COLOR_BYTES: usize = 18;
@@ -52,6 +55,7 @@ pub(crate) struct Osc {
     active: usize,
     phase: Phase,
     changed: bool,
+    saved_titles: VecDeque<Vec<u8>>,
     palette: Palette,
     palette_changed: bool,
     operations: [Operation; MAX_OSC_PALETTE_ENTRIES],
@@ -74,6 +78,7 @@ impl Osc {
             active: 0,
             phase: Phase::Idle,
             changed: false,
+            saved_titles: VecDeque::new(),
             palette,
             palette_changed: false,
             operations: [Operation::Query(0); MAX_OSC_PALETTE_ENTRIES],
@@ -124,6 +129,42 @@ impl Osc {
         std::mem::take(&mut self.changed).then(|| self.title())
     }
 
+    #[cold]
+    pub(crate) fn push_title(&mut self) -> Result<(), TryReserveError> {
+        let title = &self.buffers[self.active][..self.lengths[self.active]];
+        if self.saved_titles.len() == MAX_SAVED_TITLES {
+            let oldest = self
+                .saved_titles
+                .front_mut()
+                .expect("The title stack is full");
+            oldest.try_reserve_exact(title.len().saturating_sub(oldest.len()))?;
+            oldest.clear();
+            oldest.extend_from_slice(title);
+            self.saved_titles.rotate_left(1);
+        } else {
+            self.saved_titles
+                .try_reserve_exact(MAX_SAVED_TITLES - self.saved_titles.len())?;
+            let mut saved = Vec::new();
+            saved.try_reserve_exact(title.len())?;
+            saved.extend_from_slice(title);
+            self.saved_titles.push_back(saved);
+        }
+        Ok(())
+    }
+
+    #[cold]
+    pub(crate) fn pop_title(&mut self) {
+        let Some(title) = self.saved_titles.pop_back() else {
+            return;
+        };
+        let active = &mut self.buffers[self.active];
+        if active[..self.lengths[self.active]] != title {
+            active[..title.len()].copy_from_slice(&title);
+            self.lengths[self.active] = title.len();
+            self.changed = true;
+        }
+    }
+
     pub(crate) fn working_directory_uri(&self) -> Option<&str> {
         (self.directory_length != 0).then(|| {
             std::str::from_utf8(&self.directory[..self.directory_length])
@@ -140,6 +181,7 @@ impl Osc {
         self.directory_length = 0;
         self.changed |= self.lengths[self.active] != 0;
         self.lengths = [0; 2];
+        self.saved_titles.clear();
         self.phase = Phase::Idle;
         self.palette_changed |= self.palette.reset_all();
         self.operation_count = 0;

@@ -484,6 +484,60 @@ fn osc_text_updates_rejection_and_reset_make_no_allocation_requests() {
     assert_eq!(stats.attempts, 0);
 }
 
+#[test]
+fn title_stack_retries_initial_and_full_stack_allocations_in_order() {
+    const SAVED: &str = "a longer saved title";
+    const PUSH: &[u8] = b"\x1b[22;2t";
+    const SUFFIX: &[u8] = b"\x1b]2;temporary\x07\x1b[23;2t";
+
+    for (depth, fail_at) in [(0, 0), (0, 1), (10, 0)] {
+        let mut screen = Screen::new(2, 2).unwrap();
+        let mut processor = support::processor();
+        let mut text = |_: &mut Screen, _: &str, _: StyleId| Ok::<_, ()>(());
+        for index in 0..depth {
+            let wire = format!("\x1b]2;f{index}\x07\x1b[22t");
+            processor
+                .advance(wire.as_bytes(), &mut screen, &mut text)
+                .unwrap();
+        }
+        processor
+            .advance(b"\x1b]2;a longer saved title\x07", &mut screen, &mut text)
+            .unwrap();
+        assert_eq!(processor.take_window_title_change(), Some(SAVED));
+
+        let (result, stats) = allocator::measure(Some(fail_at), || {
+            processor.advance(PUSH, &mut screen, &mut text)
+        });
+        let error = result.unwrap_err();
+        assert!(matches!(error.error, ProcessFailure::Title(_)));
+        assert_eq!(error.consumed, PUSH.len());
+        assert_eq!(stats.failures, 1);
+        let (result, _) = allocator::measure(Some(0), || {
+            processor.advance(SUFFIX, &mut screen, &mut text)
+        });
+        let blocked = result.unwrap_err();
+        assert!(matches!(blocked.error, ProcessFailure::Title(_)));
+        assert_eq!(blocked.consumed, 0);
+        assert_eq!(processor.window_title(), SAVED);
+        assert_eq!(processor.take_window_title_change(), None);
+
+        processor.advance(&[], &mut screen, &mut text).unwrap();
+        let (result, stats) = allocator::measure(Some(0), || {
+            processor.advance(SUFFIX, &mut screen, &mut text)
+        });
+        assert_eq!(result.unwrap(), SUFFIX.len());
+        assert_eq!(stats.attempts, 0);
+        assert_eq!(processor.take_window_title_change(), Some(SAVED));
+        processor
+            .advance(b"\x1b[23t", &mut screen, &mut text)
+            .unwrap();
+        assert_eq!(
+            processor.window_title(),
+            if depth == 0 { SAVED } else { "f9" }
+        );
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct HistorySnapshot {
     rows: Vec<Vec<SnapshotCell>>,

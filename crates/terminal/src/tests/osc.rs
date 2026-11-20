@@ -113,6 +113,55 @@ fn titles_commit_atomically_across_chunks_and_coalesce_until_acknowledged() {
 }
 
 #[test]
+fn title_stack_restores_nested_titles_and_validates_xtwinops() {
+    let wire = "\x1b[22t\x1b]2;outer 水\x07\x1b[22;2t\x1b]0;inner 🌙\x1b\\\x1b[23;1t\x1b[23;2;1t\x1b[?23t\x1b[23:2t";
+    for split in 0..=wire.len() {
+        let mut processor = support::processor();
+        let mut screen = Screen::new(2, 2).unwrap();
+        advance(&mut processor, &mut screen, &wire.as_bytes()[..split]);
+        advance(&mut processor, &mut screen, &wire.as_bytes()[split..]);
+        assert_eq!(processor.take_window_title_change(), Some("inner 🌙"));
+        assert_eq!(processor.ignored_sequences(), 4);
+        advance(&mut processor, &mut screen, b"\x1b[23;0;0t");
+        assert_eq!(processor.take_window_title_change(), Some("outer 水"));
+        advance(&mut processor, &mut screen, b"\x1b[23;2t");
+        assert_eq!(processor.take_window_title_change(), Some(""));
+        advance(&mut processor, &mut screen, b"\x1b[23t");
+        assert_eq!(processor.take_window_title_change(), None);
+    }
+}
+
+#[test]
+fn title_stack_retains_the_newest_entries_and_clears_on_resets() {
+    use crate::osc::MAX_SAVED_TITLES;
+
+    let mut screen = Screen::new(2, 2).unwrap();
+    let mut processor = support::processor();
+    for index in 0..MAX_SAVED_TITLES + 3 {
+        let wire = format!("\x1b]2;saved-{index}\x07\x1b[22t");
+        advance(&mut processor, &mut screen, wire.as_bytes());
+    }
+    assert_eq!(processor.take_window_title_change(), Some("saved-12"));
+    advance(&mut processor, &mut screen, b"\x1b[23t");
+    assert!(processor.take_window_title_change().is_none());
+    for index in (3..MAX_SAVED_TITLES + 2).rev() {
+        advance(&mut processor, &mut screen, b"\x1b[23t");
+        assert_eq!(processor.window_title(), format!("saved-{index}"));
+    }
+    advance(&mut processor, &mut screen, b"\x1b[23t");
+    assert_eq!(processor.window_title(), "saved-3");
+    advance(&mut processor, &mut screen, b"\x1b[22t\x1bc\x1b[23t");
+    assert_eq!(processor.window_title(), "");
+
+    advance(&mut processor, &mut screen, b"\x1b]2;saved\x07\x1b[22t");
+    processor.reset(&mut screen, &mut |_: &mut Screen, _: &str, _: StyleId| {
+        Ok::<_, ()>(())
+    });
+    advance(&mut processor, &mut screen, b"\x1b[23t");
+    assert_eq!(processor.window_title(), "");
+}
+
+#[test]
 fn titles_reject_invalid_and_oversized_commands_without_publishing_prefixes() {
     let mut cases = vec![
         b"2".to_vec(),

@@ -147,6 +147,9 @@ fn drive(wire: &[u8], chunk: usize, fail_at: usize, expected: &Expected<'_>) {
                             panic!("Unexpected screen failure: {error}")
                         }
                         ProcessFailure::Style(error) => panic!("Unexpected style failure: {error}"),
+                        ProcessFailure::Title(error) => {
+                            panic!("Unexpected title allocation failure: {error}")
+                        }
                     }
                     processor.collect_styles(&screen, []).unwrap();
                 }
@@ -161,6 +164,9 @@ fn drive(wire: &[u8], chunk: usize, fail_at: usize, expected: &Expected<'_>) {
             Err(ProcessFailure::Text(())) => {}
             Err(ProcessFailure::Screen(error)) => panic!("Unexpected screen failure: {error}"),
             Err(ProcessFailure::Style(error)) => panic!("Unexpected style failure: {error}"),
+            Err(ProcessFailure::Title(error)) => {
+                panic!("Unexpected title allocation failure: {error}")
+            }
         }
     }
     while !processor.reply_bytes().is_empty() {
@@ -400,6 +406,7 @@ fuzz_target!(|data: &[u8]| {
     let mut replies = Vec::new();
     let mut title = String::new();
     let mut title_changed = false;
+    let mut title_stack = Vec::new();
     let mut directory = None;
     let mut directory_changed = false;
     let base_colors = [
@@ -649,6 +656,7 @@ fuzz_target!(|data: &[u8]| {
                     colors = base_colors;
                     title_changed |= !title.is_empty();
                     title.clear();
+                    title_stack.clear();
                     directory_changed |= directory.take().is_some();
                     saved = [current; 2];
                     renditions.clear();
@@ -714,6 +722,22 @@ fuzz_target!(|data: &[u8]| {
                     _ => {
                         wire.extend(b"\x1b]7;file:///invalid%2x\x07");
                         diagnostics.1 += 1;
+                    }
+                }
+                None
+            }
+            37 if bytes[7] & 8 != 0 => {
+                if bytes[1] & 1 == 0 {
+                    wire.extend(b"\x1b[22;2t");
+                    if title_stack.len() == 10 {
+                        title_stack.remove(0);
+                    }
+                    title_stack.push(title.clone());
+                } else {
+                    wire.extend(b"\x1b[23;2t");
+                    if let Some(restored) = title_stack.pop() {
+                        title_changed |= title != restored;
+                        title = restored;
                     }
                 }
                 None
