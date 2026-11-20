@@ -78,6 +78,7 @@ struct Expected<'a> {
     style: Style,
     input: InputModes,
     auto_repeat: bool,
+    synchronized_output: bool,
     color_scheme: Option<ColorScheme>,
     replies: &'a [u8],
     title: &'a str,
@@ -175,6 +176,10 @@ fn drive(wire: &[u8], chunk: usize, fail_at: usize, expected: &Expected<'_>) {
     );
     assert_eq!(processor.input_modes(), expected.input);
     assert_eq!(processor.auto_repeat_enabled(), expected.auto_repeat);
+    assert_eq!(
+        processor.synchronized_output(),
+        expected.synchronized_output
+    );
     assert_eq!(processor.window_title(), expected.title);
     assert_eq!(
         processor.take_window_title_change(),
@@ -364,6 +369,7 @@ fuzz_target!(|data: &[u8]| {
     let mut saved_charsets = [(charsets, selected); 2];
     let mut input = InputModes::default();
     let mut auto_repeat = true;
+    let mut synchronized_output = false;
     let mut color_scheme_notifications = false;
     let color_scheme = match data.first().copied().unwrap_or(0) % 3 {
         0 => None,
@@ -628,6 +634,7 @@ fuzz_target!(|data: &[u8]| {
                     saved_charsets = [(charsets, selected); 2];
                     input = InputModes::default();
                     auto_repeat = true;
+                    synchronized_output = false;
                     color_scheme_notifications = false;
                     Some(Command::Reset)
                 } else {
@@ -1077,7 +1084,10 @@ fuzz_target!(|data: &[u8]| {
             }
             55 | 56 => {
                 let enabled = bytes[1] & 1 != 0;
-                let mode = if bytes[1] & 16 != 0 {
+                let mode = if bytes[1] & 32 != 0 {
+                    synchronized_output = enabled;
+                    2026
+                } else if bytes[1] & 16 != 0 {
                     color_scheme_notifications = enabled;
                     2031
                 } else if bytes[1] & 8 != 0 {
@@ -1166,8 +1176,8 @@ fuzz_target!(|data: &[u8]| {
                     let private = bytes[1] & 2 != 0;
                     let selector = [
                         0, 1, 4, 5, 6, 7, 8, 12, 20, 25, 47, 66, 67, 1000, 1002, 1003, 1004, 1006,
-                        1047, 1048, 1049, 2004, 2031, 65535,
-                    ][usize::from(bytes[2] % 24)];
+                        1047, 1048, 1049, 2004, 2026, 2031, 65535,
+                    ][usize::from(bytes[2] % 25)];
                     let enabled = match (private, selector) {
                         (false, 20) => Some(input.new_line),
                         (true, 1) => Some(input.application_cursor),
@@ -1180,6 +1190,7 @@ fuzz_target!(|data: &[u8]| {
                         (true, 1004) => Some(input.focus_reporting),
                         (true, 1006) => Some(input.sgr_mouse),
                         (true, 2004) => Some(input.bracketed_paste),
+                        (true, 2026) => Some(synchronized_output),
                         (true, 2031) => Some(color_scheme_notifications),
                         _ => expected.mode(private, selector),
                     };
@@ -1369,6 +1380,7 @@ fuzz_target!(|data: &[u8]| {
         style: current,
         input,
         auto_repeat,
+        synchronized_output,
         color_scheme,
         replies: &replies,
     };

@@ -519,6 +519,7 @@ fn mode_queries_report_defaults_changes_and_unknown_selectors_across_splits() {
         (true, 1047, 2),
         (true, 1049, 2),
         (true, 2004, 2),
+        (true, 2026, 2),
     ] {
         let marker = if private { "?" } else { "" };
         let input = format!(
@@ -572,6 +573,54 @@ fn mode_queries_report_defaults_changes_and_unknown_selectors_across_splits() {
         assert_eq!(super::snapshot(screen.grid()), before);
         assert_eq!(processor.input_modes(), crate::InputModes::default());
     }
+}
+
+#[test]
+fn synchronized_output_keeps_processing_and_releases_on_deadline_or_reset() {
+    let mut screen = Screen::new(8, 4).unwrap();
+    let mut processor = support::processor();
+    let mut output = Vec::new();
+    let wire = b"\x1b[2026h\x1b[?2026;65535h\x1b[?2026";
+    drive(&mut processor, &mut screen, wire, &mut output);
+    assert!(!processor.synchronized_output());
+    assert_eq!(processor.ignored_sequences(), 2);
+
+    let wire = b"htext\x1b[5n\x1b[?2026$p\x1b[?2026$p";
+    let error = processor.advance(wire, &mut screen, &mut text).unwrap_err();
+    assert!(matches!(error.error, ProcessFailure::ReplyPending));
+    assert_eq!(error.consumed, b"htext\x1b[5n\x1b[?2026$p".len());
+    assert!(processor.synchronized_output());
+    assert_eq!(screen.cursor().column, 4);
+    assert_eq!(
+        screen.grid().row(0).unwrap().text(3),
+        Some(crate::CellText::Scalar('t'))
+    );
+
+    processor.end_synchronized_output();
+    assert!(!processor.synchronized_output());
+    drain(&mut processor, &mut output);
+    drive(
+        &mut processor,
+        &mut screen,
+        &wire[error.consumed..],
+        &mut output,
+    );
+    assert_eq!(output, b"\x1b[0n\x1b[?2026;1$y\x1b[?2026;2$y");
+
+    processor
+        .advance(b"\x1b[?2026h\x1b[?2026l", &mut screen, &mut text)
+        .unwrap();
+    assert!(!processor.synchronized_output());
+    processor
+        .advance(b"\x1b[?2026h\x1bc", &mut screen, &mut text)
+        .unwrap();
+    assert!(!processor.synchronized_output());
+    processor
+        .advance(b"\x1b[?2026h", &mut screen, &mut text)
+        .unwrap();
+    assert!(processor.synchronized_output());
+    processor.reset(&mut screen, &mut text);
+    assert!(!processor.synchronized_output());
 }
 
 #[test]

@@ -99,6 +99,7 @@ struct State {
     saved_charsets: [Charsets; 2],
     input: InputModes,
     auto_repeat: bool,
+    synchronized_output: bool,
     color_scheme: Option<ColorScheme>,
     color_scheme_notifications: bool,
     osc: Osc,
@@ -116,6 +117,7 @@ impl State {
             saved_charsets: [Charsets::default(); 2],
             input: InputModes::default(),
             auto_repeat: true,
+            synchronized_output: false,
             color_scheme: None,
             color_scheme_notifications: false,
             osc: Osc::new(palette),
@@ -132,6 +134,7 @@ impl State {
         self.saved_charsets = [Charsets::default(); 2];
         self.input = InputModes::default();
         self.auto_repeat = true;
+        self.synchronized_output = false;
         self.color_scheme_notifications = false;
         self.osc.reset();
         self.dcs = Dcs::default();
@@ -211,6 +214,18 @@ impl Processor {
     /// Whether the input source may deliver repeated keypresses (DECARM).
     pub fn auto_repeat_enabled(&self) -> bool {
         self.state.auto_repeat
+    }
+
+    /// Whether presentation should keep the previous frame (DEC mode 2026).
+    /// Screen mutations and protocol replies continue while this mode is set.
+    pub fn synchronized_output(&self) -> bool {
+        self.state.synchronized_output
+    }
+
+    /// Ends synchronized output when the caller's presentation deadline expires.
+    /// Already queued replies keep their captured values.
+    pub fn end_synchronized_output(&mut self) {
+        self.state.synchronized_output = false;
     }
 
     /// Current OSC 0/2 window title, initially empty. Valid UTF-8 payloads up to
@@ -586,6 +601,7 @@ impl Processor {
                             screen,
                             state.input,
                             state.auto_repeat,
+                            state.synchronized_output,
                             state.color_scheme_notifications,
                             sequence,
                         ) {
@@ -1149,6 +1165,7 @@ fn csi(screen: &mut Screen, sequence: ControlSequence<'_>, state: &mut State) ->
                                     | 1048
                                     | 1049
                                     | 2004
+                                    | 2026
                                     | 2031
                             )
                         )
@@ -1166,6 +1183,7 @@ fn csi(screen: &mut Screen, sequence: ControlSequence<'_>, state: &mut State) ->
                 (true, Some(66)) => state.input.application_keypad = enabled,
                 (true, Some(67)) => state.input.backarrow = enabled,
                 (true, Some(2004)) => state.input.bracketed_paste = enabled,
+                (true, Some(2026)) => state.synchronized_output = enabled,
                 (true, Some(2031)) => state.color_scheme_notifications = enabled,
                 (true, Some(1004)) => state.input.focus_reporting = enabled,
                 (true, Some(5)) => screen.set_reverse_video(enabled),
