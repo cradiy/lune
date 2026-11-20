@@ -637,7 +637,9 @@ fn blocked_replies_retain_captured_positions_and_partial_delivery_until_retry_or
 
 #[test]
 fn fixed_reply_storage_encodes_coordinate_digit_boundaries() {
-    let bounds = [1, 9, 10, 99, 100, 999, 1000, 9999, 10000, 65535];
+    let bounds = [
+        1, 9, 10, 99, 100, 105, 110, 910, 999, 1000, 9999, 10000, 65535,
+    ];
     let mut reply = Reply::default();
     for row in bounds {
         for column in bounds {

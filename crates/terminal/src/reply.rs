@@ -286,6 +286,10 @@ impl Reply {
         if private {
             self.append(b"?");
         }
+        if row < 10 && column < 10 {
+            self.append(&[b'0' + row as u8, b';', b'0' + column as u8, b'R']);
+            return;
+        }
         self.number(row);
         self.append(b";");
         self.number(column);
@@ -324,8 +328,26 @@ impl Reply {
         self.end += bytes.len() as u8;
     }
 
-    fn number(&mut self, number: u16) {
-        self.decimal::<5>(u32::from(number));
+    fn number(&mut self, value: u16) {
+        const DECIMAL_PAIRS: [[u8; 2]; 100] = {
+            let mut table = [[0; 2]; 100];
+            let mut index = 0;
+            while index < table.len() {
+                table[index] = [b'0' + (index / 10) as u8, b'0' + (index % 10) as u8];
+                index += 1;
+            }
+            table
+        };
+
+        match value {
+            0..=9 => self.append(&[b'0' + value as u8]),
+            10..=99 => self.append(&DECIMAL_PAIRS[usize::from(value)]),
+            100..=999 => {
+                let [tens, ones] = DECIMAL_PAIRS[usize::from(value % 100)];
+                self.append(&[b'0' + (value / 100) as u8, tens, ones]);
+            }
+            _ => self.decimal::<5>(u32::from(value)),
+        }
     }
 
     fn decimal<const DIGITS: usize>(&mut self, mut number: u32) {
