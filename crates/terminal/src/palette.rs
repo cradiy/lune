@@ -56,6 +56,12 @@ impl Palette {
         self.current[entry.index()]
     }
 
+    /// Compares the resolved indexed colors and default foreground and background.
+    pub fn same_text_colors(&self, other: &Self) -> bool {
+        let end = PaletteEntry::Cursor.index();
+        self.current[..end] == other.current[..end]
+    }
+
     pub fn base_color(&self, entry: PaletteEntry) -> Rgb {
         self.base[entry.index()]
     }

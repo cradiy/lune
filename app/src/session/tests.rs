@@ -373,6 +373,108 @@ fn presentation_runs_resolve_colors_after_screen_and_cell_inversion() {
 }
 
 #[test]
+fn presentation_damage_follows_visible_row_positions() {
+    let mut session = session(b"a\r\nb\r\nc");
+    session
+        .set_history_limits(HistoryLimits {
+            max_rows: 2,
+            max_bytes: 1024,
+        })
+        .unwrap();
+    session.pump().unwrap();
+    let mut tracker = PresentationTracker::default();
+    let frame = session.presentation_frame().unwrap();
+    assert_eq!(tracker.update(&frame).unwrap().rows, RowDamage::All);
+    assert_eq!(tracker.update(&frame).unwrap().rows, RowDamage::Rows(&[]));
+
+    session.transport.source = Cursor::new(b"\x1b[2;1HB");
+    session.pump().unwrap();
+    let frame = session.presentation_frame().unwrap();
+    assert_eq!(tracker.update(&frame).unwrap().rows, RowDamage::Rows(&[1]));
+    let retained_row = frame.viewport.row(1).unwrap().revision();
+
+    session.transport.source = Cursor::new(b"\x1b[3;1H\r\nd");
+    session.pump().unwrap();
+    let frame = session.presentation_frame().unwrap();
+    assert_eq!(frame.viewport.row(0).unwrap().revision(), retained_row);
+    assert_eq!(
+        tracker.update(&frame).unwrap().rows,
+        RowDamage::Rows(&[0, 1, 2])
+    );
+
+    assert!(session.scroll_history(1));
+    let frame = session.presentation_frame().unwrap();
+    let damage = tracker.update(&frame).unwrap();
+    assert_eq!(damage.rows, RowDamage::Rows(&[0, 1, 2]));
+    assert_eq!(damage.cursor.unwrap().after, None);
+
+    session.screen.resize(10, 4, StyleId::default()).unwrap();
+    let frame = session.presentation_frame().unwrap();
+    assert_eq!(tracker.update(&frame).unwrap().rows, RowDamage::All);
+    assert_eq!(tracker.update(&frame).unwrap().rows, RowDamage::Rows(&[]));
+    tracker.invalidate();
+    assert_eq!(tracker.update(&frame).unwrap().rows, RowDamage::All);
+}
+
+#[test]
+fn presentation_damage_separates_cursor_and_resolved_text_colors() {
+    let mut session = session(b"");
+    let mut tracker = PresentationTracker::default();
+    let damage = tracker
+        .update(&session.presentation_frame().unwrap())
+        .unwrap();
+    let initial = damage.cursor.unwrap().after.unwrap();
+
+    session.transport.source = Cursor::new(b"\x1b[2;3H\x1b[6 q\x1b]12;#010203\x07");
+    session.pump().unwrap();
+    let damage = tracker
+        .update(&session.presentation_frame().unwrap())
+        .unwrap();
+    assert_eq!(damage.rows, RowDamage::Rows(&[]));
+    let cursor = damage.cursor.unwrap();
+    assert_eq!(cursor.before, Some(initial));
+    let moved = cursor.after.unwrap();
+    assert_eq!(moved.position, CellPosition { row: 1, column: 2 });
+    assert_eq!(moved.appearance.shape, lune_terminal::CursorShape::Bar);
+    let color = Rgb {
+        red: 1,
+        green: 2,
+        blue: 3,
+    };
+    assert_eq!(moved.color, color);
+
+    session.transport.source = Cursor::new(b"\x1b[?25l\x1b]11;#010203\x07");
+    session.pump().unwrap();
+    let damage = tracker
+        .update(&session.presentation_frame().unwrap())
+        .unwrap();
+    assert_eq!(damage.rows, RowDamage::All);
+    assert_eq!(
+        damage.cursor.unwrap(),
+        CursorChange {
+            before: Some(moved),
+            after: None
+        }
+    );
+
+    let base = Rgb::default();
+    session.set_theme(&Palette::new([base; 256], base, color, base), None);
+    let damage = tracker
+        .update(&session.presentation_frame().unwrap())
+        .unwrap();
+    assert_eq!(damage.rows, RowDamage::Rows(&[]));
+    assert_eq!(damage.cursor, None);
+
+    session.transport.source = Cursor::new(b"\x1b[?5h");
+    session.pump().unwrap();
+    let damage = tracker
+        .update(&session.presentation_frame().unwrap())
+        .unwrap();
+    assert_eq!(damage.rows, RowDamage::All);
+    assert_eq!(damage.cursor, None);
+}
+
+#[test]
 fn waiting_on_a_real_pty_respects_idle_deadlines_and_drains_hangup() {
     let mut child = Command::new("sh");
     child.args([
@@ -522,13 +624,9 @@ fn external_poll_dispatches_host_io_pty_exit_and_presentation_deadline() {
     .unwrap();
     let (mut host, mut peer) = io::pipe().unwrap();
     peer.write_all(b"x").unwrap();
-    let initial = session
-        .presentation_frame()
-        .unwrap()
-        .viewport
-        .row(0)
-        .unwrap()
-        .revision();
+    let mut tracker = PresentationTracker::default();
+    let initial = session.presentation_frame().unwrap();
+    assert_eq!(tracker.update(&initial).unwrap().rows, RowDamage::All);
     let limit = Instant::now() + Duration::from_secs(5);
     let mut host_ready = false;
     let mut held = false;
@@ -607,7 +705,7 @@ fn external_poll_dispatches_host_io_pty_exit_and_presentation_deadline() {
             && let Some(frame) = session.presentation_frame()
         {
             let row = frame.viewport.row(0).unwrap();
-            assert_ne!(row.revision(), initial);
+            assert_eq!(tracker.update(&frame).unwrap().rows, RowDamage::Rows(&[0]));
             let first = row.display_units(0..frame.columns).next().unwrap();
             assert_eq!((first.column, first.text), (0, CellText::Scalar('A')));
             assert_eq!(

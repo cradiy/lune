@@ -14,8 +14,12 @@ use lune_terminal::{
     UnicodeWriter, Viewport,
 };
 
+mod presentation;
 mod wait;
 
+pub use presentation::{
+    CursorChange, PresentationDamage, PresentationTracker, PresentedCursor, RowDamage,
+};
 pub use wait::{PtyInterest, SessionInterests, SessionReady, WaitOutcome};
 
 const READ_BYTES: usize = 16 * 1024;
