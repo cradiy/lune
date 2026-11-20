@@ -6,9 +6,9 @@ use crate::charsets::Charsets;
 use crate::dcs::Dcs;
 use crate::osc::{Osc, Outcome};
 use crate::rendition_stack::RenditionStack;
-use crate::reply::{self, ColorReport, ModeReport, Reply, Report, StatusReport};
+use crate::reply::{self, ColorReport, ModeReport, Reply, Report, SizeReport, StatusReport};
 use crate::{
-    ColorScheme, CursorShape, EraseMode, InputModes, MouseFormat, Palette, Rgb, Screen,
+    ColorScheme, CursorShape, EraseMode, InputModes, MouseFormat, Palette, PixelSize, Rgb, Screen,
     ScreenBuffer, StorageError, Style, StyleError, StyleId, StyleTable, TextSink,
 };
 
@@ -87,6 +87,7 @@ enum Pending {
     StatusReply(StatusReport),
     ColorReply(ColorReport),
     OscReplies,
+    SizeReply(SizeReport),
 }
 
 struct State {
@@ -104,6 +105,8 @@ struct State {
     color_scheme_notifications: bool,
     osc: Osc,
     dcs: Dcs,
+    text_area_pixels: Option<PixelSize>,
+    cell_pixels: Option<PixelSize>,
 }
 
 impl State {
@@ -122,6 +125,8 @@ impl State {
             color_scheme_notifications: false,
             osc: Osc::new(palette),
             dcs: Dcs::default(),
+            text_area_pixels: None,
+            cell_pixels: None,
         }
     }
 
@@ -226,6 +231,13 @@ impl Processor {
     /// Already queued replies keep their captured values.
     pub fn end_synchronized_output(&mut self) {
         self.state.synchronized_output = false;
+    }
+
+    /// Supplies the text-area and character-cell sizes for CSI 14 t and CSI 16 t.
+    /// Each `None` suppresses its reply. Host sizes persist across terminal resets.
+    pub fn set_pixel_sizes(&mut self, text_area: Option<PixelSize>, cell: Option<PixelSize>) {
+        self.state.text_area_pixels = text_area;
+        self.state.cell_pixels = cell;
     }
 
     /// Current OSC 0/2 window title, initially empty. Valid UTF-8 payloads up to
@@ -612,12 +624,8 @@ impl Processor {
                             csi(screen, sequence, state)
                         }
                     } else if matches!(sequence.final_byte, b'c' | b'q' | b't') {
-                        let response = match sequence.final_byte {
-                            b't' => reply::text_area_query(screen, sequence),
-                            _ => reply::identity_query(sequence),
-                        };
-                        if let Some(reply) = response {
-                            pending[*end] = Some(Pending::Reply(reply));
+                        if let Some(reply) = size_or_identity_query(screen, state, sequence) {
+                            pending[*end] = Some(reply);
                             *end += 1;
                             true
                         } else {
@@ -821,6 +829,12 @@ impl Processor {
                     reply.encode(&mut self.reply);
                 }
                 Pending::ColorReply(reply) => {
+                    if !self.reply.is_empty() {
+                        return Err(ProcessFailure::ReplyPending);
+                    }
+                    reply.encode(&mut self.reply);
+                }
+                Pending::SizeReply(reply) => {
                     if !self.reply.is_empty() {
                         return Err(ProcessFailure::ReplyPending);
                     }
@@ -1093,6 +1107,19 @@ fn rendition_stack(
             true
         }
         _ => false,
+    }
+}
+
+#[cold]
+fn size_or_identity_query(
+    screen: &Screen,
+    state: &State,
+    sequence: ControlSequence<'_>,
+) -> Option<Pending> {
+    match sequence.final_byte {
+        b't' => reply::size_query(screen, sequence, state.text_area_pixels, state.cell_pixels)
+            .map(Pending::SizeReply),
+        _ => reply::identity_query(sequence).map(Pending::Reply),
     }
 }
 

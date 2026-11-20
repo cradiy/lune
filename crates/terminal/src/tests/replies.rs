@@ -1,7 +1,10 @@
+use std::num::NonZeroU32;
+
 use super::support;
 
 use crate::{
-    CellWidth, ColorScheme, ProcessFailure, Processor, Screen, StorageError, StyleId, reply::Reply,
+    CellWidth, ColorScheme, PixelSize, ProcessFailure, Processor, Screen, StorageError, StyleId,
+    reply::Reply,
 };
 
 fn text(screen: &mut Screen, value: &str, style: StyleId) -> Result<(), StorageError> {
@@ -248,6 +251,71 @@ fn blocked_text_area_query_retains_dimensions_at_query_time() {
     drain(&mut processor, &mut output);
     drive(&mut processor, &mut screen, remaining, &mut output);
     assert_eq!(output, b"\x1b[0n\x1b[8;5;12t\x1b[8;26;131t");
+}
+
+#[test]
+fn pixel_size_queries_capture_host_metrics_and_validate_headers_across_splits() {
+    let wire =
+        b"\x1b[14t\x1b[16t\x1b[18t\x1b[14;2t\x1b[16;0t\x1b[14:0t\x1b[?16t\x1b[14 t\x1bc\x1b[16t";
+    for split in 0..=wire.len() {
+        let mut screen = Screen::new(12, 5).unwrap();
+        let mut processor = support::processor();
+        processor.set_pixel_sizes(
+            Some(PixelSize {
+                width: NonZeroU32::MAX,
+                height: 65_536.try_into().unwrap(),
+            }),
+            Some(PixelSize {
+                width: 9.try_into().unwrap(),
+                height: 17.try_into().unwrap(),
+            }),
+        );
+        let mut output = Vec::new();
+        drive(&mut processor, &mut screen, &wire[..split], &mut output);
+        drive(&mut processor, &mut screen, &wire[split..], &mut output);
+        assert_eq!(
+            output,
+            b"\x1b[4;65536;4294967295t\x1b[6;17;9t\x1b[8;5;12t\x1b[6;17;9t"
+        );
+        assert_eq!(processor.ignored_sequences(), 5);
+    }
+}
+
+#[test]
+fn blocked_pixel_report_keeps_captured_size_across_host_updates() {
+    let mut screen = Screen::new(12, 5).unwrap();
+    let mut processor = support::processor();
+    let size = |width, height| PixelSize {
+        width: NonZeroU32::new(width).unwrap(),
+        height: NonZeroU32::new(height).unwrap(),
+    };
+    processor.set_pixel_sizes(Some(size(110, 90)), Some(size(9, 17)));
+    let wire = b"\x1b[16t\x1b[14t\x1b[14t\x1b[16t";
+    let error = processor.advance(wire, &mut screen, &mut text).unwrap_err();
+    assert!(matches!(error.error, ProcessFailure::ReplyPending));
+    assert_eq!(error.consumed, b"\x1b[16t\x1b[14t".len());
+    assert_eq!(processor.reply_bytes(), b"\x1b[6;17;9t");
+    assert!(processor.consume_reply(2));
+    processor.set_pixel_sizes(Some(size(120, 100)), None);
+    let mut output = b"\x1b[".to_vec();
+    drain(&mut processor, &mut output);
+    drive(
+        &mut processor,
+        &mut screen,
+        &wire[error.consumed..],
+        &mut output,
+    );
+    assert_eq!(output, b"\x1b[6;17;9t\x1b[4;90;110t\x1b[4;100;120t");
+    assert_eq!(processor.ignored_sequences(), 1);
+    processor.reset(&mut screen, &mut text);
+    output.clear();
+    drive(
+        &mut processor,
+        &mut screen,
+        b"\x1b[14t\x1b[16t",
+        &mut output,
+    );
+    assert_eq!(output, b"\x1b[4;100;120t");
 }
 
 #[test]

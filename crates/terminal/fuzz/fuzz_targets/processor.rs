@@ -15,12 +15,13 @@ mod model;
 mod screen_model;
 
 use std::io::Write;
+use std::num::NonZeroU32;
 
 use libfuzzer_sys::fuzz_target;
 use lune_terminal::{
     CellPosition, CellWidth, Color, ColorScheme, CursorShape, EraseMode, InputModes, Key,
     Modifiers, MouseButton, MouseEvent, MouseFormat, MouseTracking, PaletteEntry, PixelPosition,
-    ProcessFailure, Processor, Rgb, Screen, Style, StyleId, Underline,
+    PixelSize, ProcessFailure, Processor, Rgb, Screen, Style, StyleId, Underline,
 };
 use screen_model::{Command, ScreenModel};
 
@@ -80,6 +81,7 @@ struct Expected<'a> {
     auto_repeat: bool,
     synchronized_output: bool,
     color_scheme: Option<ColorScheme>,
+    pixel_sizes: [Option<PixelSize>; 2],
     replies: &'a [u8],
     title: &'a str,
     title_changed: bool,
@@ -100,6 +102,7 @@ fn drive(wire: &[u8], chunk: usize, fail_at: usize, expected: &Expected<'_>) {
     let mut screen = Screen::new(8, 4).unwrap();
     let mut processor = support::processor();
     processor.set_color_scheme(expected.color_scheme);
+    processor.set_pixel_sizes(expected.pixel_sizes[0], expected.pixel_sizes[1]);
     let mut calls = 0;
     let mut available = false;
     let mut replies = Vec::new();
@@ -382,6 +385,17 @@ fuzz_target!(|data: &[u8]| {
         1 => Some(ColorScheme::Dark),
         _ => Some(ColorScheme::Light),
     };
+    let pixel_flags = data.get(2).copied().unwrap_or(0);
+    let pixel_sizes = [
+        (pixel_flags & 1 != 0).then_some(PixelSize {
+            width: NonZeroU32::MAX,
+            height: NonZeroU32::new(90_000 + u32::from(pixel_flags)).unwrap(),
+        }),
+        (pixel_flags & 2 != 0).then_some(PixelSize {
+            width: NonZeroU32::new(9).unwrap(),
+            height: NonZeroU32::new(17).unwrap(),
+        }),
+    ];
     let mut replies = Vec::new();
     let mut title = String::new();
     let mut title_changed = false;
@@ -1238,6 +1252,17 @@ fuzz_target!(|data: &[u8]| {
                 }
                 None
             }
+            58 if bytes[1] & 16 != 0 => {
+                let index = usize::from(bytes[1] & 1);
+                let (query, response) = [(14, 4), (16, 6)][index];
+                write!(&mut wire, "\x1b[{query}t").unwrap();
+                if let Some(PixelSize { width, height }) = pixel_sizes[index] {
+                    write!(&mut replies, "\x1b[{response};{height};{width}t").unwrap();
+                } else {
+                    diagnostics.1 += 1;
+                }
+                None
+            }
             58 if bytes[1] & 4 != 0 => {
                 wire.extend(if bytes[1] & 1 == 0 {
                     b"\x1b[c".as_slice()
@@ -1406,6 +1431,7 @@ fuzz_target!(|data: &[u8]| {
         auto_repeat,
         synchronized_output,
         color_scheme,
+        pixel_sizes,
         replies: &replies,
     };
     drive(&wire, wire.len(), usize::MAX, &oracle);

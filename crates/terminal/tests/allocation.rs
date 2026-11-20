@@ -2479,8 +2479,15 @@ fn processor_retries_style_and_text_allocations_without_replaying_accepted_input
                 assert!(processor.consume_reply(1));
             }
         }
+        processor.set_pixel_sizes(
+            Some(lune_terminal::PixelSize {
+                width: std::num::NonZeroU32::MAX,
+                height: std::num::NonZeroU32::MAX,
+            }),
+            None,
+        );
         let mut queries =
-            &b"\x1b[4$p\x1b[20$p\x1b[>q\x1b[18t\x1b[?7$p\x1b[?1004$p\x1b[?1003$p\x1b[?65535$p"[..];
+            &b"\x1b[4$p\x1b[20$p\x1b[>q\x1b[18t\x1b[14t\x1b[?7$p\x1b[?1004$p\x1b[?1003$p\x1b[?65535$p"[..];
         loop {
             let result = processor.advance(queries, &mut screen, &mut text);
             while !processor.reply_bytes().is_empty() {

@@ -1,3 +1,5 @@
+use std::num::NonZeroU32;
+
 use lune_vt::{ControlSequence, OscTerminator, Parameter};
 
 use crate::dcs::StatusQuery;
@@ -42,6 +44,13 @@ pub enum ColorScheme {
     Light,
 }
 
+/// The width and height of a terminal surface or cell in pixels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PixelSize {
+    pub width: NonZeroU32,
+    pub height: NonZeroU32,
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum Report {
     Status,
@@ -49,10 +58,6 @@ pub(crate) enum Report {
         row: u16,
         column: u16,
         private: bool,
-    },
-    TextAreaSize {
-        rows: u16,
-        columns: u16,
     },
     PrimaryDeviceAttributes,
     Version,
@@ -242,7 +247,6 @@ impl Report {
                 column,
                 private,
             } => reply.position(row, column, private),
-            Self::TextAreaSize { rows, columns } => reply.text_area_size(rows, columns),
             Self::ColorScheme(scheme) => {
                 reply.clear();
                 reply.append(match scheme {
@@ -304,14 +308,28 @@ impl Reply {
         self.append(b"t");
     }
 
+    #[cold]
+    fn pixel_size(&mut self, prefix: &[u8; 4], size: PixelSize) {
+        self.clear();
+        self.append(prefix);
+        self.decimal::<10>(size.height.get());
+        self.append(b";");
+        self.decimal::<10>(size.width.get());
+        self.append(b"t");
+    }
+
     fn append(&mut self, bytes: &[u8]) {
         let end = usize::from(self.end);
         self.bytes[end..end + bytes.len()].copy_from_slice(bytes);
         self.end += bytes.len() as u8;
     }
 
-    fn number(&mut self, mut number: u16) {
-        let mut digits = [0; 5];
+    fn number(&mut self, number: u16) {
+        self.decimal::<5>(u32::from(number));
+    }
+
+    fn decimal<const DIGITS: usize>(&mut self, mut number: u32) {
+        let mut digits = [0; DIGITS];
         let mut start = digits.len();
         loop {
             start -= 1;
@@ -378,25 +396,55 @@ pub(crate) fn identity_query(sequence: ControlSequence<'_>) -> Option<Report> {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum SizeReport {
+    TextArea { rows: u16, columns: u16 },
+    TextAreaPixels(PixelSize),
+    CellPixels(PixelSize),
+}
+
+impl SizeReport {
+    #[cold]
+    pub(crate) fn encode(self, reply: &mut Reply) {
+        match self {
+            Self::TextArea { rows, columns } => reply.text_area_size(rows, columns),
+            Self::TextAreaPixels(size) => reply.pixel_size(b"\x1b[4;", size),
+            Self::CellPixels(size) => reply.pixel_size(b"\x1b[6;", size),
+        }
+    }
+}
+
 #[cold]
-pub(crate) fn text_area_query(screen: &Screen, sequence: ControlSequence<'_>) -> Option<Report> {
-    if !sequence.private_markers.is_empty()
-        || !sequence.intermediates.is_empty()
-        || !matches!(
-            sequence.parameters,
-            [lune_vt::Parameter {
-                value: Some(18),
-                is_subparameter: false
-            }]
-        )
-    {
+pub(crate) fn size_query(
+    screen: &Screen,
+    sequence: ControlSequence<'_>,
+    text_area_pixels: Option<PixelSize>,
+    cell_pixels: Option<PixelSize>,
+) -> Option<SizeReport> {
+    if !sequence.private_markers.is_empty() || !sequence.intermediates.is_empty() {
         return None;
     }
-    let grid = screen.grid();
-    Some(Report::TextAreaSize {
-        rows: u16::try_from(grid.rows()).expect("Rows fit the protocol bounds"),
-        columns: u16::try_from(grid.columns()).expect("Columns fit the protocol bounds"),
-    })
+    let [
+        Parameter {
+            value: Some(selector),
+            is_subparameter: false,
+        },
+    ] = sequence.parameters
+    else {
+        return None;
+    };
+    match selector {
+        14 => text_area_pixels.map(SizeReport::TextAreaPixels),
+        16 => cell_pixels.map(SizeReport::CellPixels),
+        18 => {
+            let grid = screen.grid();
+            Some(SizeReport::TextArea {
+                rows: u16::try_from(grid.rows()).expect("Rows fit the protocol bounds"),
+                columns: u16::try_from(grid.columns()).expect("Columns fit the protocol bounds"),
+            })
+        }
+        _ => None,
+    }
 }
 
 #[cold]

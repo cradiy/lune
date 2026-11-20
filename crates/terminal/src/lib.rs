@@ -46,7 +46,7 @@ pub use palette::{Palette, PaletteEntry, Rgb};
 pub use paste::Paste;
 pub use processor::{ProcessError, ProcessFailure, Processor};
 pub use reflow::{ReflowAffinity, ReflowAnchor, ReflowRow, ReflowRows};
-pub use reply::ColorScheme;
+pub use reply::{ColorScheme, PixelSize};
 pub use row::Row;
 pub use screen::{Cursor, CursorAppearance, CursorShape, EraseMode, Screen, ScreenBuffer};
 pub use style::{Color, Style, Underline};
