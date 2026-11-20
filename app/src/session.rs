@@ -6,11 +6,11 @@ use std::time::{Duration, Instant};
 
 use lune_pty::{ChildExit, Pty, PtySize};
 use lune_terminal::{
-    CellPosition, Color, ColorScheme, CursorAppearance, HistoryLimits, Key, KeySequence,
-    MAX_STYLES, Modifiers, MouseEvent, MouseFormat, MouseSequence, MouseTracking, Palette,
-    PaletteEntry, PixelPosition, ProcessFailure, Processor, Rgb, Screen, ScreenBuffer,
-    StorageError, Style, StyleError, StyleId, StyleTable, TerminalNotifications, TextSink,
-    UnicodeWriter, Viewport,
+    CellPosition, Color, ColorScheme, CursorAppearance, DisplayUnits, HistoryLimits, Key,
+    KeySequence, MAX_STYLES, Modifiers, MouseEvent, MouseFormat, MouseSequence, MouseTracking,
+    Palette, PaletteEntry, PixelPosition, ProcessFailure, Processor, Rgb, Row, Screen,
+    ScreenBuffer, StorageError, Style, StyleError, StyleId, StyleRun, StyleTable,
+    TerminalNotifications, TextSink, UnicodeWriter, Viewport,
 };
 
 use crate::GridGeometry;
@@ -66,7 +66,56 @@ pub struct PresentationStyle<'a> {
     pub style: &'a Style,
 }
 
+pub struct PresentationRun<'a> {
+    row: &'a Row,
+    columns: Range<usize>,
+    pub style: PresentationStyle<'a>,
+}
+
+impl<'a> PresentationRun<'a> {
+    #[inline]
+    pub fn columns(&self) -> Range<usize> {
+        self.columns.clone()
+    }
+
+    /// Complete units intersecting the span. Clip painting to its columns.
+    #[inline]
+    pub fn units(&self) -> DisplayUnits<'a> {
+        self.row.display_units(self.columns())
+    }
+}
+
 impl<'a> PresentationFrame<'a> {
+    /// Resolves a row's style spans inside the requested visible columns.
+    /// Uncovered columns of a short history row use the default style.
+    #[inline]
+    pub fn row_runs(
+        &self,
+        row: usize,
+        columns: Range<usize>,
+    ) -> Option<impl Iterator<Item = Result<PresentationRun<'a>, StyleError>> + '_> {
+        let row = self.viewport.row(row)?;
+        let end = columns.end.min(self.geometry.pty_size().columns.into());
+        let start = columns.start.min(end);
+        let padding = start.max(row.cells().len());
+        let mut padding = (padding < end).then_some(StyleRun {
+            columns: padding..end,
+            style: StyleId::default(),
+        });
+        let mut runs = row.style_runs(start..end);
+        Some(std::iter::from_fn(move || {
+            let run = runs.next().or_else(|| padding.take())?;
+            let style = self
+                .resolve_style(run.style)
+                .ok_or(StyleError::InvalidId(run.style));
+            Some(style.map(|style| PresentationRun {
+                row,
+                columns: run.columns,
+                style,
+            }))
+        }))
+    }
+
     /// Resolves colors against this frame. Screen inversion swaps the default
     /// roles before cell inversion exchanges the resolved foreground and background.
     #[inline]

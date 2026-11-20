@@ -342,7 +342,6 @@ fn presentation_runs_resolve_colors_after_screen_and_cell_inversion() {
     session.pump().unwrap();
 
     let frame = session.presentation_frame().unwrap();
-    let row = frame.viewport.row(0).unwrap();
     let indexed = Rgb {
         red: 0x12,
         green: 0x34,
@@ -358,28 +357,83 @@ fn presentation_runs_resolve_colors_after_screen_and_cell_inversion() {
         green: 5,
         blue: 6,
     };
-    let mut runs = row.style_runs(2..usize::MAX);
+    let mut runs = frame.row_runs(0, 2..usize::MAX).unwrap();
     for (columns, fg, bg, underline) in [
         (2..3, indexed, foreground, indexed),
         (3..4, explicit_background, indexed, explicit_underline),
         (4..5, foreground, background, foreground),
         (5..8, background, foreground, background),
     ] {
-        let run = runs.next().unwrap();
-        let style = frame.resolve_style(run.style).unwrap();
-        assert_eq!(run.columns, columns);
+        let run = runs.next().unwrap().unwrap();
+        let style = run.style;
+        assert_eq!(run.columns(), columns);
         assert_eq!(
             (style.foreground, style.background, style.underline_color),
             (fg, bg, underline)
         );
     }
     assert!(runs.next().is_none());
-    let wide = row.display_units(2..3).next().unwrap();
+    let clip = frame.row_runs(0, 2..3).unwrap().next().unwrap().unwrap();
+    let wide = clip.units().next().unwrap();
     assert_eq!((wide.column, wide.text), (1, CellText::Scalar('水')));
+    assert_eq!(clip.style, frame.resolve_style(wide.cell.style()).unwrap());
+
+    let unrelated_styles = StyleTable::new(1).unwrap();
+    let detached = PresentationFrame {
+        styles: &unrelated_styles,
+        ..frame
+    };
+    assert!(matches!(
+        detached.row_runs(0, 2..3).unwrap().next(),
+        Some(Err(StyleError::InvalidId(id))) if id == wide.cell.style()
+    ));
+}
+
+#[test]
+fn presentation_runs_clip_and_pad_to_the_current_width() {
+    let mut session = session("\x1b[41mabcdef水\r\nb\r\nc\r\nd".as_bytes());
+    session
+        .set_history_limits(HistoryLimits {
+            max_rows: 1,
+            max_bytes: 1024,
+        })
+        .unwrap();
+    session.pump().unwrap();
+    assert!(session.scroll_history(1));
+
+    session.screen.resize(7, 3, StyleId::default()).unwrap();
+    session.geometry = GridGeometry::from_pty_size(PtySize::new(3, 7));
+    let frame = session.presentation_frame().unwrap();
+    let mut runs = frame.row_runs(0, 6..usize::MAX).unwrap();
+    let clipped = runs.next().unwrap().unwrap();
+    assert_eq!(clipped.columns(), 6..7);
+    let wide = clipped.units().next().unwrap();
     assert_eq!(
-        row.style_runs(0..2).next().unwrap().style,
-        wide.cell.style()
+        (wide.column, wide.cell.width(), wide.text),
+        (6, 2, CellText::Scalar('水'))
     );
+    assert!(runs.next().is_none());
+    drop(runs);
+
+    session.screen.resize(10, 3, StyleId::default()).unwrap();
+    session.geometry = GridGeometry::from_pty_size(PtySize::new(3, 10));
+    let frame = session.presentation_frame().unwrap();
+    let mut runs = frame.row_runs(0, 7..usize::MAX).unwrap();
+    let tail = runs.next().unwrap().unwrap();
+    assert_eq!(tail.columns(), 7..8);
+    assert_eq!(tail.style.style.background, Color::Indexed(1));
+    assert_eq!(tail.units().next().unwrap().column, 6);
+    let padding = runs.next().unwrap().unwrap();
+    assert_eq!(padding.columns(), 8..10);
+    assert_eq!(
+        padding.style,
+        frame.resolve_style(StyleId::default()).unwrap()
+    );
+    assert!(padding.units().next().is_none());
+    assert!(runs.next().is_none());
+    assert_eq!(frame.row_runs(0, 9..10).unwrap().count(), 1);
+    assert_eq!(frame.row_runs(0, 10..10).unwrap().count(), 0);
+    assert!(frame.row_runs(3, 0..10).is_none());
 }
 
 #[test]
