@@ -2,7 +2,8 @@
 
 use libfuzzer_sys::fuzz_target;
 use lune_terminal::{
-    CellPosition, InputModes, MAX_DIMENSION, Modifiers, MouseButton, MouseEvent, MouseTracking,
+    CellPosition, InputModes, MAX_DIMENSION, Modifiers, MouseButton, MouseEvent, MouseFormat,
+    MouseTracking, PixelPosition,
 };
 
 fuzz_target!(|data: &[u8]| {
@@ -46,32 +47,68 @@ fuzz_target!(|data: &[u8]| {
                 MouseTracking::ButtonMotion,
                 MouseTracking::AnyMotion,
             ][tracking],
-            sgr_mouse: record[7] & 1 != 0,
+            mouse_format: [
+                MouseFormat::Legacy,
+                MouseFormat::Sgr,
+                MouseFormat::SgrPixels,
+            ][usize::from(record[7] % 3)],
             ..InputModes::default()
         };
-        let position = CellPosition {
-            column: usize::from(u16::from_le_bytes([record[0], record[1]])),
-            row: usize::from(u16::from_le_bytes([record[2], record[3]])),
-        };
+        let column = u32::from(u16::from_le_bytes([record[0], record[1]]));
+        let row = u32::from(u16::from_le_bytes([record[2], record[3]]));
         let modifiers = Modifiers {
             shift: record[4] & 1 != 0,
             alt: record[4] & 2 != 0,
             control: record[4] & 4 != 0,
         };
         let modifier_code = [0, 4, 8, 12, 16, 20, 24, 28][usize::from(record[4] % 8)];
-        let encoded = modes.encode_mouse(event, position, modifiers);
-        let bound = if modes.sgr_mouse { MAX_DIMENSION } else { 223 };
-        if allowed & (1 << tracking) == 0 || position.row >= bound || position.column >= bound {
+        let (encoded, x, y, bound) = if modes.mouse_format == MouseFormat::SgrPixels {
+            let x = if record[7] & 4 != 0 {
+                u32::MAX - column
+            } else {
+                column
+            };
+            let y = if record[7] & 8 != 0 {
+                u32::MAX - row
+            } else {
+                row
+            };
+            (
+                modes.encode_pixel_mouse(event, PixelPosition { x, y }, modifiers),
+                x,
+                y,
+                u32::MAX,
+            )
+        } else {
+            let position = CellPosition {
+                row: row as usize,
+                column: column as usize,
+            };
+            let bound = if modes.mouse_format == MouseFormat::Sgr {
+                MAX_DIMENSION as u32
+            } else {
+                223
+            };
+            (
+                modes.encode_mouse(event, position, modifiers),
+                column,
+                row,
+                bound,
+            )
+        };
+        if allowed & (1 << tracking) == 0 || x >= bound || y >= bound {
             assert!(encoded.is_none());
-        } else if modes.sgr_mouse {
-            let expected = format!(
-                "\x1b[<{};{};{}{suffix}",
-                sgr + modifier_code,
-                position.column + 1,
-                position.row + 1
-            );
+        } else if modes.mouse_format != MouseFormat::Legacy {
+            let expected = format!("\x1b[<{};{};{}{suffix}", sgr + modifier_code, x + 1, y + 1,);
             let encoded = encoded.unwrap();
-            assert!(encoded.as_bytes().len() <= 19);
+            assert!(
+                encoded.as_bytes().len()
+                    <= if modes.mouse_format == MouseFormat::Sgr {
+                        19
+                    } else {
+                        29
+                    }
+            );
             assert_eq!(encoded.as_bytes(), expected.as_bytes());
         } else {
             assert_eq!(
@@ -81,8 +118,8 @@ fuzz_target!(|data: &[u8]| {
                     91,
                     77,
                     normal + modifier_code + 32,
-                    position.column as u8 + 33,
-                    position.row as u8 + 33
+                    x as u8 + 33,
+                    y as u8 + 33
                 ]
             );
         }

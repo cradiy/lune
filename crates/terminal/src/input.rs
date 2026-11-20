@@ -1,6 +1,6 @@
 use std::num::NonZeroU8;
 
-use crate::{MouseTracking, Paste};
+use crate::{MouseFormat, MouseTracking, Paste};
 
 /// Terminal keys with protocol-defined encodings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -120,7 +120,7 @@ pub struct InputModes {
     /// DEC mode 1004: report terminal focus changes.
     pub focus_reporting: bool,
     pub mouse_tracking: MouseTracking,
-    pub sgr_mouse: bool,
+    pub mouse_format: MouseFormat,
     /// DEC mode 1007: send cursor keys for wheel events in the alternate buffer.
     pub alternate_scroll: bool,
 }

@@ -8,8 +8,8 @@ use crate::osc::{Osc, Outcome};
 use crate::rendition_stack::RenditionStack;
 use crate::reply::{self, ColorReport, ModeReport, Reply, Report, StatusReport};
 use crate::{
-    ColorScheme, CursorShape, EraseMode, InputModes, Palette, Rgb, Screen, ScreenBuffer,
-    StorageError, Style, StyleError, StyleId, StyleTable, TextSink,
+    ColorScheme, CursorShape, EraseMode, InputModes, MouseFormat, Palette, Rgb, Screen,
+    ScreenBuffer, StorageError, Style, StyleError, StyleId, StyleTable, TextSink,
 };
 
 const PENDING_CAPACITY: usize = 3;
@@ -1162,6 +1162,7 @@ fn csi(screen: &mut Screen, sequence: ControlSequence<'_>, state: &mut State) ->
                                     | 1004
                                     | 1006
                                     | 1007
+                                    | 1016
                                     | 1047
                                     | 1048
                                     | 1049
@@ -1188,6 +1189,20 @@ fn csi(screen: &mut Screen, sequence: ControlSequence<'_>, state: &mut State) ->
                 (true, Some(2031)) => state.color_scheme_notifications = enabled,
                 (true, Some(1004)) => state.input.focus_reporting = enabled,
                 (true, Some(1007)) => state.input.alternate_scroll = enabled,
+                (true, Some(1006)) => {
+                    state.input.mouse_format = if enabled {
+                        MouseFormat::Sgr
+                    } else {
+                        MouseFormat::Legacy
+                    };
+                }
+                (true, Some(1016)) => {
+                    state.input.mouse_format = if enabled {
+                        MouseFormat::SgrPixels
+                    } else {
+                        MouseFormat::Legacy
+                    };
+                }
                 (true, Some(5)) => screen.set_reverse_video(enabled),
                 (true, Some(6)) => screen.set_origin_mode(enabled),
                 (true, Some(7)) => screen.set_auto_wrap(enabled),
@@ -1335,7 +1350,6 @@ fn mouse_mode(input: &mut InputModes, mode: u16, enabled: bool) {
                 }
             };
         }
-        1006 => input.sgr_mouse = enabled,
         _ => unreachable!("Mode parameters were validated"),
     }
 }

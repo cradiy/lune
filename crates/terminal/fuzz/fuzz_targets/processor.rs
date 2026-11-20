@@ -19,8 +19,8 @@ use std::io::Write;
 use libfuzzer_sys::fuzz_target;
 use lune_terminal::{
     CellPosition, CellWidth, Color, ColorScheme, CursorShape, EraseMode, InputModes, Key,
-    Modifiers, MouseButton, MouseEvent, MouseTracking, PaletteEntry, ProcessFailure, Processor,
-    Rgb, Screen, Style, StyleId, Underline,
+    Modifiers, MouseButton, MouseEvent, MouseFormat, MouseTracking, PaletteEntry, PixelPosition,
+    ProcessFailure, Processor, Rgb, Screen, Style, StyleId, Underline,
 };
 use screen_model::{Command, ScreenModel};
 
@@ -225,14 +225,20 @@ fn drive(wire: &[u8], chunk: usize, fail_at: usize, expected: &Expected<'_>) {
             expected.input.mouse_tracking == MouseTracking::AnyMotion,
         ),
     ] {
-        let actual = processor.input_modes().encode_mouse(
-            event,
-            CellPosition { row: 2, column: 4 },
-            Modifiers::default(),
-        );
+        let modes = processor.input_modes();
+        let actual = match expected.input.mouse_format {
+            MouseFormat::SgrPixels => {
+                modes.encode_pixel_mouse(event, PixelPosition { x: 4, y: 2 }, Modifiers::default())
+            }
+            _ => modes.encode_mouse(
+                event,
+                CellPosition { row: 2, column: 4 },
+                Modifiers::default(),
+            ),
+        };
         if !enabled {
             assert!(actual.is_none());
-        } else if expected.input.sgr_mouse {
+        } else if expected.input.mouse_format != MouseFormat::Legacy {
             assert_eq!(
                 actual.unwrap().as_bytes(),
                 format!("\x1b[<{sgr};5;3{suffix}").as_bytes()
@@ -1091,7 +1097,7 @@ fuzz_target!(|data: &[u8]| {
                     color_scheme_notifications = enabled;
                     2031
                 } else if bytes[1] & 8 != 0 {
-                    match bytes[2] % 5 {
+                    match bytes[2] % 6 {
                         0 => {
                             input.mouse_tracking = if enabled {
                                 MouseTracking::Buttons
@@ -1117,12 +1123,24 @@ fuzz_target!(|data: &[u8]| {
                             1003
                         }
                         3 => {
-                            input.sgr_mouse = enabled;
+                            input.mouse_format = if enabled {
+                                MouseFormat::Sgr
+                            } else {
+                                MouseFormat::Legacy
+                            };
                             1006
                         }
-                        _ => {
+                        4 => {
                             input.alternate_scroll = enabled;
                             1007
+                        }
+                        _ => {
+                            input.mouse_format = if enabled {
+                                MouseFormat::SgrPixels
+                            } else {
+                                MouseFormat::Legacy
+                            };
+                            1016
                         }
                     }
                 } else if bytes[0] % 64 == 55 {
@@ -1180,8 +1198,8 @@ fuzz_target!(|data: &[u8]| {
                     let private = bytes[1] & 2 != 0;
                     let selector = [
                         0, 1, 4, 5, 6, 7, 8, 12, 20, 25, 47, 66, 67, 1000, 1002, 1003, 1004, 1006,
-                        1007, 1047, 1048, 1049, 2004, 2026, 2031, 65535,
-                    ][usize::from(bytes[2] % 26)];
+                        1007, 1016, 1047, 1048, 1049, 2004, 2026, 2031, 65535,
+                    ][usize::from(bytes[2] % 27)];
                     let enabled = match (private, selector) {
                         (false, 20) => Some(input.new_line),
                         (true, 1) => Some(input.application_cursor),
@@ -1192,8 +1210,9 @@ fuzz_target!(|data: &[u8]| {
                         (true, 1002) => Some(input.mouse_tracking == MouseTracking::ButtonMotion),
                         (true, 1003) => Some(input.mouse_tracking == MouseTracking::AnyMotion),
                         (true, 1004) => Some(input.focus_reporting),
-                        (true, 1006) => Some(input.sgr_mouse),
+                        (true, 1006) => Some(input.mouse_format == MouseFormat::Sgr),
                         (true, 1007) => Some(input.alternate_scroll),
+                        (true, 1016) => Some(input.mouse_format == MouseFormat::SgrPixels),
                         (true, 2004) => Some(input.bracketed_paste),
                         (true, 2026) => Some(synchronized_output),
                         (true, 2031) => Some(color_scheme_notifications),

@@ -1,9 +1,10 @@
 use super::support;
 
 use crate::{
-    CellPosition, InputModes, MAX_DIMENSION, Modifiers, MouseButton, MouseEvent, MouseTracking,
-    Screen, ScreenBuffer, StorageError,
+    CellPosition, InputModes, MAX_DIMENSION, Modifiers, MouseButton, MouseEvent, MouseFormat,
+    MouseTracking, PixelPosition, Screen, ScreenBuffer, StorageError,
 };
+use MouseFormat::{Legacy, Sgr, SgrPixels};
 
 #[test]
 fn mouse_reports_match_button_motion_wheel_and_modifier_wire_codes() {
@@ -50,10 +51,10 @@ fn mouse_reports_match_button_motion_wheel_and_modifier_wire_codes() {
     .into_iter()
     .enumerate()
     {
-        for sgr_mouse in [false, true] {
+        for mouse_format in [Legacy, Sgr] {
             let modes = InputModes {
                 mouse_tracking,
-                sgr_mouse,
+                mouse_format,
                 ..InputModes::default()
             };
             for (flags, modifier_code) in [0, 4, 8, 12, 16, 20, 24, 28].into_iter().enumerate() {
@@ -70,7 +71,7 @@ fn mouse_reports_match_button_motion_wheel_and_modifier_wire_codes() {
                         continue;
                     }
                     let actual = actual.unwrap();
-                    if sgr_mouse {
+                    if mouse_format == Sgr {
                         assert_eq!(
                             actual.as_bytes(),
                             format!("\x1b[<{};10;20{suffix}", sgr + modifier_code).as_bytes()
@@ -89,10 +90,10 @@ fn mouse_reports_match_button_motion_wheel_and_modifier_wire_codes() {
 
 #[test]
 fn mouse_coordinates_obey_wire_and_grid_bounds_without_truncation() {
-    for sgr_mouse in [false, true] {
+    for mouse_format in [Legacy, Sgr] {
         let modes = InputModes {
             mouse_tracking: MouseTracking::AnyMotion,
-            sgr_mouse,
+            mouse_format,
             ..InputModes::default()
         };
         for row in [
@@ -132,10 +133,14 @@ fn mouse_coordinates_obey_wire_and_grid_bounds_without_truncation() {
                         control: true,
                     },
                 );
-                let bound = if sgr_mouse { MAX_DIMENSION } else { 223 };
+                let bound = if mouse_format == Sgr {
+                    MAX_DIMENSION
+                } else {
+                    223
+                };
                 if row >= bound || column >= bound {
                     assert!(actual.is_none());
-                } else if sgr_mouse {
+                } else if mouse_format == Sgr {
                     assert_eq!(
                         actual.unwrap().as_bytes(),
                         format!("\x1b[<191;{};{}M", column + 1, row + 1).as_bytes()
@@ -149,6 +154,62 @@ fn mouse_coordinates_obey_wire_and_grid_bounds_without_truncation() {
             }
         }
     }
+}
+
+#[test]
+fn pixel_mouse_reports_use_one_based_axes_and_check_overflow() {
+    let event = MouseEvent::Motion(Some(MouseButton::Button11));
+    let modifiers = Modifiers {
+        shift: true,
+        alt: true,
+        control: true,
+    };
+    let modes = InputModes {
+        mouse_tracking: MouseTracking::ButtonMotion,
+        mouse_format: SgrPixels,
+        ..InputModes::default()
+    };
+    let position = PixelPosition { x: 0, y: 240 };
+    let report = modes
+        .encode_pixel_mouse(event, position, modifiers)
+        .unwrap();
+    assert_eq!(report.as_bytes(), b"\x1b[<191;1;241M");
+    let max = u32::MAX - 1;
+    assert_eq!(
+        modes
+            .encode_pixel_mouse(event, PixelPosition { x: max, y: max }, modifiers)
+            .unwrap()
+            .as_bytes(),
+        b"\x1b[<191;4294967295;4294967295M"
+    );
+    for position in [
+        PixelPosition { x: u32::MAX, y: 0 },
+        PixelPosition { x: 0, y: u32::MAX },
+    ] {
+        assert!(
+            modes
+                .encode_pixel_mouse(event, position, modifiers)
+                .is_none()
+        );
+    }
+    assert!(
+        modes
+            .encode_mouse(event, CellPosition { row: 0, column: 0 }, modifiers)
+            .is_none()
+    );
+    assert!(
+        InputModes {
+            mouse_format: Sgr,
+            ..modes
+        }
+        .encode_pixel_mouse(event, position, modifiers)
+        .is_none()
+    );
+    assert!(
+        modes
+            .encode_pixel_mouse(MouseEvent::Motion(None), position, modifiers)
+            .is_none()
+    );
 }
 
 #[test]
@@ -236,51 +297,70 @@ fn alternate_scroll_routes_vertical_wheel_steps_only_without_mouse_tracking() {
 
 #[test]
 fn mouse_mode_lists_switch_atomically_and_snapshots_survive_save_and_reset() {
-    let cases: &[(&[u8], MouseTracking, bool, bool)] = &[
-        (b"\x1b[?1000h", MouseTracking::Buttons, false, false),
-        (b"\x1b[?1002h", MouseTracking::ButtonMotion, false, false),
-        (b"\x1b[?1003h", MouseTracking::AnyMotion, false, false),
-        (b"\x1b[?1006h", MouseTracking::Disabled, true, false),
+    let cases: &[(&[u8], MouseTracking, MouseFormat, bool)] = &[
+        (b"\x1b[?1000h", MouseTracking::Buttons, Legacy, false),
+        (b"\x1b[?1002h", MouseTracking::ButtonMotion, Legacy, false),
+        (b"\x1b[?1003h", MouseTracking::AnyMotion, Legacy, false),
+        (b"\x1b[?1006h", MouseTracking::Disabled, Sgr, false),
+        (
+            b"\x1b[?1006;1016h",
+            MouseTracking::Disabled,
+            SgrPixels,
+            false,
+        ),
+        (b"\x1b[?1016;1006h", MouseTracking::Disabled, Sgr, false),
+        (
+            b"\x1b[?1003;1016h",
+            MouseTracking::AnyMotion,
+            SgrPixels,
+            false,
+        ),
+        (
+            b"\x1b[?1003;1016h\x1b[?1006l",
+            MouseTracking::AnyMotion,
+            Legacy,
+            false,
+        ),
         (
             b"\x1b[?1000;1002;1003;1006h",
             MouseTracking::AnyMotion,
-            true,
+            Sgr,
             false,
         ),
         (
             b"\x1b[?1003;1002;1000h",
             MouseTracking::Buttons,
-            false,
+            Legacy,
             false,
         ),
         (
             b"\x1b[?1003;1006h\x1b[?1000l",
             MouseTracking::Disabled,
-            true,
+            Sgr,
             false,
         ),
         (
             b"\x1b[?1003;1006h\x1b[?1006l",
             MouseTracking::AnyMotion,
-            false,
+            Legacy,
             false,
         ),
         (
             b"\x1b[?1003;1006;999h",
             MouseTracking::Disabled,
-            false,
+            Legacy,
             true,
         ),
         (
             b"\x1b[?1003;1006h\x1b[?1000;1006;999l",
             MouseTracking::AnyMotion,
-            true,
+            Sgr,
             true,
         ),
-        (b"\x1b[1000h", MouseTracking::Disabled, false, true),
-        (b"\x1b[?1003:0h", MouseTracking::Disabled, false, true),
+        (b"\x1b[1000h", MouseTracking::Disabled, Legacy, true),
+        (b"\x1b[?1003:0h", MouseTracking::Disabled, Legacy, true),
     ];
-    for &(wire, tracking, sgr, ignored) in cases {
+    for &(wire, tracking, format, ignored) in cases {
         for split in 0..=wire.len() {
             let mut screen = Screen::new(8, 4).unwrap();
             screen.write_ascii(b"content", crate::StyleId(0)).unwrap();
@@ -297,8 +377,8 @@ fn mouse_mode_lists_switch_atomically_and_snapshots_survive_save_and_reset() {
                 .unwrap();
             let snapshot = processor.input_modes();
             assert_eq!(
-                (snapshot.mouse_tracking, snapshot.sgr_mouse),
-                (tracking, sgr)
+                (snapshot.mouse_tracking, snapshot.mouse_format),
+                (tracking, format)
             );
             assert_eq!(processor.ignored_sequences(), u64::from(ignored));
             assert_eq!(super::snapshot(screen.grid()), before);
@@ -324,7 +404,7 @@ fn mouse_mode_lists_switch_atomically_and_snapshots_survive_save_and_reset() {
                 processor.input_modes().mouse_tracking,
                 MouseTracking::Disabled
             );
-            assert!(!processor.input_modes().sgr_mouse);
+            assert_eq!(processor.input_modes().mouse_format, Legacy);
             processor
                 .advance(b"\x1b[?1002;1006h\x1bc", &mut screen, &mut text)
                 .unwrap();

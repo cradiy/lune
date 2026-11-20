@@ -4,7 +4,8 @@ use std::{
 };
 
 use lune_terminal::{
-    CellPosition, InputModes, Key, KeySequence, Modifiers, MouseButton, MouseEvent, MouseTracking,
+    CellPosition, InputModes, Key, KeySequence, Modifiers, MouseButton, MouseEvent, MouseFormat,
+    MouseTracking,
 };
 
 fn measure_mouse(name: &str, modes: InputModes, position: CellPosition, events: &[MouseEvent]) {
@@ -110,15 +111,19 @@ fn main() {
         ("drag", MouseTracking::ButtonMotion),
         ("motion", MouseTracking::AnyMotion),
     ] {
-        for sgr_mouse in [false, true] {
+        for mouse_format in [MouseFormat::Legacy, MouseFormat::Sgr] {
             measure_mouse(
                 &format!(
                     "mouse {name} / {}",
-                    if sgr_mouse { "SGR" } else { "normal" }
+                    if mouse_format == MouseFormat::Sgr {
+                        "SGR"
+                    } else {
+                        "normal"
+                    }
                 ),
                 InputModes {
                     mouse_tracking,
-                    sgr_mouse,
+                    mouse_format,
                     ..InputModes::default()
                 },
                 CellPosition {
@@ -129,16 +134,16 @@ fn main() {
             );
         }
     }
-    for (name, sgr_mouse, coordinate) in [
-        ("mouse normal / edge", false, 222),
-        ("mouse normal / overflow", false, 223),
-        ("mouse SGR / maximum", true, 65534),
+    for (name, mouse_format, coordinate) in [
+        ("mouse normal / edge", MouseFormat::Legacy, 222),
+        ("mouse normal / overflow", MouseFormat::Legacy, 223),
+        ("mouse SGR / maximum", MouseFormat::Sgr, 65534),
     ] {
         measure_mouse(
             name,
             InputModes {
                 mouse_tracking: MouseTracking::AnyMotion,
-                sgr_mouse,
+                mouse_format,
                 ..InputModes::default()
             },
             CellPosition {

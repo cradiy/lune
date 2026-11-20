@@ -2,8 +2,8 @@ use lune_vt::{ControlSequence, OscTerminator, Parameter};
 
 use crate::dcs::StatusQuery;
 use crate::{
-    Color, CursorShape, InputModes, MouseTracking, Rgb, Screen, ScreenBuffer, Style, StyleId,
-    StyleTable, Underline,
+    Color, CursorShape, InputModes, MouseFormat, MouseTracking, Rgb, Screen, ScreenBuffer, Style,
+    StyleId, StyleTable, Underline,
 };
 
 // A full DECRQSS rendition reply fits in 78 bytes.
@@ -444,8 +444,9 @@ pub(crate) fn mode_query(
         (true, 1002) => Some(input.mouse_tracking == MouseTracking::ButtonMotion),
         (true, 1003) => Some(input.mouse_tracking == MouseTracking::AnyMotion),
         (true, 1004) => Some(input.focus_reporting),
-        (true, 1006) => Some(input.sgr_mouse),
+        (true, 1006) => Some(input.mouse_format == MouseFormat::Sgr),
         (true, 1007) => Some(input.alternate_scroll),
+        (true, 1016) => Some(input.mouse_format == MouseFormat::SgrPixels),
         (true, 2004) => Some(input.bracketed_paste),
         (true, 2026) => Some(synchronized_output),
         (true, 2031) => Some(color_scheme_notifications),

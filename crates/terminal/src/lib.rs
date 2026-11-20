@@ -38,7 +38,9 @@ pub use history::{HistoryLimits, MAX_HISTORY_BYTES, MAX_HISTORY_ROWS, RowHistory
 pub use input::{InputModes, Key, KeySequence, Modifiers};
 pub use lines::{LogicalLine, LogicalLines};
 pub use lune_text::WidthPolicy;
-pub use mouse::{MouseButton, MouseEvent, MouseSequence, MouseTracking};
+pub use mouse::{
+    MouseButton, MouseEvent, MouseFormat, MouseSequence, MouseTracking, PixelPosition,
+};
 pub use osc::{MAX_OSC_PALETTE_ENTRIES, MAX_TITLE_BYTES, MAX_WORKING_DIRECTORY_URI_BYTES};
 pub use palette::{Palette, PaletteEntry, Rgb};
 pub use paste::Paste;

@@ -2509,10 +2509,13 @@ fn processor_retries_style_and_text_allocations_without_replaying_accepted_input
             lune_terminal::MouseTracking::ButtonMotion,
             lune_terminal::MouseTracking::AnyMotion,
         ] {
-            for sgr_mouse in [false, true] {
+            for mouse_format in [
+                lune_terminal::MouseFormat::Legacy,
+                lune_terminal::MouseFormat::Sgr,
+            ] {
                 let modes = lune_terminal::InputModes {
                     mouse_tracking,
-                    sgr_mouse,
+                    mouse_format,
                     ..modes
                 };
                 for event in [
@@ -2551,6 +2554,21 @@ fn processor_retries_style_and_text_allocations_without_replaying_accepted_input
                 }
             }
         }
+        let _ = black_box(
+            lune_terminal::InputModes {
+                mouse_format: lune_terminal::MouseFormat::SgrPixels,
+                ..modes
+            }
+            .encode_pixel_mouse(
+                lune_terminal::MouseEvent::Motion(Some(lune_terminal::MouseButton::Button11)),
+                lune_terminal::PixelPosition {
+                    x: u32::MAX - 1,
+                    y: u32::MAX - 1,
+                },
+                Modifiers::default(),
+            )
+            .unwrap(),
+        );
         for enabled in [false, true] {
             for focused in [false, true] {
                 black_box(
