@@ -1,7 +1,14 @@
 use std::num::NonZeroU32;
+use std::ops::Range;
 
 use lune_pty::PtySize;
 use lune_terminal::{CellPosition, MAX_CELLS, PixelPosition, PixelSize};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PixelRect {
+    pub origin: PixelPosition,
+    pub size: PixelSize,
+}
 
 /// Physical pixel geometry measured from the terminal content origin.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,6 +71,27 @@ impl GridGeometry {
         self.contains(pixel).then(|| CellPosition {
             row: (pixel.y / cell.height) as usize,
             column: (pixel.x / cell.width) as usize,
+        })
+    }
+
+    /// Returns the pixel bounds of a nonempty column range clipped to the grid.
+    #[inline]
+    pub fn row_rect(self, row: usize, columns: Range<usize>) -> Option<PixelRect> {
+        let cell = self.cell?;
+        let end = columns.end.min(usize::from(self.size.columns));
+        if row >= usize::from(self.size.rows) || columns.start >= end {
+            return None;
+        }
+        let width = NonZeroU32::new((end - columns.start) as u32 * cell.width.get())?;
+        Some(PixelRect {
+            origin: PixelPosition {
+                x: columns.start as u32 * cell.width.get(),
+                y: row as u32 * cell.height.get(),
+            },
+            size: PixelSize {
+                width,
+                height: cell.height,
+            },
         })
     }
 }

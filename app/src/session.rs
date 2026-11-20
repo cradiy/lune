@@ -13,7 +13,7 @@ use lune_terminal::{
     TerminalNotifications, TextSink, UnicodeWriter, Viewport,
 };
 
-use crate::GridGeometry;
+use crate::{GridGeometry, PixelRect};
 
 mod presentation;
 mod wait;
@@ -72,6 +72,12 @@ pub struct PresentationRun<'a> {
     pub style: PresentationStyle<'a>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BackgroundRect {
+    pub rect: PixelRect,
+    pub color: Rgb,
+}
+
 impl<'a> PresentationRun<'a> {
     #[inline]
     pub fn columns(&self) -> Range<usize> {
@@ -95,14 +101,8 @@ impl<'a> PresentationFrame<'a> {
         columns: Range<usize>,
     ) -> Option<impl Iterator<Item = Result<PresentationRun<'a>, StyleError>> + '_> {
         let row = self.viewport.row(row)?;
-        let end = columns.end.min(self.geometry.pty_size().columns.into());
-        let start = columns.start.min(end);
-        let padding = start.max(row.cells().len());
-        let mut padding = (padding < end).then_some(StyleRun {
-            columns: padding..end,
-            style: StyleId::default(),
-        });
-        let mut runs = row.style_runs(start..end);
+        let (columns, mut padding) = self.row_columns(row, columns);
+        let mut runs = row.style_runs(columns);
         Some(std::iter::from_fn(move || {
             let run = runs.next().or_else(|| padding.take())?;
             let style = self
@@ -114,6 +114,72 @@ impl<'a> PresentationFrame<'a> {
                 style,
             }))
         }))
+    }
+
+    /// Returns solid background rectangles in physical pixels, merging adjacent
+    /// spans of the same resolved color. The row must have known pixel metrics.
+    #[inline]
+    pub fn row_backgrounds(
+        &self,
+        row: usize,
+        columns: Range<usize>,
+    ) -> Option<impl Iterator<Item = Result<BackgroundRect, StyleError>> + '_> {
+        self.geometry.cell_pixels()?;
+        if row >= usize::from(self.geometry.pty_size().rows) {
+            return None;
+        }
+        let source = self.viewport.row(row)?;
+        let (columns, mut padding) = self.row_columns(source, columns);
+        let mut spans = source.style_runs(columns);
+        let mut runs = std::iter::from_fn(move || {
+            let run = spans.next().or_else(|| padding.take())?;
+            let style = self.styles.get(run.style).ok_or(run.style);
+            Some(style.map(|style| {
+                let color = if style.inverse {
+                    style.foreground
+                } else {
+                    style.background
+                };
+                let role = if self.reverse_video ^ style.inverse {
+                    PaletteEntry::Foreground
+                } else {
+                    PaletteEntry::Background
+                };
+                (run.columns, self.palette.resolve(color, role))
+            }))
+        });
+        let mut pending = None;
+        Some(std::iter::from_fn(move || {
+            let (mut columns, color) = match pending.take().or_else(|| runs.next())? {
+                Ok(span) => span,
+                Err(id) => return Some(Err(StyleError::InvalidId(id))),
+            };
+            for next in runs.by_ref() {
+                match next {
+                    Ok((next_columns, next_color)) if next_color == color => {
+                        columns.end = next_columns.end;
+                    }
+                    _ => {
+                        pending = Some(next);
+                        break;
+                    }
+                }
+            }
+            let rect = self.geometry.row_rect(row, columns)?;
+            Some(Ok(BackgroundRect { rect, color }))
+        }))
+    }
+
+    #[inline]
+    fn row_columns(&self, row: &Row, columns: Range<usize>) -> (Range<usize>, Option<StyleRun>) {
+        let end = columns.end.min(self.geometry.pty_size().columns.into());
+        let start = columns.start.min(end);
+        let padding = start.max(row.cells().len());
+        let padding = (padding < end).then_some(StyleRun {
+            columns: padding..end,
+            style: StyleId::default(),
+        });
+        (start..end, padding)
     }
 
     /// Resolves colors against this frame. Screen inversion swaps the default

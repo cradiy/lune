@@ -390,8 +390,68 @@ fn presentation_runs_resolve_colors_after_screen_and_cell_inversion() {
 }
 
 #[test]
+fn presentation_backgrounds_merge_by_resolved_color_in_pixel_coordinates() {
+    let mut session =
+        session("\x1b[2;1H\x1b[31mA\x1b[1mB\x1b[4m水\x1b[0;7mC\x1b[0mD\x1b[?5h".as_bytes());
+    let foreground = Rgb {
+        red: 240,
+        green: 220,
+        blue: 200,
+    };
+    let background = Rgb {
+        red: 10,
+        green: 20,
+        blue: 30,
+    };
+    let black = Rgb::default();
+    session.set_theme(
+        &Palette::new([black; 256], foreground, background, black),
+        None,
+    );
+    session.pump().unwrap();
+    assert!(
+        session
+            .presentation_frame()
+            .unwrap()
+            .row_backgrounds(1, 1..8)
+            .is_none()
+    );
+    session.geometry = GridGeometry::fit(pixels(67, 51), pixels(8, 16)).unwrap();
+
+    let frame = session.presentation_frame().unwrap();
+    let mut rects = frame.row_backgrounds(1, 1..usize::MAX).unwrap();
+    let rect = |x, width, color| BackgroundRect {
+        rect: PixelRect {
+            origin: PixelPosition { x, y: 16 },
+            size: pixels(width, 16),
+        },
+        color,
+    };
+    assert_eq!(rects.next().unwrap().unwrap(), rect(8, 24, foreground));
+    assert_eq!(rects.next().unwrap().unwrap(), rect(32, 8, background));
+    assert_eq!(rects.next().unwrap().unwrap(), rect(40, 24, foreground));
+    assert!(rects.next().is_none());
+    assert_eq!(
+        frame
+            .row_backgrounds(1, 3..4)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap(),
+        rect(24, 8, foreground)
+    );
+    assert!(
+        frame
+            .row_backgrounds(1, 8..usize::MAX)
+            .unwrap()
+            .next()
+            .is_none()
+    );
+}
+
+#[test]
 fn presentation_runs_clip_and_pad_to_the_current_width() {
-    let mut session = session("\x1b[41mabcdef水\r\nb\r\nc\r\nd".as_bytes());
+    let mut session = session("\x1b]4;1;#010203\x07\x1b[41mabcdef水\r\nb\r\nc\r\nd".as_bytes());
     session
         .set_history_limits(HistoryLimits {
             max_rows: 1,
@@ -416,7 +476,7 @@ fn presentation_runs_clip_and_pad_to_the_current_width() {
     drop(runs);
 
     session.screen.resize(10, 3, StyleId::default()).unwrap();
-    session.geometry = GridGeometry::from_pty_size(PtySize::new(3, 10));
+    session.geometry = GridGeometry::fit(pixels(80, 48), pixels(8, 16)).unwrap();
     let frame = session.presentation_frame().unwrap();
     let mut runs = frame.row_runs(0, 7..usize::MAX).unwrap();
     let tail = runs.next().unwrap().unwrap();
@@ -434,6 +494,34 @@ fn presentation_runs_clip_and_pad_to_the_current_width() {
     assert_eq!(frame.row_runs(0, 9..10).unwrap().count(), 1);
     assert_eq!(frame.row_runs(0, 10..10).unwrap().count(), 0);
     assert!(frame.row_runs(3, 0..10).is_none());
+
+    let mut rects = frame.row_backgrounds(0, 7..usize::MAX).unwrap();
+    let retained = rects.next().unwrap().unwrap();
+    assert_eq!(
+        retained.rect,
+        PixelRect {
+            origin: PixelPosition { x: 56, y: 0 },
+            size: pixels(8, 16)
+        }
+    );
+    assert_eq!(
+        retained.color,
+        Rgb {
+            red: 1,
+            green: 2,
+            blue: 3
+        }
+    );
+    let padding = rects.next().unwrap().unwrap();
+    assert_eq!(
+        padding.rect,
+        PixelRect {
+            origin: PixelPosition { x: 64, y: 0 },
+            size: pixels(16, 16)
+        }
+    );
+    assert_eq!(padding.color, Rgb::default());
+    assert!(rects.next().is_none());
 }
 
 #[test]

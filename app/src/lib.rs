@@ -4,10 +4,10 @@ mod geometry;
 mod session;
 
 #[cfg(target_os = "linux")]
-pub use geometry::GridGeometry;
+pub use geometry::{GridGeometry, PixelRect};
 #[cfg(target_os = "linux")]
 pub use session::{
-    CursorChange, MAX_INPUT_BYTES, MAX_PASTE_BYTES, MouseInputOutcome, PresentationDamage,
-    PresentationFrame, PresentationRun, PresentationStyle, PresentationTracker, PresentedCursor,
-    PtyInterest, RowDamage, Session, SessionInterests, SessionReady, WaitOutcome,
+    BackgroundRect, CursorChange, MAX_INPUT_BYTES, MAX_PASTE_BYTES, MouseInputOutcome,
+    PresentationDamage, PresentationFrame, PresentationRun, PresentationStyle, PresentationTracker,
+    PresentedCursor, PtyInterest, RowDamage, Session, SessionInterests, SessionReady, WaitOutcome,
 };
