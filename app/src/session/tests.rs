@@ -639,6 +639,107 @@ fn presentation_damage_separates_cursor_and_resolved_text_colors() {
 }
 
 #[test]
+fn cursor_paint_covers_the_whole_unit_at_a_continuation_cell() {
+    let mut session = session("\x1b[2;2H\x1b[1;31;44m水\u{301}\x1b[2;3H".as_bytes());
+    session.geometry = GridGeometry::fit(pixels(64, 48), pixels(8, 16)).unwrap();
+    let background = Rgb {
+        red: 10,
+        green: 20,
+        blue: 60,
+    };
+    let cursor = Rgb {
+        red: 240,
+        green: 220,
+        blue: 200,
+    };
+    let base = Rgb::default();
+    let mut indexed = [base; 256];
+    indexed[4] = background;
+    session.set_theme(&Palette::new(indexed, base, base, cursor), None);
+    session.pump().unwrap();
+
+    let mut tracker = PresentationTracker::default();
+    let now = Instant::now();
+    let thickness = NonZeroU32::new(2).unwrap();
+    let frame = session.presentation_frame().unwrap();
+    tracker.update(&frame, now).unwrap();
+    let displayed = tracker.displayed_cursor().unwrap();
+    assert_eq!(displayed.position, CellPosition { row: 1, column: 2 });
+    let block = frame.cursor_paint(displayed, thickness).unwrap().unwrap();
+    assert_eq!(
+        block.rect,
+        PixelRect {
+            origin: PixelPosition { x: 8, y: 16 },
+            size: pixels(16, 16)
+        }
+    );
+    assert_eq!(block.color, cursor);
+    let glyph = block.glyph.unwrap();
+    assert_eq!(glyph.unit.column, 1);
+    assert_eq!(glyph.unit.text, CellText::Extended("水\u{301}"));
+    assert_eq!(glyph.color, background);
+    assert!(glyph.style.bold);
+
+    for (input, origin, size) in [
+        (
+            &b"\x1b[4 q"[..],
+            PixelPosition { x: 8, y: 30 },
+            pixels(16, 2),
+        ),
+        (
+            &b"\x1b[6 q"[..],
+            PixelPosition { x: 8, y: 16 },
+            pixels(2, 16),
+        ),
+    ] {
+        session.transport.source = Cursor::new(input);
+        session.pump().unwrap();
+        let frame = session.presentation_frame().unwrap();
+        tracker.update(&frame, now).unwrap();
+        let paint = frame
+            .cursor_paint(tracker.displayed_cursor().unwrap(), thickness)
+            .unwrap()
+            .unwrap();
+        assert_eq!(paint.rect, PixelRect { origin, size });
+        assert_eq!(paint.glyph, None);
+    }
+}
+
+#[test]
+fn block_cursor_preserves_concealment_and_handles_matching_colors() {
+    let mut session = session(b"X\x1b[8mY\x1b[1;1H");
+    session.geometry = GridGeometry::fit(pixels(64, 48), pixels(8, 16)).unwrap();
+    session.pump().unwrap();
+    let mut tracker = PresentationTracker::default();
+    let now = Instant::now();
+    let thickness = NonZeroU32::new(2).unwrap();
+    let frame = session.presentation_frame().unwrap();
+    tracker.update(&frame, now).unwrap();
+    let paint = frame
+        .cursor_paint(tracker.displayed_cursor().unwrap(), thickness)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        paint.glyph.unwrap().color,
+        Rgb {
+            red: 255,
+            green: 255,
+            blue: 255
+        }
+    );
+
+    session.transport.source = Cursor::new(b"\x1b[1;2H");
+    session.pump().unwrap();
+    let frame = session.presentation_frame().unwrap();
+    tracker.update(&frame, now).unwrap();
+    let paint = frame
+        .cursor_paint(tracker.displayed_cursor().unwrap(), thickness)
+        .unwrap()
+        .unwrap();
+    assert_eq!(paint.glyph, None);
+}
+
+#[test]
 fn cursor_blink_keeps_its_cadence_and_only_changes_the_overlay() {
     let session = session(b"");
     let frame = session.presentation_frame().unwrap();

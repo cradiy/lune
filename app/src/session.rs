@@ -19,7 +19,8 @@ mod presentation;
 mod wait;
 
 pub use presentation::{
-    CursorChange, PresentationDamage, PresentationTracker, PresentedCursor, RowDamage,
+    CursorChange, CursorGlyph, CursorPaint, PresentationDamage, PresentationTracker,
+    PresentedCursor, RowDamage,
 };
 pub use wait::{PtyInterest, SessionInterests, SessionReady, WaitOutcome};
 

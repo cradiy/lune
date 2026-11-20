@@ -1,9 +1,13 @@
 use std::collections::TryReserveError;
+use std::num::NonZeroU32;
 use std::time::{Duration, Instant};
 
-use lune_terminal::{CellPosition, CursorAppearance, Palette, PaletteEntry, Rgb, Row, RowRevision};
+use lune_terminal::{
+    CellPosition, CellText, CursorAppearance, CursorShape, DisplayUnit, Palette, PaletteEntry, Rgb,
+    Row, RowRevision, Style, StyleError,
+};
 
-use crate::GridGeometry;
+use crate::{GridGeometry, PixelRect};
 
 use super::PresentationFrame;
 
@@ -19,6 +23,110 @@ pub struct PresentedCursor {
     pub position: CellPosition,
     pub appearance: CursorAppearance,
     pub color: Rgb,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CursorPaint<'a> {
+    pub rect: PixelRect,
+    pub color: Rgb,
+    pub glyph: Option<CursorGlyph<'a>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CursorGlyph<'a> {
+    pub unit: DisplayUnit<'a>,
+    pub color: Rgb,
+    pub style: &'a Style,
+}
+
+impl<'a> PresentationFrame<'a> {
+    /// Resolves a displayed cursor against this frame. Draw its glyph at the
+    /// block origin and clip it to the rectangle.
+    pub fn cursor_paint(
+        &self,
+        cursor: PresentedCursor,
+        thickness: NonZeroU32,
+    ) -> Result<Option<CursorPaint<'a>>, StyleError> {
+        let Some(cell) = self.geometry.cell_pixels() else {
+            return Ok(None);
+        };
+        let CellPosition { row, column } = cursor.position;
+        if !cursor.appearance.visible || column >= usize::from(self.geometry.pty_size().columns) {
+            return Ok(None);
+        }
+        let Some(source) = self.viewport.row(row) else {
+            return Ok(None);
+        };
+        let cells = source.cells();
+        let Some(covered) = cells.get(column) else {
+            return Ok(None);
+        };
+        let leading = column - usize::from(covered.is_continuation());
+        let covered = cells[leading];
+        let Some(mut rect) = self
+            .geometry
+            .row_rect(row, leading..leading + covered.width())
+        else {
+            return Ok(None);
+        };
+
+        let mut glyph = None;
+        match cursor.appearance.shape {
+            CursorShape::Block if !covered.is_erased() => {
+                let id = covered.style();
+                let style = self.resolve_style(id).ok_or(StyleError::InvalidId(id))?;
+                if !style.style.hidden {
+                    let color = cursor_text_color(style.background, style.foreground, cursor.color);
+                    let text = if covered.has_extended_text() {
+                        source
+                            .text(leading)
+                            .expect("The leading column is in the row")
+                    } else {
+                        CellText::Scalar(covered.character().expect("A leading cell has a scalar"))
+                    };
+                    glyph = Some(CursorGlyph {
+                        unit: DisplayUnit {
+                            column: leading,
+                            cell: covered,
+                            text,
+                        },
+                        color,
+                        style: style.style,
+                    });
+                }
+            }
+            CursorShape::Block => {}
+            CursorShape::Bar => rect.size.width = thickness.min(cell.width),
+            CursorShape::Underline => {
+                let height = thickness.min(cell.height);
+                rect.origin.y += cell.height.get() - height.get();
+                rect.size.height = height;
+            }
+        }
+        Ok(Some(CursorPaint {
+            rect,
+            color: cursor.color,
+            glyph,
+        }))
+    }
+}
+
+fn cursor_text_color(background: Rgb, foreground: Rgb, cursor: Rgb) -> Rgb {
+    if background != cursor {
+        background
+    } else if foreground != cursor {
+        foreground
+    } else {
+        let brightness = 54 * u32::from(cursor.red)
+            + 183 * u32::from(cursor.green)
+            + 19 * u32::from(cursor.blue);
+        let channel = if brightness >= 128 * 256 { 0 } else { 255 };
+        Rgb {
+            red: channel,
+            green: channel,
+            blue: channel,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

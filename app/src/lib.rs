@@ -7,7 +7,8 @@ mod session;
 pub use geometry::{GridGeometry, PixelRect};
 #[cfg(target_os = "linux")]
 pub use session::{
-    BackgroundRect, CursorChange, MAX_INPUT_BYTES, MAX_PASTE_BYTES, MouseInputOutcome,
-    PresentationDamage, PresentationFrame, PresentationRun, PresentationStyle, PresentationTracker,
-    PresentedCursor, PtyInterest, RowDamage, Session, SessionInterests, SessionReady, WaitOutcome,
+    BackgroundRect, CursorChange, CursorGlyph, CursorPaint, MAX_INPUT_BYTES, MAX_PASTE_BYTES,
+    MouseInputOutcome, PresentationDamage, PresentationFrame, PresentationRun, PresentationStyle,
+    PresentationTracker, PresentedCursor, PtyInterest, RowDamage, Session, SessionInterests,
+    SessionReady, WaitOutcome,
 };
