@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2024"
 description = "PTY process lifecycle and byte transport"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 
