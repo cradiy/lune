@@ -7,10 +7,10 @@ use std::time::{Duration, Instant};
 
 use lune_pty::{ChildExit, Pty, PtySize};
 use lune_terminal::{
-    CellPosition, ColorScheme, HistoryLimits, Key, KeySequence, MAX_STYLES, Modifiers, MouseEvent,
-    MouseFormat, MouseSequence, MouseTracking, Palette, PixelPosition, PixelSize, ProcessFailure,
-    Processor, Screen, ScreenBuffer, StorageError, StyleError, StyleId, TerminalNotifications,
-    TextSink, UnicodeWriter,
+    CellPosition, ColorScheme, CursorAppearance, HistoryLimits, Key, KeySequence, MAX_STYLES,
+    Modifiers, MouseEvent, MouseFormat, MouseSequence, MouseTracking, Palette, PixelPosition,
+    PixelSize, ProcessFailure, Processor, Screen, ScreenBuffer, StorageError, StyleError, StyleId,
+    StyleTable, TerminalNotifications, TextSink, UnicodeWriter, Viewport,
 };
 
 mod wait;
@@ -45,6 +45,16 @@ pub enum MouseInputOutcome {
     Ignored,
     Queued,
     HistoryScrolled,
+}
+
+/// Borrowed state for one presentation pass.
+pub struct PresentationFrame<'a> {
+    pub viewport: Viewport<'a>,
+    pub columns: usize,
+    pub cursor_appearance: CursorAppearance,
+    pub reverse_video: bool,
+    pub styles: &'a StyleTable,
+    pub palette: &'a Palette,
 }
 
 /// Drives terminal state and child I/O from a nonblocking PTY.
@@ -161,6 +171,19 @@ impl<T: Read + Write> Session<T> {
     /// The live screen when it is ready for presentation.
     pub fn presentation_screen(&self) -> Option<&Screen> {
         self.presentation_deadline.is_none().then_some(&self.screen)
+    }
+
+    /// Borrows the visible viewport and its rendition state when presentation is ready.
+    pub fn presentation_frame(&self) -> Option<PresentationFrame<'_>> {
+        let screen = self.presentation_screen()?;
+        Some(PresentationFrame {
+            viewport: screen.viewport(),
+            columns: screen.grid().columns(),
+            cursor_appearance: screen.cursor_appearance(),
+            reverse_video: screen.reverse_video(),
+            styles: self.processor.styles(),
+            palette: self.processor.palette(),
+        })
     }
 
     /// When to pump again to release a synchronized frame, even if the PTY is idle.

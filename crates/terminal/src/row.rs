@@ -1,4 +1,4 @@
-use std::{fmt, ops::Range};
+use std::{fmt, iter::FusedIterator, ops::Range, slice};
 
 use crate::{Cell, CellPosition, CellText, CellWidth, MAX_CELL_TEXT_BYTES, StorageError, StyleId};
 
@@ -15,6 +15,51 @@ pub struct Row {
     cells: Vec<Cell>,
     extended: Vec<ExtendedText>,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DisplayUnit<'a> {
+    pub column: usize,
+    pub cell: Cell,
+    pub text: CellText<'a>,
+}
+
+/// Complete display units traversed in physical column order.
+pub struct DisplayUnits<'a> {
+    column: usize,
+    cells: &'a [Cell],
+    extended: slice::Iter<'a, ExtendedText>,
+}
+
+impl<'a> Iterator for DisplayUnits<'a> {
+    type Item = DisplayUnit<'a>;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        let cell = *self.cells.first()?;
+        let column = self.column;
+        let width = cell.width();
+        self.cells = &self.cells[width..];
+        self.column += width;
+        let text = if cell.has_extended_text() {
+            let entry = self.extended.next().expect("Extended text is present");
+            debug_assert_eq!(entry.column, column);
+            CellText::Extended(&entry.text)
+        } else {
+            CellText::Scalar(
+                cell.character()
+                    .expect("Display units start at a leading cell"),
+            )
+        };
+        Some(DisplayUnit { column, cell, text })
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let columns = self.cells.len();
+        (columns.div_ceil(2), Some(columns))
+    }
+}
+
+impl FusedIterator for DisplayUnits<'_> {}
 
 /// Unpublished cell storage whose extended-text slots are filled during commit.
 pub(crate) struct PreparedRow {
@@ -258,6 +303,32 @@ impl Row {
 
     pub fn cells(&self) -> &[Cell] {
         &self.cells
+    }
+
+    /// Borrows units intersecting a clamped half-open column range.
+    /// A wide unit crossing either edge is returned whole, with its leading column.
+    #[inline]
+    pub fn display_units(&self, columns: Range<usize>) -> DisplayUnits<'_> {
+        let mut end = columns.end.min(self.cells.len());
+        let mut start = columns.start.min(end);
+        if start < end {
+            start -= usize::from(self.cells[start].is_continuation());
+            end += usize::from(
+                self.cells
+                    .get(end)
+                    .is_some_and(|cell| cell.is_continuation()),
+            );
+        }
+        let first = if start < end && start != 0 {
+            self.extended.partition_point(|entry| entry.column < start)
+        } else {
+            0
+        };
+        DisplayUnits {
+            column: start,
+            cells: &self.cells[start..end],
+            extended: self.extended[first..].iter(),
+        }
     }
 
     /// Exclusive column where this row joins the next row through automatic

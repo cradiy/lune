@@ -1,6 +1,6 @@
 use std::io::Cursor;
 
-use lune_terminal::{CellText, MouseButton, PaletteEntry, Rgb, WorkingDirectoryChange};
+use lune_terminal::{CellText, Color, MouseButton, PaletteEntry, Rgb, WorkingDirectoryChange};
 
 use super::*;
 
@@ -258,6 +258,57 @@ fn synchronized_output_releases_on_explicit_end_and_pty_eof() {
 }
 
 #[test]
+fn presentation_frame_keeps_whole_units_and_matches_their_rendition() {
+    let now = Instant::now();
+    let mut session = session(
+        "\x1b[?2026h\x1b[31mA\u{301}水\x1b[32me\u{301} \x1b[?5h\x1b[?25l\x1b]11;#010203\x07"
+            .as_bytes(),
+    );
+    session.pump_with_clock(|| now).unwrap();
+    assert!(session.presentation_frame().is_none());
+    session.transport.source = Cursor::new(b"\x1b[?2026l");
+    session.pump_with_clock(|| now).unwrap();
+
+    let frame = session.presentation_frame().unwrap();
+    assert!(frame.reverse_video && !frame.cursor_appearance.visible);
+    assert_eq!(frame.viewport.cursor().unwrap().column, 5);
+    assert_eq!(
+        frame.palette.color(PaletteEntry::Background),
+        Rgb {
+            red: 1,
+            green: 2,
+            blue: 3
+        }
+    );
+    let row = frame.viewport.row(0).unwrap();
+    let mut clipped = row.display_units(2..4);
+    let first = clipped.next().unwrap();
+    assert_eq!(
+        (first.column, first.cell.width(), first.text),
+        (1, 2, CellText::Scalar('水'))
+    );
+    assert_eq!(
+        frame.styles.get(first.cell.style()).unwrap().foreground,
+        Color::Indexed(1)
+    );
+    let second = clipped.next().unwrap();
+    assert_eq!(
+        (second.column, second.text),
+        (3, CellText::Extended("e\u{301}"))
+    );
+    assert_eq!(
+        frame.styles.get(second.cell.style()).unwrap().foreground,
+        Color::Indexed(2)
+    );
+    assert!(clipped.next().is_none());
+    assert_eq!(row.display_units(0..2).last().unwrap(), first);
+
+    let mut trailing = row.display_units(4..frame.columns);
+    assert!(!trailing.next().unwrap().cell.is_erased());
+    assert!(trailing.all(|unit| unit.cell.is_erased()));
+}
+
+#[test]
 fn waiting_on_a_real_pty_respects_idle_deadlines_and_drains_hangup() {
     let mut child = Command::new("sh");
     child.args([
@@ -475,12 +526,16 @@ fn external_poll_dispatches_host_io_pty_exit_and_presentation_deadline() {
         held |= session.presentation_deadline().is_some();
         if held
             && !sent
-            && let Some(screen) = session.presentation_screen()
+            && let Some(frame) = session.presentation_frame()
         {
-            assert_eq!(
-                screen.grid().row(0).unwrap().text(0),
-                Some(CellText::Scalar('A'))
-            );
+            let first = frame
+                .viewport
+                .row(0)
+                .unwrap()
+                .display_units(0..frame.columns)
+                .next()
+                .unwrap();
+            assert_eq!((first.column, first.text), (0, CellText::Scalar('A')));
             session.queue_input(b"finish\n").unwrap();
             assert!(session.interests().pty.unwrap().write);
             sent = true;
