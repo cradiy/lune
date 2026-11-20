@@ -522,6 +522,13 @@ fn external_poll_dispatches_host_io_pty_exit_and_presentation_deadline() {
     .unwrap();
     let (mut host, mut peer) = io::pipe().unwrap();
     peer.write_all(b"x").unwrap();
+    let initial = session
+        .presentation_frame()
+        .unwrap()
+        .viewport
+        .row(0)
+        .unwrap()
+        .revision();
     let limit = Instant::now() + Duration::from_secs(5);
     let mut host_ready = false;
     let mut held = false;
@@ -599,13 +606,9 @@ fn external_poll_dispatches_host_io_pty_exit_and_presentation_deadline() {
             && !sent
             && let Some(frame) = session.presentation_frame()
         {
-            let first = frame
-                .viewport
-                .row(0)
-                .unwrap()
-                .display_units(0..frame.columns)
-                .next()
-                .unwrap();
+            let row = frame.viewport.row(0).unwrap();
+            assert_ne!(row.revision(), initial);
+            let first = row.display_units(0..frame.columns).next().unwrap();
             assert_eq!((first.column, first.text), (0, CellText::Scalar('A')));
             assert_eq!(
                 frame.resolve_style(first.cell.style()).unwrap().foreground,

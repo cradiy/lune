@@ -22,6 +22,42 @@ fn window(screen: &Screen) -> String {
 }
 
 #[test]
+fn row_revisions_follow_visible_content_and_invalidate_recycled_rows() {
+    let mut screen = Screen::new(4, 2).unwrap();
+    screen.set_history_limits(limits(1, 4096)).unwrap();
+    let style = StyleId::default();
+    screen.write("e\u{301}", CellWidth::Single, style).unwrap();
+    let first = screen.grid().row(0).unwrap().revision();
+    let second = screen.grid().row(1).unwrap().revision();
+    screen.set_cursor(0, 0);
+    assert_eq!(screen.grid().row(0).unwrap().revision(), first);
+    assert!(screen.write("", CellWidth::Single, style).is_err());
+    assert_eq!(screen.grid().row(0).unwrap().revision(), first);
+
+    screen.write("e\u{300}", CellWidth::Single, style).unwrap();
+    let edited = screen.grid().row(0).unwrap().revision();
+    assert_ne!(edited, first);
+    assert_eq!(screen.grid().row(1).unwrap().revision(), second);
+
+    screen.scroll_up(1, style).unwrap();
+    screen.scroll_viewport_up(1);
+    assert_eq!(screen.viewport().row(0).unwrap().revision(), edited);
+    assert_eq!(screen.grid().row(0).unwrap().revision(), second);
+    let replacement = screen.grid().row(1).unwrap().revision();
+
+    screen.scroll_up(1, style).unwrap();
+    assert_eq!(screen.viewport().row(0).unwrap().revision(), second);
+    assert_eq!(screen.grid().row(0).unwrap().revision(), replacement);
+    let reused = screen.grid().row(1).unwrap().revision();
+    assert_ne!(reused, edited);
+    assert_ne!(reused, second);
+
+    screen.resize(3, 2, style).unwrap();
+    assert_ne!(screen.grid().row(0).unwrap().revision(), replacement);
+    assert_ne!(screen.grid().row(1).unwrap().revision(), reused);
+}
+
+#[test]
 fn viewport_follows_then_anchors_retained_rows_and_clamps_after_eviction() {
     let mut screen = Screen::new(1, 2).unwrap();
     screen.set_history_limits(limits(8, 4096)).unwrap();

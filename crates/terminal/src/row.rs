@@ -1,6 +1,18 @@
-use std::{fmt, iter::FusedIterator, ops::Range, slice};
+use std::{
+    fmt,
+    iter::FusedIterator,
+    ops::Range,
+    slice,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use crate::{Cell, CellPosition, CellText, CellWidth, MAX_CELL_TEXT_BYTES, StorageError, StyleId};
+
+static NEXT_ROW_REVISION: AtomicU64 = AtomicU64::new(1);
+
+/// An opaque cache key for a physical row's cells, width, and extended text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct RowRevision(u64);
 
 #[derive(Debug)]
 struct ExtendedText {
@@ -14,6 +26,7 @@ struct ExtendedText {
 pub struct Row {
     cells: Vec<Cell>,
     extended: Vec<ExtendedText>,
+    revision: AtomicU64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -140,6 +153,9 @@ impl Row {
         range: Range<usize>,
     ) {
         let entries = source.extended_range(range.clone());
+        if entries.is_empty() {
+            return;
+        }
         let start = self.extended.partition_point(|entry| entry.column < column);
         for (target, entry) in self.extended[start..start + entries.len()]
             .iter_mut()
@@ -150,6 +166,8 @@ impl Row {
             debug_assert!(!entry.text.is_empty());
             target.text = std::mem::take(&mut entry.text);
         }
+        self.invalidate_revision();
+        source.invalidate_revision();
     }
 
     /// Copies aligned units into the next segment of a fresh unpublished row.
@@ -204,6 +222,7 @@ impl Row {
     #[inline]
     fn copy_cells(&mut self, column: usize, source: &Self, range: Range<usize>) {
         self.cells[column..column + range.len()].copy_from_slice(&source.cells[range.clone()]);
+        self.invalidate_revision();
         // Source edge markers can become interior cells in the destination.
         for edge in source.cells.len().saturating_sub(2)..source.cells.len() {
             if range.contains(&edge) {
@@ -304,7 +323,41 @@ impl Row {
         Ok(Self {
             cells,
             extended: Vec::new(),
+            revision: AtomicU64::new(0),
         })
+    }
+
+    /// Returns the current row revision. Moving the row preserves this key.
+    /// Successful edits can publish a new key even when the visible values match.
+    #[inline]
+    pub fn revision(&self) -> RowRevision {
+        let revision = self.revision.load(Ordering::Relaxed);
+        if revision == 0 {
+            self.publish_revision()
+        } else {
+            RowRevision(revision)
+        }
+    }
+
+    #[cold]
+    fn publish_revision(&self) -> RowRevision {
+        let fresh = NEXT_ROW_REVISION
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                value.checked_add(1)
+            })
+            .expect("Row revision space exhausted");
+        match self
+            .revision
+            .compare_exchange(0, fresh, Ordering::Relaxed, Ordering::Relaxed)
+        {
+            Ok(_) => RowRevision(fresh),
+            Err(published) => RowRevision(published),
+        }
+    }
+
+    #[inline]
+    fn invalidate_revision(&mut self) {
+        *self.revision.get_mut() = 0;
     }
 
     pub fn cells(&self) -> &[Cell] {
@@ -460,6 +513,7 @@ impl Row {
         if width == CellWidth::Double {
             self.cells[column + 1] = Cell::continuation(style);
         }
+        self.invalidate_revision();
         Ok(())
     }
 
@@ -616,6 +670,7 @@ impl Row {
             for (cell, &byte) in self.cells[column..end].iter_mut().zip(bytes) {
                 *cell = Cell::scalar(char::from(byte), CellWidth::Single, style);
             }
+            self.invalidate_revision();
         }
     }
 
@@ -660,6 +715,7 @@ impl Row {
         if self.wrap_end().is_some_and(|end| column >= end) {
             self.set_wrap_end(None);
         }
+        self.invalidate_revision();
         Ok(())
     }
 
@@ -674,6 +730,7 @@ impl Row {
         if !range.is_empty() {
             self.prepare_overwrite(range.clone(), style, None);
             self.cells[range].fill(Cell::blank(style));
+            self.invalidate_revision();
         }
         Ok(())
     }
@@ -682,12 +739,14 @@ impl Row {
     pub(crate) fn clear(&mut self, style: StyleId) {
         self.extended.clear();
         self.cells.fill(Cell::blank(style));
+        self.invalidate_revision();
     }
 
     pub(crate) fn fill_scalar(&mut self, character: char, style: StyleId) {
         self.extended.clear();
         self.cells
             .fill(Cell::scalar(character, CellWidth::Single, style));
+        self.invalidate_revision();
     }
 
     /// Replaces a recycled row with validated ASCII of exactly the row width.
@@ -698,6 +757,7 @@ impl Row {
         for (cell, &byte) in self.cells.iter_mut().zip(bytes) {
             *cell = Cell::scalar(char::from(byte), CellWidth::Single, style);
         }
+        self.invalidate_revision();
     }
 
     pub(crate) fn insert_cells(
@@ -726,6 +786,7 @@ impl Row {
         for entry in &mut self.extended[first..] {
             entry.column += count;
         }
+        self.invalidate_revision();
         Ok(())
     }
 
@@ -752,6 +813,7 @@ impl Row {
         for entry in &mut self.extended[first..] {
             entry.column -= count;
         }
+        self.invalidate_revision();
         Ok(())
     }
 
@@ -764,6 +826,7 @@ impl Row {
     pub(crate) fn resize_prepared(&mut self, columns: usize, style: StyleId) {
         if columns != self.cells.len() {
             self.set_wrap_end(None);
+            self.invalidate_revision();
         }
         if columns < self.cells.len() {
             self.cells.truncate(columns);
