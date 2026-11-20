@@ -445,6 +445,7 @@ pub(crate) fn mode_query(
         (true, 1003) => Some(input.mouse_tracking == MouseTracking::AnyMotion),
         (true, 1004) => Some(input.focus_reporting),
         (true, 1006) => Some(input.sgr_mouse),
+        (true, 1007) => Some(input.alternate_scroll),
         (true, 2004) => Some(input.bracketed_paste),
         (true, 2026) => Some(synchronized_output),
         (true, 2031) => Some(color_scheme_notifications),

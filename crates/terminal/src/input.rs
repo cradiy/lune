@@ -121,6 +121,8 @@ pub struct InputModes {
     pub focus_reporting: bool,
     pub mouse_tracking: MouseTracking,
     pub sgr_mouse: bool,
+    /// DEC mode 1007: send cursor keys for wheel events in the alternate buffer.
+    pub alternate_scroll: bool,
 }
 
 impl InputModes {

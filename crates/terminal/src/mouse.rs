@@ -1,6 +1,6 @@
 use std::num::NonZeroU8;
 
-use crate::{CellPosition, InputModes, MAX_DIMENSION, Modifiers};
+use crate::{CellPosition, InputModes, Key, KeySequence, MAX_DIMENSION, Modifiers, ScreenBuffer};
 
 /// Mouse events selected by DEC modes 1000, 1002 and 1003.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -66,6 +66,27 @@ impl MouseSequence {
 }
 
 impl InputModes {
+    /// Encodes one vertical wheel step as an unmodified cursor key when alternate
+    /// scroll is active. Mouse tracking takes precedence over alternate scroll.
+    pub fn encode_alternate_scroll(
+        self,
+        event: MouseEvent,
+        buffer: ScreenBuffer,
+    ) -> Option<KeySequence> {
+        if !self.alternate_scroll
+            || buffer != ScreenBuffer::Alternate
+            || self.mouse_tracking != MouseTracking::Disabled
+        {
+            return None;
+        }
+        let key = match event {
+            MouseEvent::WheelUp => Key::Up,
+            MouseEvent::WheelDown => Key::Down,
+            _ => return None,
+        };
+        self.encode_key(key, Modifiers::default())
+    }
+
     /// Encodes a cell event without allocating; filtered events and out-of-range positions return `None`.
     /// The caller supplies cell changes, held-button state, and coordinates within the active grid.
     pub fn encode_mouse(

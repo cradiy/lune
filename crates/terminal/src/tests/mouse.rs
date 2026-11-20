@@ -2,7 +2,7 @@ use super::support;
 
 use crate::{
     CellPosition, InputModes, MAX_DIMENSION, Modifiers, MouseButton, MouseEvent, MouseTracking,
-    Screen, StorageError,
+    Screen, ScreenBuffer, StorageError,
 };
 
 #[test]
@@ -137,6 +137,89 @@ fn mouse_coordinates_obey_wire_and_grid_bounds_without_truncation() {
             }
         }
     }
+}
+
+#[test]
+fn alternate_scroll_routes_vertical_wheel_steps_only_without_mouse_tracking() {
+    let mut screen = Screen::new(8, 4).unwrap();
+    let mut processor = support::processor();
+    let mut text = |_: &mut Screen, _: &str, _| Ok::<_, StorageError>(());
+    let wheel_up = MouseEvent::WheelUp;
+    let wheel_down = MouseEvent::WheelDown;
+    processor
+        .advance(b"\x1b[?1049;1007;65535h\x1b[?1049h", &mut screen, &mut text)
+        .unwrap();
+    assert_eq!(processor.ignored_sequences(), 1);
+    assert_eq!(screen.active_buffer(), ScreenBuffer::Alternate);
+    assert!(
+        processor
+            .input_modes()
+            .encode_alternate_scroll(wheel_up, screen.active_buffer())
+            .is_none()
+    );
+    processor
+        .advance(b"\x1b[?1007h", &mut screen, &mut text)
+        .unwrap();
+    let normal = processor.input_modes();
+    let up = normal
+        .encode_alternate_scroll(wheel_up, screen.active_buffer())
+        .unwrap();
+    assert_eq!(up.as_bytes(), b"\x1b[A");
+    assert!(
+        normal
+            .encode_alternate_scroll(MouseEvent::Motion(None), screen.active_buffer())
+            .is_none()
+    );
+    processor
+        .advance(b"\x1b[?1049l\x1b[?1;1006h", &mut screen, &mut text)
+        .unwrap();
+    assert!(
+        processor
+            .input_modes()
+            .encode_alternate_scroll(wheel_down, screen.active_buffer())
+            .is_none()
+    );
+    processor
+        .advance(b"\x1b[?1049h", &mut screen, &mut text)
+        .unwrap();
+    let application = processor.input_modes();
+    assert_eq!(
+        application
+            .encode_alternate_scroll(wheel_down, screen.active_buffer())
+            .unwrap()
+            .as_bytes(),
+        b"\x1bOB"
+    );
+    processor
+        .advance(b"\x1b[?1002h", &mut screen, &mut text)
+        .unwrap();
+    let tracked = processor.input_modes();
+    assert!(
+        tracked
+            .encode_alternate_scroll(wheel_down, screen.active_buffer())
+            .is_none()
+    );
+    assert_eq!(
+        tracked
+            .encode_mouse(
+                wheel_down,
+                CellPosition { row: 2, column: 4 },
+                Modifiers::default(),
+            )
+            .unwrap()
+            .as_bytes(),
+        b"\x1b[<65;5;3M"
+    );
+    processor
+        .advance(b"\x1b[?1002l", &mut screen, &mut text)
+        .unwrap();
+    assert_eq!(processor.input_modes(), application);
+    processor.advance(b"\x1bc", &mut screen, &mut text).unwrap();
+    assert_eq!(processor.input_modes(), InputModes::default());
+    assert_eq!(
+        normal.encode_alternate_scroll(wheel_up, ScreenBuffer::Alternate),
+        Some(up)
+    );
 }
 
 #[test]

@@ -1161,6 +1161,7 @@ fn csi(screen: &mut Screen, sequence: ControlSequence<'_>, state: &mut State) ->
                                     | 1003
                                     | 1004
                                     | 1006
+                                    | 1007
                                     | 1047
                                     | 1048
                                     | 1049
@@ -1186,6 +1187,7 @@ fn csi(screen: &mut Screen, sequence: ControlSequence<'_>, state: &mut State) ->
                 (true, Some(2026)) => state.synchronized_output = enabled,
                 (true, Some(2031)) => state.color_scheme_notifications = enabled,
                 (true, Some(1004)) => state.input.focus_reporting = enabled,
+                (true, Some(1007)) => state.input.alternate_scroll = enabled,
                 (true, Some(5)) => screen.set_reverse_video(enabled),
                 (true, Some(6)) => screen.set_origin_mode(enabled),
                 (true, Some(7)) => screen.set_auto_wrap(enabled),

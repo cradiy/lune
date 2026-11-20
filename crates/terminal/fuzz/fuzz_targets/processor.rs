@@ -1091,7 +1091,7 @@ fuzz_target!(|data: &[u8]| {
                     color_scheme_notifications = enabled;
                     2031
                 } else if bytes[1] & 8 != 0 {
-                    match bytes[2] % 4 {
+                    match bytes[2] % 5 {
                         0 => {
                             input.mouse_tracking = if enabled {
                                 MouseTracking::Buttons
@@ -1116,9 +1116,13 @@ fuzz_target!(|data: &[u8]| {
                             };
                             1003
                         }
-                        _ => {
+                        3 => {
                             input.sgr_mouse = enabled;
                             1006
+                        }
+                        _ => {
+                            input.alternate_scroll = enabled;
+                            1007
                         }
                     }
                 } else if bytes[0] % 64 == 55 {
@@ -1176,8 +1180,8 @@ fuzz_target!(|data: &[u8]| {
                     let private = bytes[1] & 2 != 0;
                     let selector = [
                         0, 1, 4, 5, 6, 7, 8, 12, 20, 25, 47, 66, 67, 1000, 1002, 1003, 1004, 1006,
-                        1047, 1048, 1049, 2004, 2026, 2031, 65535,
-                    ][usize::from(bytes[2] % 25)];
+                        1007, 1047, 1048, 1049, 2004, 2026, 2031, 65535,
+                    ][usize::from(bytes[2] % 26)];
                     let enabled = match (private, selector) {
                         (false, 20) => Some(input.new_line),
                         (true, 1) => Some(input.application_cursor),
@@ -1189,6 +1193,7 @@ fuzz_target!(|data: &[u8]| {
                         (true, 1003) => Some(input.mouse_tracking == MouseTracking::AnyMotion),
                         (true, 1004) => Some(input.focus_reporting),
                         (true, 1006) => Some(input.sgr_mouse),
+                        (true, 1007) => Some(input.alternate_scroll),
                         (true, 2004) => Some(input.bracketed_paste),
                         (true, 2026) => Some(synchronized_output),
                         (true, 2031) => Some(color_scheme_notifications),
