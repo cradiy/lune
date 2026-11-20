@@ -9,7 +9,7 @@ use lune_terminal::{
 
 use crate::{GridGeometry, PixelRect};
 
-use super::PresentationFrame;
+use super::{BackgroundRect, PresentationFrame, PresentationRun};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RowDamage<'a> {
@@ -146,6 +146,98 @@ pub struct PresentationDamage<'a> {
     pub rows: RowDamage<'a>,
     /// Overlay changes. Repaint an unchanged cursor when repainting its row.
     pub cursor: Option<CursorChange>,
+    pub displayed_cursor: Option<PresentedCursor>,
+}
+
+pub enum PaintCommand<'a> {
+    Background(BackgroundRect),
+    Text {
+        clip: PixelRect,
+        run: PresentationRun<'a>,
+    },
+    /// Replaces the cursor layer. An empty value clears it.
+    Cursor(Option<CursorPaint<'a>>),
+}
+
+#[derive(Debug)]
+pub enum PaintError<E> {
+    GeometryUnavailable,
+    InvalidRow(usize),
+    Style(StyleError),
+    Sink(E),
+}
+
+impl<'a> PresentationFrame<'a> {
+    /// Visits the changed row content, then replaces the cursor layer if needed.
+    /// An interrupted visit can replay the same frame and damage.
+    pub fn visit_paint_commands<E>(
+        &self,
+        damage: PresentationDamage<'_>,
+        cursor_thickness: NonZeroU32,
+        mut emit: impl FnMut(PaintCommand<'a>) -> Result<(), E>,
+    ) -> Result<(), PaintError<E>> {
+        if self.geometry.cell_pixels().is_none() {
+            return Err(PaintError::GeometryUnavailable);
+        }
+        let size = self.geometry.pty_size();
+        let width = usize::from(size.columns);
+        let mut replace_cursor = damage.cursor.is_some();
+        let mut paint_row = |row| {
+            let source = self
+                .viewport
+                .row(row)
+                .filter(|_| row < usize::from(size.rows))
+                .ok_or(PaintError::InvalidRow(row))?;
+            let backgrounds = self
+                .row_backgrounds(row, 0..width)
+                .expect("The row has pixel geometry");
+            for background in backgrounds {
+                let background = background.map_err(PaintError::Style)?;
+                emit(PaintCommand::Background(background)).map_err(PaintError::Sink)?;
+            }
+            let runs = self
+                .row_runs(row, 0..source.cells().len())
+                .expect("The row is in the viewport");
+            for run in runs {
+                let run = run.map_err(PaintError::Style)?;
+                if !run.style.style.hidden {
+                    let clip = self
+                        .geometry
+                        .row_rect(row, run.columns())
+                        .expect("The span clips to visible columns");
+                    emit(PaintCommand::Text { clip, run }).map_err(PaintError::Sink)?;
+                }
+            }
+            replace_cursor |= damage
+                .displayed_cursor
+                .is_some_and(|cursor| cursor.position.row == row);
+            Ok(())
+        };
+
+        match damage.rows {
+            RowDamage::All => {
+                for row in 0..self.viewport.rows() {
+                    paint_row(row)?;
+                }
+                replace_cursor = true;
+            }
+            RowDamage::Rows(rows) => {
+                for &row in rows {
+                    paint_row(row)?;
+                }
+            }
+        }
+        if replace_cursor {
+            let cursor = damage
+                .displayed_cursor
+                .map(|cursor| self.cursor_paint(cursor, cursor_thickness))
+                .transpose()
+                .map_err(PaintError::Style)?
+                .flatten();
+            emit(PaintCommand::Cursor(cursor)).map_err(PaintError::Sink)?;
+        }
+        Ok(())
+    }
 }
 
 /// Compares successive frames from one session in viewport coordinates.
@@ -285,6 +377,7 @@ impl PresentationTracker {
                 RowDamage::Rows(&self.changed_rows)
             },
             cursor,
+            displayed_cursor: self.cursor.displayed(),
         })
     }
 }

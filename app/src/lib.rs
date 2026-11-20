@@ -8,7 +8,7 @@ pub use geometry::{GridGeometry, PixelRect};
 #[cfg(target_os = "linux")]
 pub use session::{
     BackgroundRect, CursorChange, CursorGlyph, CursorPaint, MAX_INPUT_BYTES, MAX_PASTE_BYTES,
-    MouseInputOutcome, PresentationDamage, PresentationFrame, PresentationRun, PresentationStyle,
-    PresentationTracker, PresentedCursor, PtyInterest, RowDamage, Session, SessionInterests,
-    SessionReady, WaitOutcome,
+    MouseInputOutcome, PaintCommand, PaintError, PresentationDamage, PresentationFrame,
+    PresentationRun, PresentationStyle, PresentationTracker, PresentedCursor, PtyInterest,
+    RowDamage, Session, SessionInterests, SessionReady, WaitOutcome,
 };

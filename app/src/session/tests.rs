@@ -639,6 +639,102 @@ fn presentation_damage_separates_cursor_and_resolved_text_colors() {
 }
 
 #[test]
+fn paint_commands_replay_damage_and_keep_the_cursor_on_its_own_layer() {
+    #[derive(Debug, PartialEq, Eq)]
+    enum Paint {
+        Background(u32),
+        Text(PixelPosition),
+        Cursor(Option<(PixelPosition, Option<char>)>),
+    }
+
+    fn trace(frame: &PresentationFrame<'_>, damage: PresentationDamage<'_>) -> Vec<Paint> {
+        let mut commands = Vec::new();
+        frame
+            .visit_paint_commands(damage, NonZeroU32::new(2).unwrap(), |command| {
+                commands.push(match command {
+                    PaintCommand::Background(background) => {
+                        Paint::Background(background.rect.origin.y)
+                    }
+                    PaintCommand::Text { clip, run } => {
+                        assert!(!run.style.style.hidden);
+                        Paint::Text(clip.origin)
+                    }
+                    PaintCommand::Cursor(cursor) => Paint::Cursor(cursor.map(|cursor| {
+                        let character = cursor.glyph.and_then(|glyph| glyph.unit.cell.character());
+                        (cursor.rect.origin, character)
+                    })),
+                });
+                Ok::<_, std::convert::Infallible>(())
+            })
+            .unwrap();
+        commands
+    }
+    let thickness = NonZeroU32::new(2).unwrap();
+    let mut session = session(b"A\x1b[2;1H\x1b[8mB\x1b[0m\x1b[1;1H");
+    session.geometry = GridGeometry::fit(pixels(64, 48), pixels(8, 16)).unwrap();
+    session.pump().unwrap();
+    let mut tracker = PresentationTracker::default();
+    let now = Instant::now();
+    let frame = session.presentation_frame().unwrap();
+    let damage = tracker.update(&frame, now).unwrap();
+
+    let mut received = 0;
+    let interrupted = frame.visit_paint_commands(damage, thickness, |_| {
+        received += 1;
+        Err("submission interrupted")
+    });
+    assert!(matches!(
+        interrupted,
+        Err(PaintError::Sink("submission interrupted"))
+    ));
+    assert_eq!(received, 1);
+    let top_left = PixelPosition { x: 0, y: 0 };
+    assert_eq!(
+        trace(&frame, damage),
+        [
+            Paint::Background(0),
+            Paint::Text(top_left),
+            Paint::Background(16),
+            Paint::Text(PixelPosition { x: 8, y: 16 }),
+            Paint::Background(32),
+            Paint::Text(PixelPosition { x: 0, y: 32 }),
+            Paint::Cursor(Some((top_left, Some('A')))),
+        ]
+    );
+
+    session.transport.source = Cursor::new(b"Z\x1b[1;1H");
+    session.pump().unwrap();
+    let frame = session.presentation_frame().unwrap();
+    let damage = tracker.update(&frame, now).unwrap();
+    assert_eq!(damage.cursor, None);
+    assert_eq!(
+        trace(&frame, damage),
+        [
+            Paint::Background(0),
+            Paint::Text(top_left),
+            Paint::Cursor(Some((top_left, Some('Z'))))
+        ]
+    );
+
+    session.transport.source = Cursor::new(b"\x1b[3;1H");
+    session.pump().unwrap();
+    let frame = session.presentation_frame().unwrap();
+    assert_eq!(
+        trace(&frame, tracker.update(&frame, now).unwrap()),
+        [Paint::Cursor(Some((PixelPosition { x: 0, y: 32 }, None)))]
+    );
+
+    session.transport.source = Cursor::new(b"\x1b[?25l");
+    session.pump().unwrap();
+    let frame = session.presentation_frame().unwrap();
+    assert_eq!(
+        trace(&frame, tracker.update(&frame, now).unwrap()),
+        [Paint::Cursor(None)]
+    );
+    assert!(trace(&frame, tracker.update(&frame, now).unwrap()).is_empty());
+}
+
+#[test]
 fn cursor_paint_covers_the_whole_unit_at_a_continuation_cell() {
     let mut session = session("\x1b[2;2H\x1b[1;31;44m水\u{301}\x1b[2;3H".as_bytes());
     session.geometry = GridGeometry::fit(pixels(64, 48), pixels(8, 16)).unwrap();
