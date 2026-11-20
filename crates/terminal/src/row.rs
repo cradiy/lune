@@ -23,6 +23,12 @@ pub struct DisplayUnit<'a> {
     pub text: CellText<'a>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StyleRun {
+    pub columns: Range<usize>,
+    pub style: StyleId,
+}
+
 /// Complete display units traversed in physical column order.
 pub struct DisplayUnits<'a> {
     column: usize,
@@ -303,6 +309,24 @@ impl Row {
 
     pub fn cells(&self) -> &[Cell] {
         &self.cells
+    }
+
+    /// Groups consecutive physical columns by style within the clamped range.
+    #[inline]
+    pub fn style_runs(&self, columns: Range<usize>) -> impl Iterator<Item = StyleRun> + '_ {
+        let end = columns.end.min(self.cells.len());
+        let mut start = columns.start.min(end);
+        self.cells[start..end]
+            .chunk_by(|left, right| left.style() == right.style())
+            .map(move |cells| {
+                let end = start + cells.len();
+                let run = StyleRun {
+                    columns: start..end,
+                    style: cells[0].style(),
+                };
+                start = end;
+                run
+            })
     }
 
     /// Borrows units intersecting a clamped half-open column range.

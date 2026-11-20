@@ -49,7 +49,7 @@ pub use processor::{
 };
 pub use reflow::{ReflowAffinity, ReflowAnchor, ReflowRow, ReflowRows};
 pub use reply::{ColorScheme, PixelSize};
-pub use row::{DisplayUnit, DisplayUnits, Row};
+pub use row::{DisplayUnit, DisplayUnits, Row, StyleRun};
 pub use screen::{Cursor, CursorAppearance, CursorShape, EraseMode, Screen, ScreenBuffer};
 pub use style::{Color, Style, Underline};
 pub use styles::{MAX_STYLES, StyleError, StyleTable};

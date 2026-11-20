@@ -309,6 +309,70 @@ fn presentation_frame_keeps_whole_units_and_matches_their_rendition() {
 }
 
 #[test]
+fn presentation_runs_resolve_colors_after_screen_and_cell_inversion() {
+    let mut session = session(
+        "\x1b]4;1;#123456\x07\x1b[31;4mA水\x1b[7;48;2;20;21;22;58;2;4;5;6mB\x1b[0;7mC\x1b[0mD\x1b[?5h"
+            .as_bytes(),
+    );
+    let foreground = Rgb {
+        red: 110,
+        green: 111,
+        blue: 112,
+    };
+    let background = Rgb {
+        red: 10,
+        green: 11,
+        blue: 12,
+    };
+    let cursor = Rgb::default();
+    session.set_theme(
+        &Palette::new([cursor; 256], foreground, background, cursor),
+        None,
+    );
+    session.pump().unwrap();
+
+    let frame = session.presentation_frame().unwrap();
+    let row = frame.viewport.row(0).unwrap();
+    let indexed = Rgb {
+        red: 0x12,
+        green: 0x34,
+        blue: 0x56,
+    };
+    let explicit_background = Rgb {
+        red: 20,
+        green: 21,
+        blue: 22,
+    };
+    let explicit_underline = Rgb {
+        red: 4,
+        green: 5,
+        blue: 6,
+    };
+    let mut runs = row.style_runs(2..usize::MAX);
+    for (columns, fg, bg, underline) in [
+        (2..3, indexed, foreground, indexed),
+        (3..4, explicit_background, indexed, explicit_underline),
+        (4..5, foreground, background, foreground),
+        (5..8, background, foreground, background),
+    ] {
+        let run = runs.next().unwrap();
+        let style = frame.resolve_style(run.style).unwrap();
+        assert_eq!(run.columns, columns);
+        assert_eq!(
+            (style.foreground, style.background, style.underline_color),
+            (fg, bg, underline)
+        );
+    }
+    assert!(runs.next().is_none());
+    let wide = row.display_units(2..3).next().unwrap();
+    assert_eq!((wide.column, wide.text), (1, CellText::Scalar('水')));
+    assert_eq!(
+        row.style_runs(0..2).next().unwrap().style,
+        wide.cell.style()
+    );
+}
+
+#[test]
 fn waiting_on_a_real_pty_respects_idle_deadlines_and_drains_hangup() {
     let mut child = Command::new("sh");
     child.args([
@@ -436,17 +500,24 @@ fn external_poll_dispatches_host_io_pty_exit_and_presentation_deadline() {
         "-c",
         r#"
         stty -echo || exit 71
-        printf '\033[?2026hA'
+        printf '\033[?2026h\033[31mA'
         IFS= read -r value && test "$value" = finish || exit 72
         printf '\033[2;1Htail'
         exit 23
         "#,
     ]);
     let color = Rgb::default();
+    let accent = Rgb {
+        red: 42,
+        green: 21,
+        blue: 7,
+    };
+    let mut indexed = [color; 256];
+    indexed[1] = accent;
     let mut session = Session::spawn(
         child,
         PtySize::new(3, 8),
-        Palette::new([color; 256], color, color, color),
+        Palette::new(indexed, color, color, color),
     )
     .unwrap();
     let (mut host, mut peer) = io::pipe().unwrap();
@@ -536,6 +607,10 @@ fn external_poll_dispatches_host_io_pty_exit_and_presentation_deadline() {
                 .next()
                 .unwrap();
             assert_eq!((first.column, first.text), (0, CellText::Scalar('A')));
+            assert_eq!(
+                frame.resolve_style(first.cell.style()).unwrap().foreground,
+                accent
+            );
             session.queue_input(b"finish\n").unwrap();
             assert!(session.interests().pty.unwrap().write);
             sent = true;

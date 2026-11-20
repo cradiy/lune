@@ -7,10 +7,11 @@ use std::time::{Duration, Instant};
 
 use lune_pty::{ChildExit, Pty, PtySize};
 use lune_terminal::{
-    CellPosition, ColorScheme, CursorAppearance, HistoryLimits, Key, KeySequence, MAX_STYLES,
-    Modifiers, MouseEvent, MouseFormat, MouseSequence, MouseTracking, Palette, PixelPosition,
-    PixelSize, ProcessFailure, Processor, Screen, ScreenBuffer, StorageError, StyleError, StyleId,
-    StyleTable, TerminalNotifications, TextSink, UnicodeWriter, Viewport,
+    CellPosition, Color, ColorScheme, CursorAppearance, HistoryLimits, Key, KeySequence,
+    MAX_STYLES, Modifiers, MouseEvent, MouseFormat, MouseSequence, MouseTracking, Palette,
+    PaletteEntry, PixelPosition, PixelSize, ProcessFailure, Processor, Rgb, Screen, ScreenBuffer,
+    StorageError, Style, StyleError, StyleId, StyleTable, TerminalNotifications, TextSink,
+    UnicodeWriter, Viewport,
 };
 
 mod wait;
@@ -55,6 +56,42 @@ pub struct PresentationFrame<'a> {
     pub reverse_video: bool,
     pub styles: &'a StyleTable,
     pub palette: &'a Palette,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PresentationStyle<'a> {
+    pub foreground: Rgb,
+    pub background: Rgb,
+    pub underline_color: Rgb,
+    /// Rendition attributes used for glyphs, decorations, and visibility.
+    pub style: &'a Style,
+}
+
+impl<'a> PresentationFrame<'a> {
+    /// Resolves colors against this frame. Screen inversion swaps the default
+    /// roles before cell inversion exchanges the resolved foreground and background.
+    #[inline]
+    pub fn resolve_style(&self, id: StyleId) -> Option<PresentationStyle<'a>> {
+        let style = self.styles.get(id)?;
+        let (fg_role, bg_role) = if self.reverse_video {
+            (PaletteEntry::Background, PaletteEntry::Foreground)
+        } else {
+            (PaletteEntry::Foreground, PaletteEntry::Background)
+        };
+        let fg = self.palette.resolve(style.foreground, fg_role);
+        let bg = self.palette.resolve(style.background, bg_role);
+        let (foreground, background) = if style.inverse { (bg, fg) } else { (fg, bg) };
+        let underline_color = match style.underline_color {
+            Color::Default => foreground,
+            color => self.palette.resolve(color, PaletteEntry::Foreground),
+        };
+        Some(PresentationStyle {
+            foreground,
+            background,
+            underline_color,
+            style,
+        })
+    }
 }
 
 /// Drives terminal state and child I/O from a nonblocking PTY.
