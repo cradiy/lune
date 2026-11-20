@@ -5,7 +5,7 @@ use std::os::fd::{AsFd, BorrowedFd};
 use std::process::{Command, ExitStatus};
 use std::time::{Duration, Instant};
 
-use lune_pty::{Pty, PtySize};
+use lune_pty::{ChildExit, Pty, PtySize};
 use lune_terminal::{
     CellPosition, ColorScheme, HistoryLimits, Key, KeySequence, MAX_STYLES, Modifiers, MouseEvent,
     MouseFormat, MouseSequence, MouseTracking, Palette, PixelPosition, PixelSize, ProcessFailure,
@@ -50,6 +50,7 @@ pub enum MouseInputOutcome {
 /// Drives terminal state and child I/O from a nonblocking PTY.
 pub struct Session<T = Pty> {
     transport: T,
+    child_exit: Option<ChildExit>,
     size: PtySize,
     screen: Screen,
     processor: Processor,
@@ -66,6 +67,7 @@ pub struct Session<T = Pty> {
 }
 
 impl Session<Pty> {
+    /// Starts a session with a child exit monitor on Linux 5.3 or later.
     pub fn spawn(command: Command, size: PtySize, palette: Palette) -> io::Result<Self> {
         let screen = Screen::new(usize::from(size.columns), usize::from(size.rows))
             .map_err(io::Error::other)?;
@@ -74,7 +76,10 @@ impl Session<Pty> {
 
         let mut transport = Pty::spawn(command, size)?;
         transport.set_nonblocking(true)?;
-        Ok(Self::new(transport, size, screen, processor))
+        let child_exit = transport.monitor_child()?;
+        let mut session = Self::new(transport, size, screen, processor);
+        session.child_exit = Some(child_exit);
+        Ok(session)
     }
 
     /// Commits a PTY resize and reflows its screen before publishing VT geometry.
@@ -132,6 +137,7 @@ impl<T: Read + Write> Session<T> {
     fn new(transport: T, size: PtySize, screen: Screen, processor: Processor) -> Self {
         Self {
             transport,
+            child_exit: None,
             size,
             screen,
             processor,

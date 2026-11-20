@@ -4,4 +4,4 @@
 mod linux;
 
 #[cfg(target_os = "linux")]
-pub use linux::{Pty, PtySize};
+pub use linux::{ChildExit, Pty, PtySize};

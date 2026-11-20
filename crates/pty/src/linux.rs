@@ -1,6 +1,6 @@
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, ExitStatus, Stdio};
 
@@ -36,6 +36,12 @@ impl PtySize {
             ws_ypixel: self.pixel_height,
         })
     }
+}
+
+#[derive(Debug)]
+pub enum ChildExit {
+    Pending(OwnedFd),
+    Exited(ExitStatus),
 }
 
 /// Owns a Linux PTY master and its direct child. Dropping it kills and reaps
@@ -127,6 +133,22 @@ impl Pty {
 
     pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
         self.child.try_wait()
+    }
+
+    /// Opens a pollable child exit descriptor on Linux 5.3 or later.
+    /// Returns the status if the child has already been reaped by this owner.
+    /// Keep child reaping under this `Pty`'s ownership.
+    pub fn monitor_child(&mut self) -> io::Result<ChildExit> {
+        if let Some(status) = self.try_wait()? {
+            return Ok(ChildExit::Exited(status));
+        }
+        // SAFETY: The unreaped child owns this PID and pidfd_open takes two integer arguments.
+        let fd = cvt(unsafe {
+            libc::syscall(libc::SYS_pidfd_open, self.child.id() as libc::pid_t, 0_u32)
+                as libc::c_int
+        })?;
+        // SAFETY: A successful pidfd_open returns a new owned descriptor.
+        Ok(ChildExit::Pending(unsafe { OwnedFd::from_raw_fd(fd) }))
     }
 
     /// Waits for the child. Continue reading while the child can still write.

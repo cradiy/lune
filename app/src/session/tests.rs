@@ -312,10 +312,66 @@ fn waiting_on_a_real_pty_respects_idle_deadlines_and_drains_hangup() {
     );
 
     session.queue_input(b"finish\n").unwrap();
-    wait_until(&mut session, limit, "EOF", Session::is_finished);
+    let mut exit = None;
+    loop {
+        let remaining = limit.saturating_duration_since(Instant::now());
+        match session.wait_and_pump(Some(remaining)).unwrap() {
+            WaitOutcome::Pumped => {}
+            WaitOutcome::ChildExited(status) => assert!(exit.replace(status).is_none()),
+            WaitOutcome::Finished => break,
+            WaitOutcome::TimedOut => panic!("timed out waiting for session completion"),
+        }
+    }
+    assert!(exit.unwrap().success());
     assert_eq!(session.wait_and_pump(None).unwrap(), WaitOutcome::Finished);
     assert_eq!(
         session.screen().grid().row(2).unwrap().text(3),
+        Some(CellText::Scalar('l'))
+    );
+}
+
+#[test]
+fn child_exit_is_reported_once_while_a_descendant_keeps_the_pty_open() {
+    let mut child = Command::new("sh");
+    child.args([
+        "-c",
+        r#"
+        stty -echo || exit 71
+        trap '' HUP
+        exec 3<&0
+        (IFS= read -r value && test "$value" = drain && printf tail) <&3 &
+        exit 23
+        "#,
+    ]);
+    let color = Rgb::default();
+    let mut session = Session::spawn(
+        child,
+        PtySize::new(4, 20),
+        Palette::new([color; 256], color, color, color),
+    )
+    .unwrap();
+    let timeout = Some(Duration::from_secs(5));
+    let WaitOutcome::ChildExited(status) = session.wait_and_pump(timeout).unwrap() else {
+        panic!("direct child exit was not reported while the PTY remained open");
+    };
+    assert_eq!(status.code(), Some(23));
+    assert!(!session.is_finished());
+    assert_eq!(session.try_wait().unwrap(), Some(status));
+    assert_eq!(
+        session.wait_and_pump(Some(Duration::ZERO)).unwrap(),
+        WaitOutcome::TimedOut
+    );
+
+    session.queue_input(b"drain\n").unwrap();
+    wait_until(
+        &mut session,
+        Instant::now() + Duration::from_secs(5),
+        "descendant output",
+        Session::is_finished,
+    );
+    assert_eq!(session.wait_and_pump(None).unwrap(), WaitOutcome::Finished);
+    assert_eq!(
+        session.screen().grid().row(0).unwrap().text(3),
         Some(CellText::Scalar('l'))
     );
 }
