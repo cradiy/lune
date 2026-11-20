@@ -1,4 +1,5 @@
 use std::io::Cursor;
+use std::time::{Duration, Instant};
 
 use lune_terminal::{CellText, Rgb};
 
@@ -49,6 +50,7 @@ fn session(source: &'static [u8]) -> Session<Transport> {
             write_budget: 1,
             hung_up: false,
         },
+        PtySize::new(3, 8),
         Screen::new(8, 3).unwrap(),
         Processor::new(MAX_STYLES, palette).unwrap(),
     )
@@ -103,4 +105,88 @@ fn hangup_drains_child_output_and_finalizes_an_incomplete_scalar() {
         session.queue_input(b"next").unwrap_err().kind(),
         io::ErrorKind::BrokenPipe
     );
+}
+
+#[test]
+fn child_observes_committed_grid_and_pixel_resizes() {
+    let mut child = Command::new("sh");
+    child.args([
+        "-c",
+        r#"
+        read_report() {
+            expected=$(printf "$1")
+            actual=$(dd bs=1 count="${#expected}" 2>/dev/null)
+            test "$actual" = "$expected"
+        }
+        stty -echo -icanon min 1 time 0 || exit 71
+        printf '\033[?2048h'
+        read_report '\033[48;3;8;0;0t' || exit 72
+        printf 'abcdefghijkl'
+        read_report '\033[48;4;12;480;960t' || exit 73
+        test "$(stty size)" = '4 12' || exit 74
+        printf '\033[4;1HY'
+        read_report '\033[48;4;12;600;1200t' || exit 75
+        "#,
+    ]);
+    let color = Rgb::default();
+    let initial = PtySize::new(3, 8);
+    let mut session = Session::spawn(
+        child,
+        initial,
+        Palette::new([color; 256], color, color, color),
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let pump_until = |session: &mut Session, stage: &str, ready: fn(&Session) -> bool| {
+        while !ready(session) {
+            assert!(Instant::now() < deadline, "timed out waiting for {stage}");
+            assert!(!session.is_finished(), "child exited before {stage}");
+            session.pump().unwrap();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    };
+    pump_until(&mut session, "initial text", |session| {
+        session.screen.grid().row(1).unwrap().text(3) == Some(CellText::Scalar('l'))
+    });
+
+    let cursor = session.screen.cursor();
+    assert!(session.resize(PtySize::new(0, 12)).is_err());
+    assert_eq!(session.transport.size().unwrap(), initial);
+    assert_eq!(session.screen.cursor(), cursor);
+    assert!(!session.wants_write());
+
+    let resized = PtySize {
+        pixel_width: 960,
+        pixel_height: 480,
+        ..PtySize::new(4, 12)
+    };
+    session.resize(resized).unwrap();
+    assert_eq!(session.transport.size().unwrap(), resized);
+    assert_eq!(session.screen.grid().rows(), 4);
+    assert_eq!(
+        session.screen.grid().row(0).unwrap().text(11),
+        Some(CellText::Scalar('l'))
+    );
+    pump_until(&mut session, "resize acknowledgement", |session| {
+        session.screen.grid().row(3).unwrap().text(0) == Some(CellText::Scalar('Y'))
+    });
+
+    session.resize(resized).unwrap();
+    assert!(!session.wants_write());
+    let pixels_only = PtySize {
+        pixel_width: 1200,
+        pixel_height: 600,
+        ..resized
+    };
+    session.resize(pixels_only).unwrap();
+    assert_eq!(session.transport.size().unwrap(), pixels_only);
+    pump_until(&mut session, "EOF", Session::is_finished);
+    loop {
+        if let Some(status) = session.try_wait().unwrap() {
+            assert!(status.success(), "resize handshake exited with {status}");
+            break;
+        }
+        assert!(Instant::now() < deadline, "child did not exit after EOF");
+        std::thread::sleep(Duration::from_millis(1));
+    }
 }

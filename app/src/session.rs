@@ -6,16 +6,34 @@ use std::process::{Command, ExitStatus};
 
 use lune_pty::{Pty, PtySize};
 use lune_terminal::{
-    MAX_STYLES, Palette, PixelSize, ProcessFailure, Processor, Screen, StyleError, StyleId,
-    UnicodeWriter,
+    MAX_STYLES, Palette, PixelSize, ProcessFailure, Processor, Screen, StorageError, StyleError,
+    StyleId, TextSink, UnicodeWriter,
 };
 
 const READ_BYTES: usize = 16 * 1024;
 pub const MAX_INPUT_BYTES: usize = 16 * 1024;
 
+fn pixel_size(size: PtySize) -> Option<PixelSize> {
+    let width = NonZeroU32::new(u32::from(size.pixel_width))?;
+    let height = NonZeroU32::new(u32::from(size.pixel_height))?;
+    Some(PixelSize { width, height })
+}
+
+enum ResizeError {
+    Storage(StorageError),
+    Transport(io::Error),
+}
+
+impl From<StorageError> for ResizeError {
+    fn from(error: StorageError) -> Self {
+        Self::Storage(error)
+    }
+}
+
 /// Drives terminal state and child I/O from a nonblocking PTY.
 pub struct Session<T = Pty> {
     transport: T,
+    size: PtySize,
     screen: Screen,
     processor: Processor,
     writer: UnicodeWriter,
@@ -33,14 +51,50 @@ impl Session<Pty> {
         let screen = Screen::new(usize::from(size.columns), usize::from(size.rows))
             .map_err(io::Error::other)?;
         let mut processor = Processor::new(MAX_STYLES, palette).map_err(io::Error::other)?;
-        let pixel_size = NonZeroU32::new(u32::from(size.pixel_width))
-            .zip(NonZeroU32::new(u32::from(size.pixel_height)))
-            .map(|(width, height)| PixelSize { width, height });
-        processor.update_geometry(&screen, pixel_size, None);
+        processor.update_geometry(&screen, pixel_size(size), None);
 
         let mut transport = Pty::spawn(command, size)?;
         transport.set_nonblocking(true)?;
-        Ok(Self::new(transport, screen, processor))
+        Ok(Self::new(transport, size, screen, processor))
+    }
+
+    /// Commits a PTY resize and reflows its screen before publishing VT geometry.
+    /// A pending input chunk returns `WouldBlock`; pump it before retrying.
+    pub fn resize(&mut self, size: PtySize) -> io::Result<()> {
+        if self.write_closed {
+            return Err(io::ErrorKind::BrokenPipe.into());
+        }
+        if size == self.size {
+            return Ok(());
+        }
+        if self.incoming_bytes.is_some() {
+            return Err(io::ErrorKind::WouldBlock.into());
+        }
+
+        let grid_changed = size.columns != self.size.columns || size.rows != self.size.rows;
+        self.screen
+            .reflow_with(
+                usize::from(size.columns),
+                usize::from(size.rows),
+                StyleId::default(),
+                || {
+                    self.transport
+                        .resize(size)
+                        .map_err(ResizeError::Transport)?;
+                    if grid_changed {
+                        self.writer.boundary();
+                    }
+                    Ok(())
+                },
+            )
+            .map_err(|error| match error {
+                ResizeError::Storage(error) => io::Error::other(error),
+                ResizeError::Transport(error) => error,
+            })?;
+        self.size = size;
+        self.processor
+            .update_geometry(&self.screen, pixel_size(size), None);
+        Ok(())
     }
 
     /// Polls child status independently of whether PTY output has reached EOF.
@@ -56,9 +110,10 @@ impl<T: AsFd> AsFd for Session<T> {
 }
 
 impl<T: Read + Write> Session<T> {
-    fn new(transport: T, screen: Screen, processor: Processor) -> Self {
+    fn new(transport: T, size: PtySize, screen: Screen, processor: Processor) -> Self {
         Self {
             transport,
+            size,
             screen,
             processor,
             writer: UnicodeWriter::default(),

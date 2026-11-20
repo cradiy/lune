@@ -36,6 +36,28 @@ fn history(screen: &Screen) -> Vec<String> {
 }
 
 #[test]
+fn rejected_reflow_commit_leaves_source_rows_in_place() {
+    let mut screen = Screen::new(4, 2).unwrap();
+    screen
+        .write("e\u{301}", CellWidth::Single, StyleId(1))
+        .unwrap();
+    let Some(CellText::Extended(before)) = screen.grid().row(0).unwrap().text(0) else {
+        panic!("expected extended text");
+    };
+    let before = before.as_ptr();
+    let cursor = screen.cursor();
+
+    let result = screen.reflow_with(3, 3, StyleId::default(), || Err(StorageError::OutOfBounds));
+    assert!(matches!(result, Err(StorageError::OutOfBounds)));
+    assert_eq!((screen.grid().columns(), screen.grid().rows()), (4, 2));
+    assert_eq!(screen.cursor(), cursor);
+    let Some(CellText::Extended(after)) = screen.grid().row(0).unwrap().text(0) else {
+        panic!("expected extended text");
+    };
+    assert_eq!(after.as_ptr(), before);
+}
+
+#[test]
 fn screen_reflow_moves_text_allocations_and_budgets_their_retained_capacity() {
     let mut screen = Screen::new(4, 2).unwrap();
     screen

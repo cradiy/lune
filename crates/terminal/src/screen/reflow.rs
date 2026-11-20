@@ -249,8 +249,20 @@ impl Screen {
         rows: usize,
         style: StyleId,
     ) -> Result<(), StorageError> {
+        self.reflow_with(columns, rows, style, || Ok(()))
+    }
+
+    /// Runs `before_commit` after preparation and before changing the screen.
+    /// An error leaves the screen untouched. The callback runs for unchanged sizes too.
+    pub fn reflow_with<E: From<StorageError>>(
+        &mut self,
+        columns: usize,
+        rows: usize,
+        style: StyleId,
+        before_commit: impl FnOnce() -> Result<(), E>,
+    ) -> Result<(), E> {
         if columns == self.grid.columns() && rows == self.grid.rows() {
-            return Ok(());
+            return before_commit();
         }
         validate_dimensions(columns, rows)?;
         let primary_active = self.active_buffer == ScreenBuffer::Primary;
@@ -292,7 +304,9 @@ impl Screen {
         history.set_limits(limits)?;
         let skip = plan.window.start.saturating_sub(retained_rows);
         let mut storage = VecDeque::new();
-        storage.try_reserve_exact(rows)?;
+        storage
+            .try_reserve_exact(rows)
+            .map_err(StorageError::from)?;
         let mut transfers: VecDeque<RowTransfer> = VecDeque::new();
         debug_assert!(checkpoint.index <= skip);
         let mut index = checkpoint.index;
@@ -337,7 +351,7 @@ impl Screen {
                         storage.push_back(owned);
                     }
                     if retained && has_text {
-                        transfers.try_reserve(1)?;
+                        transfers.try_reserve(1).map_err(StorageError::from)?;
                         transfers.push_back(RowTransfer {
                             target: index,
                             source: row.source_range(),
@@ -390,6 +404,7 @@ impl Screen {
             column: self.cursor.column.min(columns - 1),
             wrap_pending: false,
         };
+        before_commit()?;
         // Every allocation is complete. Move source payloads before publishing state.
         {
             let old_primary = if primary_active {
