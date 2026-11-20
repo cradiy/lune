@@ -156,8 +156,14 @@ impl Read for Pty {
 }
 
 impl Write for Pty {
+    /// Writes to the master, mapping a slave-hangup EIO to BrokenPipe.
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        self.master.write(buffer)
+        match self.master.write(buffer) {
+            Err(error) if error.raw_os_error() == Some(libc::EIO) => {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, error))
+            }
+            result => result,
+        }
     }
 
     fn flush(&mut self) -> io::Result<()> {
