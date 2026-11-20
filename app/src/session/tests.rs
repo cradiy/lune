@@ -393,14 +393,21 @@ fn presentation_damage_follows_visible_row_positions() {
         .unwrap();
     session.pump().unwrap();
     let mut tracker = PresentationTracker::default();
+    let now = Instant::now();
     let frame = session.presentation_frame().unwrap();
-    assert_eq!(tracker.update(&frame).unwrap().rows, RowDamage::All);
-    assert_eq!(tracker.update(&frame).unwrap().rows, RowDamage::Rows(&[]));
+    assert_eq!(tracker.update(&frame, now).unwrap().rows, RowDamage::All);
+    assert_eq!(
+        tracker.update(&frame, now).unwrap().rows,
+        RowDamage::Rows(&[])
+    );
 
     session.transport.source = Cursor::new(b"\x1b[2;1HB");
     session.pump().unwrap();
     let frame = session.presentation_frame().unwrap();
-    assert_eq!(tracker.update(&frame).unwrap().rows, RowDamage::Rows(&[1]));
+    assert_eq!(
+        tracker.update(&frame, now).unwrap().rows,
+        RowDamage::Rows(&[1])
+    );
     let retained_row = frame.viewport.row(1).unwrap().revision();
 
     session.transport.source = Cursor::new(b"\x1b[3;1H\r\nd");
@@ -408,38 +415,42 @@ fn presentation_damage_follows_visible_row_positions() {
     let frame = session.presentation_frame().unwrap();
     assert_eq!(frame.viewport.row(0).unwrap().revision(), retained_row);
     assert_eq!(
-        tracker.update(&frame).unwrap().rows,
+        tracker.update(&frame, now).unwrap().rows,
         RowDamage::Rows(&[0, 1, 2])
     );
 
     assert!(session.scroll_history(1));
     let frame = session.presentation_frame().unwrap();
-    let damage = tracker.update(&frame).unwrap();
+    let damage = tracker.update(&frame, now).unwrap();
     assert_eq!(damage.rows, RowDamage::Rows(&[0, 1, 2]));
     assert_eq!(damage.cursor.unwrap().after, None);
 
     session.screen.resize(10, 4, StyleId::default()).unwrap();
     session.geometry = GridGeometry::from_pty_size(PtySize::new(4, 10));
     let frame = session.presentation_frame().unwrap();
-    assert_eq!(tracker.update(&frame).unwrap().rows, RowDamage::All);
-    assert_eq!(tracker.update(&frame).unwrap().rows, RowDamage::Rows(&[]));
+    assert_eq!(tracker.update(&frame, now).unwrap().rows, RowDamage::All);
+    assert_eq!(
+        tracker.update(&frame, now).unwrap().rows,
+        RowDamage::Rows(&[])
+    );
     tracker.invalidate();
-    assert_eq!(tracker.update(&frame).unwrap().rows, RowDamage::All);
+    assert_eq!(tracker.update(&frame, now).unwrap().rows, RowDamage::All);
 }
 
 #[test]
 fn presentation_damage_separates_cursor_and_resolved_text_colors() {
     let mut session = session(b"");
     let mut tracker = PresentationTracker::default();
+    let now = Instant::now();
     let damage = tracker
-        .update(&session.presentation_frame().unwrap())
+        .update(&session.presentation_frame().unwrap(), now)
         .unwrap();
     let initial = damage.cursor.unwrap().after.unwrap();
 
     session.transport.source = Cursor::new(b"\x1b[2;3H\x1b[6 q\x1b]12;#010203\x07");
     session.pump().unwrap();
     let damage = tracker
-        .update(&session.presentation_frame().unwrap())
+        .update(&session.presentation_frame().unwrap(), now)
         .unwrap();
     assert_eq!(damage.rows, RowDamage::Rows(&[]));
     let cursor = damage.cursor.unwrap();
@@ -457,7 +468,7 @@ fn presentation_damage_separates_cursor_and_resolved_text_colors() {
     session.transport.source = Cursor::new(b"\x1b[?25l\x1b]11;#010203\x07");
     session.pump().unwrap();
     let damage = tracker
-        .update(&session.presentation_frame().unwrap())
+        .update(&session.presentation_frame().unwrap(), now)
         .unwrap();
     assert_eq!(damage.rows, RowDamage::All);
     assert_eq!(
@@ -471,7 +482,7 @@ fn presentation_damage_separates_cursor_and_resolved_text_colors() {
     let base = Rgb::default();
     session.set_theme(&Palette::new([base; 256], base, color, base), None);
     let damage = tracker
-        .update(&session.presentation_frame().unwrap())
+        .update(&session.presentation_frame().unwrap(), now)
         .unwrap();
     assert_eq!(damage.rows, RowDamage::Rows(&[]));
     assert_eq!(damage.cursor, None);
@@ -479,10 +490,93 @@ fn presentation_damage_separates_cursor_and_resolved_text_colors() {
     session.transport.source = Cursor::new(b"\x1b[?5h");
     session.pump().unwrap();
     let damage = tracker
-        .update(&session.presentation_frame().unwrap())
+        .update(&session.presentation_frame().unwrap(), now)
         .unwrap();
     assert_eq!(damage.rows, RowDamage::All);
     assert_eq!(damage.cursor, None);
+}
+
+#[test]
+fn cursor_blink_keeps_its_cadence_and_only_changes_the_overlay() {
+    let session = session(b"");
+    let frame = session.presentation_frame().unwrap();
+    let mut tracker = PresentationTracker::default();
+    let start = Instant::now();
+    let phase = Duration::from_millis(40);
+    tracker.set_cursor_blink_interval(phase, start);
+    let cursor = tracker.update(&frame, start).unwrap().cursor.unwrap().after;
+    assert!(cursor.is_some());
+    assert_eq!(tracker.cursor_deadline(), Some(start + phase));
+    assert_eq!(tracker.tick_cursor(start), None);
+
+    let hidden = tracker.tick_cursor(start + phase).unwrap();
+    assert_eq!((hidden.before, hidden.after), (cursor, None));
+    assert_eq!(
+        tracker.tick_cursor(start + Duration::from_millis(125)),
+        None
+    );
+    assert_eq!(tracker.cursor_deadline(), Some(start + phase * 4));
+
+    let update = tracker
+        .update(&frame, start + Duration::from_millis(161))
+        .unwrap();
+    assert_eq!(update.rows, RowDamage::Rows(&[]));
+    assert_eq!(update.cursor.unwrap().after, cursor);
+    assert_eq!(tracker.cursor_deadline(), Some(start + phase * 5));
+
+    tracker.tick_cursor(start + phase * 5).unwrap();
+    let activity = start + Duration::from_millis(220);
+    let shown = tracker.restart_cursor_blink(activity).unwrap();
+    assert_eq!((shown.before, shown.after), (None, cursor));
+    assert_eq!(tracker.cursor_deadline(), Some(activity + phase));
+
+    tracker.tick_cursor(activity + phase).unwrap();
+    let shown = tracker
+        .set_cursor_blink_interval(Duration::ZERO, activity + phase)
+        .unwrap();
+    assert_eq!(shown.after, cursor);
+    assert_eq!(tracker.cursor_deadline(), None);
+    assert_eq!(tracker.displayed_cursor(), cursor);
+}
+
+#[test]
+fn synchronized_output_blinks_only_the_last_presented_cursor() {
+    let mut session = session(b"\x1b[?2026h\x1b[2;3H");
+    let mut tracker = PresentationTracker::default();
+    let start = Instant::now();
+    let phase = Duration::from_millis(30);
+    tracker.set_cursor_blink_interval(phase, start);
+    let initial = session.presentation_frame().unwrap();
+    tracker.update(&initial, start).unwrap();
+    let original = tracker.displayed_cursor().unwrap();
+
+    session.pump_with_clock(|| start).unwrap();
+    assert!(session.presentation_frame().is_none());
+    let hidden = tracker.tick_cursor(start + phase).unwrap();
+    assert_eq!((hidden.before, hidden.after), (Some(original), None));
+    assert_eq!(
+        tracker.tick_cursor(start + phase * 2).unwrap().after,
+        Some(original)
+    );
+
+    let release = start + Duration::from_millis(70);
+    session.transport.source = Cursor::new(b"\x1b[?2026l");
+    session.pump_with_clock(|| release).unwrap();
+    let frame = session.presentation_frame().unwrap();
+    let change = tracker.update(&frame, release).unwrap().cursor.unwrap();
+    assert_eq!(change.before, Some(original));
+    assert_eq!(
+        change.after.unwrap().position,
+        CellPosition { row: 1, column: 2 }
+    );
+    assert_eq!(tracker.cursor_deadline(), Some(release + phase));
+
+    session.transport.source = Cursor::new(b"\x1b[?12l");
+    session.pump().unwrap();
+    let frame = session.presentation_frame().unwrap();
+    tracker.update(&frame, release).unwrap();
+    assert!(tracker.displayed_cursor().is_some());
+    assert_eq!(tracker.cursor_deadline(), None);
 }
 
 #[test]
@@ -636,8 +730,9 @@ fn external_poll_dispatches_host_io_pty_exit_and_presentation_deadline() {
     let (mut host, mut peer) = io::pipe().unwrap();
     peer.write_all(b"x").unwrap();
     let mut tracker = PresentationTracker::default();
+    let now = Instant::now();
     let initial = session.presentation_frame().unwrap();
-    assert_eq!(tracker.update(&initial).unwrap().rows, RowDamage::All);
+    assert_eq!(tracker.update(&initial, now).unwrap().rows, RowDamage::All);
     let limit = Instant::now() + Duration::from_secs(5);
     let mut host_ready = false;
     let mut held = false;
@@ -716,7 +811,10 @@ fn external_poll_dispatches_host_io_pty_exit_and_presentation_deadline() {
             && let Some(frame) = session.presentation_frame()
         {
             let row = frame.viewport.row(0).unwrap();
-            assert_eq!(tracker.update(&frame).unwrap().rows, RowDamage::Rows(&[0]));
+            assert_eq!(
+                tracker.update(&frame, now).unwrap().rows,
+                RowDamage::Rows(&[0])
+            );
             let first = row
                 .display_units(0..frame.geometry.pty_size().columns.into())
                 .next()
@@ -1096,8 +1194,9 @@ fn child_observes_committed_grid_and_pixel_resizes() {
     session.resize(resized.pty_size()).unwrap();
     assert!(!session.wants_write());
     let mut tracker = PresentationTracker::default();
+    let now = Instant::now();
     tracker
-        .update(&session.presentation_frame().unwrap())
+        .update(&session.presentation_frame().unwrap(), now)
         .unwrap();
     let pixels_only = GridGeometry::fit(pixels(1200, 600), pixels(100, 150)).unwrap();
     session.resize(pixels_only.pty_size()).unwrap();
@@ -1105,7 +1204,7 @@ fn child_observes_committed_grid_and_pixel_resizes() {
     assert_eq!(session.geometry(), pixels_only);
     assert_eq!(
         tracker
-            .update(&session.presentation_frame().unwrap())
+            .update(&session.presentation_frame().unwrap(), now)
             .unwrap()
             .rows,
         RowDamage::All
