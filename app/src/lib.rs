@@ -2,4 +2,4 @@
 mod session;
 
 #[cfg(target_os = "linux")]
-pub use session::{MAX_INPUT_BYTES, MAX_PASTE_BYTES, Session};
+pub use session::{MAX_INPUT_BYTES, MAX_PASTE_BYTES, MouseInputOutcome, Session};

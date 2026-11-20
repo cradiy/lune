@@ -7,9 +7,9 @@ use std::time::{Duration, Instant};
 
 use lune_pty::{Pty, PtySize};
 use lune_terminal::{
-    CellPosition, Key, KeySequence, MAX_STYLES, Modifiers, MouseEvent, MouseFormat, MouseSequence,
-    MouseTracking, Palette, PixelPosition, PixelSize, ProcessFailure, Processor, Screen,
-    StorageError, StyleError, StyleId, TextSink, UnicodeWriter,
+    CellPosition, HistoryLimits, Key, KeySequence, MAX_STYLES, Modifiers, MouseEvent, MouseFormat,
+    MouseSequence, MouseTracking, Palette, PixelPosition, PixelSize, ProcessFailure, Processor,
+    Screen, ScreenBuffer, StorageError, StyleError, StyleId, TextSink, UnicodeWriter,
 };
 
 const READ_BYTES: usize = 16 * 1024;
@@ -33,6 +33,13 @@ impl From<StorageError> for ResizeError {
     fn from(error: StorageError) -> Self {
         Self::Storage(error)
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MouseInputOutcome {
+    Ignored,
+    Queued,
+    HistoryScrolled,
 }
 
 /// Drives terminal state and child I/O from a nonblocking PTY.
@@ -154,6 +161,27 @@ impl<T: Read + Write> Session<T> {
         &self.processor
     }
 
+    /// Updates primary scrollback limits and clamps the visible history.
+    pub fn set_history_limits(&mut self, limits: HistoryLimits) -> Result<(), StorageError> {
+        self.screen.set_history_limits(limits)
+    }
+
+    /// Moves the local viewport. Positive steps go toward older rows.
+    pub fn scroll_history(&mut self, steps: isize) -> bool {
+        let offset = self.screen.viewport_offset();
+        if steps > 0 {
+            self.screen.scroll_viewport_up(steps as usize);
+        } else {
+            self.screen.scroll_viewport_down(steps.unsigned_abs());
+        }
+        self.screen.viewport_offset() != offset
+    }
+
+    /// Returns the primary viewport to the live buffer.
+    pub fn follow_output(&mut self) {
+        self.screen.scroll_viewport_to_bottom();
+    }
+
     /// Reclaims unreachable styles while preserving IDs held by the caller.
     pub fn collect_styles(
         &mut self,
@@ -225,38 +253,64 @@ impl<T: Read + Write> Session<T> {
         Ok(self.stage_report(self.processor.input_modes().encode_focus(focused)))
     }
 
-    /// Queues a pointer report or an alternate-screen wheel key.
+    /// Routes a pointer event to the primary viewport or the PTY.
+    /// A historical viewport handles vertical wheel steps locally.
     /// Pixel reports require a position inside the committed content size.
-    /// Returns false when the event produces no report.
-    pub fn queue_mouse(
+    pub fn mouse_input(
         &mut self,
         event: MouseEvent,
         cell: CellPosition,
         pixel: Option<PixelPosition>,
         modifiers: Modifiers,
-    ) -> io::Result<bool> {
-        self.check_input_ready()?;
+    ) -> io::Result<MouseInputOutcome> {
         if cell.row >= usize::from(self.size.rows) || cell.column >= usize::from(self.size.columns)
         {
-            return Ok(false);
+            return Ok(MouseInputOutcome::Ignored);
         }
         let modes = self.processor.input_modes();
+        let buffer = self.screen.active_buffer();
+        if buffer == ScreenBuffer::Primary
+            && (modes.mouse_tracking == MouseTracking::Disabled
+                || self.write_closed
+                || self.screen.viewport_offset() != 0)
+        {
+            let steps = match event {
+                MouseEvent::WheelUp => 1,
+                MouseEvent::WheelDown => -1,
+                _ => return Ok(MouseInputOutcome::Ignored),
+            };
+            return Ok(if self.scroll_history(steps) {
+                MouseInputOutcome::HistoryScrolled
+            } else {
+                MouseInputOutcome::Ignored
+            });
+        }
+
+        self.check_input_ready()?;
         if modes.mouse_tracking == MouseTracking::Disabled {
-            let key = modes.encode_alternate_scroll(event, self.screen.active_buffer());
-            return Ok(self.stage_report(key.as_ref().map(KeySequence::as_bytes)));
+            let key = modes.encode_alternate_scroll(event, buffer);
+            return Ok(self.stage_mouse_report(key.as_ref().map(KeySequence::as_bytes)));
         }
         let report = if modes.mouse_format == MouseFormat::SgrPixels {
             let Some(pixel) = pixel.filter(|position| {
                 position.x < u32::from(self.size.pixel_width)
                     && position.y < u32::from(self.size.pixel_height)
             }) else {
-                return Ok(false);
+                return Ok(MouseInputOutcome::Ignored);
             };
             modes.encode_pixel_mouse(event, pixel, modifiers)
         } else {
             modes.encode_mouse(event, cell, modifiers)
         };
-        Ok(self.stage_report(report.as_ref().map(MouseSequence::as_bytes)))
+        Ok(self.stage_mouse_report(report.as_ref().map(MouseSequence::as_bytes)))
+    }
+
+    fn stage_mouse_report(&mut self, report: Option<&[u8]>) -> MouseInputOutcome {
+        if self.stage_report(report) {
+            MouseInputOutcome::Queued
+        } else {
+            MouseInputOutcome::Ignored
+        }
     }
 
     fn stage_report(&mut self, report: Option<&[u8]>) -> bool {

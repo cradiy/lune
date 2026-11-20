@@ -225,10 +225,11 @@ fn queued_mouse_report_finishes_before_a_reply_from_new_modes() {
         shift: true,
         ..Modifiers::default()
     };
-    assert!(
+    assert_eq!(
         session
-            .queue_mouse(MouseEvent::Press(MouseButton::Left), cell, None, shift)
-            .unwrap()
+            .mouse_input(MouseEvent::Press(MouseButton::Left), cell, None, shift)
+            .unwrap(),
+        MouseInputOutcome::Queued
     );
     session.transport.source = Cursor::new(b"\x1b[?1004;1006l\x1b[6n");
     session.transport.write_budget = 1;
@@ -242,15 +243,16 @@ fn queued_mouse_report_finishes_before_a_reply_from_new_modes() {
     session.transport.write_budget = usize::MAX;
     session.pump().unwrap();
     assert!(!session.queue_focus(false).unwrap());
-    assert!(
+    assert_eq!(
         session
-            .queue_mouse(
+            .mouse_input(
                 MouseEvent::Release(MouseButton::Left),
                 cell,
                 None,
                 Modifiers::default()
             )
-            .unwrap()
+            .unwrap(),
+        MouseInputOutcome::Queued
     );
     session.pump().unwrap();
     assert_eq!(
@@ -268,18 +270,20 @@ fn pixel_mouse_uses_content_bounds_and_tracking_takes_precedence_over_alternate_
     session.pump().unwrap();
     let cell = CellPosition { row: 2, column: 7 };
     let modifiers = Modifiers::default();
-    assert!(
-        !session
-            .queue_mouse(MouseEvent::WheelUp, cell, None, modifiers)
-            .unwrap()
+    assert_eq!(
+        session
+            .mouse_input(MouseEvent::WheelUp, cell, None, modifiers)
+            .unwrap(),
+        MouseInputOutcome::Ignored
     );
 
     session.transport.source = Cursor::new(b"\x1b[?1049h");
     session.pump().unwrap();
-    assert!(
+    assert_eq!(
         session
-            .queue_mouse(MouseEvent::WheelUp, cell, None, modifiers)
-            .unwrap()
+            .mouse_input(MouseEvent::WheelUp, cell, None, modifiers)
+            .unwrap(),
+        MouseInputOutcome::Queued
     );
     session.pump().unwrap();
 
@@ -293,24 +297,103 @@ fn pixel_mouse_uses_content_bounds_and_tracking_takes_precedence_over_alternate_
             Some(PixelPosition { x: 63, y: 47 }),
         ),
     ] {
-        assert!(
-            !session
-                .queue_mouse(MouseEvent::WheelDown, cell, pixel, modifiers)
-                .unwrap()
+        assert_eq!(
+            session
+                .mouse_input(MouseEvent::WheelDown, cell, pixel, modifiers)
+                .unwrap(),
+            MouseInputOutcome::Ignored
         );
     }
-    assert!(
+    assert_eq!(
         session
-            .queue_mouse(
+            .mouse_input(
                 MouseEvent::WheelDown,
                 cell,
                 Some(PixelPosition { x: 63, y: 47 }),
                 modifiers
             )
-            .unwrap()
+            .unwrap(),
+        MouseInputOutcome::Queued
     );
     session.pump().unwrap();
     assert_eq!(session.transport.written, b"\x1bOA\x1b[<65;64;48M");
+}
+
+#[test]
+fn browsing_scrollback_keeps_the_anchor_and_routes_wheel_steps_locally() {
+    let mut session = session(b"a\r\nb\r\nc\r\nd\r\ne");
+    let limits = HistoryLimits {
+        max_rows: 2,
+        max_bytes: 1024,
+    };
+    session.set_history_limits(limits).unwrap();
+    session.pump().unwrap();
+    let cell = CellPosition { row: 0, column: 0 };
+    let mouse = |session: &mut Session<Transport>, event| {
+        session
+            .mouse_input(event, cell, None, Modifiers::default())
+            .unwrap()
+    };
+    let top = |session: &Session<Transport>| match session
+        .presentation_screen()
+        .unwrap()
+        .viewport()
+        .row(0)
+        .unwrap()
+        .text(0)
+    {
+        Some(CellText::Scalar(value)) => value,
+        _ => panic!("expected a viewport marker"),
+    };
+    session.queue_input(b"x").unwrap();
+    assert_eq!(
+        mouse(&mut session, MouseEvent::WheelUp),
+        MouseInputOutcome::HistoryScrolled
+    );
+    assert_eq!(top(&session), 'b');
+
+    session.transport.source = Cursor::new(b"\r\nf\x1b[?1000;1006h");
+    session.transport.write_budget = usize::MAX;
+    session.pump().unwrap();
+    assert_eq!(top(&session), 'b');
+    assert_eq!(session.screen().history().len(), 2);
+    assert_eq!(
+        mouse(&mut session, MouseEvent::Press(MouseButton::Left)),
+        MouseInputOutcome::Ignored
+    );
+    assert_eq!(
+        mouse(&mut session, MouseEvent::WheelDown),
+        MouseInputOutcome::HistoryScrolled
+    );
+    assert_eq!(top(&session), 'c');
+
+    session.follow_output();
+    assert_eq!(top(&session), 'd');
+    assert_eq!(
+        mouse(&mut session, MouseEvent::WheelDown),
+        MouseInputOutcome::Queued
+    );
+    session.pump().unwrap();
+    assert_eq!(session.transport.written, b"x\x1b[<65;1;1M");
+
+    session.transport.hung_up = true;
+    session.pump().unwrap();
+    assert_eq!(
+        mouse(&mut session, MouseEvent::WheelUp),
+        MouseInputOutcome::HistoryScrolled
+    );
+    assert!(session.scroll_history(isize::MAX));
+    let max_bytes = session.screen().history().retained_bytes() / 2;
+    session
+        .set_history_limits(HistoryLimits {
+            max_bytes,
+            ..limits
+        })
+        .unwrap();
+    assert_eq!(session.screen().viewport_offset(), 1);
+    assert_eq!(top(&session), 'c');
+    assert!(session.scroll_history(isize::MIN));
+    assert_eq!(top(&session), 'd');
 }
 
 #[test]
