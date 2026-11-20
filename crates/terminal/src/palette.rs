@@ -107,7 +107,14 @@ impl Palette {
         background: Rgb,
         cursor: Rgb,
     ) -> bool {
-        let base = colors(indexed, foreground, background, cursor);
+        self.set_base_colors(colors(indexed, foreground, background, cursor))
+    }
+
+    pub(crate) fn set_base_from(&mut self, theme: &Self) -> bool {
+        self.set_base_colors(theme.base)
+    }
+
+    fn set_base_colors(&mut self, base: [Rgb; ENTRIES]) -> bool {
         let mut changed = false;
         for (index, (&color, current)) in base.iter().zip(&mut self.current).enumerate() {
             if self.overrides[index / 64] & (1 << (index % 64)) == 0 {

@@ -120,13 +120,23 @@ impl Osc {
         changed
     }
 
+    pub(crate) fn set_base_from(&mut self, theme: &Palette) -> bool {
+        let changed = self.palette.set_base_from(theme);
+        self.palette_changed |= changed;
+        changed
+    }
+
     pub(crate) fn title(&self) -> &str {
         std::str::from_utf8(&self.buffers[self.active][..self.lengths[self.active]])
             .expect("Committed window titles are valid UTF-8")
     }
 
     pub(crate) fn take_title_change(&mut self) -> Option<&str> {
-        std::mem::take(&mut self.changed).then(|| self.title())
+        self.take_title_changed().then(|| self.title())
+    }
+
+    pub(crate) fn take_title_changed(&mut self) -> bool {
+        std::mem::take(&mut self.changed)
     }
 
     #[cold]

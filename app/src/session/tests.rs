@@ -1,6 +1,6 @@
 use std::io::Cursor;
 
-use lune_terminal::{CellText, MouseButton, Rgb};
+use lune_terminal::{CellText, MouseButton, PaletteEntry, Rgb, WorkingDirectoryChange};
 
 use super::*;
 
@@ -103,6 +103,92 @@ fn hangup_drains_child_output_and_finalizes_an_incomplete_scalar() {
     assert_eq!(
         session.queue_input(b"next").unwrap_err().kind(),
         io::ErrorKind::BrokenPipe
+    );
+}
+
+#[test]
+fn session_notifications_coalesce_and_distinguish_clearing_metadata() {
+    let mut session = session(
+        b"\x1b]2;first\x07\x1b]2;latest\x07\x1b]7;file:///sample\x07\x1b]11;#123456\x07\x07\x07",
+    );
+    session.pump().unwrap();
+    let changes = session.take_notifications();
+    assert_eq!(changes.window_title, Some("latest"));
+    assert_eq!(
+        changes.working_directory,
+        WorkingDirectoryChange::Set("file:///sample")
+    );
+    let background = Rgb {
+        red: 0x12,
+        green: 0x34,
+        blue: 0x56,
+    };
+    assert_eq!(
+        changes.palette.unwrap().color(PaletteEntry::Background),
+        background
+    );
+    assert!(changes.bell);
+
+    let changes = session.take_notifications();
+    assert!(changes.window_title.is_none() && changes.palette.is_none() && !changes.bell);
+    assert_eq!(changes.working_directory, WorkingDirectoryChange::Unchanged);
+
+    session.transport.source = Cursor::new(b"\x1bc");
+    session.pump().unwrap();
+    let changes = session.take_notifications();
+    assert_eq!(changes.window_title, Some(""));
+    assert_eq!(changes.working_directory, WorkingDirectoryChange::Cleared);
+    assert_eq!(
+        changes.palette.unwrap().color(PaletteEntry::Background),
+        Rgb::default()
+    );
+    assert!(!changes.bell);
+}
+
+#[test]
+fn combined_theme_switch_preserves_overrides_and_reports_one_final_scheme() {
+    let black = Rgb::default();
+    let white = Rgb {
+        red: 255,
+        green: 255,
+        blue: 255,
+    };
+    let dark = Palette::new([black; 256], white, black, white);
+    let light = Palette::new([white; 256], black, white, black);
+    let mut session = session(b"\x1b[?2031h\x1b]11;#010203\x07");
+    session.set_theme(&dark, Some(ColorScheme::Dark));
+    session.pump().unwrap();
+    assert!(!session.wants_write());
+    session.take_notifications();
+
+    session.set_theme(&light, Some(ColorScheme::Light));
+    let palette = session.take_notifications().palette.unwrap();
+    assert_eq!(palette.color(PaletteEntry::Foreground), black);
+    assert_eq!(
+        palette.color(PaletteEntry::Background),
+        Rgb {
+            red: 1,
+            green: 2,
+            blue: 3
+        }
+    );
+    assert_eq!(palette.base_color(PaletteEntry::Background), white);
+    session.pump().unwrap();
+    assert_eq!(session.transport.written, b"\x1b");
+    session.set_theme(&light, Some(ColorScheme::Light));
+    session.transport.write_budget = usize::MAX;
+    session.pump().unwrap();
+    assert_eq!(session.transport.written, b"\x1b[?997;2n");
+
+    session.transport.source = Cursor::new(b"\x1b[?996n");
+    session.transport.write_budget = 1;
+    session.pump().unwrap();
+    session.set_theme(&dark, Some(ColorScheme::Dark));
+    session.transport.write_budget = usize::MAX;
+    session.pump().unwrap();
+    assert_eq!(
+        session.transport.written,
+        b"\x1b[?997;2n\x1b[?997;2n\x1b[?997;1n"
     );
 }
 

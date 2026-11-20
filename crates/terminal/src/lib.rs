@@ -44,7 +44,9 @@ pub use mouse::{
 pub use osc::{MAX_OSC_PALETTE_ENTRIES, MAX_TITLE_BYTES, MAX_WORKING_DIRECTORY_URI_BYTES};
 pub use palette::{Palette, PaletteEntry, Rgb};
 pub use paste::Paste;
-pub use processor::{ProcessError, ProcessFailure, Processor};
+pub use processor::{
+    ProcessError, ProcessFailure, Processor, TerminalNotifications, WorkingDirectoryChange,
+};
 pub use reflow::{ReflowAffinity, ReflowAnchor, ReflowRow, ReflowRows};
 pub use reply::{ColorScheme, PixelSize};
 pub use row::Row;

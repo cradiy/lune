@@ -78,6 +78,23 @@ impl<E: Error + 'static> Error for ProcessError<E> {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkingDirectoryChange<'a> {
+    Unchanged,
+    Cleared,
+    Set(&'a str),
+}
+
+/// Latest metadata changes and any pending bell since acknowledgement.
+#[derive(Debug)]
+pub struct TerminalNotifications<'a> {
+    /// An empty title clears the displayed title.
+    pub window_title: Option<&'a str>,
+    pub working_directory: WorkingDirectoryChange<'a>,
+    pub palette: Option<&'a Palette>,
+    pub bell: bool,
+}
+
 #[derive(Clone, Copy)]
 enum Pending {
     Text(char),
@@ -302,17 +319,37 @@ impl Processor {
         self.state.osc.take_working_directory_change()
     }
 
+    /// Acknowledges and borrows the latest terminal notifications as one batch.
+    pub fn take_notifications(&mut self) -> TerminalNotifications<'_> {
+        let osc = &mut self.state.osc;
+        let title_changed = osc.take_title_changed();
+        let directory_changed = osc.take_working_directory_change();
+        let palette_changed = osc.take_palette_change();
+        let working_directory = if directory_changed {
+            osc.working_directory_uri()
+                .map_or(WorkingDirectoryChange::Cleared, WorkingDirectoryChange::Set)
+        } else {
+            WorkingDirectoryChange::Unchanged
+        };
+        TerminalNotifications {
+            window_title: title_changed.then(|| osc.title()),
+            working_directory,
+            palette: palette_changed.then(|| osc.palette()),
+            bell: std::mem::take(&mut self.bell_pending),
+        }
+    }
+
     /// Sets the preference reported by `CSI ? 996 n`. When subscribed, changes
     /// queue a notification. `None` clears the preference and any queued notice.
     /// The host preference survives terminal resets.
     pub fn set_color_scheme(&mut self, scheme: Option<ColorScheme>) {
-        if scheme == self.state.color_scheme {
-            return;
-        }
-        self.state.color_scheme = scheme;
-        if self.state.color_scheme_notifications {
-            self.queue_color_scheme_notice(scheme);
-        }
+        self.publish_theme_change(scheme, false);
+    }
+
+    /// Updates the host theme and scheme together, retaining application overrides.
+    pub fn set_theme(&mut self, palette: &Palette, scheme: Option<ColorScheme>) {
+        let changed = self.state.osc.set_base_from(palette);
+        self.publish_theme_change(scheme, changed);
     }
 
     /// Current theme and runtime colors. OSC 10/11/12 accepts consecutive numeric
@@ -338,10 +375,16 @@ impl Processor {
             .state
             .osc
             .set_base(indexed, foreground, background, cursor);
-        if changed && self.state.color_scheme_notifications {
-            self.queue_color_scheme_notice(self.state.color_scheme);
-        }
+        self.publish_theme_change(self.state.color_scheme, changed);
         changed
+    }
+
+    fn publish_theme_change(&mut self, scheme: Option<ColorScheme>, palette_changed: bool) {
+        let scheme_changed = self.state.color_scheme != scheme;
+        self.state.color_scheme = scheme;
+        if (scheme_changed || palette_changed) && self.state.color_scheme_notifications {
+            self.queue_color_scheme_notice(scheme);
+        }
     }
 
     #[cold]

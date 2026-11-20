@@ -7,9 +7,10 @@ use std::time::{Duration, Instant};
 
 use lune_pty::{Pty, PtySize};
 use lune_terminal::{
-    CellPosition, HistoryLimits, Key, KeySequence, MAX_STYLES, Modifiers, MouseEvent, MouseFormat,
-    MouseSequence, MouseTracking, Palette, PixelPosition, PixelSize, ProcessFailure, Processor,
-    Screen, ScreenBuffer, StorageError, StyleError, StyleId, TextSink, UnicodeWriter,
+    CellPosition, ColorScheme, HistoryLimits, Key, KeySequence, MAX_STYLES, Modifiers, MouseEvent,
+    MouseFormat, MouseSequence, MouseTracking, Palette, PixelPosition, PixelSize, ProcessFailure,
+    Processor, Screen, ScreenBuffer, StorageError, StyleError, StyleId, TerminalNotifications,
+    TextSink, UnicodeWriter,
 };
 
 const READ_BYTES: usize = 16 * 1024;
@@ -159,6 +160,14 @@ impl<T: Read + Write> Session<T> {
 
     pub fn processor(&self) -> &Processor {
         &self.processor
+    }
+
+    pub fn take_notifications(&mut self) -> TerminalNotifications<'_> {
+        self.processor.take_notifications()
+    }
+
+    pub fn set_theme(&mut self, palette: &Palette, scheme: Option<ColorScheme>) {
+        self.processor.set_theme(palette, scheme);
     }
 
     /// Updates primary scrollback limits and clamps the visible history.
