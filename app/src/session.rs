@@ -1,5 +1,4 @@
 use std::io::{self, Read, Write};
-use std::num::NonZeroU32;
 use std::ops::Range;
 use std::os::fd::{AsFd, BorrowedFd};
 use std::process::{Command, ExitStatus};
@@ -9,10 +8,12 @@ use lune_pty::{ChildExit, Pty, PtySize};
 use lune_terminal::{
     CellPosition, Color, ColorScheme, CursorAppearance, HistoryLimits, Key, KeySequence,
     MAX_STYLES, Modifiers, MouseEvent, MouseFormat, MouseSequence, MouseTracking, Palette,
-    PaletteEntry, PixelPosition, PixelSize, ProcessFailure, Processor, Rgb, Screen, ScreenBuffer,
+    PaletteEntry, PixelPosition, ProcessFailure, Processor, Rgb, Screen, ScreenBuffer,
     StorageError, Style, StyleError, StyleId, StyleTable, TerminalNotifications, TextSink,
     UnicodeWriter, Viewport,
 };
+
+use crate::GridGeometry;
 
 mod presentation;
 mod wait;
@@ -27,12 +28,6 @@ const SYNCHRONIZED_OUTPUT_TIMEOUT: Duration = Duration::from_millis(150);
 pub const MAX_INPUT_BYTES: usize = 16 * 1024;
 const PASTE_WRITE_BYTES: usize = MAX_INPUT_BYTES;
 pub const MAX_PASTE_BYTES: usize = 1024 * 1024;
-
-fn pixel_size(size: PtySize) -> Option<PixelSize> {
-    let width = NonZeroU32::new(u32::from(size.pixel_width))?;
-    let height = NonZeroU32::new(u32::from(size.pixel_height))?;
-    Some(PixelSize { width, height })
-}
 
 enum ResizeError {
     Storage(StorageError),
@@ -55,7 +50,7 @@ pub enum MouseInputOutcome {
 /// Borrowed state for one presentation pass.
 pub struct PresentationFrame<'a> {
     pub viewport: Viewport<'a>,
-    pub columns: usize,
+    pub geometry: GridGeometry,
     pub cursor_appearance: CursorAppearance,
     pub reverse_video: bool,
     pub styles: &'a StyleTable,
@@ -102,7 +97,7 @@ impl<'a> PresentationFrame<'a> {
 pub struct Session<T = Pty> {
     transport: T,
     child_exit: Option<ChildExit>,
-    size: PtySize,
+    geometry: GridGeometry,
     screen: Screen,
     processor: Processor,
     writer: UnicodeWriter,
@@ -122,8 +117,7 @@ impl Session<Pty> {
     pub fn spawn(command: Command, size: PtySize, palette: Palette) -> io::Result<Self> {
         let screen = Screen::new(usize::from(size.columns), usize::from(size.rows))
             .map_err(io::Error::other)?;
-        let mut processor = Processor::new(MAX_STYLES, palette).map_err(io::Error::other)?;
-        processor.update_geometry(&screen, pixel_size(size), None);
+        let processor = Processor::new(MAX_STYLES, palette).map_err(io::Error::other)?;
 
         let mut transport = Pty::spawn(command, size)?;
         transport.set_nonblocking(true)?;
@@ -139,14 +133,15 @@ impl Session<Pty> {
         if self.write_closed {
             return Err(io::ErrorKind::BrokenPipe.into());
         }
-        if size == self.size {
+        let previous = self.geometry.pty_size();
+        if size == previous {
             return Ok(());
         }
         if self.incoming_bytes.is_some() {
             return Err(io::ErrorKind::WouldBlock.into());
         }
 
-        let grid_changed = size.columns != self.size.columns || size.rows != self.size.rows;
+        let grid_changed = size.columns != previous.columns || size.rows != previous.rows;
         self.screen
             .reflow_with(
                 usize::from(size.columns),
@@ -166,9 +161,12 @@ impl Session<Pty> {
                 ResizeError::Storage(error) => io::Error::other(error),
                 ResizeError::Transport(error) => error,
             })?;
-        self.size = size;
-        self.processor
-            .update_geometry(&self.screen, pixel_size(size), None);
+        self.geometry = GridGeometry::from_pty_size(size);
+        self.processor.update_geometry(
+            &self.screen,
+            self.geometry.text_area_pixels(),
+            self.geometry.cell_pixels(),
+        );
         Ok(())
     }
 
@@ -185,11 +183,13 @@ impl<T: AsFd> AsFd for Session<T> {
 }
 
 impl<T: Read + Write> Session<T> {
-    fn new(transport: T, size: PtySize, screen: Screen, processor: Processor) -> Self {
+    fn new(transport: T, size: PtySize, screen: Screen, mut processor: Processor) -> Self {
+        let geometry = GridGeometry::from_pty_size(size);
+        processor.update_geometry(&screen, geometry.text_area_pixels(), geometry.cell_pixels());
         Self {
             transport,
             child_exit: None,
-            size,
+            geometry,
             screen,
             processor,
             writer: UnicodeWriter::default(),
@@ -209,6 +209,10 @@ impl<T: Read + Write> Session<T> {
         &self.screen
     }
 
+    pub fn geometry(&self) -> GridGeometry {
+        self.geometry
+    }
+
     /// The live screen when it is ready for presentation.
     pub fn presentation_screen(&self) -> Option<&Screen> {
         self.presentation_deadline.is_none().then_some(&self.screen)
@@ -219,7 +223,7 @@ impl<T: Read + Write> Session<T> {
         let screen = self.presentation_screen()?;
         Some(PresentationFrame {
             viewport: screen.viewport(),
-            columns: screen.grid().columns(),
+            geometry: self.geometry,
             cursor_appearance: screen.cursor_appearance(),
             reverse_video: screen.reverse_video(),
             styles: self.processor.styles(),
@@ -346,8 +350,8 @@ impl<T: Read + Write> Session<T> {
         pixel: Option<PixelPosition>,
         modifiers: Modifiers,
     ) -> io::Result<MouseInputOutcome> {
-        if cell.row >= usize::from(self.size.rows) || cell.column >= usize::from(self.size.columns)
-        {
+        let size = self.geometry.pty_size();
+        if cell.row >= usize::from(size.rows) || cell.column >= usize::from(size.columns) {
             return Ok(MouseInputOutcome::Ignored);
         }
         let modes = self.processor.input_modes();
@@ -375,10 +379,7 @@ impl<T: Read + Write> Session<T> {
             return Ok(self.stage_mouse_report(key.as_ref().map(KeySequence::as_bytes)));
         }
         let report = if modes.mouse_format == MouseFormat::SgrPixels {
-            let Some(pixel) = pixel.filter(|position| {
-                position.x < u32::from(self.size.pixel_width)
-                    && position.y < u32::from(self.size.pixel_height)
-            }) else {
+            let Some(pixel) = pixel.filter(|&position| self.geometry.contains(position)) else {
                 return Ok(MouseInputOutcome::Ignored);
             };
             modes.encode_pixel_mouse(event, pixel, modifiers)
@@ -386,6 +387,19 @@ impl<T: Read + Write> Session<T> {
             modes.encode_mouse(event, cell, modifiers)
         };
         Ok(self.stage_mouse_report(report.as_ref().map(MouseSequence::as_bytes)))
+    }
+
+    /// Routes a pixel hit in the committed grid through the current mouse mode.
+    pub fn mouse_input_at(
+        &mut self,
+        event: MouseEvent,
+        pixel: PixelPosition,
+        modifiers: Modifiers,
+    ) -> io::Result<MouseInputOutcome> {
+        let Some(cell) = self.geometry.cell_at(pixel) else {
+            return Ok(MouseInputOutcome::Ignored);
+        };
+        self.mouse_input(event, cell, Some(pixel), modifiers)
     }
 
     fn stage_mouse_report(&mut self, report: Option<&[u8]>) -> MouseInputOutcome {

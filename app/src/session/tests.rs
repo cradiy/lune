@@ -1,6 +1,9 @@
 use std::io::Cursor;
+use std::num::NonZeroU32;
 
-use lune_terminal::{CellText, Color, MouseButton, PaletteEntry, Rgb, WorkingDirectoryChange};
+use lune_terminal::{
+    CellText, Color, MouseButton, PaletteEntry, PixelSize, Rgb, WorkingDirectoryChange,
+};
 
 use super::*;
 
@@ -53,6 +56,13 @@ fn session(source: &'static [u8]) -> Session<Transport> {
         Screen::new(8, 3).unwrap(),
         Processor::new(MAX_STYLES, palette).unwrap(),
     )
+}
+
+fn pixels(width: u32, height: u32) -> PixelSize {
+    PixelSize {
+        width: NonZeroU32::new(width).unwrap(),
+        height: NonZeroU32::new(height).unwrap(),
+    }
 }
 
 #[test]
@@ -303,7 +313,7 @@ fn presentation_frame_keeps_whole_units_and_matches_their_rendition() {
     assert!(clipped.next().is_none());
     assert_eq!(row.display_units(0..2).last().unwrap(), first);
 
-    let mut trailing = row.display_units(4..frame.columns);
+    let mut trailing = row.display_units(4..frame.geometry.pty_size().columns.into());
     assert!(!trailing.next().unwrap().cell.is_erased());
     assert!(trailing.all(|unit| unit.cell.is_erased()));
 }
@@ -409,6 +419,7 @@ fn presentation_damage_follows_visible_row_positions() {
     assert_eq!(damage.cursor.unwrap().after, None);
 
     session.screen.resize(10, 4, StyleId::default()).unwrap();
+    session.geometry = GridGeometry::from_pty_size(PtySize::new(4, 10));
     let frame = session.presentation_frame().unwrap();
     assert_eq!(tracker.update(&frame).unwrap().rows, RowDamage::All);
     assert_eq!(tracker.update(&frame).unwrap().rows, RowDamage::Rows(&[]));
@@ -706,7 +717,10 @@ fn external_poll_dispatches_host_io_pty_exit_and_presentation_deadline() {
         {
             let row = frame.viewport.row(0).unwrap();
             assert_eq!(tracker.update(&frame).unwrap().rows, RowDamage::Rows(&[0]));
-            let first = row.display_units(0..frame.columns).next().unwrap();
+            let first = row
+                .display_units(0..frame.geometry.pty_size().columns.into())
+                .next()
+                .unwrap();
             assert_eq!((first.column, first.text), (0, CellText::Scalar('A')));
             assert_eq!(
                 frame.resolve_style(first.cell.style()).unwrap().foreground,
@@ -817,10 +831,26 @@ fn queued_mouse_report_finishes_before_a_reply_from_new_modes() {
 }
 
 #[test]
+fn grid_geometry_checks_pty_and_grid_capacity() {
+    let cell = pixels(8, 16);
+    assert!(GridGeometry::fit(pixels(7, 32), cell).is_none());
+    assert!(GridGeometry::fit(pixels(65_536, 16), pixels(32_768, 16)).is_none());
+    assert!(GridGeometry::fit(pixels(1025, 1024), pixels(1, 1)).is_none());
+    assert!(GridGeometry::fit(pixels(1024, 1024), pixels(1, 1)).is_some());
+
+    let uneven = GridGeometry::from_pty_size(PtySize {
+        pixel_width: 65,
+        pixel_height: 48,
+        ..PtySize::new(3, 8)
+    });
+    assert_eq!(uneven.text_area_pixels(), Some(pixels(65, 48)));
+    assert_eq!(uneven.cell_pixels(), None);
+}
+
+#[test]
 fn pixel_mouse_uses_content_bounds_and_tracking_takes_precedence_over_alternate_scroll() {
     let mut session = session(b"\x1b[?1;1007;1016h");
-    session.size.pixel_width = 64;
-    session.size.pixel_height = 48;
+    session.geometry = GridGeometry::fit(pixels(67, 61), pixels(8, 16)).unwrap();
     session.transport.write_budget = usize::MAX;
     session.pump().unwrap();
     let cell = CellPosition { row: 2, column: 7 };
@@ -859,19 +889,38 @@ fn pixel_mouse_uses_content_bounds_and_tracking_takes_precedence_over_alternate_
             MouseInputOutcome::Ignored
         );
     }
+    for pixel in [
+        PixelPosition { x: 64, y: 47 },
+        PixelPosition { x: 63, y: 48 },
+    ] {
+        assert_eq!(
+            session
+                .mouse_input_at(MouseEvent::WheelDown, pixel, modifiers)
+                .unwrap(),
+            MouseInputOutcome::Ignored
+        );
+    }
+    let last_pixel = PixelPosition { x: 63, y: 47 };
     assert_eq!(
         session
-            .mouse_input(
-                MouseEvent::WheelDown,
-                cell,
-                Some(PixelPosition { x: 63, y: 47 }),
-                modifiers
-            )
+            .mouse_input_at(MouseEvent::WheelDown, last_pixel, modifiers)
             .unwrap(),
         MouseInputOutcome::Queued
     );
     session.pump().unwrap();
-    assert_eq!(session.transport.written, b"\x1bOA\x1b[<65;64;48M");
+    session.transport.source = Cursor::new(b"\x1b[?1016l\x1b[?1006h");
+    session.pump().unwrap();
+    assert_eq!(
+        session
+            .mouse_input_at(MouseEvent::WheelDown, last_pixel, modifiers)
+            .unwrap(),
+        MouseInputOutcome::Queued
+    );
+    session.pump().unwrap();
+    assert_eq!(
+        session.transport.written,
+        b"\x1bOA\x1b[<65;64;48M\x1b[<65;8;3M"
+    );
 }
 
 #[test]
@@ -1000,8 +1049,12 @@ fn child_observes_committed_grid_and_pixel_resizes() {
         printf 'abcdefghijkl'
         read_report '\033[48;4;12;480;960t' || exit 73
         test "$(stty size)" = '4 12' || exit 74
+        printf '\033[16t'
+        read_report '\033[6;120;80t' || exit 75
         printf '\033[4;1HY'
-        read_report '\033[48;4;12;600;1200t' || exit 75
+        read_report '\033[48;4;12;600;1200t' || exit 76
+        printf '\033[16t'
+        read_report '\033[6;150;100t' || exit 77
         "#,
     ]);
     let color = Rgb::default();
@@ -1020,16 +1073,14 @@ fn child_observes_committed_grid_and_pixel_resizes() {
     let cursor = session.screen.cursor();
     assert!(session.resize(PtySize::new(0, 12)).is_err());
     assert_eq!(session.transport.size().unwrap(), initial);
+    assert_eq!(session.geometry().pty_size(), initial);
     assert_eq!(session.screen.cursor(), cursor);
     assert!(!session.wants_write());
 
-    let resized = PtySize {
-        pixel_width: 960,
-        pixel_height: 480,
-        ..PtySize::new(4, 12)
-    };
-    session.resize(resized).unwrap();
-    assert_eq!(session.transport.size().unwrap(), resized);
+    let resized = GridGeometry::fit(pixels(979, 501), pixels(80, 120)).unwrap();
+    session.resize(resized.pty_size()).unwrap();
+    assert_eq!(session.transport.size().unwrap(), resized.pty_size());
+    assert_eq!(session.geometry(), resized);
     assert_eq!(session.screen.grid().rows(), 4);
     assert_eq!(
         session.screen.grid().row(0).unwrap().text(11),
@@ -1042,15 +1093,23 @@ fn child_observes_committed_grid_and_pixel_resizes() {
         |session| session.screen.grid().row(3).unwrap().text(0) == Some(CellText::Scalar('Y')),
     );
 
-    session.resize(resized).unwrap();
+    session.resize(resized.pty_size()).unwrap();
     assert!(!session.wants_write());
-    let pixels_only = PtySize {
-        pixel_width: 1200,
-        pixel_height: 600,
-        ..resized
-    };
-    session.resize(pixels_only).unwrap();
-    assert_eq!(session.transport.size().unwrap(), pixels_only);
+    let mut tracker = PresentationTracker::default();
+    tracker
+        .update(&session.presentation_frame().unwrap())
+        .unwrap();
+    let pixels_only = GridGeometry::fit(pixels(1200, 600), pixels(100, 150)).unwrap();
+    session.resize(pixels_only.pty_size()).unwrap();
+    assert_eq!(session.transport.size().unwrap(), pixels_only.pty_size());
+    assert_eq!(session.geometry(), pixels_only);
+    assert_eq!(
+        tracker
+            .update(&session.presentation_frame().unwrap())
+            .unwrap()
+            .rows,
+        RowDamage::All
+    );
     wait_until(&mut session, deadline, "EOF", Session::is_finished);
     loop {
         if let Some(status) = session.try_wait().unwrap() {

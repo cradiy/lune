@@ -2,6 +2,8 @@ use std::collections::TryReserveError;
 
 use lune_terminal::{CellPosition, CursorAppearance, Palette, PaletteEntry, Rgb, Row, RowRevision};
 
+use crate::GridGeometry;
+
 use super::PresentationFrame;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -34,7 +36,7 @@ pub struct PresentationDamage<'a> {
 /// Compares successive frames from one session in viewport coordinates.
 #[derive(Default)]
 pub struct PresentationTracker {
-    columns: usize,
+    geometry: Option<GridGeometry>,
     revisions: Vec<RowRevision>,
     changed_rows: Vec<usize>,
     palette: Option<Palette>,
@@ -45,7 +47,7 @@ pub struct PresentationTracker {
 impl PresentationTracker {
     /// Forces a full redraw on the next update after a surface reset or failed draw.
     pub fn invalidate(&mut self) {
-        self.palette = None;
+        self.geometry = None;
         self.cursor = None;
     }
 
@@ -69,7 +71,7 @@ impl PresentationTracker {
             .as_ref()
             .is_none_or(|palette| !palette.same_text_colors(frame.palette));
         let all_rows = height_changed
-            || self.columns != frame.columns
+            || self.geometry != Some(frame.geometry)
             || colors_changed
             || self.reverse_video != frame.reverse_video;
         self.changed_rows.clear();
@@ -77,7 +79,7 @@ impl PresentationTracker {
             self.revisions.clear();
             self.revisions
                 .extend(frame.viewport.iter_rows().map(Row::revision));
-            self.columns = frame.columns;
+            self.geometry = Some(frame.geometry);
             self.reverse_video = frame.reverse_video;
         } else {
             for (index, (previous, row)) in self
