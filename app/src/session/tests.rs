@@ -258,6 +258,69 @@ fn synchronized_output_releases_on_explicit_end_and_pty_eof() {
 }
 
 #[test]
+fn waiting_on_a_real_pty_respects_idle_deadlines_and_drains_hangup() {
+    let mut child = Command::new("sh");
+    child.args([
+        "-c",
+        r#"
+        stty -echo || exit 71
+        printf 'ready'
+        IFS= read -r value && test "$value" = begin || exit 72
+        printf '\033[?2026hA'
+        IFS= read -r value && test "$value" = finish || exit 73
+        printf '\033[3;1Htail'
+        "#,
+    ]);
+    let color = Rgb::default();
+    let mut session = Session::spawn(
+        child,
+        PtySize::new(4, 20),
+        Palette::new([color; 256], color, color, color),
+    )
+    .unwrap();
+    let limit = Instant::now() + Duration::from_secs(5);
+    wait_until(&mut session, limit, "initial text", |session| {
+        session.screen().grid().row(0).unwrap().text(4) == Some(CellText::Scalar('y'))
+    });
+    assert_eq!(
+        session.wait_and_pump(Some(Duration::ZERO)).unwrap(),
+        WaitOutcome::TimedOut
+    );
+    let timeout = Duration::from_millis(10);
+    let start = Instant::now();
+    assert_eq!(
+        session.wait_and_pump(Some(timeout)).unwrap(),
+        WaitOutcome::TimedOut
+    );
+    assert!(start.elapsed() >= timeout);
+
+    session.queue_input(b"begin\n").unwrap();
+    wait_until(&mut session, limit, "synchronized output", |session| {
+        session.presentation_deadline().is_some()
+    });
+    assert!(session.presentation_screen().is_none());
+    let deadline = session.presentation_deadline().unwrap();
+    assert_eq!(
+        session.wait_and_pump(Some(Duration::from_secs(5))).unwrap(),
+        WaitOutcome::Pumped
+    );
+    assert!(Instant::now() >= deadline);
+    let screen = session.presentation_screen().unwrap();
+    assert_eq!(
+        screen.grid().row(0).unwrap().text(5),
+        Some(CellText::Scalar('A'))
+    );
+
+    session.queue_input(b"finish\n").unwrap();
+    wait_until(&mut session, limit, "EOF", Session::is_finished);
+    assert_eq!(session.wait_and_pump(None).unwrap(), WaitOutcome::Finished);
+    assert_eq!(
+        session.screen().grid().row(2).unwrap().text(3),
+        Some(CellText::Scalar('l'))
+    );
+}
+
+#[test]
 fn queued_key_keeps_its_encoding_across_a_mode_change() {
     let mut session = session(b"\x1b[?1h");
     session.pump().unwrap();
@@ -544,15 +607,7 @@ fn child_observes_committed_grid_and_pixel_resizes() {
     )
     .unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
-    let pump_until = |session: &mut Session, stage: &str, ready: fn(&Session) -> bool| {
-        while !ready(session) {
-            assert!(Instant::now() < deadline, "timed out waiting for {stage}");
-            assert!(!session.is_finished(), "child exited before {stage}");
-            session.pump().unwrap();
-            std::thread::sleep(Duration::from_millis(1));
-        }
-    };
-    pump_until(&mut session, "initial text", |session| {
+    wait_until(&mut session, deadline, "initial text", |session| {
         session.screen.grid().row(1).unwrap().text(3) == Some(CellText::Scalar('l'))
     });
 
@@ -574,9 +629,12 @@ fn child_observes_committed_grid_and_pixel_resizes() {
         session.screen.grid().row(0).unwrap().text(11),
         Some(CellText::Scalar('l'))
     );
-    pump_until(&mut session, "resize acknowledgement", |session| {
-        session.screen.grid().row(3).unwrap().text(0) == Some(CellText::Scalar('Y'))
-    });
+    wait_until(
+        &mut session,
+        deadline,
+        "resize acknowledgement",
+        |session| session.screen.grid().row(3).unwrap().text(0) == Some(CellText::Scalar('Y')),
+    );
 
     session.resize(resized).unwrap();
     assert!(!session.wants_write());
@@ -587,7 +645,7 @@ fn child_observes_committed_grid_and_pixel_resizes() {
     };
     session.resize(pixels_only).unwrap();
     assert_eq!(session.transport.size().unwrap(), pixels_only);
-    pump_until(&mut session, "EOF", Session::is_finished);
+    wait_until(&mut session, deadline, "EOF", Session::is_finished);
     loop {
         if let Some(status) = session.try_wait().unwrap() {
             assert!(status.success(), "resize handshake exited with {status}");
@@ -595,5 +653,23 @@ fn child_observes_committed_grid_and_pixel_resizes() {
         }
         assert!(Instant::now() < deadline, "child did not exit after EOF");
         std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+fn wait_until(
+    session: &mut Session,
+    deadline: Instant,
+    stage: &str,
+    ready: impl Fn(&Session) -> bool,
+) {
+    while !ready(session) {
+        assert!(!session.is_finished(), "child exited before {stage}");
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(!remaining.is_zero(), "timed out waiting for {stage}");
+        assert_ne!(
+            session.wait_and_pump(Some(remaining)).unwrap(),
+            WaitOutcome::TimedOut,
+            "timed out waiting for {stage}"
+        );
     }
 }

@@ -13,6 +13,10 @@ use lune_terminal::{
     TextSink, UnicodeWriter,
 };
 
+mod wait;
+
+pub use wait::WaitOutcome;
+
 const READ_BYTES: usize = 16 * 1024;
 const SYNCHRONIZED_OUTPUT_TIMEOUT: Duration = Duration::from_millis(150);
 pub const MAX_INPUT_BYTES: usize = 16 * 1024;
