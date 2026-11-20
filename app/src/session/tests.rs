@@ -753,6 +753,112 @@ fn paint_commands_replay_damage_and_keep_the_cursor_on_its_own_layer() {
 }
 
 #[test]
+fn paint_batch_retains_text_rendition_and_cursor_after_the_source_changes() {
+    let mut session = session("A\x1b[2;1H\x1b[1;31;44m水\u{301}\x1b[2;2H".as_bytes());
+    session.geometry = GridGeometry::fit(pixels(64, 48), pixels(8, 16)).unwrap();
+    let red = Rgb {
+        red: 180,
+        green: 5,
+        blue: 10,
+    };
+    let blue = Rgb {
+        red: 3,
+        green: 20,
+        blue: 160,
+    };
+    let base = Rgb::default();
+    let mut indexed = [base; 256];
+    indexed[1] = red;
+    indexed[4] = blue;
+    session.set_theme(&Palette::new(indexed, base, base, base), None);
+    session.pump().unwrap();
+
+    let mut tracker = PresentationTracker::default();
+    let mut batch = PaintBatch::default();
+    let now = Instant::now();
+    let thickness = NonZeroU32::new(2).unwrap();
+    let frame = session.presentation_frame().unwrap();
+    let prepared = tracker.prepare(&frame, now).unwrap();
+    batch.capture(&frame, prepared.damage(), thickness).unwrap();
+    prepared.commit();
+
+    session.transport.source = Cursor::new(b"\x1b[2;1H\x1b[0mZ\x1b[2;1H");
+    session.pump().unwrap();
+    session.set_theme(&Palette::new([base; 256], base, base, base), None);
+    let mut commands = batch.commands();
+    assert!(matches!(commands.next(), Some(PaintCommand::Background(_))));
+    let PaintCommand::Text { run, .. } = commands.next().unwrap() else {
+        panic!("Expected the first text run");
+    };
+    assert_eq!(run.units().next().unwrap().text, CellText::Scalar('A'));
+    let PaintCommand::Background(background) = commands.next().unwrap() else {
+        panic!("Expected the stored row background");
+    };
+    assert_eq!(background.color, blue);
+    assert_eq!(background.rect.size, pixels(16, 16));
+    let PaintCommand::Text { run, .. } = commands
+        .find(|command| matches!(command, PaintCommand::Text { .. }))
+        .unwrap()
+    else {
+        panic!("Expected the extended text run");
+    };
+    assert_eq!(run.columns(), 0..2);
+    let unit = run.units().next().unwrap();
+    assert_eq!(unit.text, CellText::Extended("水\u{301}"));
+    assert_eq!(unit.cell.width(), 2);
+    assert!(run.style.style.bold);
+    assert_eq!(run.style.foreground, red);
+    let PaintCommand::Cursor(Some(cursor)) = commands.last().unwrap() else {
+        panic!("Expected the stored cursor");
+    };
+    let glyph = cursor.glyph.unwrap();
+    assert_eq!(glyph.unit, unit);
+    assert_eq!(glyph.color, blue);
+    assert!(glyph.style.bold);
+
+    let frame = session.presentation_frame().unwrap();
+    let prepared = tracker.prepare(&frame, now).unwrap();
+    batch.capture(&frame, prepared.damage(), thickness).unwrap();
+    let PaintCommand::Cursor(Some(cursor)) = batch.commands().last().unwrap() else {
+        panic!("Expected the new cursor");
+    };
+    assert_eq!(cursor.glyph.unwrap().unit.text, CellText::Scalar('Z'));
+    prepared.commit();
+}
+
+#[test]
+fn failed_paint_capture_leaves_the_reusable_batch_empty() {
+    let mut session = session(b"A\x1b[2;1H\x1b[1mB");
+    session.geometry = GridGeometry::fit(pixels(64, 48), pixels(8, 16)).unwrap();
+    session.pump().unwrap();
+    let frame = session.presentation_frame().unwrap();
+    let mut tracker = PresentationTracker::default();
+    let mut batch = PaintBatch::default();
+    let thickness = NonZeroU32::new(2).unwrap();
+    let prepared = tracker.prepare(&frame, Instant::now()).unwrap();
+    let damage = prepared.damage();
+    batch.capture(&frame, damage, thickness).unwrap();
+    assert!(batch.commands().len() > 0);
+
+    let detached_styles = StyleTable::new(1).unwrap();
+    let detached = PresentationFrame {
+        styles: &detached_styles,
+        ..frame
+    };
+    assert!(matches!(
+        batch.capture(&detached, damage, thickness),
+        Err(PaintError::Style(StyleError::InvalidId(_)))
+    ));
+    assert_eq!(batch.commands().len(), 0);
+    batch.capture(&frame, damage, thickness).unwrap();
+    assert!(matches!(
+        batch.commands().last(),
+        Some(PaintCommand::Cursor(Some(_)))
+    ));
+    prepared.commit();
+}
+
+#[test]
 fn failed_submission_repaints_and_retains_the_last_committed_cursor() {
     let mut session = session(b"A\x1b[1;1H");
     session.geometry = GridGeometry::fit(pixels(64, 48), pixels(8, 16)).unwrap();

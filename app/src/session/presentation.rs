@@ -11,6 +11,10 @@ use crate::{GridGeometry, PixelRect};
 
 use super::{BackgroundRect, PresentationFrame, PresentationRun};
 
+mod batch;
+
+pub use batch::{BatchRun, PaintBatch};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RowDamage<'a> {
     All,
@@ -149,11 +153,11 @@ pub struct PresentationDamage<'a> {
     pub displayed_cursor: Option<PresentedCursor>,
 }
 
-pub enum PaintCommand<'a> {
+pub enum PaintCommand<'a, Run> {
     Background(BackgroundRect),
     Text {
         clip: PixelRect,
-        run: PresentationRun<'a>,
+        run: Run,
     },
     /// Replaces the cursor layer. An empty value clears it.
     Cursor(Option<CursorPaint<'a>>),
@@ -174,7 +178,7 @@ impl<'a> PresentationFrame<'a> {
         &self,
         damage: PresentationDamage<'_>,
         cursor_thickness: NonZeroU32,
-        mut emit: impl FnMut(PaintCommand<'a>) -> Result<(), E>,
+        mut emit: impl FnMut(PaintCommand<'a, PresentationRun<'a>>) -> Result<(), E>,
     ) -> Result<(), PaintError<E>> {
         if self.geometry.cell_pixels().is_none() {
             return Err(PaintError::GeometryUnavailable);
