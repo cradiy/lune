@@ -243,7 +243,7 @@ impl<'a> PresentationFrame<'a> {
 /// Compares successive frames from one session in viewport coordinates.
 #[derive(Default)]
 pub struct PresentationTracker {
-    geometry: Option<GridGeometry>,
+    committed_geometry: Option<GridGeometry>,
     revisions: Vec<RowRevision>,
     changed_rows: Vec<usize>,
     palette: Option<Palette>,
@@ -251,10 +251,48 @@ pub struct PresentationTracker {
     cursor: CursorOverlay,
 }
 
+/// A staged frame update. Dropping it before commit forces a full redraw.
+#[must_use = "commit the presentation after submitting it"]
+pub struct PreparedPresentation<'a> {
+    tracker: &'a mut PresentationTracker,
+    geometry: GridGeometry,
+    all_rows: bool,
+    cursor_change: Option<CursorChange>,
+    cursor: Option<CursorOverlay>,
+}
+
+impl PreparedPresentation<'_> {
+    #[inline]
+    pub fn damage(&self) -> PresentationDamage<'_> {
+        PresentationDamage {
+            rows: if self.all_rows {
+                RowDamage::All
+            } else {
+                RowDamage::Rows(&self.tracker.changed_rows)
+            },
+            cursor: self.cursor_change,
+            displayed_cursor: self
+                .cursor
+                .as_ref()
+                .unwrap_or(&self.tracker.cursor)
+                .displayed(),
+        }
+    }
+
+    /// Acknowledges a successful submission and retains its comparison baseline.
+    #[inline]
+    pub fn commit(self) {
+        self.tracker.committed_geometry = Some(self.geometry);
+        if let Some(cursor) = self.cursor {
+            self.tracker.cursor = cursor;
+        }
+    }
+}
+
 impl PresentationTracker {
-    /// Forces a full redraw on the next update after a surface reset or failed draw.
+    /// Forces a full redraw and resets the cursor overlay after a surface reset.
     pub fn invalidate(&mut self) {
-        self.geometry = None;
+        self.committed_geometry = None;
         self.cursor.source = None;
         self.cursor.deadline = None;
     }
@@ -289,25 +327,15 @@ impl PresentationTracker {
 
     /// Advances the last presented cursor independently of terminal output.
     pub fn tick_cursor(&mut self, now: Instant) -> Option<CursorChange> {
-        if !self.cursor.advance(now) {
-            return None;
-        }
-        let source = self.cursor.source;
-        let (before, after) = if self.cursor.hidden {
-            (source, None)
-        } else {
-            (None, source)
-        };
-        Some(CursorChange { before, after })
+        self.cursor.tick(now)
     }
 
-    /// Computes damage and records the frame as the next comparison baseline.
-    /// Apply row damage before drawing the cursor overlay.
-    pub fn update(
+    /// Stages damage and cursor state until the renderer confirms submission.
+    pub fn prepare(
         &mut self,
         frame: &PresentationFrame<'_>,
         now: Instant,
-    ) -> Result<PresentationDamage<'_>, TryReserveError> {
+    ) -> Result<PreparedPresentation<'_>, TryReserveError> {
         let rows = frame.viewport.rows();
         let height_changed = self.revisions.len() != rows;
         if rows > self.revisions.len() {
@@ -321,8 +349,10 @@ impl PresentationTracker {
             .palette
             .as_ref()
             .is_none_or(|palette| !palette.same_text_colors(frame.palette));
+        // Row cache entries can be reused only after the staged frame commits.
+        let committed_geometry = self.committed_geometry.take();
         let all_rows = height_changed
-            || self.geometry != Some(frame.geometry)
+            || committed_geometry != Some(frame.geometry)
             || colors_changed
             || self.reverse_video != frame.reverse_video;
         self.changed_rows.clear();
@@ -330,7 +360,6 @@ impl PresentationTracker {
             self.revisions.clear();
             self.revisions
                 .extend(frame.viewport.iter_rows().map(Row::revision));
-            self.geometry = Some(frame.geometry);
             self.reverse_video = frame.reverse_video;
         } else {
             for (index, (previous, row)) in self
@@ -362,27 +391,33 @@ impl PresentationTracker {
                 appearance: frame.cursor_appearance,
                 color: frame.palette.color(PaletteEntry::Cursor),
             });
-        let cursor = if self.cursor.source == source {
-            self.tick_cursor(now)
-        } else {
-            let before = self.cursor.displayed();
-            self.cursor.source = source;
-            self.cursor.restart(now);
-            CursorChange::between(before, source)
-        };
-        Ok(PresentationDamage {
-            rows: if all_rows {
-                RowDamage::All
+        let source_changed = self.cursor.source != source;
+        let (cursor, cursor_change) =
+            if source_changed || self.cursor.deadline.is_some_and(|deadline| now >= deadline) {
+                let mut cursor = self.cursor;
+                let change = if source_changed {
+                    let before = cursor.displayed();
+                    cursor.source = source;
+                    cursor.restart(now);
+                    CursorChange::between(before, source)
+                } else {
+                    cursor.tick(now)
+                };
+                (Some(cursor), change)
             } else {
-                RowDamage::Rows(&self.changed_rows)
-            },
+                (None, None)
+            };
+        Ok(PreparedPresentation {
+            tracker: self,
+            geometry: frame.geometry,
+            all_rows,
+            cursor_change,
             cursor,
-            displayed_cursor: self.cursor.displayed(),
         })
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 struct CursorOverlay {
     source: Option<PresentedCursor>,
     interval: Duration,
@@ -404,6 +439,18 @@ impl CursorOverlay {
         } else {
             None
         };
+    }
+
+    fn tick(&mut self, now: Instant) -> Option<CursorChange> {
+        if !self.advance(now) {
+            return None;
+        }
+        let (before, after) = if self.hidden {
+            (self.source, None)
+        } else {
+            (None, self.source)
+        };
+        Some(CursorChange { before, after })
     }
 
     fn advance(&mut self, now: Instant) -> bool {
