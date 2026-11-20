@@ -15,7 +15,7 @@ use lune_terminal::{
 
 mod wait;
 
-pub use wait::WaitOutcome;
+pub use wait::{PtyInterest, SessionInterests, SessionReady, WaitOutcome};
 
 const READ_BYTES: usize = 16 * 1024;
 const SYNCHRONIZED_OUTPUT_TIMEOUT: Duration = Duration::from_millis(150);

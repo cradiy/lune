@@ -377,6 +377,125 @@ fn child_exit_is_reported_once_while_a_descendant_keeps_the_pty_open() {
 }
 
 #[test]
+fn external_poll_dispatches_host_io_pty_exit_and_presentation_deadline() {
+    use std::os::fd::AsRawFd;
+
+    let mut child = Command::new("sh");
+    child.args([
+        "-c",
+        r#"
+        stty -echo || exit 71
+        printf '\033[?2026hA'
+        IFS= read -r value && test "$value" = finish || exit 72
+        printf '\033[2;1Htail'
+        exit 23
+        "#,
+    ]);
+    let color = Rgb::default();
+    let mut session = Session::spawn(
+        child,
+        PtySize::new(3, 8),
+        Palette::new([color; 256], color, color, color),
+    )
+    .unwrap();
+    let (mut host, mut peer) = io::pipe().unwrap();
+    peer.write_all(b"x").unwrap();
+    let limit = Instant::now() + Duration::from_secs(5);
+    let mut host_ready = false;
+    let mut held = false;
+    let mut sent = false;
+    let mut exit = None;
+    loop {
+        let interests = session.interests();
+        let mut descriptors = [
+            libc::pollfd {
+                fd: interests.pty.map_or(-1, |pty| pty.fd.as_raw_fd()),
+                events: interests.pty.map_or(0, |pty| {
+                    (if pty.read { libc::POLLIN } else { 0 })
+                        | (if pty.write { libc::POLLOUT } else { 0 })
+                }),
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: interests.child_exit.map_or(-1, |fd| fd.as_raw_fd()),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: host.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let now = Instant::now();
+        assert!(now < limit, "external polling did not complete");
+        if !interests.immediate {
+            let deadline = interests
+                .presentation_deadline
+                .map_or(limit, |deadline| deadline.min(limit));
+            let timeout = deadline
+                .saturating_duration_since(now)
+                .as_nanos()
+                .div_ceil(1_000_000);
+            // SAFETY: The three entries are initialized and their live descriptors remain owned.
+            if unsafe {
+                libc::poll(
+                    descriptors.as_mut_ptr(),
+                    descriptors.len() as libc::nfds_t,
+                    timeout as i32,
+                )
+            } < 0
+            {
+                assert_eq!(
+                    io::Error::last_os_error().kind(),
+                    io::ErrorKind::Interrupted
+                );
+                continue;
+            }
+        }
+        if descriptors[2].revents & libc::POLLIN != 0 {
+            let mut byte = [0];
+            host.read_exact(&mut byte).unwrap();
+            assert_eq!(&byte, b"x");
+            host_ready = true;
+        }
+        let ready = SessionReady {
+            pty: descriptors[0].revents != 0,
+            child_exit: descriptors[1].revents != 0,
+        };
+        match session.dispatch_ready(ready).unwrap() {
+            Some(WaitOutcome::ChildExited(status)) => {
+                assert!(exit.replace(status).is_none());
+                assert!(session.interests().child_exit.is_none());
+            }
+            Some(WaitOutcome::Finished) => break,
+            Some(WaitOutcome::TimedOut) => panic!("dispatch waited"),
+            Some(WaitOutcome::Pumped) | None => {}
+        }
+        held |= session.presentation_deadline().is_some();
+        if held
+            && !sent
+            && let Some(screen) = session.presentation_screen()
+        {
+            assert_eq!(
+                screen.grid().row(0).unwrap().text(0),
+                Some(CellText::Scalar('A'))
+            );
+            session.queue_input(b"finish\n").unwrap();
+            assert!(session.interests().pty.unwrap().write);
+            sent = true;
+        }
+    }
+    assert!(host_ready && held && sent);
+    assert_eq!(exit.unwrap().code(), Some(23));
+    assert!(session.interests().pty.is_none());
+    assert_eq!(
+        session.screen().grid().row(1).unwrap().text(3),
+        Some(CellText::Scalar('l'))
+    );
+}
+
+#[test]
 fn queued_key_keeps_its_encoding_across_a_mode_change() {
     let mut session = session(b"\x1b[?1h");
     session.pump().unwrap();

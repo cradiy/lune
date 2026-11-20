@@ -2,4 +2,7 @@
 mod session;
 
 #[cfg(target_os = "linux")]
-pub use session::{MAX_INPUT_BYTES, MAX_PASTE_BYTES, MouseInputOutcome, Session, WaitOutcome};
+pub use session::{
+    MAX_INPUT_BYTES, MAX_PASTE_BYTES, MouseInputOutcome, PtyInterest, Session, SessionInterests,
+    SessionReady, WaitOutcome,
+};
