@@ -73,11 +73,35 @@ impl Grid {
         Self { columns, rows }
     }
 
-    pub(crate) fn exchange_top(&mut self, replacement: Row) -> Row {
+    pub(crate) fn exchange_top(&mut self, end: usize, replacement: Row) -> Row {
+        let rows = self.rows.len();
+        debug_assert!((1..=rows).contains(&end));
         debug_assert_eq!(replacement.cells().len(), self.columns);
         let outgoing = std::mem::replace(&mut self.rows[0], replacement);
-        self.rows.rotate_left(1);
+        let fixed = rows - end;
+        if fixed == 0 {
+            self.rows.rotate_left(1);
+        } else if fixed + 1 < end {
+            // Move only the fixed suffix when it is shorter than the scrolling region.
+            self.rows.rotate_left(1);
+            self.rotate_rows_left(end - 1..rows, fixed);
+        } else if end > 1 {
+            self.rotate_rows_left(0..end, 1);
+        }
         outgoing
+    }
+
+    pub(crate) fn rotate_top_down(&mut self, end: usize, lines: usize) {
+        let rows = self.rows.len();
+        debug_assert!(lines < end && end <= rows);
+        if end == rows {
+            self.rows.rotate_right(lines);
+        } else if rows - end + lines < end {
+            self.rotate_rows_left(end - lines..rows, lines);
+            self.rows.rotate_right(lines);
+        } else {
+            self.rotate_rows_left(0..end, end - lines);
+        }
     }
 
     pub fn new(columns: usize, rows: usize) -> Result<Self, StorageError> {

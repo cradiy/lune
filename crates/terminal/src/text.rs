@@ -97,8 +97,16 @@ impl<'a> ScreenView<'a> {
         &self,
     ) -> impl ExactSizeIterator<Item = &'a Row> + DoubleEndedIterator + FusedIterator + use<'a>
     {
+        self.rows_in(0..self.rows())
+    }
+
+    pub(crate) fn rows_in(
+        &self,
+        range: Range<usize>,
+    ) -> impl ExactSizeIterator<Item = &'a Row> + DoubleEndedIterator + FusedIterator + use<'a>
+    {
         let view = *self;
-        (0..self.rows()).map(move |index| view.row(index).expect("A view row is in bounds"))
+        range.map(move |index| view.row(index).expect("A view row is in bounds"))
     }
 
     /// Validates a row-major half-open range against each endpoint row's width.

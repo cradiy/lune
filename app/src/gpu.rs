@@ -2,12 +2,13 @@ use std::collections::HashMap;
 use std::ops::Range;
 
 use lune_terminal::{
-    GraphicsImage, GraphicsImageFormat, GraphicsImageKey, GraphicsPixelRevision,
-    GraphicsPixelUpdate, GraphicsPixelUpdates, GraphicsPlacement, PixelSize, RowRevision,
-    ScreenBuffer,
+    GraphicsImage, GraphicsImageFormat, GraphicsImageKey, GraphicsImageStore, GraphicsLayout,
+    GraphicsPixelRevision, GraphicsPixelUpdate, GraphicsPixelUpdates, GraphicsPlaceholderCache,
+    GraphicsPlacement, RowRevision, ScreenBuffer,
 };
 use wgpu::{Buffer, Device, Queue, RenderPipeline, Sampler, Texture, TextureFormat, TextureView};
 
+use crate::session::GraphicsStamp;
 use crate::{GridGeometry, PresentationFrame};
 
 mod backgrounds;
@@ -116,9 +117,25 @@ struct Draw {
 
 struct PreparedImages {
     geometry: GridGeometry,
-    stamp: Option<crate::session::GraphicsStamp>,
-    storage_revision: u64,
+    stamp: Option<GraphicsStamp>,
+    texture_stamp: TextureStamp,
     rejected: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct TextureStamp {
+    sources: u64,
+    anonymous_placements: Option<u64>,
+}
+
+impl TextureStamp {
+    fn new(store: &GraphicsImageStore, placements: Option<u64>) -> Self {
+        Self {
+            sources: store.storage_revision(),
+            // Anonymous sources can expire when their last placement is dropped.
+            anonymous_placements: placements.filter(|_| store.has_anonymous_images()),
+        }
+    }
 }
 
 struct ImagePipeline {
@@ -251,7 +268,7 @@ pub struct ImageRenderer {
     has_indexed: bool,
     images: HashMap<GraphicsImageKey, CachedImage>,
     inactive_images: HashMap<GraphicsImageKey, CachedImage>,
-    inactive_storage_revision: Option<u64>,
+    inactive_texture_stamp: Option<TextureStamp>,
     graphics_buffer: ScreenBuffer,
     buffer: Option<Buffer>,
     instances: Vec<ImageInstance>,
@@ -260,6 +277,7 @@ pub struct ImageRenderer {
     prepared: Option<PreparedImages>,
     layout_generation: u64,
     placeholder_rows: Vec<Option<RowRevision>>,
+    parent_origins: GraphicsPlaceholderCache,
     pixel_scratch: Vec<u8>,
 }
 
@@ -269,7 +287,7 @@ impl ImageRenderer {
             label: None,
             source: wgpu::ShaderSource::Wgsl(include_str!("gpu/image.wgsl").into()),
         });
-        let palette = make_texture(device, 256, 1, TextureFormat::Rgba8UnormSrgb);
+        let palette = make_texture(device, 16, 16, TextureFormat::Rgba8UnormSrgb);
         let palette_view = palette.create_view(&wgpu::TextureViewDescriptor::default());
         let pipeline = |fragment| {
             let pipeline = create_quad_pipeline(
@@ -314,7 +332,7 @@ impl ImageRenderer {
             has_indexed: false,
             images: HashMap::new(),
             inactive_images: HashMap::new(),
-            inactive_storage_revision: None,
+            inactive_texture_stamp: None,
             graphics_buffer: ScreenBuffer::Primary,
             buffer: None,
             instances: Vec::new(),
@@ -323,6 +341,7 @@ impl ImageRenderer {
             prepared: None,
             layout_generation: 0,
             placeholder_rows: Vec::new(),
+            parent_origins: GraphicsPlaceholderCache::default(),
             pixel_scratch: Vec::new(),
         }
     }
@@ -330,6 +349,11 @@ impl ImageRenderer {
     #[cfg(test)]
     pub(crate) fn has_cached_image(&self, key: GraphicsImageKey) -> bool {
         self.images.contains_key(&key)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_inactive_cached_image(&self, key: GraphicsImageKey) -> bool {
+        self.inactive_images.contains_key(&key)
     }
 
     #[cfg(test)]
@@ -375,18 +399,27 @@ impl ImageRenderer {
         if self.graphics_buffer != frame.graphics_buffer() {
             self.graphics_buffer = frame.graphics_buffer();
             std::mem::swap(&mut self.images, &mut self.inactive_images);
-            self.inactive_storage_revision = self.prepared.take().map(|p| p.storage_revision);
+            self.inactive_texture_stamp = self.prepared.take().map(|p| p.texture_stamp);
         }
         let inactive_store = frame.inactive_image_store();
-        let inactive_revision = Some(inactive_store.storage_revision());
-        if self.inactive_storage_revision != inactive_revision {
+        let inactive_stamp = TextureStamp::new(inactive_store, frame.inactive_graphics_revision);
+        if self.inactive_texture_stamp != Some(inactive_stamp) {
             self.inactive_images.retain(|&id, cached| {
                 inactive_store.source_revision(id) == Some(cached.source_revision)
             });
-            self.inactive_storage_revision = inactive_revision;
+            self.inactive_texture_stamp = Some(inactive_stamp);
         }
         let stamp = frame.graphics_stamp();
-        let storage_revision = frame.image_store().storage_revision();
+        let store = frame.image_store();
+        let texture_stamp = TextureStamp::new(store, stamp.map(GraphicsStamp::placement_revision));
+        if self
+            .prepared
+            .as_ref()
+            .is_none_or(|state| state.texture_stamp != texture_stamp)
+        {
+            self.images
+                .retain(|&id, cached| store.source_revision(id) == Some(cached.source_revision));
+        }
         if let Some(prepared) = &self.prepared
             && prepared.geometry == frame.geometry
             && (prepared.stamp == stamp
@@ -401,18 +434,13 @@ impl ImageRenderer {
             && (prepared.stamp == stamp || self.refresh_visible_pixels(queue, frame))
         {
             let prepared = self.prepared.as_mut().expect("A layout was prepared");
-            if prepared.storage_revision != storage_revision {
-                self.images.retain(|&id, cached| {
-                    frame.image_store().source_revision(id) == Some(cached.source_revision)
-                });
-                prepared.storage_revision = storage_revision;
-            }
+            prepared.texture_stamp = texture_stamp;
             prepared.stamp = stamp;
             let rejected = prepared.rejected;
             self.update_palette(queue, frame);
             return rejected;
         }
-        let rejected = self.prepare_changed(device, queue, frame);
+        let rejected = self.prepare_changed(device, queue, frame, stamp);
         self.placeholder_rows.clear();
         self.placeholder_rows
             .extend(frame.graphics_placeholder_revisions());
@@ -420,7 +448,7 @@ impl ImageRenderer {
         self.prepared = Some(PreparedImages {
             geometry: frame.geometry,
             stamp,
-            storage_revision,
+            texture_stamp,
             rejected,
         });
         rejected
@@ -455,15 +483,13 @@ impl ImageRenderer {
         device: &Device,
         queue: &Queue,
         frame: &PresentationFrame<'_>,
+        stamp: Option<GraphicsStamp>,
     ) -> usize {
         self.layout_generation = self.layout_generation.wrapping_add(1);
         self.draws.clear();
         self.instances.clear();
         self.visible_images.clear();
         self.has_indexed = false;
-        self.images.retain(|&id, cached| {
-            frame.image_store().source_revision(id) == Some(cached.source_revision)
-        });
         let Some((cell, area)) = frame
             .geometry
             .cell_pixels()
@@ -471,30 +497,57 @@ impl ImageRenderer {
         else {
             return 0;
         };
+        let [cell_pixels, area_pixels] =
+            [cell, area].map(|size| [f64::from(size.width.get()), f64::from(size.height.get())]);
         let mut rejected = 0;
-        let placeholders = placeholders::collect(frame);
+        let placeholders = frame
+            .has_virtual_graphics()
+            .then(|| placeholders::collect(frame, cell, stamp, &mut self.parent_origins));
+        let size = frame.geometry.pty_size();
+        let viewport_cells = [usize::from(size.columns), usize::from(size.rows)];
+        let history_offset = frame.viewport.offset();
         let limits = device.limits();
         let buffer_limit = limits.max_buffer_size;
         let max_instances =
             (buffer_limit / size_of::<ImageInstance>() as u64).min(u64::from(u32::MAX)) as usize;
         let mut tile_instances = Vec::new();
         for placement in frame.graphics_placements() {
+            let location;
+            let locations = if placement.is_virtual() {
+                let Some(pieces) = placeholders
+                    .as_ref()
+                    .and_then(|pieces| pieces.get(&placement.serial()))
+                else {
+                    continue;
+                };
+                pieces.as_slice()
+            } else {
+                let Some(origin) = placement
+                    .origin_in_view(history_offset, |parent| self.parent_origins.origin(parent))
+                else {
+                    continue;
+                };
+                if !placement.intersects_viewport(origin, viewport_cells) {
+                    continue;
+                }
+                location = ImageLocation {
+                    origin,
+                    clip: [i64::MIN..i64::MAX, i64::MIN..i64::MAX],
+                };
+                std::slice::from_ref(&location)
+            };
             let image_id = placement.placement.image;
             let Some(image) = frame.graphics_image(placement) else {
                 continue;
             };
-            let virtual_pieces = if placement.is_virtual() {
-                placeholders
-                    .pieces
-                    .get(&placement.serial())
-                    .map_or(&[][..], Vec::as_slice)
-            } else {
-                &[]
+            let layout = placement.layout(cell);
+            let project = |location: &ImageLocation| {
+                ImageQuad::new(&layout, cell_pixels, area_pixels, location)
             };
             let previous_instances = self.instances.len();
             let mut uploaded = None;
             let mut push = |location: &ImageLocation| {
-                let Some(quad) = ImageQuad::new(placement, cell, area, location) else {
+                let Some(quad) = project(location) else {
                     return;
                 };
                 if self.instances.len() >= max_instances {
@@ -507,8 +560,8 @@ impl ImageRenderer {
                         if region.pixel_count() > max_pixels {
                             return None;
                         }
-                        for piece in virtual_pieces.iter().skip(1) {
-                            if let Some(quad) = ImageQuad::new(placement, cell, area, piece) {
+                        for piece in locations.iter().skip(1) {
+                            if let Some(quad) = project(piece) {
                                 region = region.bounding_rect(quad.source_region());
                                 if region.pixel_count() > max_pixels {
                                     return None;
@@ -561,20 +614,8 @@ impl ImageRenderer {
                     self.push_instance(placement, image.format(), tile as u32, vertices);
                 }
             };
-            if placement.is_virtual() {
-                for location in virtual_pieces {
-                    push(location);
-                }
-            } else if let Some(origin) = placement
-                .origin_in_view(frame.viewport.offset(), |parent| {
-                    placeholders.parents.get(&parent).copied().flatten()
-                })
-            {
-                let unbounded = i64::MIN..i64::MAX;
-                push(&ImageLocation {
-                    origin,
-                    clip: [unbounded.clone(), unbounded],
-                });
+            for location in locations {
+                push(location);
             }
             if image_id.id() != 0 && self.instances.len() != previous_instances {
                 self.visible_images.push(image_id);
@@ -623,7 +664,12 @@ impl ImageRenderer {
             let color = frame.palette.graphics_color(index as u8);
             [color.red, color.green, color.blue, 255]
         });
-        write_texture(queue, &self.palette, bytemuck::cast_slice(&colors), 1024);
+        write_texture(
+            queue,
+            &self.palette,
+            bytemuck::cast_slice(&colors),
+            self.palette.width() * 4,
+        );
         self.palette_revision = Some(revision);
     }
 
@@ -807,14 +853,11 @@ struct ImageQuad {
 
 impl ImageQuad {
     fn new(
-        placement: &GraphicsPlacement,
-        cell: PixelSize,
-        area: PixelSize,
+        layout: &GraphicsLayout,
+        cell: [f64; 2],
+        screen: [f64; 2],
         location: &ImageLocation,
     ) -> Option<Self> {
-        let layout = placement.layout(cell);
-        let cell = [f64::from(cell.width.get()), f64::from(cell.height.get())];
-        let screen = [f64::from(area.width.get()), f64::from(area.height.get())];
         let mut quad = Self {
             bounds: [[0.0; 2]; 2],
             source: [[0.0; 2]; 2],

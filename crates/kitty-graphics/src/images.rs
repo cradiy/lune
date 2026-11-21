@@ -13,7 +13,7 @@ use crate::animation::{
     Animation, Canvas, FrameBudget, FrameComposition, FrameControl, FrameUpload, INDEXED,
     LOAD_FIELDS, PixelRevision, Region,
 };
-use crate::pixels::{INVALID, ImageFormat, PixelTransfer, Pixels, QUOTA, UNSUPPORTED};
+use crate::pixels::{INVALID, ImageFormat, PixelTransfer, Pixels, PngProfiles, QUOTA, UNSUPPORTED};
 use crate::source::{BAD_SOURCE, LocalSource};
 
 mod quota;
@@ -257,6 +257,7 @@ pub struct ImageStore {
     // Sorted by image number, with matching entries in upload order.
     numbered: Vec<NumberedImage>,
     pending: Option<Transfer>,
+    png_profiles: PngProfiles,
     next_id: u32,
     next_anonymous: u64,
     frame_budget: OnceLock<Arc<FrameBudget>>,
@@ -275,11 +276,12 @@ impl ImageStore {
             images: HashMap::new(),
             numbered: Vec::new(),
             pending: None,
+            png_profiles: PngProfiles::default(),
             next_id: 1,
             next_anonymous: u64::from(u32::MAX) + 1,
             frame_budget: OnceLock::new(),
             visual_revision: 0,
-            storage_revision: 0,
+            storage_revision: next_image_revision(),
             animation_wakes: AnimationWakes::default(),
         }
     }
@@ -308,8 +310,13 @@ impl ImageStore {
         self.visual_revision
     }
 
+    /// The unique revision assigned at creation and when stored sources are invalidated.
     pub fn storage_revision(&self) -> u64 {
         self.storage_revision
+    }
+
+    pub fn has_anonymous_images(&self) -> bool {
+        self.anonymous_images != 0
     }
 
     pub fn animation_deadline(&self) -> Option<Instant> {
@@ -349,6 +356,13 @@ impl ImageStore {
         (last.number == number).then_some(last.id)
     }
 
+    pub fn remove_id(&mut self, id: u32) {
+        let key = ImageKey(u64::from(id));
+        if let Some(entry) = self.images.remove(&key) {
+            self.release_stored(key, entry, next_image_revision());
+        }
+    }
+
     pub fn retain_ids(&mut self, mut keep: impl FnMut(u32) -> bool) {
         let before = self.images.len();
         let mut removed_numbered = false;
@@ -373,9 +387,9 @@ impl ImageStore {
             self.numbered
                 .retain(|entry| self.images.contains_key(&ImageKey(u64::from(entry.id))));
         }
-        self.storage_revision = self
-            .storage_revision
-            .wrapping_add(u64::from(before != self.images.len()));
+        if before != self.images.len() {
+            self.storage_revision = next_image_revision();
+        }
     }
 
     pub fn delete_frame(
@@ -415,7 +429,7 @@ impl ImageStore {
             })
             .is_ok()
         {
-            self.remove_stored(key);
+            self.remove_stored(key, next_image_revision());
         }
     }
 
@@ -434,11 +448,12 @@ impl ImageStore {
 
     pub fn clear(&mut self) {
         self.abort_transfer();
-        self.storage_revision = self
-            .storage_revision
-            .wrapping_add(u64::from(!self.images.is_empty()));
+        if !self.images.is_empty() {
+            self.storage_revision = next_image_revision();
+        }
         self.images.clear();
         self.numbered.clear();
+        self.png_profiles = PngProfiles::default();
         self.stored_bytes = 0;
         self.anonymous_images = 0;
         self.animation_wakes.clear();
@@ -560,8 +575,6 @@ impl ImageStore {
         let quiet_value = transfer.quiet;
         let result = (|| {
             quiet?;
-            let local = transfer.local.is_some();
-            let format_error = |error| if local { BAD_SOURCE } else { error };
             if let Some(source) = transfer.local.take() {
                 let mut decoded = [0; INLINE_DECODED_BYTES];
                 let written = command
@@ -581,8 +594,7 @@ impl ImageStore {
             }
             let pixels = transfer
                 .pixels
-                .finish(self.max_bytes)
-                .map_err(format_error)?;
+                .finish(self.max_bytes, &mut self.png_profiles)?;
             if let Some(frame) = transfer.frame {
                 self.apply_frame(transfer.key, |animation, canvas| {
                     animation.upload(frame, pixels, canvas)
@@ -897,11 +909,11 @@ impl ImageStore {
             StoredImage::Named(image)
         };
         for victim in evicted {
-            self.remove_stored(victim);
+            self.remove_stored(victim, revision);
         }
         let bytes = entry.storage_bytes();
         if let Some(previous) = self.images.insert(key, entry) {
-            self.release_stored(key, previous);
+            self.release_stored(key, previous, revision);
         }
         if number != 0 {
             let index = if self
@@ -927,14 +939,14 @@ impl ImageStore {
         Ok(())
     }
 
-    fn remove_stored(&mut self, key: ImageKey) {
+    fn remove_stored(&mut self, key: ImageKey, revision: u64) {
         if let Some(entry) = self.images.remove(&key) {
-            self.release_stored(key, entry);
+            self.release_stored(key, entry, revision);
         }
     }
 
-    fn release_stored(&mut self, key: ImageKey, mut entry: StoredImage) {
-        self.storage_revision = self.storage_revision.wrapping_add(1);
+    fn release_stored(&mut self, key: ImageKey, mut entry: StoredImage, revision: u64) {
+        self.storage_revision = revision;
         self.stored_bytes -= entry.storage_bytes();
         self.anonymous_images -= usize::from(key.id() == 0);
         if let StoredImage::Named(image) = &mut entry {

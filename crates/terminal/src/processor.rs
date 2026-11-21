@@ -11,8 +11,9 @@ use crate::reply::{
     self, ColorReport, ModeReport, Reply, Report, ResizeReport, SizeReport, StatusReport,
 };
 use crate::{
-    ColorScheme, CursorShape, EraseMode, InputModes, MouseFormat, Palette, PixelSize, Rgb, Screen,
-    ScreenBuffer, StorageError, Style, StyleError, StyleId, StyleTable, TextSink,
+    ColorScheme, CursorShape, EraseMode, HistoryLimits, InputModes, MouseFormat, Palette,
+    PixelSize, Rgb, Screen, ScreenBuffer, StorageError, Style, StyleError, StyleId, StyleTable,
+    TextSink,
 };
 
 const INPUT_PENDING_CAPACITY: usize = 2;
@@ -104,6 +105,7 @@ enum Pending {
     Execute(u8),
     Index(bool),
     ScrollUp(usize),
+    Unscroll(usize),
     Rendition(Style),
     PopRendition,
     Reply(Report),
@@ -241,6 +243,17 @@ pub struct Processor {
 impl Processor {
     pub fn graphics_images(&self, buffer: ScreenBuffer) -> &crate::GraphicsImageStore {
         self.state.graphics.images(buffer)
+    }
+
+    /// Sets primary scrollback limits and releases images orphaned by eviction.
+    pub fn set_history_limits(
+        &mut self,
+        screen: &mut Screen,
+        limits: HistoryLimits,
+    ) -> Result<(), StorageError> {
+        screen.set_history_limits(limits)?;
+        self.state.graphics.reap_orphans(screen);
+        Ok(())
     }
 
     pub fn poll_graphics_animations(
@@ -552,6 +565,18 @@ impl Processor {
         screen: &mut Screen,
         text: &mut T,
     ) -> Result<usize, ProcessError<E>> {
+        let result = self.advance_input(input, screen, text);
+        self.state.graphics.reap_orphans(screen);
+        result
+    }
+
+    #[inline(always)]
+    fn advance_input<E, T: TextSink<Error = E>>(
+        &mut self,
+        input: &[u8],
+        screen: &mut Screen,
+        text: &mut T,
+    ) -> Result<usize, ProcessError<E>> {
         self.drain(screen, text)
             .map_err(|error| ProcessError { consumed: 0, error })?;
         if input.len() == 1 && self.parser.is_ground() {
@@ -719,13 +744,21 @@ impl Processor {
                                 false
                             }
                         }
-                    } else if sequence.final_byte == b'S' {
+                    } else if sequence.final_byte == b'S'
+                        || (sequence.final_byte == b'T' && sequence.intermediates == b"+")
+                    {
+                        let up = sequence.final_byte == b'S';
                         if sequence.private_markers.is_empty()
-                            && sequence.intermediates.is_empty()
+                            && (!up || sequence.intermediates.is_empty())
                             && sequence.parameters.len() <= 1
                             && sequence.parameters.iter().all(|p| !p.is_subparameter)
                         {
-                            pending[*end] = Some(Pending::ScrollUp(count(sequence.parameters)));
+                            let lines = count(sequence.parameters);
+                            pending[*end] = Some(if up {
+                                Pending::ScrollUp(lines)
+                            } else {
+                                Pending::Unscroll(lines)
+                            });
                             *end += 1;
                             true
                         } else {
@@ -824,7 +857,6 @@ impl Processor {
             self.drain(screen, text)
                 .map_err(|error| ProcessError { consumed, error })?;
         }
-        self.state.graphics.reap_orphans(screen);
         Ok(consumed)
     }
 
@@ -832,6 +864,16 @@ impl Processor {
     /// repeated successful calls emit no further replacements or diagnostics.
     /// Active reply bytes remain available after a successful finish.
     pub fn finish<E>(
+        &mut self,
+        screen: &mut Screen,
+        text: &mut impl TextSink<Error = E>,
+    ) -> Result<(), ProcessFailure<E>> {
+        let result = self.finish_input(screen, text);
+        self.state.graphics.reap_orphans(screen);
+        result
+    }
+
+    fn finish_input<E>(
         &mut self,
         screen: &mut Screen,
         text: &mut impl TextSink<Error = E>,
@@ -940,6 +982,12 @@ impl Processor {
                     text.boundary();
                     screen
                         .scroll_up(count, self.state.style)
+                        .map_err(ProcessFailure::Screen)?;
+                }
+                Pending::Unscroll(count) => {
+                    text.boundary();
+                    screen
+                        .unscroll(count, self.state.style)
                         .map_err(ProcessFailure::Screen)?;
                 }
                 Pending::Rendition(style) => {

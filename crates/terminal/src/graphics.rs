@@ -18,8 +18,9 @@ use crate::{
 mod placeholders;
 mod visibility;
 pub use placeholders::{
-    GraphicsPlaceholderRun, visit_graphics_placeholders, visit_graphics_placeholders_with_parents,
+    GraphicsPlaceholderCache, GraphicsPlaceholderRun, visit_graphics_placeholders,
 };
+use placeholders::{Origins, VirtualParentOrigins};
 use visibility::AnimationVisibility;
 
 const MAX_PLACEMENTS: usize = 4096;
@@ -111,11 +112,15 @@ impl GraphicsPlacement {
     }
 
     fn intersects_display(&self, [x, y]: [i64; 2], grid: &Grid) -> bool {
-        let rows = self.rows_at(y);
-        x < grid.columns() as i64
+        self.intersects_viewport([x, y], [grid.columns(), grid.rows()])
+    }
+
+    /// Checks the placement's cell span at its resolved viewport origin.
+    pub fn intersects_viewport(&self, [x, y]: [i64; 2], [columns, rows]: [usize; 2]) -> bool {
+        x < columns as i64
+            && y < rows as i64
             && self.columns_at(x).end > 0
-            && rows.start < grid.rows() as i64
-            && rows.end > 0
+            && self.rows_at(y).end > 0
     }
 
     pub fn layout(&self, cell: PixelSize) -> GraphicsLayout {
@@ -337,6 +342,7 @@ pub(crate) struct GraphicsPlacements {
     next_serial: u64,
     virtual_count: usize,
     virtual_parents: bool,
+    parent_origins: VirtualParentOrigins,
     anchors: HashMap<u64, usize>,
     orphaned: Vec<OrphanedImage>,
 }
@@ -482,19 +488,13 @@ impl GraphicsPlacements {
     }
 
     pub(crate) fn clear_live(&mut self, view: ScreenView<'_>, styles: &StyleTable) {
-        let origins = if self.virtual_parents {
-            visit_graphics_placeholders_with_parents(&self.images, view, styles, |_| {})
-                .unwrap_or_default()
-        } else {
-            HashMap::new()
-        };
-        self.remove_matching(|image| {
+        self.remove_matching_with_origins(Some((view, styles)), |image, origins| {
             if image.is_virtual() {
                 return false;
             }
             if image.virtual_parent().is_some() {
                 return image
-                    .origin_in_view(0, |parent| origins.get(&parent).copied().flatten())
+                    .origin_in_view(0, |parent| origins?.get(&parent).copied().flatten())
                     .is_some_and(|origin| image.intersects_display(origin, view.live_grid()));
             }
             image.rows().end > 0
@@ -622,70 +622,93 @@ impl GraphicsPlacements {
                 | DeleteTarget::Column(_)
                 | DeleteTarget::Row(_)
         );
-        let origins = if coordinates && self.virtual_parents {
-            let Ok(origins) =
-                visit_graphics_placeholders_with_parents(&self.images, view, styles, |_| {})
-            else {
-                return;
-            };
-            origins
-        } else {
-            HashMap::new()
-        };
-        self.remove_matching(|image| {
-            let placement = image.placement;
-            let by_image = matches!(
-                target,
-                DeleteTarget::Image { .. } | DeleteTarget::IdRange { .. }
-            );
-            if !by_image && image.is_virtual() {
-                return false;
-            }
-            let origin =
-                || image.origin_in_view(0, |parent| origins.get(&parent).copied().flatten());
-            let at_cell = |column, row| {
-                origin().is_some_and(|[x, y]| {
-                    image.columns_at(x).contains(&column) && image.rows_at(y).contains(&row)
-                })
-            };
-            let matches = match target {
-                DeleteTarget::Visible => origin()
-                    .is_some_and(|origin| image.intersects_display(origin, view.live_grid())),
-                DeleteTarget::Image { id, placement_id } => {
-                    placement.image.id() == id
-                        && (placement_id == 0 || placement.id == placement_id)
+        self.remove_matching_with_origins(
+            coordinates.then_some((view, styles)),
+            |image, origins| {
+                let placement = image.placement;
+                let by_image = matches!(
+                    target,
+                    DeleteTarget::Image { .. } | DeleteTarget::IdRange { .. }
+                );
+                if !by_image && image.is_virtual() {
+                    return false;
                 }
-                DeleteTarget::Number { .. } | DeleteTarget::Frame { .. } => false,
-                DeleteTarget::IdRange { .. } => target.selects_image(placement.image.id()),
-                DeleteTarget::Cursor => at_cell(cursor.column as i64, cursor.row as i64),
-                DeleteTarget::Point { column, row, z } => {
-                    z.is_none_or(|z| placement.z == z) && at_cell(i64::from(column), i64::from(row))
+                let origin =
+                    || image.origin_in_view(0, |parent| origins?.get(&parent).copied().flatten());
+                let at_cell = |column, row| {
+                    origin().is_some_and(|[x, y]| {
+                        image.columns_at(x).contains(&column) && image.rows_at(y).contains(&row)
+                    })
+                };
+                let matches = match target {
+                    DeleteTarget::Visible => origin()
+                        .is_some_and(|origin| image.intersects_display(origin, view.live_grid())),
+                    DeleteTarget::Image { id, placement_id } => {
+                        placement.image.id() == id
+                            && (placement_id == 0 || placement.id == placement_id)
+                    }
+                    DeleteTarget::Number { .. } | DeleteTarget::Frame { .. } => false,
+                    DeleteTarget::IdRange { .. } => target.selects_image(placement.image.id()),
+                    DeleteTarget::Cursor => at_cell(cursor.column as i64, cursor.row as i64),
+                    DeleteTarget::Point { column, row, z } => {
+                        z.is_none_or(|z| placement.z == z)
+                            && at_cell(i64::from(column), i64::from(row))
+                    }
+                    DeleteTarget::Column(column) => origin()
+                        .is_some_and(|[x, _]| image.columns_at(x).contains(&i64::from(column))),
+                    DeleteTarget::Row(row) => {
+                        origin().is_some_and(|[_, y]| image.rows_at(y).contains(&i64::from(row)))
+                    }
+                    DeleteTarget::Layer(z) => placement.z == z,
+                };
+                if matches {
+                    removed(placement.image.id());
                 }
-                DeleteTarget::Column(column) => {
-                    origin().is_some_and(|[x, _]| image.columns_at(x).contains(&i64::from(column)))
-                }
-                DeleteTarget::Row(row) => {
-                    origin().is_some_and(|[_, y]| image.rows_at(y).contains(&i64::from(row)))
-                }
-                DeleteTarget::Layer(z) => placement.z == z,
-            };
-            if matches {
-                removed(placement.image.id());
-            }
-            matches
-        });
+                matches
+            },
+        );
     }
 
     fn remove_matching(&mut self, mut matches: impl FnMut(&GraphicsPlacement) -> bool) {
         let count = self.images.len();
-        let virtual_count = &mut self.virtual_count;
-        self.images.retain(|image| {
+        Self::retain_placements(&mut self.images, &mut self.virtual_count, &mut matches);
+        self.finish_removal(count);
+    }
+
+    fn remove_matching_with_origins(
+        &mut self,
+        view: Option<(ScreenView<'_>, &StyleTable)>,
+        mut matches: impl FnMut(&GraphicsPlacement, Option<&Origins>) -> bool,
+    ) {
+        let Some((view, styles)) = view.filter(|_| self.virtual_parents) else {
+            self.remove_matching(|image| matches(image, None));
+            return;
+        };
+        let origins = self
+            .parent_origins
+            .collect(&self.images, view, styles, |_| {});
+        let count = self.images.len();
+        Self::retain_placements(&mut self.images, &mut self.virtual_count, |image| {
+            matches(image, Some(origins))
+        });
+        self.finish_removal(count);
+    }
+
+    fn retain_placements(
+        images: &mut Vec<GraphicsPlacement>,
+        virtual_count: &mut usize,
+        mut matches: impl FnMut(&GraphicsPlacement) -> bool,
+    ) {
+        images.retain(|image| {
             let removed = matches(image);
             if removed && image.is_virtual() {
                 *virtual_count -= 1;
             }
             !removed
         });
+    }
+
+    fn finish_removal(&mut self, count: usize) {
         if self.images.len() != count {
             self.sync_graph(true);
             if !self.images.is_empty() {
@@ -748,9 +771,20 @@ impl GraphicsPlacements {
             .filter(|_| !replaces_image)
             .map(|index| self.images[index].serial);
         image.serial = retained_serial.unwrap_or(self.next_serial + 1);
+        let mut needs_virtual_origins =
+            self.virtual_parents || (image.is_virtual() && !self.anchors.is_empty());
         if let PlacementPosition::Relative(parent) = spec.position {
             let referenced = self.parent(parent).ok_or(PlacementError::MissingParent)?;
             image.parent = Some(referenced.serial);
+            needs_virtual_origins |=
+                referenced.is_virtual() || referenced.virtual_parent().is_some();
+        }
+        if needs_virtual_origins {
+            // Coordinate removal must fit both maps regardless of which placeholders are present.
+            let virtual_count = self.virtual_count + usize::from(image.is_virtual());
+            self.parent_origins
+                .reserve(virtual_count)
+                .map_err(|_| PlacementError::Quota)?;
         }
         if !self.anchors.is_empty() || image.parent.is_some() {
             self.anchors
@@ -975,8 +1009,12 @@ impl GraphicsPlacements {
         }
     }
 
+    pub(crate) fn has_orphans(&self) -> bool {
+        !self.orphaned.is_empty()
+    }
+
     pub(crate) fn reap_orphans(&mut self, images: &mut ImageStore) {
-        if self.orphaned.is_empty() {
+        if !self.has_orphans() {
             return;
         }
         self.orphaned.sort_unstable_by_key(|orphan| orphan.id);
@@ -1158,7 +1196,7 @@ impl Graphics {
 
     #[inline]
     pub(crate) fn reap_orphans(&mut self, screen: &mut Screen) {
-        if self.has_relative {
+        if self.has_relative && screen.has_graphics_orphans() {
             screen.reap_graphics_orphans(&mut self.images);
         }
     }
@@ -1188,26 +1226,83 @@ fn delete_images(
         screen.delete_placements(delete.target, styles, |_| {});
         return;
     }
-    let mut removed = Vec::new();
-    let mut referenced = Vec::new();
-    let count = screen.graphics_placements().len();
-    // Reserve both lists before changing placements or image storage.
-    if removed.try_reserve_exact(count).is_err() || referenced.try_reserve_exact(count).is_err() {
-        return;
+    match delete.target {
+        DeleteTarget::Image { id, placement_id } => {
+            let mut removed = false;
+            screen.delete_placements(delete.target, styles, |_| removed = true);
+            if placement_id == 0
+                || (removed
+                    && !screen
+                        .graphics_placements()
+                        .iter()
+                        .any(|placement| placement.placement.image.id() == id))
+            {
+                images.remove_id(id);
+            }
+            if images.has_anonymous_images() {
+                images.retain_ids(|_| true);
+            }
+            return;
+        }
+        target @ DeleteTarget::IdRange { .. } => {
+            screen.delete_placements(target, styles, |_| {});
+            images.retain_ids(|id| !target.selects_image(id));
+            return;
+        }
+        _ => {}
     }
-    screen.delete_placements(delete.target, styles, |id| removed.push(id));
-    referenced.extend(
-        screen
-            .graphics_placements()
-            .iter()
-            .map(|image| image.placement.image.id()),
-    );
-    removed.sort_unstable();
-    referenced.sort_unstable();
-    images.retain_ids(|id| {
-        referenced.binary_search(&id).is_ok()
-            || !(delete.target.selects_image(id) || removed.binary_search(&id).is_ok())
+    const INLINE_IDS: usize = 32;
+    if screen.graphics_placements().len() <= INLINE_IDS {
+        delete_unreferenced::<INLINE_IDS>(delete.target, screen, images, styles);
+    } else {
+        delete_unreferenced::<MAX_PLACEMENTS>(delete.target, screen, images, styles);
+    }
+}
+
+#[inline(never)]
+fn delete_unreferenced<const N: usize>(
+    target: DeleteTarget,
+    screen: &mut Screen,
+    images: &mut ImageStore,
+    styles: &StyleTable,
+) {
+    let mut ids = [0; N];
+    let mut count = 0;
+    screen.delete_placements(target, styles, |id| {
+        if id != 0 {
+            ids[count] = id;
+            count += 1;
+        }
     });
+    let (removed, available) = ids.split_at_mut(count);
+    let placements = screen.graphics_placements();
+    match removed {
+        [] => {}
+        [id] => {
+            if !placements
+                .iter()
+                .any(|image| image.placement.image.id() == *id)
+            {
+                images.remove_id(*id);
+            }
+        }
+        _ => {
+            // Removed and surviving placement lists share the original placement bound.
+            let referenced = &mut available[..placements.len()];
+            for (id, placement) in referenced.iter_mut().zip(placements) {
+                *id = placement.placement.image.id();
+            }
+            removed.sort_unstable();
+            referenced.sort_unstable();
+            images.retain_ids(|id| {
+                removed.binary_search(&id).is_err() || referenced.binary_search(&id).is_ok()
+            });
+            return;
+        }
+    }
+    if images.has_anonymous_images() {
+        images.retain_ids(|_| true);
+    }
 }
 
 #[cfg(test)]

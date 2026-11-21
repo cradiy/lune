@@ -7,6 +7,7 @@ description = "Kitty terminal graphics protocol"
 [dependencies]
 base64 = "0.22.1"
 flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
+moxcms = { version = "0.8.1", features = ["extended_range"] }
 png = "0.18"
 
 [target.'cfg(target_os = "linux")'.dependencies]

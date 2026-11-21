@@ -64,6 +64,10 @@ impl GraphicsStamp {
             && self.viewport_offset == other.viewport_offset
             && self.history_endpoints == other.history_endpoints
     }
+
+    pub(crate) fn placement_revision(self) -> u64 {
+        self.placement_revision
+    }
 }
 
 /// Borrowed state for one presentation pass.
@@ -76,6 +80,8 @@ pub struct PresentationFrame<'a> {
     pub palette: &'a Palette,
     graphics: &'a [GraphicsPlacement],
     graphics_revision: Option<u64>,
+    #[cfg(feature = "wgpu-renderer")]
+    pub(crate) inactive_graphics_revision: Option<u64>,
     virtual_graphics: bool,
     virtual_parents: bool,
     buffer: ScreenBuffer,
@@ -439,6 +445,8 @@ impl<T: Read + Write> Session<T> {
             palette: self.processor.palette(),
             graphics: screen.graphics_placements(),
             graphics_revision: screen.graphics_revision(),
+            #[cfg(feature = "wgpu-renderer")]
+            inactive_graphics_revision: screen.inactive_graphics_revision(),
             virtual_graphics: screen.has_virtual_graphics(),
             virtual_parents: screen.has_virtual_graphics_parents(),
             buffer: screen.active_buffer(),
@@ -478,7 +486,8 @@ impl<T: Read + Write> Session<T> {
 
     /// Updates primary scrollback limits and clamps the visible history.
     pub fn set_history_limits(&mut self, limits: HistoryLimits) -> Result<(), StorageError> {
-        self.screen.set_history_limits(limits)?;
+        self.processor
+            .set_history_limits(&mut self.screen, limits)?;
         self.poll_graphics_animations(Instant::now);
         Ok(())
     }

@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use lune_kitty_graphics::ImageStore;
 
-use super::{visit_graphics_placeholders, visit_graphics_placeholders_with_parents};
+use super::{GraphicsPlaceholderCache, GraphicsPlaceholderRun, visit_graphics_placeholders};
 use crate::{PixelSize, Row, RowRevision, Screen, StyleTable};
 
 #[derive(Default)]
@@ -10,6 +10,7 @@ pub(super) struct AnimationVisibility {
     stamp: Option<VisibilityStamp>,
     rows: Vec<Option<RowRevision>>,
     virtual_placements: HashSet<u64>,
+    parents: GraphicsPlaceholderCache,
     animated: Vec<usize>,
     has_virtual: bool,
     has_parents: bool,
@@ -79,26 +80,29 @@ impl AnimationVisibility {
         }
 
         let [columns, rows] = stamp.dimensions.map(|size| size as i64);
-        let offset = stamp.offset as i64;
         self.virtual_placements.clear();
         let visible = &mut self.virtual_placements;
-        let mut record = |serial, [column, row]: [i64; 2]| {
+        let record = |run: GraphicsPlaceholderRun| {
+            let [column, row] = run.position;
             if column < columns && (0..rows).contains(&row) {
-                visible.insert(serial);
+                visible.insert(run.placement);
             }
         };
-        let parents = if has_parents {
-            visit_graphics_placeholders_with_parents(placements, view.source(), styles, |run| {
-                record(run.placement, [run.position[0], run.position[1] + offset]);
-            })
-            .unwrap_or_default()
+        let scanned = if has_parents {
+            self.parents
+                .visit(
+                    graphics.expect("A parent belongs to a placement"),
+                    placements,
+                    view,
+                    styles,
+                    stamp.cell,
+                    self.has_virtual.then_some(record),
+                )
+                .is_ok()
+        } else if self.has_virtual {
+            visit_graphics_placeholders(placements, view.iter_rows(), styles, record).is_ok()
         } else {
-            if self.has_virtual {
-                let _ = visit_graphics_placeholders(placements, view.iter_rows(), styles, |run| {
-                    record(run.placement, run.position);
-                });
-            }
-            Default::default()
+            true
         };
         let cell = [stamp.cell.width.get(), stamp.cell.height.get()].map(f64::from);
         let area = [columns as f64 * cell[0], rows as f64 * cell[1]];
@@ -108,9 +112,8 @@ impl AnimationVisibility {
             if placement.is_virtual() {
                 return visible.contains(&placement.serial()).then_some(key);
             }
-            let origin = placement.origin_in_view(view.offset(), |parent| {
-                parents.get(&parent).copied().flatten()
-            })?;
+            let origin =
+                placement.origin_in_view(stamp.offset, |parent| self.parents.origin(parent))?;
             let layout = placement.layout(stamp.cell);
             (0..2)
                 .all(|axis| {
@@ -123,6 +126,6 @@ impl AnimationVisibility {
         if scans_rows {
             self.rows.extend(revisions());
         }
-        self.stamp = Some(stamp);
+        self.stamp = scanned.then_some(stamp);
     }
 }

@@ -446,6 +446,202 @@ fn kitty_history_preserves_visible_fragments_until_their_rows_are_evicted() {
 }
 
 #[test]
+fn kitty_images_follow_top_region_scrollback_past_a_fixed_status_row() {
+    let size = PtySize {
+        pixel_width: 16,
+        pixel_height: 10,
+        ..PtySize::new(5, 8)
+    };
+    let mut session = session_with_size(
+        concat!(
+            "\x1b[1;4rA\x1b_Ga=T,s=1,v=1,C=1,q=2;/wAA/w==\x1b\\",
+            "\x1b_Ga=T,i=42,U=1,c=1,r=1,s=1,v=1,q=2;AP8A/w==\x1b\\",
+            "\x1b[1;4H\x1b[38;5;42m\u{10eeee}\x1b[0m",
+            "\x1b[4;6H\x1b_Ga=T,i=3,s=1,v=1,r=2,C=1,q=2;AAD//w==\x1b\\",
+            "\x1b[5;1HSTATUS\x1b[4;1H\x1bD",
+        )
+        .as_bytes(),
+        size,
+    );
+    session
+        .set_history_limits(HistoryLimits {
+            max_rows: 2,
+            max_bytes: 4096,
+        })
+        .unwrap();
+    session.pump().unwrap();
+    assert!(session.scroll_history(1));
+    let frame = session.presentation_frame().unwrap();
+    let anonymous = frame
+        .graphics_placements()
+        .iter()
+        .find(|image| image.placement.image.id() == 0)
+        .unwrap();
+    let key = anonymous.placement.image;
+    assert_eq!(anonymous.row, -1);
+
+    session.transport.source = Cursor::new(b"\x1b[S");
+    session.pump().unwrap();
+    let frame = session.presentation_frame().unwrap();
+    assert_eq!(frame.viewport.offset(), 2);
+    let top = frame.viewport.row(0).unwrap();
+    assert_eq!(top.text(0), Some(CellText::Scalar('A')));
+    assert_eq!(top.text(3), Some(CellText::Scalar('\u{10eeee}')));
+    assert!(
+        frame
+            .graphics_placements()
+            .iter()
+            .any(|placement| { placement.placement.image == key && placement.row == -2 })
+    );
+    assert!(
+        frame
+            .graphics_placements()
+            .iter()
+            .any(|placement| { placement.placement.image.id() == 3 && placement.row == 3 })
+    );
+    assert_eq!(
+        session.screen().grid().row(4).unwrap().text(0),
+        Some(CellText::Scalar('S'))
+    );
+
+    session.transport.source = Cursor::new(b"\x1b[S");
+    session.pump().unwrap();
+    let frame = session.presentation_frame().unwrap();
+    assert!(frame.image_store().source_revision(key).is_none());
+    assert_eq!(
+        frame.viewport.row(0).unwrap().text(3),
+        Some(CellText::Scalar(' '))
+    );
+}
+
+#[test]
+fn kitty_unscroll_restores_images_with_their_anchored_rows() {
+    let size = PtySize {
+        pixel_width: 16,
+        pixel_height: 10,
+        ..PtySize::new(5, 8)
+    };
+    let mut session = session_with_size(
+        concat!(
+            "\x1b[1;4rA\x1b_Ga=T,i=1,p=1,s=1,v=1,C=1,q=2;/wAA/w==\x1b\\",
+            "\x1b_Ga=T,i=3,P=1,Q=1,H=1,s=1,v=1,q=2;AAD//w==\x1b\\",
+            "\x1b_Ga=T,i=42,U=1,c=1,r=1,s=1,v=1,q=2;AP8A/w==\x1b\\",
+            "\x1b[1;4H\x1b[38;5;42m\u{10eeee}\x1b[0m",
+            "\x1b[2;1HB\x1b[5;1HSTATUS\x1b[4;1H\x1b[2S",
+        )
+        .as_bytes(),
+        size,
+    );
+    session
+        .set_history_limits(HistoryLimits {
+            max_rows: 4,
+            max_bytes: 4096,
+        })
+        .unwrap();
+    session.pump().unwrap();
+    assert!(session.scroll_history(2));
+    for (command, offset, live) in [(b"\x1b[+T".as_slice(), 1, 'B'), (b"\x1b[1+T", 0, 'A')] {
+        session.transport.source = Cursor::new(command);
+        session.pump().unwrap();
+        let frame = session.presentation_frame().unwrap();
+        assert_eq!(frame.viewport.offset(), offset);
+        let anchor = frame.viewport.row(0).unwrap();
+        assert_eq!(anchor.text(0), Some(CellText::Scalar('A')));
+        assert_eq!(anchor.text(3), Some(CellText::Scalar('\u{10eeee}')));
+        for (id, column) in [(1, 1), (3, 2)] {
+            let placement = frame
+                .graphics_placements()
+                .iter()
+                .find(|placement| placement.placement.image.id() == id)
+                .unwrap();
+            assert_eq!(
+                placement.origin_in_view(offset, |_| None),
+                Some([column, 0])
+            );
+        }
+        assert_eq!(
+            session.screen().grid().row(0).unwrap().text(0),
+            Some(CellText::Scalar(live))
+        );
+        assert_eq!(
+            session.screen().grid().row(4).unwrap().text(0),
+            Some(CellText::Scalar('S'))
+        );
+    }
+    assert_eq!(session.screen().history().retained_bytes(), 0);
+}
+
+#[test]
+fn kitty_history_limits_release_orphaned_images_in_either_buffer() {
+    let size = PtySize {
+        pixel_width: 16,
+        pixel_height: 6,
+        ..PtySize::new(3, 8)
+    };
+    let input = concat!(
+        "\x1b_Ga=T,i=1,p=1,s=1,v=1,C=1,q=2;/wAA/w==\x1b\\",
+        "\x1b_Ga=T,i=2,p=1,P=1,Q=1,V=1,s=1,v=1,q=2;AP8A/w==\x1b\\",
+        "\x1b_Ga=T,i=3,p=1,P=2,Q=1,s=1,v=1,q=2;AAD//w==\x1b\\",
+        "\x1b_Ga=T,i=4,p=1,P=1,Q=1,s=1,v=1,q=2;/////w==\x1b\\",
+        "\x1b[3;2H\x1b_Ga=p,i=4,p=2,C=1,q=2\x1b\\\x1bD",
+    );
+    for alternate in [false, true] {
+        let mut session = session_with_size(input.as_bytes(), size);
+        session
+            .set_history_limits(HistoryLimits {
+                max_rows: 1,
+                max_bytes: 4096,
+            })
+            .unwrap();
+        session.pump().unwrap();
+        assert_eq!(session.screen().history().len(), 1);
+        assert_eq!(session.screen().graphics_placements().len(), 5);
+        if alternate {
+            session.transport.source = Cursor::new(b"\x1b[?47h");
+            session.pump().unwrap();
+            assert_eq!(session.screen().active_buffer(), ScreenBuffer::Alternate);
+        }
+        session
+            .set_history_limits(HistoryLimits::default())
+            .unwrap();
+        let images = session.processor().graphics_images(ScreenBuffer::Primary);
+        assert!(images.get(2).is_none());
+        assert!(images.get(3).is_none());
+        assert!(images.get(1).is_some());
+        assert!(images.get(4).is_some());
+    }
+}
+
+#[test]
+fn kitty_scroll_releases_orphaned_images_when_replies_are_backpressured() {
+    let mut session = session_with_size(
+        concat!(
+            "\x1b_Ga=T,i=1,p=1,s=1,v=1,C=1,q=2;/wAA/w==\x1b\\",
+            "\x1b_Ga=T,i=2,p=1,P=1,Q=1,V=1,s=1,v=1,q=2;AP8A/w==\x1b\\",
+            "\x1b[6n\x1b[S\x1b[2;3H\x1b[6n\x1b_Ga=p,i=2,p=1\x1b\\",
+        )
+        .as_bytes(),
+        PtySize {
+            pixel_width: 16,
+            pixel_height: 6,
+            ..PtySize::new(3, 8)
+        },
+    );
+    session.pump().unwrap();
+    assert_eq!(session.transport.written, b"\x1b");
+    assert!(!session.wants_read());
+    assert!(session.screen().graphics_placements().is_empty());
+    assert!(session.graphics_image(2).is_none());
+
+    session.transport.write_budget = usize::MAX;
+    session.pump().unwrap();
+    assert_eq!(
+        session.transport.written,
+        b"\x1b[1;1R\x1b[2;3R\x1b_Gi=2,p=1;ENOENT:Image not found\x1b\\",
+    );
+}
+
+#[test]
 fn kitty_full_page_reverse_scroll_preserves_history_and_offscreen_pixels() {
     let size = PtySize {
         pixel_width: 16,
@@ -917,7 +1113,7 @@ fn kitty_images_compose_in_an_offscreen_wgpu_pass() {
     );
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         required_limits: wgpu::Limits {
-            max_texture_dimension_2d: 256,
+            max_texture_dimension_2d: 128,
             ..Default::default()
         },
         ..Default::default()
@@ -1507,6 +1703,39 @@ fn kitty_images_compose_in_an_offscreen_wgpu_pass() {
     assert_eq!(pixel(&moved_and_updated, 4, 8), [0, 0, 255, 255]);
     assert_eq!(pixel(&moved_and_updated, 12, 8), [0, 0, 0, 0]);
 
+    let mut letterbox = session_with_size(
+        concat!(
+            "\x1b_Ga=T,i=42,U=1,c=3,r=1,s=1,v=1,q=2;AP8A/w==\x1b\\",
+            "\x1b_Ga=T,i=43,P=42,H=2,s=1,v=1,q=2;AAD//w==\x1b\\",
+            "\x1b[1;1H\x1b[38;5;42m\u{10eeee}\x1b[0m",
+        )
+        .as_bytes(),
+        size,
+    );
+    letterbox.pump().unwrap();
+    let frame = letterbox.presentation_frame().unwrap();
+    let stamp = frame.graphics_stamp();
+    assert_eq!(renderer.prepare(&device, &queue, &frame), 0);
+    assert_eq!(renderer.image_instance_count(), 0);
+    for (width, expected) in [
+        (size.pixel_width / 2, [0, 0, 255, 255]),
+        (size.pixel_width, [0; 4]),
+    ] {
+        letterbox.geometry = GridGeometry::from_pty_size(PtySize {
+            pixel_width: width,
+            ..size
+        });
+        letterbox.processor.update_geometry(
+            &mut letterbox.screen,
+            letterbox.geometry.text_area_pixels(),
+            letterbox.geometry.cell_pixels(),
+        );
+        let frame = letterbox.presentation_frame().unwrap();
+        assert_eq!(frame.graphics_stamp(), stamp);
+        assert_eq!(renderer.prepare(&device, &queue, &frame), 0);
+        assert_eq!(pixel(&read_frame(&renderer), 4, 0), expected);
+    }
+
     for scroll in [b"\x1b[4S".as_slice(), b"\x1b[S\x1b[S\x1b[S\x1b[S"] {
         let mut scrolled = session_with_size(
             concat!(
@@ -1634,26 +1863,26 @@ fn kitty_images_compose_in_an_offscreen_wgpu_pass() {
             .unwrap();
         assert_eq!(consumed, wire.len());
     };
-    let prefix = "AAAA".repeat(252);
+    let prefix = "AAAA".repeat(124);
     let rows = [
         "AAAAAAAAAAAAAAAA",
         "AAAA/wAAAP8AAAAA",
         "AAAAAAD//wD/AAAA",
         "AAAAAAAAAAAAAAAA",
     ];
-    for row in 0..257 {
+    for row in 0..129 {
         let header = if row == 0 {
-            "i=47,f=24,s=257,v=257,q=2,"
+            "i=47,f=24,s=129,v=129,q=2,"
         } else {
             ""
         };
-        let more = u8::from(row != 256);
-        let samples = rows[row.clamp(252, 255) - 252];
+        let more = u8::from(row != 128);
+        let samples = rows[row.clamp(124, 127) - 124];
         let wire = format!("\x1b_G{header}m={more};{prefix}{samples}AAAA\x1b\\");
         send(&mut tiled, wire.as_bytes());
     }
     let near = b"\x1b_Ga=p,i=47,p=7,w=1,h=1,C=1,q=2\x1b\\";
-    let far = b"\x1b_Ga=p,i=47,p=7,x=256,y=256,w=1,h=1,C=1,q=2\x1b\\";
+    let far = b"\x1b_Ga=p,i=47,p=7,x=128,y=128,w=1,h=1,C=1,q=2\x1b\\";
     for wire in [near.as_slice(), far, near] {
         send(&mut tiled, wire);
         assert_eq!(
@@ -1665,9 +1894,9 @@ fn kitty_images_compose_in_an_offscreen_wgpu_pass() {
     send(
         &mut tiled,
         concat!(
-            "\x1b_Ga=f,i=47,c=1,x=256,y=256,s=1,v=1,X=1,q=2;AP8A/w==\x1b\\",
+            "\x1b_Ga=f,i=47,c=1,x=128,y=128,s=1,v=1,X=1,q=2;AP8A/w==\x1b\\",
             "\x1b_Ga=a,i=47,c=2,q=2\x1b\\",
-            "\x1b_Ga=p,i=47,p=7,x=256,y=256,w=1,h=1,C=1,q=2\x1b\\",
+            "\x1b_Ga=p,i=47,p=7,x=128,y=128,w=1,h=1,C=1,q=2\x1b\\",
         )
         .as_bytes(),
     );
@@ -1685,7 +1914,7 @@ fn kitty_images_compose_in_an_offscreen_wgpu_pass() {
         ),
         (
             concat!(
-                "\x1b_Ga=f,i=47,x=256,y=256,s=1,v=1,Y=4278190335,X=1,q=2;AAD//w==\x1b\\",
+                "\x1b_Ga=f,i=47,x=128,y=128,s=1,v=1,Y=4278190335,X=1,q=2;AAD//w==\x1b\\",
                 "\x1b_Ga=a,i=47,c=3,q=2\x1b\\",
             )
             .as_bytes(),
@@ -1703,7 +1932,7 @@ fn kitty_images_compose_in_an_offscreen_wgpu_pass() {
         assert_eq!(renderer.prepare(&device, &queue, &frame), 0);
         let image = frame.graphics_placements()[0].placement.image;
         assert_eq!(renderer.resident_image_tiles(image), tiles);
-        assert!(renderer.pixel_scratch_capacity() <= 256 * 256 * 4);
+        assert!(renderer.pixel_scratch_capacity() <= 128 * 128 * 4);
         assert_eq!(pixel(&read_frame(&renderer), 0, 0), expected);
     }
     send(&mut tiled, b"\x1b_Ga=p,i=47,p=7,c=2,r=2,C=1,q=2\x1b\\");
@@ -1715,7 +1944,7 @@ fn kitty_images_compose_in_an_offscreen_wgpu_pass() {
         &mut tiled,
         concat!(
             "\x1b_Ga=p,i=47,p=7,w=1,h=1,C=1,q=2\x1b\\",
-            "\x1b_Ga=f,i=47,x=256,y=256,s=1,v=1,Y=16711935,X=1,q=2;AAD//w==\x1b\\",
+            "\x1b_Ga=f,i=47,x=128,y=128,s=1,v=1,Y=16711935,X=1,q=2;AAD//w==\x1b\\",
             "\x1b_Ga=a,i=47,c=4,q=2\x1b\\",
         )
         .as_bytes(),
@@ -1725,10 +1954,10 @@ fn kitty_images_compose_in_an_offscreen_wgpu_pass() {
         0
     );
     assert_eq!(pixel(&read_frame(&renderer), 0, 0), [0, 255, 0, 255]);
-    assert!(renderer.pixel_scratch_capacity() <= 256 * 256 * 4);
+    assert!(renderer.pixel_scratch_capacity() <= 128 * 128 * 4);
     send(
         &mut tiled,
-        b"\x1b_Ga=p,i=47,p=7,x=256,y=256,w=1,h=1,C=1,q=2\x1b\\",
+        b"\x1b_Ga=p,i=47,p=7,x=128,y=128,w=1,h=1,C=1,q=2\x1b\\",
     );
     assert_eq!(
         renderer.prepare(&device, &queue, &tiled.presentation_frame().unwrap()),
@@ -1741,7 +1970,7 @@ fn kitty_images_compose_in_an_offscreen_wgpu_pass() {
         (b"\x1b_Ga=p,i=47,p=7,w=1,h=1,C=1,q=2\x1b\\", [0, 0, 0, 255]),
         (b"\x1b_Ga=a,i=47,c=2,q=2\x1b\\", [0, 0, 0, 255]),
         (
-            b"\x1b_Ga=p,i=47,p=7,x=256,y=256,w=1,h=1,C=1,q=2\x1b\\",
+            b"\x1b_Ga=p,i=47,p=7,x=128,y=128,w=1,h=1,C=1,q=2\x1b\\",
             [0, 255, 0, 255],
         ),
     ] {
@@ -1766,7 +1995,7 @@ fn kitty_images_compose_in_an_offscreen_wgpu_pass() {
         0
     );
     assert_eq!(renderer.cached_texture(image), Some(&first_tile));
-    assert!(renderer.pixel_scratch_capacity() <= 256 * 256 * 4);
+    assert!(renderer.pixel_scratch_capacity() <= 128 * 128 * 4);
     assert_eq!(pixel(&read_frame(&renderer), 0, 0), [255, 0, 0, 255]);
     send(
         &mut tiled,
@@ -1781,7 +2010,7 @@ fn kitty_images_compose_in_an_offscreen_wgpu_pass() {
     let reference = rows.concat();
     let wire = format!(
         concat!(
-            "\x1b_Ga=p,i=47,p=1,x=253,y=253,w=2,h=2,c=2,r=2,C=1,q=2\x1b\\",
+            "\x1b_Ga=p,i=47,p=1,x=125,y=125,w=2,h=2,c=2,r=2,C=1,q=2\x1b\\",
             "\x1b_Gi=49,f=24,s=4,v=4,q=2;{}\x1b\\",
             "\x1b[1;3H\x1b_Ga=p,i=49,x=1,y=1,w=2,h=2,c=2,r=2,C=1,q=2\x1b\\",
         ),
@@ -1821,7 +2050,7 @@ fn kitty_images_compose_in_an_offscreen_wgpu_pass() {
     for (wire, expected) in [
         (
             concat!(
-                "\x1b_Ga=f,i=47,c=1,f=24,x=254,y=254,s=1,v=1,X=1,q=2;////\x1b\\",
+                "\x1b_Ga=f,i=47,c=1,f=24,x=126,y=126,s=1,v=1,X=1,q=2;////\x1b\\",
                 "\x1b_Ga=f,i=49,c=1,f=24,x=2,y=2,s=1,v=1,X=1,q=2;////\x1b\\",
                 "\x1b_Ga=a,i=47,c=2,q=2\x1b\\\x1b_Ga=a,i=49,c=2,q=2\x1b\\",
             )
@@ -1830,9 +2059,9 @@ fn kitty_images_compose_in_an_offscreen_wgpu_pass() {
         ),
         (
             concat!(
-                "\x1b_Ga=f,i=47,r=2,x=254,y=254,s=1,v=1,X=1,q=2;AP8AAA==\x1b\\",
+                "\x1b_Ga=f,i=47,r=2,x=126,y=126,s=1,v=1,X=1,q=2;AP8AAA==\x1b\\",
                 "\x1b_Ga=f,i=49,r=2,x=2,y=2,s=1,v=1,X=1,q=2;AP8AAA==\x1b\\",
-                "\x1b[1;1H\x1b_Ga=p,i=47,p=1,x=253,y=253,w=2,h=2,c=2,r=2,C=1,q=2\x1b\\",
+                "\x1b[1;1H\x1b_Ga=p,i=47,p=1,x=125,y=125,w=2,h=2,c=2,r=2,C=1,q=2\x1b\\",
             )
             .as_bytes(),
             [198, 120, 120, 239],
@@ -1861,9 +2090,9 @@ fn kitty_images_compose_in_an_offscreen_wgpu_pass() {
     tiled.transport.source = Cursor::new(
         concat!(
             "\x1b_Ga=f,i=47,c=1,s=1,v=1,X=1,q=2;/wAA/w==\x1b\\",
-            "\x1b_Ga=f,i=47,c=1,x=254,y=254,s=1,v=1,X=1,q=2;/////w==\x1b\\",
+            "\x1b_Ga=f,i=47,c=1,x=126,y=126,s=1,v=1,X=1,q=2;/////w==\x1b\\",
             "\x1b[1;5H\x1b_Ga=p,i=47,p=3,w=1,h=1,C=1,q=2\x1b\\",
-            "\x1b[1;6H\x1b_Ga=p,i=47,p=4,x=254,y=254,w=1,h=1,C=1,q=2\x1b\\",
+            "\x1b[1;6H\x1b_Ga=p,i=47,p=4,x=126,y=126,w=1,h=1,C=1,q=2\x1b\\",
             "\x1b_Ga=a,i=47,c=3,q=2\x1b\\",
         )
         .as_bytes(),
@@ -2041,6 +2270,36 @@ fn kitty_images_compose_in_an_offscreen_wgpu_pass() {
         if expected[0] == red {
             assert_eq!(renderer.cached_texture(key), Some(&primary_texture));
         }
+    }
+
+    for inactive in [false, true] {
+        let mut anonymous = session_with_size(
+            b"\x1b_Ga=T,s=1,v=1,C=1,q=2;/wAA/w==\x1b\\\x1b[5;1H\x1bD",
+            size,
+        );
+        anonymous
+            .set_history_limits(HistoryLimits {
+                max_rows: 1,
+                max_bytes: 4096,
+            })
+            .unwrap();
+        anonymous.pump().unwrap();
+        let key = anonymous.screen().graphics_placements()[0].placement.image;
+        assert!(anonymous.scroll_history(1));
+        assert_eq!(pixel(&draw(&mut renderer, &anonymous), 0, 0), red);
+        assert!(renderer.has_cached_image(key));
+        if inactive {
+            anonymous.transport.source = Cursor::new(b"\x1b[?47h");
+            anonymous.pump().unwrap();
+            assert_eq!(pixel(&draw(&mut renderer, &anonymous), 0, 0), empty);
+            assert!(renderer.has_inactive_cached_image(key));
+        }
+        anonymous
+            .set_history_limits(HistoryLimits::default())
+            .unwrap();
+        assert_eq!(pixel(&draw(&mut renderer, &anonymous), 0, 0), empty);
+        assert!(!renderer.has_cached_image(key));
+        assert!(!renderer.has_inactive_cached_image(key));
     }
 
     let mut inherited = session_with_size(
@@ -2698,6 +2957,60 @@ fn kitty_animation_waits_for_placement_and_only_damages_visible_images() {
     assert!(session.scroll_history(1));
     assert!(session.presentation_deadline().is_some());
     session.follow_output();
+    assert_eq!(session.presentation_deadline(), None);
+}
+
+#[test]
+fn kitty_relative_animation_follows_viewport_and_hidden_parent_edits() {
+    let mut session = session(
+        concat!(
+            "\x1b_Ga=T,i=1,U=1,c=1,r=1,s=1,v=1,q=2;AAAA/w==\x1b\\",
+            "\x1b_Ga=T,i=2,P=1,H=6,V=-3,s=1,v=1,q=2;/wAA/w==\x1b\\",
+            "\x1b_Ga=f,i=2,s=1,v=1,z=10,q=2;AP8A/w==\x1b\\",
+            "\x1b_Ga=a,i=2,s=3,r=1,z=10,q=2\x1b\\",
+            "\x1b[3;1H\x1bD\x1b[38;5;1m\u{10eeee}\x1b[0m",
+        )
+        .as_bytes(),
+    );
+    session
+        .set_history_limits(HistoryLimits {
+            max_rows: 2,
+            max_bytes: 4096,
+        })
+        .unwrap();
+    let start = Instant::now();
+    let at = |ms| start + Duration::from_millis(ms);
+    let current = |session: &Session<Transport>| -> [u8; 4] {
+        session
+            .graphics_image(2)
+            .unwrap()
+            .pixels(&mut Vec::new())
+            .unwrap()
+            .try_into()
+            .unwrap()
+    };
+
+    session.pump_with_clock(|| at(0)).unwrap();
+    assert_eq!(session.presentation_deadline(), None);
+    session.screen.scroll_viewport_up(1);
+    session.pump_with_clock(|| at(20)).unwrap();
+    assert_eq!(session.presentation_deadline(), Some(at(30)));
+    session.pump_with_clock(|| at(30)).unwrap();
+    assert_eq!(current(&session), [0, 255, 0, 255]);
+
+    session.transport.source =
+        Cursor::new("\x1b[3;1H\x1b[X\x1b[3;4H\x1b[38;5;1m\u{10eeee}\x1b[0m".as_bytes());
+    session.pump_with_clock(|| at(31)).unwrap();
+    assert_eq!(session.presentation_deadline(), None);
+    session.pump_with_clock(|| at(99)).unwrap();
+    assert_eq!(current(&session), [0, 255, 0, 255]);
+
+    session.transport.source =
+        Cursor::new("\x1b[3;4H\x1b[X\x1b[3;1H\x1b[38;5;1m\u{10eeee}\x1b[0m".as_bytes());
+    session.pump_with_clock(|| at(100)).unwrap();
+    assert_eq!(session.presentation_deadline(), Some(at(110)));
+    session.screen.scroll_viewport_to_bottom();
+    session.pump_with_clock(|| at(101)).unwrap();
     assert_eq!(session.presentation_deadline(), None);
 }
 

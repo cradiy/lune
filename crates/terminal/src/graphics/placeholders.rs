@@ -1,10 +1,62 @@
 use std::collections::HashMap;
 
 use crate::{
-    Color, GRAPHICS_PLACEHOLDER, GraphicsPlaceholder, Row, ScreenView, StorageError, StyleTable,
+    Color, GRAPHICS_PLACEHOLDER, GraphicsPlaceholder, PixelSize, Row, RowRevision, ScreenView,
+    StorageError, StyleTable, Viewport,
 };
 
 use super::GraphicsPlacement;
+
+type PlaceholderIndex = HashMap<(u32, u32), usize>;
+pub(super) type Origins = HashMap<u64, Option<[i64; 2]>>;
+
+#[derive(Debug, Default)]
+pub(super) struct VirtualParentOrigins {
+    lookup: PlaceholderIndex,
+    origins: Origins,
+}
+
+impl VirtualParentOrigins {
+    pub(super) fn reserve(&mut self, virtual_count: usize) -> Result<(), StorageError> {
+        self.lookup
+            .try_reserve((virtual_count * 2).saturating_sub(self.lookup.len()))?;
+        self.origins
+            .try_reserve(virtual_count.saturating_sub(self.origins.len()))?;
+        Ok(())
+    }
+
+    pub(super) fn collect(
+        &mut self,
+        placements: &[GraphicsPlacement],
+        view: ScreenView<'_>,
+        styles: &StyleTable,
+        mut visit: impl FnMut(GraphicsPlaceholderRun),
+    ) -> &Origins {
+        self.origins.clear();
+        for parent in placements
+            .iter()
+            .filter_map(GraphicsPlacement::virtual_parent)
+        {
+            self.origins.entry(parent).or_insert(None);
+        }
+        index_placeholders(placements, &mut self.lookup);
+        visit_indexed_rows(
+            placements,
+            view.placeholder_rows(),
+            styles,
+            &self.lookup,
+            |tile| {
+                if let Some(origin) = self.origins.get_mut(&tile.placement) {
+                    let minimum = origin.get_or_insert(tile.position);
+                    minimum[0] = minimum[0].min(tile.position[0]);
+                    minimum[1] = minimum[1].min(tile.position[1]);
+                }
+                visit(tile);
+            },
+        );
+        &self.origins
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct GraphicsPlaceholderRun {
@@ -14,33 +66,81 @@ pub struct GraphicsPlaceholderRun {
     pub columns: u32,
 }
 
-/// Visits placeholders and resolves virtual parents in live-buffer coordinates,
-/// including retained history.
-pub fn visit_graphics_placeholders_with_parents(
-    placements: &[GraphicsPlacement],
-    view: ScreenView<'_>,
-    styles: &StyleTable,
-    mut visit: impl FnMut(GraphicsPlaceholderRun),
-) -> Result<HashMap<u64, Option<[i64; 2]>>, StorageError> {
-    let mut origins = HashMap::new();
-    for parent in placements
-        .iter()
-        .filter_map(GraphicsPlacement::virtual_parent)
-    {
-        if !origins.contains_key(&parent) {
-            origins.try_reserve(1).map_err(StorageError::from)?;
-            origins.insert(parent, None);
-        }
+#[derive(Default)]
+pub struct GraphicsPlaceholderCache {
+    sources: Option<ParentSources>,
+    live_rows: Vec<Option<RowRevision>>,
+    parents: VirtualParentOrigins,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ParentSources {
+    placement_revision: u64,
+    history: Option<[RowRevision; 2]>,
+    cell: PixelSize,
+}
+
+impl GraphicsPlaceholderCache {
+    /// Returns a virtual parent's origin in live-buffer coordinates.
+    pub fn origin(&self, serial: u64) -> Option<[i64; 2]> {
+        self.parents.origins.get(&serial).copied().flatten()
     }
-    visit_placeholder_rows(placements, view.placeholder_rows(), styles, |tile| {
-        if let Some(origin) = origins.get_mut(&tile.placement) {
-            let minimum = origin.get_or_insert(tile.position);
-            minimum[0] = minimum[0].min(tile.position[0]);
-            minimum[1] = minimum[1].min(tile.position[1]);
+
+    /// Resolves virtual parents for the supplied placement revision and optionally visits
+    /// placeholder runs in viewport coordinates.
+    pub fn visit(
+        &mut self,
+        placement_revision: u64,
+        placements: &[GraphicsPlacement],
+        viewport: Viewport<'_>,
+        styles: &StyleTable,
+        cell: PixelSize,
+        mut visit: Option<impl FnMut(GraphicsPlaceholderRun)>,
+    ) -> Result<(), StorageError> {
+        let view = viewport.source();
+        let sources = ParentSources {
+            placement_revision,
+            history: view.history_endpoints(),
+            cell,
+        };
+        let revisions = || {
+            view.iter_live_rows()
+                .map(Row::graphics_placeholder_revision)
+        };
+        if self.sources == Some(sources) && revisions().eq(self.live_rows.iter().copied()) {
+            if let Some(visit) = visit {
+                visit_indexed_rows(
+                    placements,
+                    number_rows(viewport.iter_rows()),
+                    styles,
+                    &self.parents.lookup,
+                    visit,
+                );
+            }
+            return Ok(());
         }
-        visit(tile);
-    })?;
-    Ok(origins)
+
+        self.sources = None;
+        self.parents.origins.clear();
+        self.live_rows.clear();
+        self.live_rows.try_reserve(revisions().len())?;
+        let virtual_count = placements.iter().filter(|entry| entry.is_virtual()).count();
+        self.parents.reserve(virtual_count)?;
+        let offset = viewport.offset() as i64;
+        let rows = 0..viewport.rows() as i64;
+        self.parents.collect(placements, view, styles, |mut run| {
+            if let Some(visit) = &mut visit {
+                run.position[1] += offset;
+                if rows.contains(&run.position[1]) {
+                    run.origin[1] += offset;
+                    visit(run);
+                }
+            }
+        });
+        self.live_rows.extend(revisions());
+        self.sources = Some(sources);
+        Ok(())
+    }
 }
 
 /// Visits runs of adjacent placeholder cells covered by the image in view order.
@@ -51,43 +151,66 @@ pub fn visit_graphics_placeholders<'a>(
     styles: &StyleTable,
     visit: impl FnMut(GraphicsPlaceholderRun),
 ) -> Result<(), StorageError> {
-    visit_placeholder_rows(
-        placements,
-        rows.into_iter()
-            .enumerate()
-            .map(|(index, row)| (index as i64, row)),
-        styles,
-        visit,
-    )
+    visit_placeholder_rows(placements, number_rows(rows), styles, visit)
+}
+
+fn number_rows<'a>(
+    rows: impl IntoIterator<Item = &'a Row>,
+) -> impl Iterator<Item = (i64, &'a Row)> {
+    rows.into_iter()
+        .enumerate()
+        .map(|(index, row)| (index as i64, row))
 }
 
 fn visit_placeholder_rows<'a>(
     placements: &[GraphicsPlacement],
     rows: impl IntoIterator<Item = (i64, &'a Row)>,
     styles: &StyleTable,
-    mut visit: impl FnMut(GraphicsPlaceholderRun),
+    visit: impl FnMut(GraphicsPlaceholderRun),
 ) -> Result<(), StorageError> {
-    let virtual_placements = placements.iter().filter(|placement| placement.is_virtual());
-    let count = virtual_placements.clone().count();
+    let count = placements
+        .iter()
+        .filter(|placement| placement.is_virtual())
+        .count();
     if count == 0 {
         return Ok(());
     }
     let mut lookup = HashMap::new();
     lookup.try_reserve(count * 2).map_err(StorageError::from)?;
-    for placement in virtual_placements {
+    index_placeholders(placements, &mut lookup);
+    visit_indexed_rows(placements, rows, styles, &lookup, visit);
+    Ok(())
+}
+
+fn index_placeholders(placements: &[GraphicsPlacement], lookup: &mut PlaceholderIndex) {
+    lookup.clear();
+    for (index, placement) in placements
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| item.is_virtual())
+    {
         let image = placement.placement.image.id();
         lookup
             .entry((image, 0))
-            .and_modify(|current: &mut &GraphicsPlacement| {
-                if placement.serial() < current.serial() {
-                    *current = placement;
+            .and_modify(|current| {
+                if placement.serial() < placements[*current].serial() {
+                    *current = index;
                 }
             })
-            .or_insert(placement);
+            .or_insert(index);
         if placement.placement.id != 0 {
-            lookup.insert((image, placement.placement.id), placement);
+            lookup.insert((image, placement.placement.id), index);
         }
     }
+}
+
+fn visit_indexed_rows<'a>(
+    placements: &[GraphicsPlacement],
+    rows: impl IntoIterator<Item = (i64, &'a Row)>,
+    styles: &StyleTable,
+    lookup: &PlaceholderIndex,
+    mut visit: impl FnMut(GraphicsPlaceholderRun),
+) {
     let mut last_key = None;
     let mut last_placement = None;
     for (row_index, row) in rows {
@@ -126,7 +249,7 @@ fn visit_placeholder_rows<'a>(
             previous = Some((column, colors, glyph));
             let key = (glyph.image_id, glyph.placement_id);
             if last_key != Some(key) {
-                last_placement = lookup.get(&key).copied();
+                last_placement = lookup.get(&key).map(|&index| &placements[index]);
                 last_key = Some(key);
             }
             let Some(placement) = last_placement else {
@@ -165,7 +288,6 @@ fn visit_placeholder_rows<'a>(
             visit(run);
         }
     }
-    Ok(())
 }
 
 fn color_id(color: Color) -> u32 {

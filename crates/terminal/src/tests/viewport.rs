@@ -237,7 +237,7 @@ fn viewport_tracks_lf_counted_ascii_and_unicode_capture_and_byte_budget_eviction
                 screen.viewport_offset(),
                 if case == 1 {
                     4
-                } else if case >= 5 {
+                } else if case == 6 {
                     2
                 } else {
                     3

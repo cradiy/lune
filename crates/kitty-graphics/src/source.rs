@@ -207,17 +207,16 @@ mod linux {
         let available = u64::try_from(stat.st_size)
             .ok()?
             .checked_sub(source.offset)?;
+        let requested = source.size.map_or(available, |size| size as u64);
+        if requested > available {
+            return None;
+        }
         let len = if fixed_capacity.is_some() {
-            if source.size.is_some_and(|size| size < limit) {
-                return None;
-            }
             limit
-        } else if let Some(size) = source.size {
-            size
         } else {
-            usize::try_from(available).ok()?
+            usize::try_from(requested).ok()?
         };
-        if len == 0 || len > limit || len as u64 > available {
+        if len > limit || len as u64 > requested {
             return None;
         }
         let mut bytes = Vec::new();

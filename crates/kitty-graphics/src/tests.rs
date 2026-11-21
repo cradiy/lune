@@ -850,6 +850,51 @@ fn zlib_checks_stream_boundaries_and_png_expands_paletted_alpha() {
 }
 
 #[test]
+fn rejected_png_uploads_preserve_the_existing_image() {
+    let mut images = ImageStore::new(4, 1);
+    let mut receive = |wire: &str| {
+        let mut reply = None;
+        feed(wire.as_bytes(), 7, |command| {
+            reply = images.receive(command.unwrap(), |_| Ok(()));
+        });
+        let reply = reply.unwrap();
+        assert_eq!(reply.id, 1);
+        (reply.message, images.get(1).unwrap().source_revision())
+    };
+    let (message, original) = receive("\x1b_Gi=1,s=1,v=1;AQIDBA==\x1b\\");
+    assert_eq!(message, b"OK");
+
+    // The IDAT CRC is valid. Only the zlib stream's Adler-32 is wrong.
+    let (message, retained) = receive(concat!(
+        "\x1b_Gi=1,f=100;",
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGM44NBwAAAFhQJAPU4x7AAAAABJRU5ErkJggg==",
+        "\x1b\\",
+    ));
+    assert_eq!(message, b"EBADPNG:Invalid PNG image data");
+    assert_eq!(retained, original);
+
+    let (message, retained) = receive(concat!(
+        "\x1b_Gi=1,f=100;",
+        "iVBORw0KGgoAAAANSUhEUgAAJxEAAAABCAYAAACXHN81AAAADUlEQVR4nGNgZGL+DwABFAEG1rmmRQAAAABJRU5ErkJggg==",
+        "\x1b\\",
+    ));
+    assert_eq!(message, b"ENOMEM:PNG image is too large");
+    assert_eq!(retained, original);
+
+    let (message, replaced) = receive(concat!(
+        "\x1b_Gi=1,f=100;",
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACklEQVR4nGM44NBwAAAFqPLXkQAAAANJREFUhQJBLdmETQAAAABJRU5ErkJggg==",
+        "\x1b\\",
+    ));
+    assert_eq!(message, b"OK");
+    assert_ne!(replaced, original);
+    assert_eq!(
+        images.get(1).unwrap().pixels(&mut Vec::new()).unwrap(),
+        &[192, 64, 128, 192]
+    );
+}
+
+#[test]
 fn png_expansion_preserves_pixels_across_rows() {
     let cases = [
         (
@@ -944,6 +989,250 @@ fn png_gamma_corrects_color_at_source_precision_and_keeps_alpha() {
     }
 }
 
+#[test]
+fn png_chromaticities_and_gamma_convert_to_srgb() {
+    use png::{BitDepth, ScaledFloat, SourceChromaticities};
+
+    let pair = |x, y| (ScaledFloat::from_scaled(x), ScaledFloat::from_scaled(y));
+    let p3 = SourceChromaticities {
+        white: pair(31270, 32900),
+        red: pair(68000, 32000),
+        green: pair(26500, 69000),
+        blue: pair(15000, 6000),
+    };
+    let mut images = ImageStore::new(4, 1);
+    for (depth, primaries, gamma, input, expected) in [
+        (
+            BitDepth::Eight,
+            p3,
+            100_000,
+            [128, 64, 32, 127].as_slice(),
+            [197, 135, 92, 127],
+        ),
+        (
+            BitDepth::Eight,
+            p3,
+            45_455,
+            &[128, 64, 32, 127],
+            [139, 57, 11, 127],
+        ),
+        (
+            BitDepth::Sixteen,
+            p3,
+            100_000,
+            &[0, 127, 0, 255, 1, 128, 127, 128],
+            [5, 13, 18, 127],
+        ),
+        (
+            BitDepth::Eight,
+            SourceChromaticities {
+                green: p3.red,
+                ..p3
+            },
+            100_000,
+            &[128, 64, 32, 127],
+            [186, 136, 99, 127],
+        ),
+    ] {
+        let mut png = Vec::new();
+        let mut encoder = png::Encoder::new(&mut png, 1, 1);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(depth);
+        encoder.set_source_chromaticities(primaries);
+        encoder.set_source_gamma(ScaledFloat::from_scaled(gamma));
+        encoder
+            .write_header()
+            .unwrap()
+            .write_image_data(input)
+            .unwrap();
+
+        let wire = format!("\x1b_Gi=1,f=100;{}\x1b\\", PAYLOAD_ENGINE.encode(&png));
+        feed(wire.as_bytes(), 13, |command| {
+            let reply = images.receive(command.unwrap(), |_| Ok(())).unwrap();
+            assert_eq!(reply.message, b"OK");
+        });
+        let mut scratch = Vec::new();
+        let pixels = images.get(1).unwrap().pixels(&mut scratch).unwrap();
+        assert_eq!(pixels[3], expected[3]);
+        assert!(
+            pixels[..3]
+                .iter()
+                .zip(expected)
+                .all(|(&actual, target)| actual.abs_diff(target) <= 1),
+            "{pixels:?} vs {expected:?}"
+        );
+    }
+}
+
+#[test]
+fn png_cicp_uses_the_highest_supported_color_metadata() {
+    for (codes, depth, input, embedded, expected) in [
+        (
+            [12, 13, 0, 1],
+            png::BitDepth::Eight,
+            [185, 96, 40, 127].as_slice(),
+            moxcms::ColorProfile::new_srgb(),
+            [199, 90, 14, 127],
+        ),
+        (
+            [1, 13, 0, 1],
+            png::BitDepth::Eight,
+            &[185, 96, 40, 127],
+            moxcms::ColorProfile::new_display_p3(),
+            [185, 96, 40, 127],
+        ),
+        (
+            [12, 255, 0, 1],
+            png::BitDepth::Eight,
+            &[185, 96, 40, 127],
+            moxcms::ColorProfile::new_display_p3(),
+            [199, 90, 14, 127],
+        ),
+        (
+            [12, 8, 0, 1],
+            png::BitDepth::Sixteen,
+            &[0, 127, 0, 255, 1, 128, 127, 128],
+            moxcms::ColorProfile::new_srgb(),
+            [5, 13, 18, 127],
+        ),
+        (
+            [1, 13, 0, 0],
+            png::BitDepth::Eight,
+            &[16, 235, 126, 129],
+            moxcms::ColorProfile::new_srgb(),
+            [0, 255, 128, 129],
+        ),
+        (
+            [12, 8, 0, 0],
+            png::BitDepth::Eight,
+            &[64, 0, 64, 127],
+            moxcms::ColorProfile::new_srgb(),
+            [145, 0, 135, 127],
+        ),
+        (
+            [1, 1, 0, 0],
+            png::BitDepth::Sixteen,
+            &[0x10, 0, 0xeb, 0, 0x7d, 0x80, 127, 128],
+            moxcms::ColorProfile::new_srgb(),
+            [0, 255, 139, 127],
+        ),
+    ] {
+        let mut png = Vec::new();
+        let mut info = png::Info::with_size(1, 1);
+        info.color_type = png::ColorType::Rgba;
+        info.bit_depth = depth;
+        info.icc_profile = Some(embedded.encode().unwrap().into());
+        let mut writer = png::Encoder::with_info(&mut png, info)
+            .unwrap()
+            .write_header()
+            .unwrap();
+        writer.write_chunk(png::chunk::cICP, &codes).unwrap();
+        writer.write_chunk(png::chunk::sRGB, &[0]).unwrap();
+        writer.write_image_data(input).unwrap();
+        writer.finish().unwrap();
+
+        let wire = format!("\x1b_Gi=1,f=100;{}\x1b\\", PAYLOAD_ENGINE.encode(&png));
+        let mut images = ImageStore::new(4, 1);
+        feed(wire.as_bytes(), 13, |command| {
+            let reply = images.receive(command.unwrap(), |_| Ok(())).unwrap();
+            assert_eq!(reply.message, b"OK");
+        });
+        let mut scratch = Vec::new();
+        let pixels = images.get(1).unwrap().pixels(&mut scratch).unwrap();
+        assert_eq!(pixels[3], expected[3]);
+        assert!(
+            pixels[..3]
+                .iter()
+                .zip(expected)
+                .all(|(&actual, target)| actual.abs_diff(target) <= 1),
+            "{pixels:?} vs {expected:?}"
+        );
+    }
+}
+
+#[test]
+fn png_embedded_profiles_convert_to_srgb_and_keep_alpha() {
+    use moxcms::ColorProfile;
+
+    let linear_gray = ColorProfile::new_gray_with_gamma(1.0);
+    let mut linear_rgb = ColorProfile::new_srgb();
+    linear_rgb.cicp = None;
+    linear_rgb.red_trc = linear_gray.gray_trc.clone();
+    linear_rgb.green_trc = linear_gray.gray_trc.clone();
+    linear_rgb.blue_trc = linear_gray.gray_trc.clone();
+    let mut images = ImageStore::new(8, 1);
+    for (depth, color, profile, input, expected) in [
+        (
+            png::BitDepth::Eight,
+            png::ColorType::Rgba,
+            ColorProfile::new_display_p3(),
+            [185, 96, 40, 127].as_slice(),
+            [[199, 90, 14, 127]].as_slice(),
+        ),
+        (
+            png::BitDepth::Eight,
+            png::ColorType::GrayscaleAlpha,
+            ColorProfile::new_gray_with_gamma(1.0),
+            &[1, 31, 128, 63],
+            &[[13, 13, 13, 31], [188, 188, 188, 63]],
+        ),
+        (
+            png::BitDepth::Sixteen,
+            png::ColorType::Rgba,
+            linear_rgb,
+            &[0, 127, 0, 255, 1, 128, 127, 128],
+            &[[6, 13, 18, 127]],
+        ),
+        (
+            png::BitDepth::Sixteen,
+            png::ColorType::GrayscaleAlpha,
+            linear_gray,
+            &[0, 127, 31, 128, 0, 255, 63, 128],
+            &[[6, 6, 6, 31], [13, 13, 13, 63]],
+        ),
+        (
+            png::BitDepth::Sixteen,
+            png::ColorType::GrayscaleAlpha,
+            ColorProfile::new_gray_with_gamma(2.2),
+            &[0, 127, 31, 128, 0, 255, 63, 128],
+            &[[0, 0, 0, 31], [0, 0, 0, 63]],
+        ),
+    ] {
+        let profile = profile.encode().unwrap();
+        let mut png = Vec::new();
+        let mut info = png::Info::with_size(expected.len() as u32, 1);
+        info.bit_depth = depth;
+        info.color_type = color;
+        info.icc_profile = Some(profile.into());
+        info.source_gamma = Some(png::ScaledFloat::from_scaled(45_455));
+        png::Encoder::with_info(&mut png, info)
+            .unwrap()
+            .write_header()
+            .unwrap()
+            .write_image_data(input)
+            .unwrap();
+
+        let wire = format!("\x1b_Gi=1,f=100;{}\x1b\\", PAYLOAD_ENGINE.encode(&png));
+        feed(wire.as_bytes(), 17, |command| {
+            let reply = images.receive(command.unwrap(), |_| Ok(())).unwrap();
+            assert_eq!(reply.message, b"OK");
+        });
+        let mut scratch = Vec::new();
+        let pixels = images.get(1).unwrap().pixels(&mut scratch).unwrap();
+        assert_eq!(pixels.len(), expected.len() * 4);
+        for (pixel, reference) in pixels.as_chunks::<4>().0.iter().zip(expected) {
+            assert_eq!(pixel[3], reference[3]);
+            assert!(
+                pixel[..3]
+                    .iter()
+                    .zip(reference)
+                    .all(|(&a, &b)| a.abs_diff(b) <= 1),
+                "{pixel:?}"
+            );
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn local_reply(images: &mut ImageStore, controls: &str, name: &[u8]) -> Reply {
     let wire = format!("\x1b_G{controls};{}\x1b\\", PAYLOAD_ENGINE.encode(name));
@@ -988,16 +1277,36 @@ fn local_transfers_use_checked_ranges_and_unlink_only_tagged_temp_files() {
     let mut images = ImageStore::new(16, 4);
     let b = |path: &std::path::Path| path.as_os_str().as_encoded_bytes().to_vec();
     assert_eq!(
-        local_reply(&mut images, "i=1,t=f,s=1,v=1,S=23,O=2", &b(&link)).message,
+        local_reply(&mut images, "i=1,t=f,s=1,v=1,S=5,O=2", &b(&link)).message,
         b"OK"
     );
-    assert_eq!(
-        local_reply(&mut images, "a=q,i=1,t=f,s=1,v=1,S=3,O=2", &b(&link)).message,
-        b"EBADF:Failed to read image file"
-    );
+    let revision = images.get(1).unwrap().source_revision();
+    for controls in ["a=q,i=1,t=f,s=1,v=1,S=3,O=2", "i=1,t=f,s=1,v=1,S=6,O=2"] {
+        assert_eq!(
+            local_reply(&mut images, controls, &b(&link)).message,
+            b"EBADF:Failed to read image file"
+        );
+        assert_eq!(images.get(1).unwrap().source_revision(), revision);
+    }
     for path in [&fifo, &directory.0.join("missing"), &file] {
         let reply = local_reply(&mut images, "i=1,t=f,s=1,v=1,S=4,O=5", &b(path));
         assert_eq!(reply.message, b"EBADF:Failed to read image file");
+    }
+    for (controls, expected) in [
+        (
+            "a=q,i=1,t=f,f=100",
+            b"EBADPNG:Invalid PNG image data".as_slice(),
+        ),
+        ("a=q,i=1,t=f,f=100,O=7", b"EBADPNG:Invalid PNG image data"),
+        (
+            "a=q,i=1,t=f,f=100,o=z",
+            b"EINVAL:Invalid image data".as_slice(),
+        ),
+    ] {
+        assert_eq!(
+            local_reply(&mut images, controls, &b(&link)).message,
+            expected
+        );
     }
     assert_eq!(
         images.get(1).unwrap().pixels(&mut Vec::new()).unwrap(),
@@ -1050,12 +1359,6 @@ fn posix_shared_transfer_reads_and_unlinks_the_object() {
         .unwrap()
         .as_nanos();
     let name = format!("lune-graphics-{nonce}");
-    let file = shm::open(
-        name.as_str(),
-        OFlags::CREATE | OFlags::EXCL | OFlags::RDWR,
-        Mode::RUSR | Mode::WUSR,
-    )
-    .unwrap();
     struct Cleanup<'a>(&'a str);
     impl Drop for Cleanup<'_> {
         fn drop(&mut self) {
@@ -1063,24 +1366,32 @@ fn posix_shared_transfer_reads_and_unlinks_the_object() {
         }
     }
     let _cleanup = Cleanup(&name);
-    File::from(file).write_all(&[0, 3, 17, 0]).unwrap();
     let mut images = ImageStore::new(4, 1);
-    assert_eq!(
-        local_reply(
-            &mut images,
-            "i=1,t=s,f=16,s=1,v=1,O=1,S=19",
-            name.as_bytes()
+    for (size, expected) in [
+        (3, b"OK".as_slice()),
+        (4, b"EBADF:Failed to read image file"),
+    ] {
+        let file = shm::open(
+            name.as_str(),
+            OFlags::CREATE | OFlags::EXCL | OFlags::RDWR,
+            Mode::RUSR | Mode::WUSR,
         )
-        .message,
-        b"OK"
-    );
-    let image = images.get(1).unwrap();
+        .unwrap();
+        File::from(file).write_all(&[0, 3, 17, 0]).unwrap();
+        let controls = format!("i={size},t=s,f=16,s=1,v=1,O=1,S={size}");
+        assert_eq!(
+            local_reply(&mut images, &controls, name.as_bytes()).message,
+            expected
+        );
+        assert_eq!(
+            shm::open(name.as_str(), OFlags::RDONLY, Mode::empty()).unwrap_err(),
+            rustix::io::Errno::NOENT
+        );
+    }
+    let image = images.get(3).unwrap();
     assert_eq!(image.format(), ImageFormat::IndexedAlpha);
     assert_eq!(image.pixels(&mut Vec::new()).unwrap(), &[3, 17]);
-    assert_eq!(
-        shm::open(name.as_str(), OFlags::RDONLY, Mode::empty()).unwrap_err(),
-        rustix::io::Errno::NOENT
-    );
+    assert!(images.get(4).is_none());
 }
 
 #[test]

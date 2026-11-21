@@ -56,7 +56,7 @@ impl<'a> Viewport<'a> {
         &self,
     ) -> impl ExactSizeIterator<Item = &'a Row> + DoubleEndedIterator + FusedIterator + use<'a>
     {
-        self.view.iter_rows().skip(self.start).take(self.height)
+        self.view.rows_in(self.range())
     }
 
     /// Visits viewport rows and, for virtual parents, the remaining live rows.

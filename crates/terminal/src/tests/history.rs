@@ -183,7 +183,7 @@ fn byte_limits_account_for_capacity_and_oversized_rows_break_adjacency() {
 }
 
 #[test]
-fn alternate_and_partial_scrolling_preserve_history_and_screen_state_rules() {
+fn capture_follows_the_primary_top_region() {
     let mut screen = Screen::new(4, 4).unwrap();
     screen.write_ascii(b"abcdefghijklZ", StyleId(1)).unwrap();
     screen.set_history_limits(limits(4, 4096)).unwrap();
@@ -212,7 +212,11 @@ fn alternate_and_partial_scrolling_preserve_history_and_screen_state_rules() {
     assert!(screen.origin_mode() && screen.insert_mode());
     screen.set_scroll_region(0..2).unwrap();
     screen.scroll_up(1, StyleId(4)).unwrap();
-    assert_eq!(screen.history().row(0).unwrap().wrap_end(), None);
+    assert_eq!(screen.history().len(), 2);
+    assert_eq!(screen.history().row(0).unwrap().wrap_end(), Some(4));
+    let captured = screen.history().row(1).unwrap();
+    assert_eq!(captured.text(0), Some(CellText::Scalar('e')));
+    assert_eq!(captured.wrap_end(), None);
     screen.clear_history();
     assert_eq!(screen.history().limits(), limits(4, 4096));
     assert!(screen.history().is_empty());
@@ -306,10 +310,15 @@ fn automatic_capture_preserves_control_boundaries_and_single_row_early_wraps() {
 fn automatic_history_matches_fragmented_unicode_input_and_edits_end_top_adjacency() {
     let wire = "abcdefghijk\r\nabc❤\u{fe0f}X\nabc\u{600}abcdefghijkl\x1b[2S水\u{301}👩\u{200d}💻";
     for columns in [1, 2, 4, 9] {
-        for rows in [1, 3] {
+        for (rows, end) in [(1, 1), (3, 3), (2, 1), (4, 3)] {
             let run = |chunk| {
                 let mut screen = Screen::new(columns, rows).unwrap();
                 screen.set_history_limits(limits(7, 65536)).unwrap();
+                if end < rows {
+                    screen.set_cursor(end, 0);
+                    screen.write_ascii(b"S", StyleId(0)).unwrap();
+                    screen.set_scroll_region(0..end).unwrap();
+                }
                 let mut processor = support::processor();
                 let mut writer = UnicodeWriter::default();
                 for part in wire.as_bytes().chunks(chunk) {
@@ -317,6 +326,12 @@ fn automatic_history_matches_fragmented_unicode_input_and_edits_end_top_adjacenc
                 }
                 processor.finish(&mut screen, &mut writer).unwrap();
                 assert_invariants(screen.grid());
+                if end < rows {
+                    assert_eq!(
+                        screen.grid().row(end).unwrap().text(0),
+                        Some(CellText::Scalar('S'))
+                    );
+                }
                 screen
             };
             let bulk = run(wire.len());

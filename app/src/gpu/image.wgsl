@@ -117,7 +117,8 @@ fn bilinear_filter(position: vec2<f32>, dimensions: vec2<u32>) -> BilinearFilter
 
 fn indexed_color(texel: vec2<i32>, has_alpha: bool) -> vec4<f32> {
     let index = textureLoad(indices, texel, 0).rg;
-    let rgb = textureLoad(palette, vec2<i32>(i32(index.r), 0), 0).rgb;
+    let palette_texel = vec2<i32>(i32(index.r & 15u), i32(index.r >> 4u));
+    let rgb = textureLoad(palette, palette_texel, 0).rgb;
     let alpha = select(1.0, f32(index.g) / 255.0, has_alpha);
     return vec4<f32>(rgb * alpha, alpha);
 }

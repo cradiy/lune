@@ -181,20 +181,31 @@ impl Screen {
                 .saturating_add(lines)
                 .min(self.history.len());
         }
+        self.shift_graphics_with_history(-(lines as i64));
+    }
+
+    fn shift_graphics_with_history(&mut self, delta: i64) {
         if !self.graphics.is_empty() {
             let first_row = -(self.history.len() as i64);
             let cell = self.graphics_cell_extent();
-            self.graphics.scroll(
-                i64::MIN..i64::MAX,
-                first_row..i64::MAX,
-                -(lines as i64),
-                cell,
-            );
+            let whole_screen = self.scroll_region.end == self.grid.rows();
+            let last_row = if whole_screen {
+                i64::MAX
+            } else {
+                self.scroll_region.end as i64
+            };
+            self.graphics
+                .scroll(i64::MIN..last_row, first_row..last_row, delta, cell);
+            if !whole_screen {
+                self.graphics.discard_history_before(first_row, cell);
+            }
         }
     }
 
     fn capture_history(&mut self, style: StyleId) -> Result<bool, StorageError> {
-        let captured = self.history.capture(&mut self.grid, style)?;
+        let captured = self
+            .history
+            .capture(&mut self.grid, self.scroll_region.end, style)?;
         self.history_captured(captured);
         Ok(captured)
     }
@@ -233,7 +244,7 @@ impl Screen {
 
     fn update_history_capture(&mut self) {
         self.history_capture = self.active_buffer == ScreenBuffer::Primary
-            && self.scroll_region == (0..self.grid.rows())
+            && self.scroll_region.start == 0
             && self.history.enabled_for(self.grid.columns());
     }
 
@@ -292,6 +303,10 @@ impl Screen {
         if !self.history_capture || !self.auto_wrap || length == 0 {
             return Ok(false);
         }
+        let Some(rows_before_scroll) = (self.scroll_region.end - 1).checked_sub(self.cursor.row)
+        else {
+            return Ok(false);
+        };
         let columns = self.grid.columns();
         let start = if self.cursor.wrap_pending {
             columns
@@ -299,7 +314,7 @@ impl Screen {
             self.cursor.column
         };
         let wraps = start.saturating_add(length - 1) / columns;
-        let scrolls = wraps.saturating_sub(self.grid.rows() - 1 - self.cursor.row);
+        let scrolls = wraps.saturating_sub(rows_before_scroll);
         self.history.prepare(columns, scrolls, style)
     }
 
@@ -355,6 +370,11 @@ impl Screen {
             .chain(self.inactive.graphics.as_slice())
     }
 
+    pub(crate) fn has_graphics_orphans(&self) -> bool {
+        self.graphics.has_orphans() || self.inactive.graphics.has_orphans()
+    }
+
+    #[cold]
     pub(crate) fn reap_graphics_orphans(&mut self, images: &mut [ImageStore; 2]) {
         let active = self.active_buffer as usize;
         self.graphics.reap_orphans(&mut images[active]);
@@ -393,6 +413,10 @@ impl Screen {
 
     pub fn graphics_revision(&self) -> Option<u64> {
         self.graphics.revision()
+    }
+
+    pub fn inactive_graphics_revision(&self) -> Option<u64> {
+        self.inactive.graphics.revision()
     }
 
     pub fn has_virtual_graphics(&self) -> bool {
@@ -941,9 +965,14 @@ impl Screen {
         let (row, column) = if wrap {
             let row = if self.cursor.row == self.scroll_region.end - 1 {
                 if self.history_capture {
-                    let captured =
-                        self.history
-                            .write_scrolling(&mut self.grid, text, width, style, gap)?;
+                    let captured = self.history.write_scrolling(
+                        &mut self.grid,
+                        self.scroll_region.end,
+                        text,
+                        width,
+                        style,
+                        gap,
+                    )?;
                     self.history_captured(captured);
                 } else {
                     self.grid.write_scrolling(
@@ -1132,7 +1161,7 @@ impl Screen {
                     }
                     if self.history_capture {
                         let captured = self.capture_history(style)?;
-                        if self.grid.rows() == 1 && captured {
+                        if self.scroll_region.end == 1 && captured {
                             self.history.connect_latest(columns);
                         }
                     } else {
@@ -1228,8 +1257,8 @@ impl Screen {
     /// region's height; zero preserves all state. The cursor position, pending
     /// wrapping, and region boundaries are preserved, including when the cursor
     /// is outside the region. Retained rows keep their text and style; recycled
-    /// row buffers are reused. Primary full-screen scrolling captures history
-    /// under its configured limits, reserving replacements before mutation.
+    /// row buffers are reused. Primary scrolling from row zero captures history
+    /// within its configured limits, reserving replacements before mutation.
     /// Every error preserves both buffers, history, and cursor state.
     #[inline]
     pub fn scroll_up(&mut self, count: usize, style: StyleId) -> Result<(), StorageError> {
@@ -1244,7 +1273,10 @@ impl Screen {
             let prepared = self.history.prepare(self.grid.columns(), count, style)?;
             let mut captured = 0;
             let result = (0..count).try_for_each(|_| {
-                if self.history.capture(&mut self.grid, style)? {
+                if self
+                    .history
+                    .capture(&mut self.grid, self.scroll_region.end, style)?
+                {
                     captured += 1;
                 } else {
                     self.scroll_captured_history(std::mem::take(&mut captured));
@@ -1280,6 +1312,33 @@ impl Screen {
             .scroll_down(self.scroll_region.clone(), count, style)
             .expect("The scrolling region is valid");
         self.scroll_graphics(self.scroll_region.start, count, true);
+    }
+
+    pub(crate) fn unscroll(&mut self, count: usize, style: StyleId) -> Result<(), StorageError> {
+        if count == 0 {
+            return Ok(());
+        }
+        if self.active_buffer != ScreenBuffer::Primary
+            || self.scroll_region.start != 0
+            || self.history.is_empty()
+        {
+            self.scroll_down(count, style);
+            return Ok(());
+        }
+        let count = count.min(self.grid.rows().max(self.history.len()));
+        let restored = count.min(self.history.len());
+        let blank = count - restored;
+        self.history.restore(
+            &mut self.grid,
+            self.scroll_region.end,
+            restored,
+            blank,
+            style,
+        )?;
+        self.display_offset = self.display_offset.saturating_sub(restored);
+        self.shift_graphics_with_history(restored as i64);
+        self.scroll_graphics(0, blank, true);
+        Ok(())
     }
 
     /// Inserts blank rows at the cursor, shifting rows down through the scrolling
@@ -1371,8 +1430,8 @@ impl Screen {
     /// Advances one row, scrolling at the region's bottom edge. Outside the
     /// region, movement stops at the physical bottom without scrolling. The
     /// column is preserved and pending wrapping is canceled. Exposed cells use `style`.
-    /// Full-screen primary scrolling captures history. Allocation failures preserve
-    /// both buffers, history, and cursor state.
+    /// Primary scrolling from row zero captures history. Allocation failures
+    /// preserve both buffers, history, and cursor state.
     #[inline]
     pub fn line_feed(&mut self, style: StyleId) -> Result<(), StorageError> {
         if self.cursor.row == self.scroll_region.end - 1 {

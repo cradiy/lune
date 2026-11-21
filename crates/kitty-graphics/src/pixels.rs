@@ -4,6 +4,7 @@ use crate::source::LocalSource;
 use crate::{Command, Controls, PayloadError, Value};
 
 mod png_data;
+pub(crate) use png_data::PngProfiles;
 use png_data::decode_png;
 
 pub(crate) const INVALID: &[u8] = b"EINVAL:Invalid image data";
@@ -203,7 +204,11 @@ impl PixelTransfer {
         Ok(())
     }
 
-    pub(crate) fn finish(self, max_bytes: usize) -> Result<Pixels, &'static [u8]> {
+    pub(crate) fn finish(
+        self,
+        max_bytes: usize,
+        profiles: &mut PngProfiles,
+    ) -> Result<Pixels, &'static [u8]> {
         let bytes = match self.compression {
             Compression::Zlib => match self.expected {
                 Some(size) => inflate(&self.bytes, size, self.format.output_capacity(size))?,
@@ -241,7 +246,7 @@ impl PixelTransfer {
                     bytes,
                 })
             }
-            Format::Png => decode_png(&bytes, max_bytes),
+            Format::Png => decode_png(&bytes, max_bytes, profiles),
         }
     }
 }
@@ -336,21 +341,14 @@ fn inflate_chunk(
     while !input.is_empty() || !more {
         let read = decoder.total_in();
         let written = decoder.total_out() as usize;
-        let status = if written == size {
-            // Leave room to detect excess output while consuming the checksum.
-            decoder.decompress(input, &mut [0], FlushDecompress::None)
-        } else {
-            if written == output.len() {
-                let needed = written.saturating_mul(2).max(8192).min(size);
-                let reserve = if needed == size { capacity } else { needed };
-                output
-                    .try_reserve_exact(reserve - written)
-                    .map_err(|_| QUOTA)?;
-                output.resize(needed, 0);
-            }
-            decoder.decompress(input, &mut output[written..], FlushDecompress::None)
+        if written == output.capacity() && written < size {
+            let needed = written.saturating_mul(2).max(8192).min(size);
+            let reserve = if needed == size { capacity } else { needed };
+            output
+                .try_reserve_exact(reserve - written)
+                .map_err(|_| QUOTA)?;
         }
-        .map_err(|_| INVALID)?;
+        let status = decompress_into(decoder, input, output, written, size)?;
         let consumed = (decoder.total_in() - read) as usize;
         input = &input[consumed..];
         let total = decoder.total_out() as usize;
@@ -372,11 +370,10 @@ fn inflate_chunk(
 
 fn inflate(bytes: &[u8], size: usize, capacity: usize) -> Result<Vec<u8>, &'static [u8]> {
     // Grow large outputs as the decoder produces bytes.
-    let mut inflated = if size <= MAX_EAGER_INFLATE_BYTES {
-        zeroed(size, capacity)?
-    } else {
-        Vec::new()
-    };
+    let mut inflated = Vec::new();
+    if size <= MAX_EAGER_INFLATE_BYTES {
+        inflated.try_reserve_exact(capacity).map_err(|_| QUOTA)?;
+    }
     inflate_chunk(
         &mut Decompress::new(true),
         bytes,
@@ -390,37 +387,54 @@ fn inflate(bytes: &[u8], size: usize, capacity: usize) -> Result<Vec<u8>, &'stat
 
 fn inflate_limited(bytes: &[u8], limit: usize) -> Result<Vec<u8>, &'static [u8]> {
     let mut decoder = Decompress::new(true);
-    let mut block = [0; 8192];
-    let mut pixels = Vec::new();
+    let mut output = Vec::new();
+    let initial = bytes.len().clamp(256, MAX_EAGER_INFLATE_BYTES);
     loop {
         let input = decoder.total_in();
-        let output = decoder.total_out();
-        let status = decoder
-            .decompress(&bytes[input as usize..], &mut block, FlushDecompress::None)
-            .map_err(|_| INVALID)?;
-        let written = (decoder.total_out() - output) as usize;
-        if written > limit - pixels.len() {
+        let filled = decoder.total_out() as usize;
+        let input_bytes = &bytes[input as usize..];
+        if filled == output.capacity() && filled < limit {
+            let additional = filled.max(initial).min(limit - filled);
+            output.try_reserve_exact(additional).map_err(|_| QUOTA)?;
+        }
+        let status = decompress_into(&mut decoder, input_bytes, &mut output, filled, limit)?;
+        let decoded = decoder.total_out() as usize;
+        if decoded > limit {
             return Err(QUOTA);
         }
-        let needed = pixels.len() + written;
-        if needed > pixels.capacity() {
-            let capacity = pixels.capacity().saturating_mul(2).max(needed).min(limit);
-            pixels
-                .try_reserve_exact(capacity - pixels.len())
-                .map_err(|_| QUOTA)?;
-        }
-        pixels.extend_from_slice(&block[..written]);
         if status == Status::StreamEnd {
             return if decoder.total_in() == bytes.len() as u64 {
-                Ok(pixels)
+                output.truncate(decoded);
+                Ok(output)
             } else {
                 Err(INVALID)
             };
         }
-        if written == 0 && input == decoder.total_in() {
+        if decoded == filled && input == decoder.total_in() {
             return Err(INVALID);
         }
     }
+}
+
+#[inline]
+fn decompress_into(
+    decoder: &mut Decompress,
+    input: &[u8],
+    output: &mut Vec<u8>,
+    filled: usize,
+    limit: usize,
+) -> Result<Status, &'static [u8]> {
+    let result = if filled == limit {
+        // Consume the trailer and detect any output beyond the limit.
+        decoder.decompress(input, &mut [0], FlushDecompress::None)
+    } else if output.capacity() > limit {
+        // RGB expansion or allocator rounding can leave extra capacity.
+        output.resize(limit, 0);
+        decoder.decompress(input, &mut output[filled..], FlushDecompress::None)
+    } else {
+        decoder.decompress_vec(input, output, FlushDecompress::None)
+    };
+    result.map_err(|_| INVALID)
 }
 
 fn expand_rgb_pixels(rgb: &[u8], rgba: &mut [u8]) {
@@ -448,4 +462,31 @@ fn expand_rgb(mut rgba: Vec<u8>) -> Result<Vec<u8>, &'static [u8]> {
         rgba.as_chunks_mut::<4>().0[index] = [r, g, b, 255];
     }
     Ok(rgba)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use flate2::{Compression, write::ZlibEncoder};
+
+    use super::{INVALID, QUOTA, inflate_limited};
+
+    #[test]
+    fn bounded_inflation_checks_the_trailer_at_its_output_limit() {
+        let data = b"image payload".repeat(5001);
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&data).unwrap();
+        let stream = encoder.finish().unwrap();
+        let limit = data.len();
+        assert_eq!(inflate_limited(&stream, limit).unwrap(), data);
+        assert_eq!(inflate_limited(&stream, limit - 1), Err(QUOTA));
+        assert_eq!(
+            inflate_limited(&stream[..stream.len() - 1], limit),
+            Err(INVALID)
+        );
+        let mut trailing = stream;
+        trailing.push(0);
+        assert_eq!(inflate_limited(&trailing, limit), Err(INVALID));
+    }
 }

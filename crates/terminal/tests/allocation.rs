@@ -682,6 +682,180 @@ fn history_allocation_failures_preserve_owners_and_saturated_capture_reuses_rows
 }
 
 #[test]
+fn kitty_hard_deletes_keep_references_without_allocating() {
+    for remove_visible in [
+        b"\x1b_Ga=d,d=N,I=7,p=6\x1b\\".as_slice(),
+        b"\x1b_Ga=d,d=P,x=3,y=1\x1b\\",
+        b"\x1b_Ga=d,d=A\x1b\\",
+    ] {
+        let mut screen = Screen::new(8, 3).unwrap();
+        screen
+            .set_history_limits(HistoryLimits {
+                max_rows: 4,
+                max_bytes: 4096,
+            })
+            .unwrap();
+        let mut processor = support::processor();
+        let mut writer = UnicodeWriter::default();
+        processor
+            .advance(
+                concat!(
+                    "\x1b_GI=7,s=1,v=1,q=2;AAAA/w==\x1b\\",
+                    "\x1b_Ga=T,I=7,p=5,s=1,v=1,C=1,q=2;/wAA/w==\x1b\\",
+                    "\x1b[3;1H\x1bD\x1b[1;3H\x1b_Ga=p,I=7,p=6,C=1,q=2\x1b\\",
+                    "\x1b_Ga=T,i=3,P=2,Q=6,H=1,s=1,v=1,q=2;AP8A/w==\x1b\\",
+                )
+                .as_bytes(),
+                &mut screen,
+                &mut writer,
+            )
+            .unwrap();
+        for (command, newest, placement_count) in [
+            (remove_visible, Some(2), 1),
+            (b"\x1b_Ga=d,d=I,i=2,p=5\x1b\\", Some(1), 0),
+            (b"\x1b_Ga=d,d=R,x=1,y=1\x1b\\", None, 0),
+        ] {
+            let (result, stats) = allocator::measure(Some(0), || {
+                processor.advance(command, &mut screen, &mut writer)
+            });
+            assert_eq!(result.unwrap(), command.len());
+            assert_eq!(stats.attempts, 0);
+            let images = processor.graphics_images(ScreenBuffer::Primary);
+            assert_eq!(images.newest_id(7), newest);
+            assert!(images.get(3).is_none());
+            assert_eq!(screen.graphics_placements().len(), placement_count);
+            if let [retained] = screen.graphics_placements() {
+                assert_eq!((retained.placement.id, retained.row), (5, -1));
+            }
+        }
+        assert!(processor.graphics_images(ScreenBuffer::Primary).is_empty());
+    }
+}
+
+#[test]
+fn kitty_removal_resolves_history_parents_under_allocation_failure() {
+    for (command, point_delete) in [
+        (b"\x1b_Ga=d,d=Q,x=3,y=1,z=0\x1b\\".as_slice(), true),
+        (b"\x1b[2J", false),
+    ] {
+        let mut screen = Screen::new(8, 3).unwrap();
+        screen
+            .set_history_limits(HistoryLimits {
+                max_rows: 4,
+                max_bytes: 4096,
+            })
+            .unwrap();
+        let mut processor = support::processor();
+        let mut writer = UnicodeWriter::default();
+        processor
+            .advance(
+                concat!(
+                    "\x1b_Ga=T,i=42,U=1,p=5,c=1,r=1,s=1,v=1,C=1,q=2;AAAA/w==\x1b\\",
+                    "\x1b[38;5;42;58;5;5m\u{10eeee}\x1b[0m",
+                    "\x1b_Ga=T,i=43,P=42,Q=5,H=2,V=1,C=1,s=1,v=1,q=2;/wAA/w==\x1b\\",
+                    "\x1b[3;1H\x1bD",
+                )
+                .as_bytes(),
+                &mut screen,
+                &mut writer,
+            )
+            .unwrap();
+        assert_eq!(screen.graphics_placements().len(), 2);
+        assert_eq!(screen.history().len(), 1);
+
+        let (result, stats) = allocator::measure(Some(0), || {
+            processor.advance(command, &mut screen, &mut writer)
+        });
+        assert_eq!(result.unwrap(), command.len());
+        if point_delete {
+            assert_eq!(stats.attempts, 0);
+        }
+        let [prototype] = screen.graphics_placements() else {
+            panic!("The virtual prototype remains");
+        };
+        assert!(prototype.is_virtual());
+        let images = processor.graphics_images(ScreenBuffer::Primary);
+        assert!(images.get(42).is_some());
+        assert!(images.get(43).is_none());
+    }
+}
+
+#[test]
+fn unscroll_widens_rows_atomically_and_moves_owned_text() {
+    let prepare = |columns| {
+        let mut screen = Screen::new(4, 2).unwrap();
+        screen
+            .set_history_limits(HistoryLimits {
+                max_rows: 4,
+                max_bytes: 4096,
+            })
+            .unwrap();
+        for text in ["e\u{301}", "a\u{30a}"] {
+            screen.set_cursor(0, 0);
+            screen.write(text, CellWidth::Single, StyleId(0)).unwrap();
+            screen.write_ascii(b"Z", StyleId(0)).unwrap();
+            screen.write("水", CellWidth::Double, StyleId(0)).unwrap();
+            screen.scroll_up(1, StyleId(0)).unwrap();
+        }
+        screen.resize(columns, 3, StyleId(0)).unwrap();
+        screen.set_scroll_region(0..2).unwrap();
+        screen.scroll_viewport_up(2);
+        screen
+    };
+    let command = b"\x1b[2+T";
+    for columns in [3, 4, 9] {
+        let mut expected_screen = prepare(columns);
+        let mut processor = support::processor();
+        let mut writer = UnicodeWriter::default();
+        let (result, stats) = allocator::measure(None, || {
+            processor.advance(command, &mut expected_screen, &mut writer)
+        });
+        assert_eq!(result.unwrap(), command.len());
+        assert_eq!(stats.attempts == 0, columns <= 4);
+        assert_eq!(expected_screen.history().retained_bytes(), 0);
+        assert_eq!(expected_screen.viewport_offset(), 0);
+        let first = expected_screen.grid().row(0).unwrap();
+        assert_eq!(first.text(0), Some(CellText::Extended("e\u{301}")));
+        assert_eq!(
+            first.text(2),
+            Some(CellText::Scalar(if columns == 3 { ' ' } else { '水' }))
+        );
+
+        for point in 0..stats.attempts {
+            let mut screen = prepare(columns);
+            let before = (
+                snapshot(screen.grid()),
+                retained(screen.history()),
+                screen.cursor(),
+            );
+            let mut processor = support::processor();
+            let (result, failed) = allocator::measure(Some(point), || {
+                processor.advance(command, &mut screen, &mut writer)
+            });
+            let error = result.unwrap_err();
+            assert!(matches!(
+                error.error,
+                ProcessFailure::Screen(StorageError::Allocation(_))
+            ));
+            assert_eq!(error.consumed, command.len());
+            assert_eq!(failed.failures, 1);
+            assert_eq!(
+                (
+                    snapshot(screen.grid()),
+                    retained(screen.history()),
+                    screen.cursor()
+                ),
+                before
+            );
+            assert_eq!(screen.viewport_offset(), 2);
+            assert_eq!(processor.advance(&[], &mut screen, &mut writer).unwrap(), 0);
+            assert_eq!(snapshot(screen.grid()), snapshot(expected_screen.grid()));
+            assert_eq!(screen.history().retained_bytes(), 0);
+        }
+    }
+}
+
+#[test]
 fn automatic_history_preflights_complete_text_callbacks_and_counted_scrolls() {
     for case in 0..9 {
         let prepare = || {

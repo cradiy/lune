@@ -1243,15 +1243,28 @@ impl Region {
 }
 
 fn blend(target: &mut [u8; 4], source: &[u8; 4]) {
-    if source[3] == 0 {
-        return;
-    }
-    if source[3] == 255 || target[3] == 0 {
+    if source[3] == 255 {
         *target = *source;
         return;
     }
-    let front = u32::from(source[3]) * 255;
-    let back = u32::from(target[3]) * (255 - u32::from(source[3]));
+    if source[3] == 0 {
+        return;
+    }
+    if target[3] == 0 {
+        *target = *source;
+        return;
+    }
+    let opacity = u32::from(source[3]);
+    let inverse = 255 - opacity;
+    if target[3] == 255 {
+        for (dst, &src) in target[..3].iter_mut().zip(source) {
+            let mixed = u32::from(src) * opacity + u32::from(*dst) * inverse;
+            *dst = ((mixed + 127) / 255) as u8;
+        }
+        return;
+    }
+    let front = opacity * 255;
+    let back = u32::from(target[3]) * inverse;
     let total = front + back;
     for (dst, &src) in target[..3].iter_mut().zip(source) {
         let mixed = u32::from(src) * front + u32::from(*dst) * back;
