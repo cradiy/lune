@@ -102,7 +102,7 @@ fn drive(wire: &[u8], chunk: usize, fail_at: usize, expected: &Expected<'_>) {
     let mut screen = Screen::new(8, 4).unwrap();
     let mut processor = support::processor();
     processor.set_color_scheme(expected.color_scheme);
-    processor.update_geometry(&screen, expected.pixel_sizes[0], expected.pixel_sizes[1]);
+    processor.update_geometry(&mut screen, expected.pixel_sizes[0], expected.pixel_sizes[1]);
     let mut calls = 0;
     let mut available = false;
     let mut replies = Vec::new();

@@ -1,6 +1,6 @@
 use lune_text::{GraphemeBuffer, TextFailure, TextUpdate, WidthPolicy};
 
-use crate::{CellPosition, CellWidth, Screen, StorageError, StyleId};
+use crate::{CellPosition, CellWidth, GRAPHICS_PLACEHOLDER, Screen, StorageError, StyleId};
 
 const _: () = assert!(lune_text::MAX_GRAPHEME_BYTES == crate::MAX_CELL_TEXT_BYTES);
 
@@ -177,7 +177,9 @@ impl UnicodeWriter {
                         } else {
                             columns - column
                         };
-                        let width = if unit.columns.min(available) >= 2 {
+                        let width = if unit.columns.min(available) >= 2
+                            && !unit.text.starts_with(GRAPHICS_PLACEHOLDER)
+                        {
                             CellWidth::Double
                         } else {
                             CellWidth::Single

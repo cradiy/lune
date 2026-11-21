@@ -58,6 +58,68 @@ fn rejected_reflow_commit_leaves_source_rows_in_place() {
 }
 
 #[test]
+fn graphics_anchors_reflow_with_primary_text_and_alternate_crop() {
+    let mut screen = Screen::new(6, 3).unwrap();
+    screen
+        .write_ascii(b"abcdefghi", StyleId::default())
+        .unwrap();
+    let mut processor = super::support::processor();
+    let mut text =
+        |screen: &mut Screen, value: &str, style| screen.write_ascii(value.as_bytes(), style);
+    processor
+        .advance(
+            b"\x1b[1;5H\x1b_Ga=T,i=1,p=1,s=1,v=1,C=1,q=1;/wAA/w==\x1b\\\x1b_Ga=T,i=2,P=1,Q=1,H=1,V=1,s=1,v=1,q=1;AAD//w==\x1b\\\x1b[1;1H",
+            &mut screen,
+            &mut text,
+        )
+        .unwrap();
+    assert!(processor.reply_bytes().is_empty());
+    screen.save_cursor();
+    let root_serial = screen.graphics_placements()[0].serial();
+    screen.select_buffer(ScreenBuffer::Alternate);
+    processor
+        .advance(
+            b"\x1b[1;6H\x1b_Ga=T,i=3,s=1,v=1,C=1,q=1;AAAA/w==\x1b\\\x1b[1;2H\x1b_Ga=T,i=4,s=1,v=1,C=1,q=1;AAAA/w==\x1b\\",
+            &mut screen,
+            &mut text,
+        )
+        .unwrap();
+    assert!(processor.reply_bytes().is_empty());
+    let snapshot = |screen: &Screen| {
+        screen
+            .all_graphics_placements()
+            .map(|image| (image.serial(), image.row, image.column))
+            .collect::<Vec<_>>()
+    };
+    let before = snapshot(&screen);
+    let rejected = screen.reflow_with(3, 5, StyleId::default(), || Err(StorageError::OutOfBounds));
+    assert!(matches!(rejected, Err(StorageError::OutOfBounds)));
+    assert_eq!(snapshot(&screen), before);
+    screen.reflow(3, 5, StyleId::default()).unwrap();
+    let [remaining] = screen.graphics_placements() else {
+        panic!("One alternate placement stays")
+    };
+    assert_eq!(remaining.placement.image.id(), 4);
+    assert_eq!((remaining.row, remaining.column), (0, 1));
+    screen.select_buffer(ScreenBuffer::Primary);
+
+    let [root, child] = screen.graphics_placements() else {
+        panic!("Primary placements stay")
+    };
+    assert_eq!(root.serial(), root_serial);
+    assert_eq!((root.row, root.column), (1, 1));
+    assert_eq!(
+        screen
+            .grid()
+            .row(root.row as usize)
+            .unwrap()
+            .text(root.column as usize),
+        Some(CellText::Scalar('e'))
+    );
+    assert_eq!((child.row, child.column), (2, 2));
+}
+
+#[test]
 fn screen_reflow_moves_text_allocations_and_budgets_their_retained_capacity() {
     let mut screen = Screen::new(4, 2).unwrap();
     screen

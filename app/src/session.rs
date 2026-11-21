@@ -6,11 +6,11 @@ use std::time::{Duration, Instant};
 
 use lune_pty::{ChildExit, Pty, PtySize};
 use lune_terminal::{
-    CellPosition, Color, ColorScheme, CursorAppearance, DisplayUnits, HistoryLimits, Key,
-    KeySequence, MAX_STYLES, Modifiers, MouseEvent, MouseFormat, MouseSequence, MouseTracking,
-    Palette, PaletteEntry, PixelPosition, ProcessFailure, Processor, Rgb, Row, Screen,
-    ScreenBuffer, StorageError, Style, StyleError, StyleId, StyleRun, StyleTable,
-    TerminalNotifications, TextSink, UnicodeWriter, Viewport,
+    CellPosition, Color, ColorScheme, CursorAppearance, DisplayUnit, GRAPHICS_PLACEHOLDER,
+    GraphicsImage, GraphicsPlacement, HistoryLimits, Key, KeySequence, MAX_STYLES, Modifiers,
+    MouseEvent, MouseFormat, MouseSequence, MouseTracking, Palette, PaletteEntry, PixelPosition,
+    ProcessFailure, Processor, Rgb, Row, Screen, ScreenBuffer, StorageError, Style, StyleError,
+    StyleId, StyleRun, StyleTable, TerminalNotifications, TextSink, UnicodeWriter, Viewport,
 };
 
 use crate::{GridGeometry, PixelRect};
@@ -48,6 +48,8 @@ pub enum MouseInputOutcome {
     HistoryScrolled,
 }
 
+pub(crate) type GraphicsStamp = (u64, u64, usize);
+
 /// Borrowed state for one presentation pass.
 pub struct PresentationFrame<'a> {
     pub viewport: Viewport<'a>,
@@ -56,6 +58,50 @@ pub struct PresentationFrame<'a> {
     pub reverse_video: bool,
     pub styles: &'a StyleTable,
     pub palette: &'a Palette,
+    graphics: &'a [GraphicsPlacement],
+    graphics_revision: Option<u64>,
+    virtual_graphics: bool,
+    processor: &'a Processor,
+}
+
+impl<'a> PresentationFrame<'a> {
+    pub fn graphics_placements(&self) -> &'a [GraphicsPlacement] {
+        self.graphics
+    }
+
+    pub fn graphics_image(&self, placement: &'a GraphicsPlacement) -> Option<&'a GraphicsImage> {
+        placement.anonymous_image().or_else(|| {
+            self.processor
+                .graphics_image(placement.placement.image.id())
+        })
+    }
+
+    #[cfg(feature = "wgpu-renderer")]
+    pub(crate) fn graphics_image_revision(
+        &self,
+        key: lune_terminal::GraphicsImageKey,
+    ) -> Option<u64> {
+        self.processor.graphics_image_revision(key)
+    }
+
+    #[cfg(feature = "wgpu-renderer")]
+    pub(crate) fn graphics_storage_revision(&self) -> u64 {
+        self.processor.graphics_storage_revision()
+    }
+
+    pub(crate) fn graphics_stamp(&self) -> Option<GraphicsStamp> {
+        self.graphics_revision.map(|revision| {
+            (
+                revision,
+                self.processor.graphics_visual_revision(),
+                self.viewport.offset(),
+            )
+        })
+    }
+
+    pub(crate) fn has_virtual_graphics(&self) -> bool {
+        self.virtual_graphics
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -87,8 +133,10 @@ impl<'a> PresentationRun<'a> {
 
     /// Complete units intersecting the span. Clip painting to its columns.
     #[inline]
-    pub fn units(&self) -> DisplayUnits<'a> {
-        self.row.display_units(self.columns())
+    pub fn units(&self) -> impl Iterator<Item = DisplayUnit<'a>> + use<'a> {
+        self.row
+            .display_units(self.columns())
+            .filter(|unit| unit.cell.character() != Some(GRAPHICS_PLACEHOLDER))
     }
 }
 
@@ -279,7 +327,7 @@ impl Session<Pty> {
             })?;
         self.geometry = GridGeometry::from_pty_size(size);
         self.processor.update_geometry(
-            &self.screen,
+            &mut self.screen,
             self.geometry.text_area_pixels(),
             self.geometry.cell_pixels(),
         );
@@ -299,9 +347,13 @@ impl<T: AsFd> AsFd for Session<T> {
 }
 
 impl<T: Read + Write> Session<T> {
-    fn new(transport: T, size: PtySize, screen: Screen, mut processor: Processor) -> Self {
+    fn new(transport: T, size: PtySize, mut screen: Screen, mut processor: Processor) -> Self {
         let geometry = GridGeometry::from_pty_size(size);
-        processor.update_geometry(&screen, geometry.text_area_pixels(), geometry.cell_pixels());
+        processor.update_geometry(
+            &mut screen,
+            geometry.text_area_pixels(),
+            geometry.cell_pixels(),
+        );
         Self {
             transport,
             child_exit: None,
@@ -344,12 +396,25 @@ impl<T: Read + Write> Session<T> {
             reverse_video: screen.reverse_video(),
             styles: self.processor.styles(),
             palette: self.processor.palette(),
+            graphics: screen.graphics_placements(),
+            graphics_revision: screen.graphics_revision(),
+            virtual_graphics: screen.has_virtual_graphics(),
+            processor: &self.processor,
         })
     }
 
-    /// When to pump again to release a synchronized frame, even if the PTY is idle.
+    /// When to pump again for presentation work, even if the PTY is idle.
     pub fn presentation_deadline(&self) -> Option<Instant> {
-        self.presentation_deadline
+        if self.finished {
+            return None;
+        }
+        match (
+            self.presentation_deadline,
+            self.processor.graphics_animation_deadline(),
+        ) {
+            (Some(sync), Some(animation)) => Some(sync.min(animation)),
+            (sync, animation) => sync.or(animation),
+        }
     }
 
     pub fn processor(&self) -> &Processor {
@@ -602,6 +667,7 @@ impl<T: Read + Write> Session<T> {
         {
             self.processor.end_synchronized_output();
             self.presentation_deadline = None;
+            self.processor.poll_graphics_animations(&now);
             return Ok(());
         }
 
@@ -611,6 +677,9 @@ impl<T: Read + Write> Session<T> {
                 .get_or_insert_with(|| now() + SYNCHRONIZED_OUTPUT_TIMEOUT);
         } else {
             self.presentation_deadline = None;
+        }
+        if !self.finished {
+            self.processor.poll_graphics_animations(now);
         }
         result
     }

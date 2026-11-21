@@ -111,7 +111,7 @@ enum Pending {
     ModeReply(ModeReport),
     StatusReply(StatusReport),
     ColorReply(ColorReport),
-    GraphicsReply(lune_kitty_graphics::Reply),
+    GraphicsReply,
     OscReplies,
     SizeReply(SizeReport),
     PushTitle,
@@ -243,6 +243,26 @@ impl Processor {
         self.state.graphics.get(id)
     }
 
+    pub fn graphics_image_revision(&self, key: crate::GraphicsImageKey) -> Option<u64> {
+        self.state.graphics.image_revision(key)
+    }
+
+    pub fn graphics_visual_revision(&self) -> u64 {
+        self.state.graphics.visual_revision()
+    }
+
+    pub fn graphics_storage_revision(&self) -> u64 {
+        self.state.graphics.storage_revision()
+    }
+
+    pub fn graphics_animation_deadline(&self) -> Option<std::time::Instant> {
+        self.state.graphics.animation_deadline()
+    }
+
+    pub fn poll_graphics_animations(&mut self, clock: impl FnOnce() -> std::time::Instant) {
+        self.state.graphics.poll_animations(clock);
+    }
+
     /// Starts with default rendition and a bounded style table. Construction
     /// makes no allocation requests; the limit includes permanent default.
     pub fn new(style_limit: usize, palette: Palette) -> Result<Self, StyleError> {
@@ -291,12 +311,14 @@ impl Processor {
     /// sizes, and subscribed applications receive changes to the text area.
     pub fn update_geometry(
         &mut self,
-        screen: &Screen,
+        screen: &mut Screen,
         text_area: Option<PixelSize>,
         cell: Option<PixelSize>,
     ) {
         self.state.text_area_pixels = text_area;
         self.state.cell_pixels = cell;
+        screen.set_graphics_cell(cell);
+        self.state.graphics.reap_orphans(screen);
         if let Some(previous) = self.state.resize_reporting {
             let size = ResizeReport::capture(screen, text_area);
             if size != previous {
@@ -741,7 +763,7 @@ impl Processor {
                             *end += 1;
                             true
                         } else {
-                            execute_csi(screen, sequence, state, pending, end)
+                            execute_csi(screen, sequence, state, styles, pending, end)
                         }
                     } else if matches!(sequence.final_byte, b'c' | b'q' | b't') {
                         if let Some(action) = window_or_identity_action(screen, state, sequence) {
@@ -749,7 +771,7 @@ impl Processor {
                             *end += 1;
                             true
                         } else {
-                            execute_csi(screen, sequence, state, pending, end)
+                            execute_csi(screen, sequence, state, styles, pending, end)
                         }
                     } else if sequence.final_byte == b'b' {
                         repeat_sequence(sequence, state.last_graphic, pending, end)
@@ -757,7 +779,7 @@ impl Processor {
                         sequence.intermediates == b"#"
                             && rendition_stack(sequence, state, styles, pending, end)
                     } else {
-                        execute_csi(screen, sequence, state, pending, end)
+                        execute_csi(screen, sequence, state, styles, pending, end)
                     };
                     state.last_graphic = '\0';
                     if !accepted {
@@ -787,8 +809,8 @@ impl Processor {
                 }
                 Event::Apc(event) => {
                     state.last_graphic = '\0';
-                    if let Some(reply) = state.graphics.event(event) {
-                        pending[*end] = Some(Pending::GraphicsReply(reply));
+                    if state.graphics.event(event, screen, styles) {
+                        pending[*end] = Some(Pending::GraphicsReply);
                         *end += 1;
                     }
                 }
@@ -812,6 +834,7 @@ impl Processor {
             self.drain(screen, text)
                 .map_err(|error| ProcessError { consumed, error })?;
         }
+        self.state.graphics.reap_orphans(screen);
         Ok(consumed)
     }
 
@@ -969,10 +992,15 @@ impl Processor {
                     }
                     reply.encode(&mut self.reply);
                 }
-                Pending::GraphicsReply(reply) => {
+                Pending::GraphicsReply => {
                     if !self.reply.is_empty() {
                         return Err(ProcessFailure::ReplyPending);
                     }
+                    let reply = self
+                        .state
+                        .graphics
+                        .take_reply()
+                        .expect("A graphics reply is pending");
                     self.reply.graphics(reply);
                 }
                 Pending::SizeReply(reply) => {
@@ -1290,13 +1318,14 @@ fn execute_csi(
     screen: &mut Screen,
     sequence: ControlSequence<'_>,
     state: &mut State,
+    styles: &StyleTable,
     pending: &mut [Option<Pending>; PENDING_CAPACITY],
     end: &mut usize,
 ) -> bool {
     if matches!(sequence.final_byte, b'h' | b'l') && sequence.intermediates.is_empty() {
         set_modes(screen, sequence, state, pending, end)
     } else {
-        csi(screen, sequence, state)
+        csi(screen, sequence, state, styles)
     }
 }
 
@@ -1401,7 +1430,7 @@ fn set_modes(
                     && !enabled
                     && screen.active_buffer() == ScreenBuffer::Alternate
                 {
-                    screen.erase_display(EraseMode::All, state.style);
+                    screen.clear_alternate_display(state.style);
                 }
                 screen.select_buffer(if enabled {
                     ScreenBuffer::Alternate
@@ -1410,7 +1439,7 @@ fn set_modes(
                 });
                 if parameter.value == Some(1049) {
                     if enabled {
-                        screen.erase_display(EraseMode::All, state.style);
+                        screen.clear_alternate_display(state.style);
                     } else {
                         restore_cursor(screen, state);
                     }
@@ -1444,7 +1473,12 @@ fn set_modes(
     true
 }
 
-fn csi(screen: &mut Screen, sequence: ControlSequence<'_>, state: &mut State) -> bool {
+fn csi(
+    screen: &mut Screen,
+    sequence: ControlSequence<'_>,
+    state: &mut State,
+    styles: &StyleTable,
+) -> bool {
     let style = state.style;
     let p = sequence.parameters;
     if p.iter().any(|p| p.is_subparameter) {
@@ -1539,6 +1573,9 @@ fn csi(screen: &mut Screen, sequence: ControlSequence<'_>, state: &mut State) ->
                 return false;
             };
             if sequence.final_byte == b'J' {
+                if mode == EraseMode::All {
+                    screen.clear_live_graphics(styles);
+                }
                 screen.erase_display(mode, style);
             } else {
                 screen.erase_line(mode, style);

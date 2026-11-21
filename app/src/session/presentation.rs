@@ -3,8 +3,8 @@ use std::num::NonZeroU32;
 use std::time::{Duration, Instant};
 
 use lune_terminal::{
-    CellPosition, CellText, CursorAppearance, CursorShape, DisplayUnit, Palette, PaletteEntry, Rgb,
-    Row, RowRevision, Style, StyleError,
+    CellPosition, CellText, CursorAppearance, CursorShape, DisplayUnit, GraphicsImageFormat,
+    Palette, PaletteEntry, Rgb, Row, RowRevision, Style, StyleError,
 };
 
 use crate::{GridGeometry, PixelRect};
@@ -76,7 +76,10 @@ impl<'a> PresentationFrame<'a> {
 
         let mut glyph = None;
         match cursor.appearance.shape {
-            CursorShape::Block if !covered.is_erased() => {
+            CursorShape::Block
+                if !covered.is_erased()
+                    && covered.character() != Some(lune_terminal::GRAPHICS_PLACEHOLDER) =>
+            {
                 let id = covered.style();
                 let style = self.resolve_style(id).ok_or(StyleError::InvalidId(id))?;
                 if !style.style.hidden {
@@ -148,6 +151,7 @@ impl CursorChange {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PresentationDamage<'a> {
     pub rows: RowDamage<'a>,
+    pub graphics_changed: bool,
     /// Overlay changes. Repaint an unchanged cursor when repainting its row.
     pub cursor: Option<CursorChange>,
     pub displayed_cursor: Option<PresentedCursor>,
@@ -248,6 +252,9 @@ impl<'a> PresentationFrame<'a> {
 #[derive(Default)]
 pub struct PresentationTracker {
     committed_geometry: Option<GridGeometry>,
+    committed_graphics: Option<super::GraphicsStamp>,
+    indexed_graphics: bool,
+    graphics_palette: u64,
     revisions: Vec<RowRevision>,
     changed_rows: Vec<usize>,
     palette: Option<Palette>,
@@ -260,6 +267,10 @@ pub struct PresentationTracker {
 pub struct PreparedPresentation<'a> {
     tracker: &'a mut PresentationTracker,
     geometry: GridGeometry,
+    graphics: Option<super::GraphicsStamp>,
+    graphics_changed: bool,
+    indexed_graphics: bool,
+    graphics_palette: u64,
     all_rows: bool,
     cursor_change: Option<CursorChange>,
     cursor: Option<CursorOverlay>,
@@ -274,6 +285,7 @@ impl PreparedPresentation<'_> {
             } else {
                 RowDamage::Rows(&self.tracker.changed_rows)
             },
+            graphics_changed: self.graphics_changed,
             cursor: self.cursor_change,
             displayed_cursor: self
                 .cursor
@@ -287,6 +299,9 @@ impl PreparedPresentation<'_> {
     #[inline]
     pub fn commit(self) {
         self.tracker.committed_geometry = Some(self.geometry);
+        self.tracker.committed_graphics = self.graphics;
+        self.tracker.indexed_graphics = self.indexed_graphics;
+        self.tracker.graphics_palette = self.graphics_palette;
         if let Some(cursor) = self.cursor {
             self.tracker.cursor = cursor;
         }
@@ -355,6 +370,21 @@ impl PresentationTracker {
             .is_none_or(|palette| !palette.same_text_colors(frame.palette));
         // Row cache entries can be reused only after the staged frame commits.
         let committed_geometry = self.committed_geometry.take();
+        let graphics = frame.graphics_stamp();
+        let indexed_graphics =
+            if graphics.map(|stamp| stamp.0) == self.committed_graphics.map(|stamp| stamp.0) {
+                self.indexed_graphics
+            } else {
+                frame.graphics_placements().iter().any(|placement| {
+                    frame
+                        .graphics_image(placement)
+                        .is_some_and(|image| image.format() != GraphicsImageFormat::Rgba)
+                })
+            };
+        let graphics_palette = frame.palette.revision();
+        let mut graphics_changed = graphics != self.committed_graphics
+            || (graphics.is_some() && committed_geometry != Some(frame.geometry))
+            || (indexed_graphics && graphics_palette != self.graphics_palette);
         let all_rows = height_changed
             || committed_geometry != Some(frame.geometry)
             || colors_changed
@@ -382,6 +412,8 @@ impl PresentationTracker {
         if colors_changed {
             self.palette = Some(frame.palette.clone());
         }
+        graphics_changed |=
+            frame.has_virtual_graphics() && (all_rows || !self.changed_rows.is_empty());
 
         let source = frame
             .viewport
@@ -414,6 +446,10 @@ impl PresentationTracker {
         Ok(PreparedPresentation {
             tracker: self,
             geometry: frame.geometry,
+            graphics,
+            graphics_changed,
+            indexed_graphics,
+            graphics_palette,
             all_rows,
             cursor_change,
             cursor,

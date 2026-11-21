@@ -43,6 +43,10 @@ impl Write for Transport {
 }
 
 fn session(source: &'static [u8]) -> Session<Transport> {
+    session_with_size(source, PtySize::new(3, 8))
+}
+
+fn session_with_size(source: &'static [u8], size: PtySize) -> Session<Transport> {
     let color = Rgb::default();
     let palette = Palette::new([color; 256], color, color, color);
     Session::new(
@@ -52,8 +56,8 @@ fn session(source: &'static [u8]) -> Session<Transport> {
             write_budget: 1,
             hung_up: false,
         },
-        PtySize::new(3, 8),
-        Screen::new(8, 3).unwrap(),
+        size,
+        Screen::new(size.columns.into(), size.rows.into()).unwrap(),
         Processor::new(MAX_STYLES, palette).unwrap(),
     )
 }
@@ -72,17 +76,815 @@ fn kitty_images_commit_after_the_last_chunk_and_keep_reply_order() {
     assert!(session.processor().graphics_image(7).is_none());
     assert!(session.transport.written.is_empty());
 
-    session.transport.source = Cursor::new(b"\x1b_Gm=0;AAD/\x1b\\\x1b[c");
+    session.transport.source = Cursor::new(
+        concat!(
+            "\x1b_Ga=q,i=31,e=T,U=1,C=1,f=32,N=1,P=2,H=-3,m=1;%%ignored%%\x1b\\",
+            "\x1b_Ga=q,i=32,e=a,s=3,c=2\x1b\\",
+            "\x1b_Gm=0;AAD/\x1b\\\x1b[c"
+        )
+        .as_bytes(),
+    );
     session.pump().unwrap();
-    let image = session.processor().graphics_image(7).unwrap();
-    assert_eq!(image.dimensions(), (2, 1));
-    assert_eq!(image.rgba(), &[255, 0, 0, 255, 0, 0, 255, 255]);
     assert_eq!(session.transport.written, b"\x1b");
     assert!(!session.wants_read());
+    assert!(session.processor().graphics_image(7).is_none());
 
     session.transport.write_budget = usize::MAX;
     session.pump().unwrap();
-    assert_eq!(session.transport.written, b"\x1b_Gi=7;OK\x1b\\\x1b[?6c");
+    let image = session.processor().graphics_image(7).unwrap();
+    assert_eq!(image.dimensions(), (2, 1));
+    assert_eq!(
+        image.pixels(&mut Vec::new()).unwrap(),
+        &[255, 0, 0, 255, 0, 0, 255, 255]
+    );
+    assert_eq!(
+        session.transport.written,
+        concat!(
+            "\x1b_Gi=31,e=T,N=1,C=1,U=1,P=2,H=-3;OK\x1b\\",
+            "\x1b_Gi=32,e=a,c=2,s=3;OK\x1b\\",
+            "\x1b_Gi=7;OK\x1b\\\x1b[?6c"
+        )
+        .as_bytes(),
+    );
+}
+
+#[test]
+fn kitty_placements_use_the_final_cursor_and_replace_atomically() {
+    let size = PtySize {
+        pixel_width: 16,
+        pixel_height: 6,
+        ..PtySize::new(3, 8)
+    };
+    let mut session = session_with_size(b"\x1b_Ga=T,i=7,p=5,f=24,s=2,v=1,m=1,C=1;/wAA\x1b\\", size);
+    session.transport.write_budget = usize::MAX;
+    session.pump().unwrap();
+    assert!(session.screen().graphics_placements().is_empty());
+
+    session.transport.source = Cursor::new(b"\x1b[2;3H\x1b_Gm=0;AAD/\x1b\\");
+    session.pump().unwrap();
+    let [image] = session.screen().graphics_placements() else {
+        panic!("Expected one placement")
+    };
+    assert_eq!((image.row, image.column), (1, 2));
+    assert_eq!(session.screen().cursor().column, 2);
+    assert_eq!(session.transport.written, b"\x1b_Gi=7,p=5;OK\x1b\\");
+
+    session.transport.source = Cursor::new(b"\x1b[1;1H\x1b_Ga=p,i=7,p=5,x=1,c=1,r=1,q=1\x1b\\\x1b_Ga=T,i=7,p=6,s=1,v=1,x=1;AAAAAA==\x1b\\");
+    session.pump().unwrap();
+    let [image] = session.screen().graphics_placements() else {
+        panic!("Expected a replaced placement")
+    };
+    assert_eq!((image.row, image.column), (0, 0));
+    assert_eq!(image.placement.source_size, [1, 1]);
+    assert_eq!(
+        (
+            session.screen().cursor().row,
+            session.screen().cursor().column
+        ),
+        (1, 1)
+    );
+    assert!(
+        session
+            .transport
+            .written
+            .ends_with(b"\x1b_Gi=7,p=6;EINVAL:Invalid placement region\x1b\\")
+    );
+    assert_eq!(
+        session.processor().graphics_image(7).unwrap().dimensions(),
+        (2, 1)
+    );
+
+    let now = Instant::now();
+    let mut tracker = PresentationTracker::default();
+    tracker
+        .prepare(&session.presentation_frame().unwrap(), now)
+        .unwrap()
+        .commit();
+    session.transport.source = Cursor::new(b"\x1b_Ga=p,i=7,p=5,C=1,q=1\x1b\\");
+    session.pump().unwrap();
+    let frame = session.presentation_frame().unwrap();
+    let prepared = tracker.prepare(&frame, now).unwrap();
+    assert_eq!(prepared.damage().rows, RowDamage::Rows(&[]));
+    assert!(prepared.damage().cursor.is_none());
+    assert!(prepared.damage().graphics_changed);
+    drop(prepared);
+    let retry = tracker.prepare(&frame, now).unwrap();
+    assert!(retry.damage().graphics_changed);
+    retry.commit();
+    assert!(
+        !tracker
+            .prepare(&frame, now)
+            .unwrap()
+            .damage()
+            .graphics_changed
+    );
+
+    session.transport.source = Cursor::new(b"\x1b[?1049h\x1b_Ga=p,i=7,C=1,q=1\x1b\\\x1b[?1049l");
+    session.pump().unwrap();
+    assert_eq!(session.screen().graphics_placements().len(), 1);
+    session.transport.source = Cursor::new(b"\x1b[2J");
+    session.pump().unwrap();
+    assert!(session.screen().graphics_placements().is_empty());
+    assert!(session.processor().graphics_image(7).is_some());
+}
+
+#[test]
+fn kitty_history_preserves_visible_fragments_until_their_rows_are_evicted() {
+    let size = PtySize {
+        pixel_width: 16,
+        pixel_height: 6,
+        ..PtySize::new(3, 8)
+    };
+    let mut session = session_with_size(
+        "\x1b_Ga=T,s=1,v=4,C=1;/wAA//8AAP8A/wD/AAD//w==\x1b\\\x1b[3;8HA水".as_bytes(),
+        size,
+    );
+    session
+        .set_history_limits(HistoryLimits {
+            max_rows: 1,
+            max_bytes: 4096,
+        })
+        .unwrap();
+    session.pump().unwrap();
+    assert!(session.scroll_history(1));
+    let frame = session.presentation_frame().unwrap();
+    let [placement] = frame.graphics_placements() else {
+        panic!("Expected one placement")
+    };
+    assert_eq!(placement.row + frame.viewport.offset() as i64, 0);
+    assert_eq!(placement.row_clip().start, -1);
+    let key = placement.placement.image;
+    assert!(session.processor().graphics_image_revision(key).is_some());
+
+    session.transport.source = Cursor::new(b"\n\x1b[2J");
+    session.pump().unwrap();
+    let [placement] = session.screen().graphics_placements() else {
+        panic!("Expected the historical fragment")
+    };
+    assert_eq!(placement.row, -2);
+    assert_eq!(placement.row_clip().start, -1);
+    assert_eq!(session.screen().viewport_offset(), 1);
+
+    session.screen.reflow(16, 3, StyleId::default()).unwrap();
+    let [resized] = session.screen().graphics_placements() else {
+        panic!("The retained history fragment survives reflow");
+    };
+    assert_eq!((resized.row, resized.row_clip().start), (-2, -1));
+
+    session.transport.source = Cursor::new(b"\x1b[3J");
+    session.pump().unwrap();
+    assert!(session.screen().graphics_placements().is_empty());
+    assert!(session.processor().graphics_image_revision(key).is_none());
+}
+
+#[test]
+fn kitty_delete_preserves_surviving_references_and_cancels_pending_uploads() {
+    let mut session = session(
+        concat!(
+            "\x1b_Ga=T,i=41,p=5,s=1,v=1,z=-2,C=1,q=1;AAAA/w==\x1b\\",
+            "\x1b[1;3H\x1b_Ga=p,i=41,p=6,z=3,C=1,q=1\x1b\\",
+            "\x1b_Ga=d,d=Q,x=1,y=1,z=-2\x1b\\"
+        )
+        .as_bytes(),
+    );
+    session.pump().unwrap();
+    let [remaining] = session.screen().graphics_placements() else {
+        panic!("Expected one placement")
+    };
+    assert_eq!(remaining.placement.id, 6);
+    assert!(session.processor().graphics_image(41).is_some());
+
+    session.transport.source = Cursor::new(b"\x1b_Ga=d,d=i,i=41,p=6\x1b\\");
+    session.pump().unwrap();
+    assert!(session.screen().graphics_placements().is_empty());
+    assert!(session.processor().graphics_image(41).is_some());
+
+    session.transport.source = Cursor::new(
+        concat!(
+            "\x1b_Ga=p,i=41,p=6,C=1,q=1\x1b\\\x1b_Ga=d,d=C\x1b\\",
+            "\x1b_Ga=t,i=42,s=1,v=1,q=1;AAAA/w==\x1b\\\x1b_Ga=d,d=R,x=42,y=42\x1b\\",
+            "\x1b_Ga=T,i=50,m=1,f=24,s=2,v=1,q=1,C=1;/wAA\x1b\\",
+            "\x1b_Ga=d,d=y,y=1\x1b\\\x1b_Gm=0;AAD/\x1b\\"
+        )
+        .as_bytes(),
+    );
+    session.pump().unwrap();
+    assert!(session.screen().graphics_placements().is_empty());
+    for id in [41, 42, 50] {
+        assert!(
+            session.processor().graphics_image(id).is_none(),
+            "Image {id}"
+        );
+    }
+    assert!(session.transport.written.is_empty());
+}
+
+#[test]
+fn kitty_numbered_images_use_the_newest_live_id() {
+    let mut session = session(
+        concat!(
+            "\x1b_Gi=1,s=1,v=1,q=1;AAAA/w==\x1b\\",
+            "\x1b_GI=13,s=1,v=1;AQID/w==\x1b\\",
+            "\x1b_GI=13,s=1,v=1;BAUG/w==\x1b\\",
+            "\x1b_Ga=p,I=13,p=9,C=1\x1b\\"
+        )
+        .as_bytes(),
+    );
+    session.transport.write_budget = usize::MAX;
+    session.pump().unwrap();
+    assert_eq!(
+        session.transport.written,
+        b"\x1b_Gi=2,I=13;OK\x1b\\\x1b_Gi=3,I=13;OK\x1b\\\x1b_Gi=3,I=13,p=9;OK\x1b\\"
+    );
+    assert_eq!(
+        session.screen().graphics_placements()[0]
+            .placement
+            .image
+            .id(),
+        3
+    );
+
+    session.transport.source = Cursor::new(
+        concat!(
+            "\x1b_Ga=d,d=N,I=13\x1b\\\x1b_Ga=p,I=13,p=10,C=1\x1b\\",
+            "\x1b_Ga=p,i=1,I=13,p=1,C=1\x1b\\"
+        )
+        .as_bytes(),
+    );
+    session.pump().unwrap();
+    let [placement] = session.screen().graphics_placements() else {
+        panic!("Expected one placement")
+    };
+    assert_eq!(placement.placement.image.id(), 2);
+    assert_eq!(
+        session
+            .processor()
+            .graphics_image(2)
+            .unwrap()
+            .pixels(&mut Vec::new())
+            .unwrap(),
+        &[1, 2, 3, 255]
+    );
+    assert!(session.processor().graphics_image(3).is_none());
+    assert!(session.transport.written.ends_with(
+        b"\x1b_Gi=2,I=13,p=10;OK\x1b\\\x1b_Gi=1,I=13,p=1;EINVAL:Invalid image data\x1b\\"
+    ));
+}
+
+#[test]
+fn kitty_relative_placements_follow_parent_replacement_and_release_descendants() {
+    let mut session = session(
+        concat!(
+            "\x1b[2;3H\x1b_Ga=T,i=20,p=1,s=1,v=1,C=1,q=1;AAAA/w==\x1b\\",
+            "\x1b_Ga=T,i=21,p=2,P=20,Q=1,H=-1,V=1,s=1,v=1,q=1;AAAA/w==\x1b\\",
+            "\x1b_Ga=T,i=22,p=3,P=21,Q=2,H=2,V=-1,s=1,v=1,q=1;AAAA/w==\x1b\\",
+            "\x1b_Ga=p,i=20,p=1,P=22,Q=3\x1b\\",
+            "\x1b_Ga=p,i=21,p=2,P=900,Q=1\x1b\\"
+        )
+        .as_bytes(),
+    );
+    session.transport.write_budget = usize::MAX;
+    session.pump().unwrap();
+    let cursor = session.screen().cursor();
+    assert_eq!((cursor.column, cursor.row), (2, 1));
+    assert_eq!(session.transport.written, b"\x1b_Gi=20,p=1;ECYCLE:Placement cycle\x1b\\\x1b_Gi=21,p=2;ENOPARENT:Parent placement missing\x1b\\");
+    let points = |session: &Session<Transport>| {
+        session
+            .screen()
+            .graphics_placements()
+            .iter()
+            .map(|p| (p.column, p.row))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(points(&session), [(2, 1), (1, 2), (3, 1)]);
+
+    session.transport.source = Cursor::new(b"\x1b[3;5H\x1b_Ga=p,i=20,p=1,C=1,q=1\x1b\\\x1b[S");
+    session.pump().unwrap();
+    assert_eq!(points(&session), [(4, 1), (3, 2), (5, 1)]);
+
+    session.transport.source = Cursor::new(b"\x1b_Ga=d,d=i,i=20,p=1\x1b\\");
+    session.pump().unwrap();
+    assert!(session.screen().graphics_placements().is_empty());
+    assert!(session.processor().graphics_image(20).is_some());
+    assert!(session.processor().graphics_image(21).is_none());
+    assert!(session.processor().graphics_image(22).is_none());
+}
+
+#[test]
+fn kitty_relative_depth_limit_keeps_the_existing_chain() {
+    use std::fmt::Write as _;
+
+    let mut session = session(b"");
+    let mut wire = String::from("\x1b_Ga=T,i=1,p=1,s=1,v=1,q=1,C=1;AAAA/w==\x1b\\");
+    for id in 2..=17 {
+        write!(
+            wire,
+            "\x1b_Ga=T,i={id},p=1,P={},Q=1,H=1,s=1,v=1,q=1;AAAA/w==\x1b\\",
+            id - 1
+        )
+        .unwrap();
+    }
+    wire.push_str("\x1b_Ga=T,i=18,p=1,P=17,Q=1,H=1,s=1,v=1;AAAA/w==\x1b\\");
+    session
+        .processor
+        .advance(wire.as_bytes(), &mut session.screen, &mut session.writer)
+        .unwrap();
+    assert_eq!(
+        session.processor.reply_bytes(),
+        b"\x1b_Gi=18,p=1;ETOODEEP:Placement chain too deep\x1b\\"
+    );
+    let placements = session.screen().graphics_placements();
+    assert_eq!(placements.len(), 17);
+    assert_eq!(placements[16].column, 16);
+    assert!(session.processor.graphics_image(18).is_none());
+}
+
+#[cfg(feature = "wgpu-renderer")]
+#[test]
+#[ignore = "Requires a Vulkan adapter"]
+fn kitty_images_compose_in_an_offscreen_wgpu_pass() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let size = PtySize {
+        pixel_width: 16,
+        pixel_height: 10,
+        ..PtySize::new(5, 8)
+    };
+    let mut session = session_with_size(
+        concat!(
+            "\x1b[2;2H\x1b_Ga=T,i=8,s=1,v=1,C=1,q=1;AAD/gA==\x1b\\",
+            "\x1b_Ga=T,i=7,s=2,v=2,C=1,q=1;/wAA/wD/AIAAAP9A////AA==\x1b\\",
+            "\x1b[1;8H\x1b_Ga=p,i=7,p=2,x=0,y=1,w=2,h=1,X=1,C=1,q=1\x1b\\",
+            "\x1b[1;1H\x1b_Ga=T,f=100,z=-1,C=1,m=1;iVBORw0KGgoAAAAN\x1b\\",
+            "\x1b_Gm=0;SUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==\x1b\\",
+            "\x1b[4;5r\x1b[4;3H\x1b_Ga=T,i=10,s=1,v=4,C=1,q=1;/wAA//8AAP8A/wD/AAD//w==\x1b\\\x1b[S",
+            "\x1b]4;3;#ff0000\x07\x1b]11;#0000ff\x07",
+            "\x1b[1;5H\x1b_Ga=T,i=11,f=8,s=1,v=1,C=1,q=1;Aw==\x1b\\",
+            "\x1b[1;6H\x1b_Ga=T,i=12,f=16,s=2,v=1,C=1,q=1;A4D4/w==\x1b\\",
+            "\x1b_Ga=T,i=33554474,p=9,U=1,c=2,r=1,s=2,v=1,q=1;//8A/wD///8=\x1b\\",
+            "\x1b_Ga=T,i=13,p=1,P=33554474,Q=9,H=3,s=1,v=1,q=1;/wD//w==\x1b\\",
+            "\x1b[5;1H\x1b[38;5;42;58;5;9m\u{10eeee}\u{305}\u{305}\u{30e}\u{10eeee}\x1b[0m"
+        )
+        .as_bytes(),
+        size,
+    );
+    session.writer = UnicodeWriter::new(lune_terminal::WidthPolicy::Wide);
+    session.pump().unwrap();
+    let frame = session.presentation_frame().unwrap();
+    assert!(
+        frame
+            .row_runs(4, 0..2)
+            .unwrap()
+            .all(|run| run.unwrap().units().next().is_none())
+    );
+
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+    let adapter =
+        pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
+            .expect("A Vulkan adapter is required");
+    let info = adapter.get_info();
+    eprintln!(
+        "Offscreen adapter: {:?} {:?}",
+        info.backend, info.device_type
+    );
+    let (device, queue) =
+        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).unwrap();
+    let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+    let mut renderer = crate::ImageRenderer::new(&device, format);
+    assert_eq!(renderer.prepare(&device, &queue, &frame), 0);
+    let now = Instant::now();
+    let mut tracker = PresentationTracker::default();
+    tracker.prepare(&frame, now).unwrap().commit();
+    let graphic_stamp = frame.graphics_stamp();
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: None,
+        size: wgpu::Extent3d {
+            width: size.pixel_width.into(),
+            height: size.pixel_height.into(),
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+
+    let stride = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: u64::from(stride) * u64::from(size.pixel_height),
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let read_frame = |renderer: &crate::ImageRenderer| {
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        {
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                ..Default::default()
+            });
+            renderer.draw(&mut pass, crate::GraphicsLayer::BehindText);
+            renderer.draw(&mut pass, crate::GraphicsLayer::AboveText);
+        }
+        encoder.copy_texture_to_buffer(
+            texture.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(stride),
+                    rows_per_image: None,
+                },
+            },
+            texture.size(),
+        );
+        let submission = queue.submit([encoder.finish()]);
+        let slice = buffer.slice(..);
+        let (send, receive) = mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            send.send(result).unwrap();
+        });
+        let timeout = Duration::from_secs(5);
+        device
+            .poll(wgpu::PollType::Wait {
+                submission_index: Some(submission),
+                timeout: Some(timeout),
+            })
+            .unwrap();
+        receive.recv_timeout(timeout).unwrap().unwrap();
+
+        let mapped = slice.get_mapped_range().unwrap().to_vec();
+        buffer.unmap();
+        mapped
+    };
+    let pixel = |mapped: &[u8], x: usize, y: usize| {
+        let start = y * stride as usize + x * 4;
+        <[u8; 4]>::try_from(&mapped[start..start + 4]).unwrap()
+    };
+    let before = read_frame(&renderer);
+    for ((x, y), expected) in [
+        ((0, 0), [255, 0, 0, 255]),
+        ((14, 0), [0, 0, 0, 0]),
+        ((15, 0), [0, 0, 137, 64]),
+        ((2, 2), [187, 0, 188, 255]),
+        ((3, 2), [0, 188, 0, 128]),
+        ((2, 3), [0, 0, 137, 64]),
+        ((3, 3), [0, 0, 0, 0]),
+        ((4, 5), [0, 0, 0, 0]),
+        ((4, 6), [0, 255, 0, 255]),
+        ((4, 7), [0, 0, 255, 255]),
+        ((8, 0), [255, 0, 0, 255]),
+        ((10, 0), [188, 0, 0, 128]),
+        ((11, 0), [0, 0, 255, 255]),
+        ((0, 8), [255, 255, 0, 255]),
+        ((2, 8), [0, 255, 255, 255]),
+        ((6, 8), [255, 0, 255, 255]),
+    ] {
+        let actual = pixel(&before, x, y);
+        assert!(
+            actual
+                .into_iter()
+                .zip(expected)
+                .all(|(actual, expected)| actual.abs_diff(expected) <= 1),
+            "({x}, {y}): {actual:?} != {expected:?}"
+        );
+    }
+
+    session.transport.source = Cursor::new(concat!(
+        "\x1b]4;3;#00ff00\x07\x1b]11;#ff0000\x07",
+        "\x1b[5;1H\x1b[2X\x1b[5;3H\x1b[38;5;42;58;5;9m\u{10eeee}\u{305}\u{305}\u{30e}\u{10eeee}\x1b[0m"
+    ).as_bytes());
+    session.pump().unwrap();
+    let frame = session.presentation_frame().unwrap();
+    assert_eq!(frame.graphics_stamp(), graphic_stamp);
+    let prepared = tracker.prepare(&frame, now).unwrap();
+    assert!(prepared.damage().graphics_changed);
+    prepared.commit();
+    assert_eq!(renderer.prepare(&device, &queue, &frame), 0);
+    let after = read_frame(&renderer);
+    assert_eq!(pixel(&after, 8, 0), [0, 255, 0, 255]);
+    let [r, g, b, a] = pixel(&after, 10, 0);
+    assert_eq!([r, b, a], [0, 0, 128]);
+    assert!(g.abs_diff(188) <= 1);
+    assert_eq!(pixel(&after, 11, 0), [255, 0, 0, 255]);
+    assert_eq!(pixel(&after, 2, 2), pixel(&before, 2, 2));
+    assert_eq!(pixel(&after, 0, 8), [0, 0, 0, 0]);
+    assert_eq!(pixel(&after, 4, 8), [255, 255, 0, 255]);
+    assert_eq!(pixel(&after, 6, 8), [0, 255, 255, 255]);
+    assert_eq!(pixel(&after, 10, 8), [255, 0, 255, 255]);
+
+    session.transport.source =
+        Cursor::new(b"\x1b_Ga=d,d=p,x=4,y=5\x1b\\\x1b_Ga=d,d=q,x=6,y=5,z=8\x1b\\");
+    session.pump().unwrap();
+    assert!(session.processor().graphics_image(13).is_some());
+
+    session.transport.source =
+        Cursor::new(b"\x1b_Ga=f,i=33554474,c=1,x=1,s=1,v=1,X=1,q=1;AP8A/w==\x1b\\");
+    session.pump().unwrap();
+    assert_eq!(
+        session.presentation_frame().unwrap().graphics_stamp(),
+        graphic_stamp
+    );
+    session.transport.source = Cursor::new(b"\x1b_Ga=a,i=33554474,s=2,r=1,z=1\x1b\\");
+    session.pump_with_clock(|| now).unwrap();
+    let next = now + Duration::from_millis(1);
+    assert_eq!(session.presentation_deadline(), Some(next));
+    session.pump_with_clock(|| next).unwrap();
+    let frame = session.presentation_frame().unwrap();
+    assert_ne!(frame.graphics_stamp(), graphic_stamp);
+    let prepared = tracker.prepare(&frame, now).unwrap();
+    assert_eq!(prepared.damage().rows, RowDamage::Rows(&[]));
+    assert!(prepared.damage().graphics_changed);
+    prepared.commit();
+    assert_eq!(renderer.prepare(&device, &queue, &frame), 0);
+    let selected = read_frame(&renderer);
+    assert_eq!(pixel(&selected, 4, 8), [255, 255, 0, 255]);
+    assert_eq!(pixel(&selected, 6, 8), [0, 255, 0, 255]);
+    assert_eq!(pixel(&selected, 10, 8), [255, 0, 255, 255]);
+
+    session.transport.source =
+        Cursor::new(b"\x1b_Ga=c,i=33554474,r=2,c=2,X=1,w=1,h=1,C=1,q=1\x1b\\");
+    session.pump().unwrap();
+    assert_eq!(
+        renderer.prepare(&device, &queue, &session.presentation_frame().unwrap()),
+        0
+    );
+    let composed = read_frame(&renderer);
+    assert_eq!(pixel(&composed, 4, 8), [0, 255, 0, 255]);
+    assert_eq!(pixel(&composed, 6, 8), [0, 255, 0, 255]);
+
+    session.transport.source = Cursor::new(b"\x1b_Ga=d,d=Q,x=6,y=5,z=0\x1b\\");
+    session.pump().unwrap();
+    assert!(session.processor().graphics_image(13).is_none());
+    let frame = session.presentation_frame().unwrap();
+    assert_eq!(renderer.prepare(&device, &queue, &frame), 0);
+    let deleted_child = read_frame(&renderer);
+    assert_eq!(pixel(&deleted_child, 4, 8), [0, 255, 0, 255]);
+    assert_eq!(pixel(&deleted_child, 6, 8), [0, 255, 0, 255]);
+    assert_eq!(pixel(&deleted_child, 10, 8), [0, 0, 0, 0]);
+
+    session.transport.source =
+        Cursor::new(b"\x1b_Ga=T,i=13,p=1,P=33554474,Q=9,H=3,s=1,v=1,q=1;/wD//w==\x1b\\\x1b_Ga=d,d=f,i=33554474,r=1\x1b\\\x1b_Ga=a,i=33554474,c=1\x1b\\");
+    session.pump().unwrap();
+    let frame = session.presentation_frame().unwrap();
+    assert_eq!(renderer.prepare(&device, &queue, &frame), 0);
+    assert_eq!(pixel(&read_frame(&renderer), 4, 8), [0, 255, 0, 255]);
+
+    session.transport.source = Cursor::new(b"\x1b_Ga=d,d=F,i=33554474,r=1\x1b\\");
+    session.pump().unwrap();
+    let frame = session.presentation_frame().unwrap();
+    assert_eq!(renderer.prepare(&device, &queue, &frame), 0);
+    let deleted = read_frame(&renderer);
+    assert_eq!(pixel(&deleted, 4, 8), [0, 0, 0, 0]);
+    assert_eq!(pixel(&deleted, 10, 8), [0, 0, 0, 0]);
+
+    let cached = frame
+        .graphics_placements()
+        .iter()
+        .find(|placement| placement.placement.image.id() == 11)
+        .unwrap()
+        .placement
+        .image;
+    session.transport.source = Cursor::new(b"\x1b_Ga=d,d=i,i=11\x1b\\");
+    session.pump().unwrap();
+    let frame = session.presentation_frame().unwrap();
+    let stamp = frame.graphics_stamp();
+    assert_eq!(renderer.prepare(&device, &queue, &frame), 0);
+    assert!(renderer.has_cached_image(cached));
+
+    session.transport.source = Cursor::new(b"\x1b_Ga=d,d=I,i=11\x1b\\");
+    session.pump().unwrap();
+    let frame = session.presentation_frame().unwrap();
+    assert_eq!(frame.graphics_stamp(), stamp);
+    assert_eq!(renderer.prepare(&device, &queue, &frame), 0);
+    assert!(!renderer.has_cached_image(cached));
+
+    session.transport.source = Cursor::new(
+        concat!(
+            "\x1bc\x1b[1;5H\x1b_Ga=T,i=31,p=1,s=1,v=1,C=1,q=1;/wAA/w==\x1b\\",
+            "\x1b_Ga=T,i=32,p=1,P=31,Q=1,H=1,V=1,s=1,v=1,q=1;/wD//w==\x1b\\",
+            "\x1b[1;1H",
+        )
+        .as_bytes(),
+    );
+    session.pump().unwrap();
+    let frame = session.presentation_frame().unwrap();
+    assert_eq!(renderer.prepare(&device, &queue, &frame), 0);
+    let before = read_frame(&renderer);
+    assert_eq!(pixel(&before, 8, 0), [255, 0, 0, 255]);
+    assert_eq!(pixel(&before, 10, 2), [255, 0, 255, 255]);
+    let resized = PtySize { columns: 4, ..size };
+    session.screen.reflow(4, 5, StyleId::default()).unwrap();
+    session.geometry = GridGeometry::from_pty_size(resized);
+    session.processor.update_geometry(
+        &mut session.screen,
+        session.geometry.text_area_pixels(),
+        session.geometry.cell_pixels(),
+    );
+    let frame = session.presentation_frame().unwrap();
+    assert_eq!(renderer.prepare(&device, &queue, &frame), 0);
+    let reflowed = read_frame(&renderer);
+    assert_eq!(pixel(&reflowed, 0, 2), [255, 0, 0, 255]);
+    assert_eq!(pixel(&reflowed, 4, 4), [255, 0, 255, 255]);
+    assert_eq!(pixel(&reflowed, 8, 0), [0, 0, 0, 0]);
+
+    session.transport.source = Cursor::new(
+        concat!(
+            "\x1b_Ga=T,i=42,U=1,c=1,r=1,s=1,v=1,q=1;/////w==\x1b\\",
+            "\x1b_Ga=T,i=43,P=42,H=1,s=1,v=1,q=1;/wAA/w==\x1b\\",
+            "\x1b[5;1H\x1b[38;5;42m\u{10eeee}\x1b[0m",
+        )
+        .as_bytes(),
+    );
+    session.pump().unwrap();
+    assert_eq!(
+        renderer.prepare(&device, &queue, &session.presentation_frame().unwrap()),
+        0
+    );
+    assert_eq!(pixel(&read_frame(&renderer), 4, 8), [255, 0, 0, 255]);
+    session.transport.source =
+        Cursor::new("\x1b[2J\x1b[5;1H\x1b[38;5;42m\u{10eeee}\x1b[0m".as_bytes());
+    session.pump().unwrap();
+    assert_eq!(
+        renderer.prepare(&device, &queue, &session.presentation_frame().unwrap()),
+        0
+    );
+    let cleared = read_frame(&renderer);
+    assert_eq!(pixel(&cleared, 1, 8), [255, 255, 255, 255]);
+    assert_eq!(pixel(&cleared, 4, 8), [0, 0, 0, 0]);
+}
+
+#[test]
+fn kitty_virtual_children_use_live_placeholder_bounds_for_coordinate_deletion() {
+    for delete in [
+        b"\x1b[2;3H\x1b_Ga=d,d=C\x1b\\".as_slice(),
+        b"\x1b_Ga=d,d=X,x=3\x1b\\",
+        b"\x1b_Ga=d,d=Y,y=2\x1b\\",
+        b"\x1b_Ga=d,d=A\x1b\\",
+    ] {
+        let mut session = session(
+            concat!(
+                "\x1b_Ga=T,i=42,p=1,U=1,c=2,r=2,s=1,v=1,q=1;AAAA/w==\x1b\\",
+                "\x1b_Ga=T,i=43,p=1,P=42,Q=1,H=1,V=1,s=1,v=1,q=1;/wAA/w==\x1b\\",
+                "\x1b[38;5;42;58;5;1m\x1b[1;5H\u{10eeee}\u{305}\u{305}",
+                "\x1b[2;2H\u{10eeee}\u{30d}\u{305}\x1b[0m",
+            )
+            .as_bytes(),
+        );
+        session.pump().unwrap();
+        assert_eq!(session.screen().graphics_placements().len(), 2);
+        session.transport.source = Cursor::new(delete);
+        session.pump().unwrap();
+        let [prototype] = session.screen().graphics_placements() else {
+            panic!("The virtual prototype remains");
+        };
+        assert!(prototype.is_virtual());
+        assert!(session.processor().graphics_image(43).is_none());
+    }
+}
+
+#[test]
+fn kitty_display_erase_and_alternate_entry_clear_their_placements() {
+    let mut session = session(
+        concat!(
+            "\x1b_Ga=T,i=1,p=1,U=1,c=1,r=1,s=1,v=1,q=1;AAAA/w==\x1b\\",
+            "\x1b_Ga=T,i=2,P=1,Q=1,H=1,s=1,v=1,q=1;/wAA/w==\x1b\\",
+            "\x1b_Ga=T,i=3,P=1,Q=1,H=100,s=1,v=1,q=1;AAD//w==\x1b\\",
+            "\x1b[38;5;1m\u{10eeee}\x1b[2K",
+        )
+        .as_bytes(),
+    );
+    let placements = |session: &Session<Transport>| {
+        session
+            .screen()
+            .graphics_placements()
+            .iter()
+            .map(|image| image.placement.image.id())
+            .collect::<Vec<_>>()
+    };
+    session.pump().unwrap();
+    assert_eq!(placements(&session), [1, 2, 3]);
+    session.transport.source =
+        Cursor::new("\x1b[1;1H\u{10eeee}\x1b[2J\x1b[1;1H\u{10eeee}".as_bytes());
+    session.pump().unwrap();
+    assert_eq!(placements(&session), [1, 3]);
+    assert!(session.processor().graphics_image(2).is_some());
+
+    session.transport.source = Cursor::new(
+        concat!(
+            "\x1b[?47h",
+            "\x1b_Ga=p,i=1,p=2,U=1,c=1,r=1,q=1\x1b\\",
+            "\x1b_Ga=p,i=2,P=1,Q=2,H=1,q=1\x1b\\",
+            "\x1b[?47l\x1b[?47h",
+        )
+        .as_bytes(),
+    );
+    session.pump().unwrap();
+    assert_eq!(placements(&session), [1, 2]);
+    session.transport.source = Cursor::new(b"\x1b[?47l\x1b[?1049h");
+    session.pump().unwrap();
+    assert!(placements(&session).is_empty());
+    assert!(session.processor().graphics_image(1).is_some());
+
+    session.transport.source = Cursor::new(b"\x1b[?1049l");
+    session.pump().unwrap();
+    assert_eq!(placements(&session), [1, 3]);
+    session.transport.source = Cursor::new(b"\x1bc");
+    session.pump().unwrap();
+    assert!(placements(&session).is_empty());
+    assert!((1..=3).all(|id| session.processor().graphics_image(id).is_none()));
+}
+
+#[test]
+fn kitty_animation_deadlines_follow_loading_and_finite_loops() {
+    let mut session = session(
+        concat!(
+            "\x1b_Ga=T,i=1,s=1,v=1,C=1,q=1;/wAA/w==\x1b\\",
+            "\x1b_Ga=f,i=1,s=1,v=1,z=-1,q=1;AP8A/w==\x1b\\",
+            "\x1b_Ga=f,i=1,s=1,v=1,z=20,q=1;AAD//w==\x1b\\",
+            "\x1b_Ga=a,i=1,s=2,r=1,z=10\x1b\\"
+        )
+        .as_bytes(),
+    );
+    let start = Instant::now();
+    let at = |millis| start + Duration::from_millis(millis);
+    let current = |session: &Session<Transport>, id| -> [u8; 4] {
+        session
+            .processor()
+            .graphics_image(id)
+            .unwrap()
+            .pixels(&mut Vec::new())
+            .unwrap()
+            .try_into()
+            .unwrap()
+    };
+    session.pump_with_clock(|| at(0)).unwrap();
+    assert_eq!(session.presentation_deadline(), Some(at(10)));
+    session.pump_with_clock(|| at(9)).unwrap();
+    assert_eq!(current(&session, 1), [255, 0, 0, 255]);
+    session.pump_with_clock(|| at(10)).unwrap();
+    assert_eq!(current(&session, 1), [0, 0, 255, 255]);
+    assert_eq!(session.presentation_deadline(), Some(at(30)));
+    session.pump_with_clock(|| at(30)).unwrap();
+    assert!(session.presentation_deadline().is_none());
+    session
+        .pump_with_clock(|| panic!("Waiting animations have no clock work"))
+        .unwrap();
+
+    session.transport.source = Cursor::new(b"\x1b_Ga=f,i=1,s=1,v=1,z=40,q=1;/////w==\x1b\\");
+    session.pump_with_clock(|| at(100)).unwrap();
+    assert_eq!(current(&session, 1), [255, 255, 255, 255]);
+    assert_eq!(session.presentation_deadline(), Some(at(140)));
+
+    session.transport.source = Cursor::new(b"\x1b_Ga=a,i=1,s=3,c=1,v=3\x1b\\");
+    session.pump_with_clock(|| at(200)).unwrap();
+    assert_eq!(session.presentation_deadline(), Some(at(210)));
+    session.pump_with_clock(|| at(275)).unwrap();
+    assert_eq!(current(&session, 1), [255, 0, 0, 255]);
+    assert_eq!(session.presentation_deadline(), Some(at(280)));
+    session.pump_with_clock(|| at(500)).unwrap();
+    assert_eq!(current(&session, 1), [255, 255, 255, 255]);
+    assert!(session.presentation_deadline().is_none());
+
+    session.transport.source = Cursor::new(b"\x1b_Ga=a,i=1,s=1,c=1\x1b\\");
+    session.pump_with_clock(|| at(510)).unwrap();
+    assert!(session.presentation_deadline().is_none());
+    session.transport.source = Cursor::new(b"\x1b_Ga=a,i=1,s=3,v=1\x1b\\");
+    session.pump_with_clock(|| at(600)).unwrap();
+    session.pump_with_clock(|| at(70_615)).unwrap();
+    assert_eq!(current(&session, 1), [0, 0, 255, 255]);
+    assert_eq!(session.presentation_deadline(), Some(at(70_630)));
+
+    session.transport.source = Cursor::new(
+        concat!(
+            "\x1b_Gi=2,s=1,v=1,q=1;AAAA/w==\x1b\\",
+            "\x1b_Ga=f,i=2,s=1,v=1,z=15,q=1;//8A/w==\x1b\\",
+            "\x1b_Ga=a,i=2,s=2,r=1,z=15\x1b\\"
+        )
+        .as_bytes(),
+    );
+    session.pump_with_clock(|| at(70_615)).unwrap();
+    assert_eq!(session.presentation_deadline(), Some(at(70_630)));
+    session.pump_with_clock(|| at(70_630)).unwrap();
+    assert_eq!(current(&session, 1), [255, 255, 255, 255]);
+    assert_eq!(current(&session, 2), [255, 255, 0, 255]);
+    assert_eq!(session.presentation_deadline(), Some(at(70_645)));
+
+    session.transport.source = Cursor::new(b"\x1b_Gi=2,s=1,v=1,q=1;AAAA/w==\x1b\\");
+    session.pump_with_clock(|| at(70_630)).unwrap();
+    assert_eq!(session.presentation_deadline(), Some(at(70_670)));
 }
 
 #[test]
@@ -1258,6 +2060,10 @@ fn waiting_on_a_real_pty_respects_idle_deadlines_and_drains_hangup() {
         printf 'ready'
         IFS= read -r value && test "$value" = begin || exit 72
         printf '\033[?2026hA'
+        IFS= read -r value && test "$value" = animate || exit 74
+        printf '\033_Ga=T,i=1,s=1,v=1,C=1,q=1;/wAA/w==\033\\'
+        printf '\033_Ga=f,i=1,s=1,v=1,z=25,q=1;AAD//w==\033\\'
+        printf '\033_Ga=a,i=1,s=3,v=2,r=1,z=25\033\\'
         IFS= read -r value && test "$value" = finish || exit 73
         printf '\033[3;1Htail'
         "#,
@@ -1300,6 +2106,25 @@ fn waiting_on_a_real_pty_respects_idle_deadlines_and_drains_hangup() {
     assert_eq!(
         screen.grid().row(0).unwrap().text(5),
         Some(CellText::Scalar('A'))
+    );
+
+    session.queue_input(b"animate\n").unwrap();
+    wait_until(&mut session, limit, "animation deadline", |session| {
+        session.presentation_deadline().is_some()
+    });
+    let deadline = session.presentation_deadline().unwrap();
+    assert_eq!(
+        session.wait_and_pump(Some(Duration::from_secs(5))).unwrap(),
+        WaitOutcome::Pumped
+    );
+    assert!(Instant::now() >= deadline);
+    assert_eq!(
+        session
+            .processor()
+            .graphics_image(1)
+            .unwrap()
+            .pixels(&mut Vec::new()),
+        Some(&[0, 0, 255, 255][..]),
     );
 
     session.queue_input(b"finish\n").unwrap();

@@ -193,26 +193,32 @@ impl<'a> ReflowRow<'a> {
 
     #[inline]
     pub(crate) fn map_normalized_position(&self, source: CellPosition) -> Option<usize> {
-        if source < self.start || source > self.end {
+        self.map_position_from(self.start, source)
+    }
+
+    #[inline]
+    pub(crate) fn map_position_from(
+        &self,
+        start: CellPosition,
+        source: CellPosition,
+    ) -> Option<usize> {
+        debug_assert!(start >= self.start && start <= self.end);
+        if source < start || source > self.end {
             return None;
         }
-        if source.row == self.start.row {
-            return Some(source.column - self.start.column);
+        if source.row == start.row {
+            return Some(source.column - start.column);
         }
         let mut column = 0;
-        for index in self.start.row..=source.row {
+        for index in start.row..=source.row {
             let row = self.view.row(index).expect("A mapped source row exists");
-            let start = if index == self.start.row {
-                self.start.column
-            } else {
-                0
-            };
+            let begin = if index == start.row { start.column } else { 0 };
             let end = if index == source.row {
                 source.column
             } else {
                 row.wrap_end().unwrap_or(row.cells().len())
             };
-            column += end - start;
+            column += end - begin;
         }
         Some(column)
     }

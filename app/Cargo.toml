@@ -4,12 +4,20 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
+[features]
+wgpu-renderer = ["dep:bytemuck", "dep:wgpu"]
+
 [dependencies]
 lune-terminal = { path = "../crates/terminal" }
 lune-pty = { path = "../crates/pty" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
+bytemuck = { version = "1", optional = true }
+wgpu = { version = "30.0.1", default-features = false, features = ["std", "vulkan", "wgsl"], optional = true }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+pollster = "0.4"
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

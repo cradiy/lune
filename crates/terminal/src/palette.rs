@@ -1,7 +1,10 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use crate::Color;
 
 const ENTRIES: usize = 259;
 const WORDS: usize = ENTRIES.div_ceil(64);
+static NEXT_REVISION: AtomicU64 = AtomicU64::new(1);
 
 /// A resolved color with eight bits per channel.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -9,6 +12,14 @@ pub struct Rgb {
     pub red: u8,
     pub green: u8,
     pub blue: u8,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GraphicsColors {
+    pub selection_background: Option<Rgb>,
+    pub selection_foreground: Option<Rgb>,
+    pub cursor_text: Option<Rgb>,
+    pub url_hover: Option<Rgb>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -38,6 +49,8 @@ pub struct Palette {
     base: [Rgb; ENTRIES],
     current: [Rgb; ENTRIES],
     overrides: [u64; WORDS],
+    graphics: GraphicsColors,
+    revision: u64,
 }
 
 impl Palette {
@@ -48,12 +61,46 @@ impl Palette {
             base,
             current: base,
             overrides: [0; WORDS],
+            graphics: GraphicsColors::default(),
+            revision: NEXT_REVISION.fetch_add(1, Ordering::Relaxed),
         }
     }
 
     #[inline]
     pub fn color(&self, entry: PaletteEntry) -> Rgb {
         self.current[entry.index()]
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    pub fn graphics_color(&self, index: u8) -> Rgb {
+        let foreground = self.color(PaletteEntry::Foreground);
+        let background = self.color(PaletteEntry::Background);
+        match index {
+            0..=247 => self.color(PaletteEntry::Indexed(index)),
+            248 => background,
+            249 | 255 => foreground,
+            250 => self.graphics.selection_background.unwrap_or(foreground),
+            251 => self.graphics.selection_foreground.unwrap_or(background),
+            252 => self.color(PaletteEntry::Cursor),
+            253 => self.graphics.cursor_text.unwrap_or(background),
+            254 => self.graphics.url_hover.unwrap_or(foreground),
+        }
+    }
+
+    pub fn set_graphics_colors(&mut self, colors: GraphicsColors) -> bool {
+        let changed = self.graphics != colors;
+        self.graphics = colors;
+        self.record_change(changed)
+    }
+
+    fn record_change(&mut self, changed: bool) -> bool {
+        if changed {
+            self.revision = NEXT_REVISION.fetch_add(1, Ordering::Relaxed);
+        }
+        changed
     }
 
     /// Compares the resolved indexed colors and default foreground and background.
@@ -85,7 +132,7 @@ impl Palette {
         self.overrides[index / 64] |= 1 << (index % 64);
         let changed = self.current[index] != color;
         self.current[index] = color;
-        changed
+        self.record_change(changed)
     }
 
     pub fn reset(&mut self, entry: PaletteEntry) -> bool {
@@ -93,7 +140,7 @@ impl Palette {
         self.overrides[index / 64] &= !(1 << (index % 64));
         let changed = self.current[index] != self.base[index];
         self.current[index] = self.base[index];
-        changed
+        self.record_change(changed)
     }
 
     /// Restores the indexed table while retaining default role overrides.
@@ -117,7 +164,8 @@ impl Palette {
     }
 
     pub(crate) fn set_base_from(&mut self, theme: &Self) -> bool {
-        self.set_base_colors(theme.base)
+        let changed = self.set_base_colors(theme.base);
+        self.set_graphics_colors(theme.graphics) || changed
     }
 
     fn set_base_colors(&mut self, base: [Rgb; ENTRIES]) -> bool {
@@ -129,7 +177,7 @@ impl Palette {
             }
         }
         self.base = base;
-        changed
+        self.record_change(changed)
     }
 
     fn reset_words(&mut self, end: usize) -> bool {
@@ -143,7 +191,7 @@ impl Palette {
                 bits &= bits - 1;
             }
         }
-        changed
+        self.record_change(changed)
     }
 }
 

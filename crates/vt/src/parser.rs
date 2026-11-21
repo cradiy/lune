@@ -198,21 +198,15 @@ impl Parser {
     #[inline]
     pub fn advance(&mut self, bytes: &[u8], mut emit: impl FnMut(Event<'_>)) {
         if let [byte] = bytes {
-            if *byte >= 0x20 && *byte != 0x7f {
-                match self.state {
-                    State::Ground | State::Utf8Pending => {
-                        if self.decode(*byte, &mut emit) {
-                            // An invalid pending prefix leaves this byte to be decoded again.
-                            self.decode(*byte, &mut emit);
-                        }
-                        return;
-                    }
-                    State::String { kind } => {
-                        kind.emit_data(bytes, &mut emit);
-                        return;
-                    }
-                    _ => {}
+            if matches!(self.state, State::Ground | State::Utf8Pending)
+                && *byte >= 0x20
+                && *byte != 0x7f
+            {
+                if self.decode(*byte, &mut emit) {
+                    // An invalid pending prefix leaves this byte to be decoded again.
+                    self.decode(*byte, &mut emit);
                 }
+                return;
             }
             self.advance_byte(*byte, &mut emit);
             return;
@@ -395,6 +389,13 @@ impl Parser {
             self.state,
             State::String { .. } | State::StringEscape { .. }
         ) {
+            if let State::String { kind } = self.state
+                && byte >= 0x20
+                && byte != 0x7f
+            {
+                kind.emit_data(&[byte], emit);
+                return;
+            }
             self.advance_string(byte, emit);
             return;
         }
@@ -492,7 +493,6 @@ impl Parser {
             }
             0x00..=0x1f if kind == StringKind::Dcs => emit(Event::Dcs(DcsEvent::Data(&[byte]))),
             0x00..=0x1f if kind == StringKind::Apc => emit(Event::Apc(ApcEvent::Data(&[byte]))),
-            0x20..=0x7e | 0x80..=0xff => kind.emit_data(&[byte], emit),
             _ => {}
         }
     }

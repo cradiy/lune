@@ -450,6 +450,23 @@ impl Row {
         }
     }
 
+    // Starts at the last lookup's successor for known extended cells visited in order.
+    pub(crate) fn next_extended_text(&self, column: usize, next: &mut usize) -> &str {
+        let remaining = &self.extended[*next..];
+        let index = if remaining
+            .first()
+            .is_some_and(|entry| entry.column == column)
+        {
+            0
+        } else {
+            remaining
+                .binary_search_by_key(&column, |entry| entry.column)
+                .expect("Extended text is present")
+        };
+        *next += index + 1;
+        &remaining[index].text
+    }
+
     pub(crate) fn write_text(
         &self,
         range: Range<usize>,

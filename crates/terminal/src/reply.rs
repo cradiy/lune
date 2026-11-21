@@ -9,7 +9,7 @@ use crate::{
 };
 
 // A full DECRQSS rendition reply fits in 78 bytes.
-const CAPACITY: usize = 80;
+const CAPACITY: usize = lune_kitty_graphics::MAX_FEATURE_REPLY_BYTES;
 const VERSION_REPLY: &[u8] = concat!(
     "\x1bP>|",
     env!("CARGO_PKG_NAME"),
@@ -23,8 +23,8 @@ const _: () = assert!(VERSION_REPLY.len() <= CAPACITY);
 #[derive(Clone, Copy)]
 pub(crate) struct Reply {
     bytes: [u8; CAPACITY],
-    start: u8,
-    end: u8,
+    start: u16,
+    end: u16,
 }
 
 impl Default for Reply {
@@ -262,8 +262,42 @@ impl Reply {
     #[cold]
     pub(crate) fn graphics(&mut self, reply: lune_kitty_graphics::Reply) {
         self.clear();
-        self.append(b"\x1b_Gi=");
-        self.decimal::<10>(reply.id);
+        self.append(b"\x1b_G");
+        if reply.id != 0 {
+            self.append(b"i=");
+            self.decimal::<10>(reply.id);
+        }
+        if reply.number != 0 {
+            if reply.id != 0 {
+                self.append(b",");
+            }
+            self.append(b"I=");
+            self.decimal::<10>(reply.number);
+        }
+        if reply.placement_id != 0 {
+            self.append(b",p=");
+            self.decimal::<10>(reply.placement_id);
+        }
+        if reply.frame_number != 0 {
+            self.append(b",r=");
+            self.decimal::<10>(reply.frame_number);
+        }
+        if let Some(features) = reply.features {
+            use lune_kitty_graphics::Value;
+
+            self.append(&[b',', b'e', b'=', features.action()]);
+            for &(key, value) in features.controls() {
+                self.append(&[b',', key, b'=']);
+                match value {
+                    Value::Unsigned(value) => self.decimal::<10>(value),
+                    Value::Signed(value) => {
+                        self.append(b"-");
+                        self.decimal::<10>(value.unsigned_abs());
+                    }
+                    Value::Letter(value) => self.append(&[value]),
+                }
+            }
+        }
         self.append(b";");
         self.append(reply.message);
         self.append(b"\x1b\\");
@@ -281,7 +315,7 @@ impl Reply {
         if count > usize::from(self.end - self.start) {
             return false;
         }
-        self.start += count as u8;
+        self.start += count as u16;
         true
     }
 
@@ -335,7 +369,7 @@ impl Reply {
     fn append(&mut self, bytes: &[u8]) {
         let end = usize::from(self.end);
         self.bytes[end..end + bytes.len()].copy_from_slice(bytes);
-        self.end += bytes.len() as u8;
+        self.end += bytes.len() as u16;
     }
 
     fn number(&mut self, value: u16) {

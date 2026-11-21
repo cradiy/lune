@@ -276,7 +276,7 @@ fn host_notices_wait_for_both_pending_input_events_and_reuse_drained_slots() {
     assert_eq!(error.consumed, 2);
     assert!(matches!(error.error, ProcessFailure::Text(None)));
     screen.resize(10, 3, StyleId(0)).unwrap();
-    processor.update_geometry(&screen, None, None);
+    processor.update_geometry(&mut screen, None, None);
     processor.set_color_scheme(Some(crate::ColorScheme::Light));
     assert!(processor.reply_bytes().is_empty());
 
@@ -286,7 +286,7 @@ fn host_notices_wait_for_both_pending_input_events_and_reuse_drained_slots() {
     assert_eq!(text(&screen, 0, 0), CellText::Scalar('�'));
     assert_eq!(processor.reply_bytes(), b"\x1b[48;3;10;0;0t");
     screen.resize(12, 4, StyleId(0)).unwrap();
-    processor.update_geometry(&screen, None, None);
+    processor.update_geometry(&mut screen, None, None);
     assert!(processor.consume_reply(processor.reply_bytes().len()));
     assert_eq!(processor.reply_bytes(), b"\x1b[?997;2n");
     assert!(processor.consume_reply(processor.reply_bytes().len()));

@@ -2534,7 +2534,7 @@ fn processor_retries_style_and_text_allocations_without_replaying_accepted_input
             }
         }
         processor.update_geometry(
-            &screen,
+            &mut screen,
             Some(lune_terminal::PixelSize {
                 width: std::num::NonZeroU32::MAX,
                 height: std::num::NonZeroU32::MAX,

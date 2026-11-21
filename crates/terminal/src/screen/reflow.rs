@@ -1,6 +1,7 @@
 use std::{collections::VecDeque, ops::Range};
 
 use super::{Cursor, SavedCursor, Screen, ScreenBuffer};
+use crate::graphics::GraphicsAnchor;
 use crate::grid::validate_dimensions;
 use crate::reflow::normalize_position;
 use crate::row::RowTransfer;
@@ -113,12 +114,12 @@ fn clipped(mut cursor: Cursor, window: Range<usize>) -> Cursor {
 
 fn layout<'a>(
     view: ScreenView<'a>,
-    columns: usize,
-    height: usize,
+    (columns, height): (usize, usize),
     pivot: Cursor,
     saved: Cursor,
     offset: usize,
     retained_rows: usize,
+    image_anchors: &mut [GraphicsAnchor],
 ) -> Result<(Layout, Checkpoint<'a>), StorageError> {
     let history = view.history_rows();
     let sources = [
@@ -157,6 +158,7 @@ fn layout<'a>(
     });
     let mut next_anchor = 0;
     let mut mapped = [None; 3];
+    let mut next_image = 0;
     let mut count = 0_usize;
     let stride = retained_rows + height;
     let interval = stride.div_ceil(2);
@@ -188,6 +190,22 @@ fn layout<'a>(
                 }
                 mapped[*index] = Some(CellPosition { row: count, column });
                 next_anchor += 1;
+            }
+            if next_image < image_anchors.len() {
+                let mut previous = row.source_range().start;
+                let mut column = 0;
+                while let Some(anchor) = image_anchors.get_mut(next_image) {
+                    let Some(distance) = row.map_position_from(previous, anchor.source) else {
+                        break;
+                    };
+                    column += distance;
+                    if row.wrap_end().is_some() && column == row.used_columns() {
+                        break;
+                    }
+                    anchor.destination = Some(CellPosition { row: count, column });
+                    previous = anchor.source;
+                    next_image += 1;
+                }
             }
             if replay.is_none() && mapped[0].is_some() {
                 // The selected window starts no earlier than pivot - height + 1.
@@ -291,14 +309,20 @@ impl Screen {
         } else {
             limits.max_rows
         };
+        let primary_graphics = if primary_active {
+            &self.graphics
+        } else {
+            &self.inactive.graphics
+        };
+        let mut graphics_anchors = primary_graphics.reflow_anchors(view, primary.columns())?;
         let (plan, checkpoint) = layout(
             view,
-            columns,
-            rows,
+            (columns, rows),
             pivot,
             saved,
             self.display_offset,
             retained_rows,
+            &mut graphics_anchors,
         )?;
         let mut history = RowHistory::default();
         history.set_limits(limits)?;
@@ -405,6 +429,18 @@ impl Screen {
             wrap_pending: false,
         };
         before_commit()?;
+        let (primary_graphics, alternate_graphics) = if primary_active {
+            (&mut self.graphics, &mut self.inactive.graphics)
+        } else {
+            (&mut self.inactive.graphics, &mut self.graphics)
+        };
+        primary_graphics.commit_reflow(
+            graphics_anchors,
+            plan.window.clone(),
+            history.len(),
+            columns,
+        );
+        alternate_graphics.crop_alternate(columns, rows);
         // Every allocation is complete. Move source payloads before publishing state.
         {
             let old_primary = if primary_active {

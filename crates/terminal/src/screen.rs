@@ -1,12 +1,16 @@
-use std::ops::Range;
+use std::{num::NonZeroU32, ops::Range};
+
+use lune_kitty_graphics::{
+    DeleteTarget, EvictionRanking, ImageChange, PlacementError, PlacementPosition,
+};
 
 mod reflow;
 
 use crate::{
-    CellPosition, CellWidth, Grid, HistoryLimits, MAX_CELL_TEXT_BYTES, RowHistory, ScreenView,
-    StorageError, StyleId, Viewport,
+    CellPosition, CellWidth, GraphicsPlacement, Grid, HistoryLimits, MAX_CELL_TEXT_BYTES,
+    PixelSize, RowHistory, ScreenView, StorageError, StyleId, Viewport,
 };
-use crate::{grid::validate_dimensions, tabs::TabStops};
+use crate::{graphics::GraphicsPlacements, grid::validate_dimensions, tabs::TabStops};
 
 /// Cursor-relative extent for line or display erasure. Both directions include
 /// the cursor cell and complete wide units intersecting the extent.
@@ -68,6 +72,8 @@ pub enum ScreenBuffer {
 #[derive(Debug)]
 pub struct Screen {
     grid: Grid,
+    graphics: GraphicsPlacements,
+    graphics_cell: Option<PixelSize>,
     history: RowHistory,
     history_capture: bool,
     display_offset: usize,
@@ -87,6 +93,7 @@ pub struct Screen {
 #[derive(Debug)]
 struct InactiveBuffer {
     grid: Grid,
+    graphics: GraphicsPlacements,
     saved_cursor: SavedCursor,
 }
 
@@ -163,6 +170,15 @@ impl Screen {
                 .saturating_add(usize::from(captured))
                 .min(self.history.len());
         }
+        if !self.graphics.is_empty() {
+            if captured {
+                let first_row = -(self.history.len() as i64);
+                self.graphics
+                    .scroll(i64::MIN..i64::MAX, first_row..i64::MAX, -1);
+            } else {
+                self.scroll_graphics(self.scroll_region.start, 1, false);
+            }
+        }
     }
 
     fn capture_history(&mut self, style: StyleId) -> Result<bool, StorageError> {
@@ -189,6 +205,7 @@ impl Screen {
     /// history. Either zero limit disables capture and resumes live following.
     pub fn set_history_limits(&mut self, limits: HistoryLimits) -> Result<(), StorageError> {
         self.history.set_limits(limits)?;
+        self.discard_evicted_graphics();
         self.display_offset = self.display_offset.min(self.history.len());
         self.update_history_capture();
         Ok(())
@@ -198,6 +215,7 @@ impl Screen {
     /// display buffers, cursor, and modes are preserved.
     pub fn clear_history(&mut self) {
         self.history.clear();
+        self.discard_evicted_graphics();
         self.display_offset = 0;
     }
 
@@ -205,6 +223,39 @@ impl Screen {
         self.history_capture = self.active_buffer == ScreenBuffer::Primary
             && self.scroll_region == (0..self.grid.rows())
             && self.history.enabled_for(self.grid.columns());
+    }
+
+    fn discard_evicted_graphics(&mut self) {
+        let first_row = -(self.history.len() as i64);
+        let primary = if self.active_buffer == ScreenBuffer::Primary {
+            &mut self.graphics
+        } else {
+            &mut self.inactive.graphics
+        };
+        primary.discard_history_before(first_row);
+    }
+
+    #[inline]
+    fn scroll_graphics(&mut self, start: usize, count: usize, down: bool) {
+        if !self.graphics.is_empty() && count != 0 {
+            self.scroll_graphics_nonempty(start, count, down);
+        }
+    }
+
+    #[cold]
+    fn scroll_graphics_nonempty(&mut self, start: usize, count: usize, down: bool) {
+        let end = self.scroll_region.end;
+        let whole_screen = start == 0 && end == self.grid.rows();
+        let source = start as i64..if whole_screen { i64::MAX } else { end as i64 };
+        let destination_end = if whole_screen && !down {
+            i64::MAX
+        } else {
+            end as i64
+        };
+        let moves = count.min(end - start) as i64;
+        let delta = if down { moves } else { -moves };
+        self.graphics
+            .scroll(source, start as i64..destination_end, delta);
     }
 
     fn disconnect_top(&mut self, top: usize) {
@@ -247,11 +298,14 @@ impl Screen {
     pub fn new(columns: usize, rows: usize) -> Result<Self, StorageError> {
         Ok(Self {
             grid: Grid::new(columns, rows)?,
+            graphics: GraphicsPlacements::default(),
+            graphics_cell: None,
             history: RowHistory::default(),
             history_capture: false,
             display_offset: 0,
             inactive: InactiveBuffer {
                 grid: Grid::new(columns, rows)?,
+                graphics: GraphicsPlacements::default(),
                 saved_cursor: SavedCursor::default(),
             },
             active_buffer: ScreenBuffer::Primary,
@@ -275,6 +329,138 @@ impl Screen {
         self.active_buffer
     }
 
+    pub fn graphics_placements(&self) -> &[GraphicsPlacement] {
+        self.graphics.as_slice()
+    }
+
+    pub(crate) fn all_graphics_placements(&self) -> impl Iterator<Item = &GraphicsPlacement> {
+        self.graphics
+            .as_slice()
+            .iter()
+            .chain(self.inactive.graphics.as_slice())
+    }
+
+    pub(crate) fn has_graphics_orphans(&self) -> bool {
+        !self.graphics.orphaned().is_empty() || !self.inactive.graphics.orphaned().is_empty()
+    }
+
+    pub(crate) fn graphics_orphaned(&self, id: u32) -> bool {
+        self.graphics.orphaned().contains(&id) || self.inactive.graphics.orphaned().contains(&id)
+    }
+
+    pub(crate) fn clear_graphics_orphans(&mut self) {
+        self.graphics.clear_orphaned();
+        self.inactive.graphics.clear_orphaned();
+    }
+
+    #[inline]
+    pub(crate) fn clear_live_graphics(&mut self, styles: &crate::StyleTable) {
+        if !self.graphics.is_empty() {
+            self.graphics.clear_live(&self.grid, styles);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn clear_alternate_display(&mut self, style: StyleId) {
+        debug_assert_eq!(self.active_buffer, ScreenBuffer::Alternate);
+        if !self.graphics.is_empty() {
+            self.graphics.clear_buffer();
+        }
+        self.erase_display(EraseMode::All, style);
+    }
+
+    pub(crate) fn delete_placements(
+        &mut self,
+        target: DeleteTarget,
+        styles: &crate::StyleTable,
+        removed: impl FnMut(u32),
+    ) {
+        self.graphics
+            .delete(target, self.cursor, &self.grid, styles, removed);
+    }
+
+    pub fn graphics_revision(&self) -> Option<u64> {
+        self.graphics.revision()
+    }
+
+    pub fn has_virtual_graphics(&self) -> bool {
+        self.graphics.has_virtual()
+    }
+
+    pub(crate) fn set_graphics_cell(&mut self, cell: Option<PixelSize>) {
+        if self.graphics_cell != cell {
+            self.graphics_cell = cell;
+            let cell = self.graphics_cell_extent();
+            self.graphics.set_cell_size(cell);
+            self.inactive.graphics.set_cell_size(cell);
+        }
+    }
+
+    fn graphics_cell_extent(&self) -> PixelSize {
+        self.graphics_cell.unwrap_or(PixelSize {
+            width: NonZeroU32::MIN,
+            height: NonZeroU32::MIN,
+        })
+    }
+
+    pub(crate) fn apply_image(&mut self, change: ImageChange<'_>) -> Result<(), PlacementError> {
+        match change {
+            ImageChange::RankEvictions { placement, ranking } => {
+                self.rank_graphics_evictions(
+                    placement.map(|placement| placement.position),
+                    ranking,
+                )?;
+            }
+            ImageChange::Remove { replaced, evicted } => {
+                self.graphics.remove_images(replaced, evicted);
+                self.inactive.graphics.remove_images(replaced, evicted);
+            }
+            ImageChange::Place {
+                placement,
+                dimensions,
+                replaces_image,
+                anonymous,
+                evicted,
+            } => {
+                let image = GraphicsPlacement::at_cursor(
+                    self.cursor,
+                    placement,
+                    dimensions,
+                    self.graphics_cell_extent(),
+                    anonymous,
+                )?;
+                let [columns, rows] = image.cursor_travel(self.graphics_cell.is_some());
+                self.graphics.insert(image, replaces_image, evicted)?;
+                if replaces_image || !evicted.is_empty() {
+                    self.inactive
+                        .graphics
+                        .remove_images(replaces_image.then_some(placement.image), evicted);
+                }
+                if placement.position == PlacementPosition::Cursor && !placement.keep_cursor {
+                    self.move_cursor_right(columns);
+                    self.move_cursor_down(rows);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cold]
+    fn rank_graphics_evictions(
+        &self,
+        position: Option<PlacementPosition>,
+        ranking: &mut EvictionRanking,
+    ) -> Result<(), PlacementError> {
+        for placement in self.all_graphics_placements() {
+            ranking.mark_placed(placement.placement.image)?;
+        }
+        if let Some(PlacementPosition::Relative(parent)) = position {
+            self.graphics
+                .for_each_ancestor(parent, |key| ranking.protect(key))?;
+        }
+        Ok(())
+    }
+
     /// Read-only storage for either buffer, including its soft-wrap connections.
     pub fn buffer(&self, buffer: ScreenBuffer) -> &Grid {
         if buffer == self.active_buffer {
@@ -293,6 +479,7 @@ impl Screen {
             return;
         }
         std::mem::swap(&mut self.grid, &mut self.inactive.grid);
+        std::mem::swap(&mut self.graphics, &mut self.inactive.graphics);
         std::mem::swap(&mut self.saved_cursor, &mut self.inactive.saved_cursor);
         self.active_buffer = buffer;
         self.update_history_capture();
@@ -346,6 +533,8 @@ impl Screen {
         self.select_buffer(ScreenBuffer::Primary);
         self.grid.clear(style);
         self.inactive.grid.clear(style);
+        self.graphics.clear();
+        self.inactive.graphics.clear();
         self.clear_history();
         self.inactive.saved_cursor = SavedCursor::default();
         self.cursor = Cursor::default();
@@ -754,6 +943,7 @@ impl Screen {
                         style,
                         gap,
                     )?;
+                    self.scroll_graphics(self.scroll_region.start, 1, false);
                     self.disconnect_top(self.scroll_region.start);
                 }
                 self.cursor.row
@@ -924,6 +1114,7 @@ impl Screen {
                             &bytes[..columns],
                             style,
                         );
+                        self.scroll_graphics(self.scroll_region.start, 1, false);
                         self.disconnect_top(self.scroll_region.start);
                         self.advance(source, columns);
                         bytes = &bytes[columns..];
@@ -938,6 +1129,7 @@ impl Screen {
                         self.grid
                             .scroll_up(self.scroll_region.clone(), 1, style)
                             .expect("The scrolling region is valid");
+                        self.scroll_graphics(self.scroll_region.start, 1, false);
                         self.disconnect_top(self.scroll_region.start);
                     }
                     if self.scroll_region.len() > 1 {
@@ -1049,6 +1241,7 @@ impl Screen {
             self.grid
                 .scroll_up(self.scroll_region.clone(), count, style)
                 .expect("The scrolling region is valid");
+            self.scroll_graphics(self.scroll_region.start, count, false);
             self.disconnect_top(self.scroll_region.start);
             Ok(())
         }
@@ -1065,6 +1258,7 @@ impl Screen {
         self.grid
             .scroll_down(self.scroll_region.clone(), count, style)
             .expect("The scrolling region is valid");
+        self.scroll_graphics(self.scroll_region.start, count, true);
     }
 
     /// Inserts blank rows at the cursor, shifting rows down through the scrolling
@@ -1081,6 +1275,7 @@ impl Screen {
         self.grid
             .scroll_down(self.cursor.row..self.scroll_region.end, count, style)
             .expect("The cursor suffix is a valid row range");
+        self.scroll_graphics(self.cursor.row, count, true);
         self.cursor.wrap_pending = false;
     }
 
@@ -1095,6 +1290,7 @@ impl Screen {
         self.grid
             .scroll_up(self.cursor.row..self.scroll_region.end, count, style)
             .expect("The cursor suffix is a valid row range");
+        self.scroll_graphics(self.cursor.row, count, false);
         self.cursor.wrap_pending = false;
     }
 
@@ -1120,7 +1316,7 @@ impl Screen {
         self.cursor.wrap_pending = false;
     }
 
-    /// Erases part or all of the physical display using `style`. The extent
+    /// Erases text in part or all of the physical display using `style`. The extent
     /// includes rows outside the scrolling region. Cursor coordinates and region
     /// boundaries are preserved; pending wrapping is canceled. This does not allocate.
     pub fn erase_display(&mut self, mode: EraseMode, style: StyleId) {
@@ -1165,6 +1361,7 @@ impl Screen {
                 self.grid
                     .scroll_up(self.scroll_region.clone(), 1, style)
                     .expect("The scrolling region is valid");
+                self.scroll_graphics(self.scroll_region.start, 1, false);
                 self.disconnect_top(self.scroll_region.start);
             }
         } else if self.cursor.row + 1 < self.grid.rows() {
@@ -1185,6 +1382,7 @@ impl Screen {
             self.grid
                 .scroll_down(self.scroll_region.clone(), 1, style)
                 .expect("The scrolling region is valid");
+            self.scroll_graphics(self.scroll_region.start, 1, true);
         } else {
             self.cursor.row = self.cursor.row.saturating_sub(1);
         }

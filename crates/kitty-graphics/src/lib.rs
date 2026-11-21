@@ -6,9 +6,23 @@ use base64::{
     engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig},
 };
 
+mod animation;
+mod delete;
+mod features;
 mod images;
+mod pixels;
+mod placeholder;
+mod placement;
+mod source;
 
-pub use images::{DirectImages, Image, Reply};
+pub use delete::{Delete, DeleteTarget};
+pub use features::{FeatureReply, MAX_FEATURE_REPLY_BYTES};
+pub use images::{Image, ImageKey, ImageStore, Reply};
+pub use pixels::ImageFormat;
+pub use placeholder::{PLACEHOLDER, Placeholder};
+pub use placement::{
+    EvictionRanking, ImageChange, Placement, PlacementError, PlacementPosition, RelativePlacement,
+};
 
 const KEY_COUNT: usize = 52;
 const MAX_CONTROL_BYTES: usize = KEY_COUNT * 14;
@@ -31,6 +45,7 @@ pub enum Value {
 #[derive(Debug, PartialEq, Eq)]
 pub struct Controls {
     values: [Option<Value>; KEY_COUNT],
+    present: u64,
 }
 
 impl Controls {
@@ -38,35 +53,55 @@ impl Controls {
         self.values[key_index(key)?]
     }
 
-    fn only(&self, keys: &[u8]) -> bool {
-        self.values.iter().flatten().count()
-            == keys.iter().filter(|&&key| self.get(key).is_some()).count()
+    fn only(&self, allowed: u64) -> bool {
+        self.present & !allowed == 0
+    }
+
+    fn is_feature_query(&self) -> bool {
+        self.present & const { control_keys(b"e") } != 0
+            && self.get(b'a') == Some(Value::Letter(b'q'))
     }
 
     fn parse(header: &[u8]) -> Result<Self, DecodeError> {
         let mut values = [None; KEY_COUNT];
+        let mut present = 0;
         if !header.is_empty() {
             for pair in header.split(|&byte| byte == b',') {
                 let [key, b'=', value @ ..] = pair else {
                     return Err(DecodeError::InvalidControl);
                 };
                 let index = key_index(*key).ok_or(DecodeError::InvalidControl)?;
-                if values[index].is_some() {
+                let bit = 1 << index;
+                if present & bit != 0 {
                     return Err(DecodeError::DuplicateKey(*key));
                 }
                 values[index] = Some(parse_value(value).ok_or(DecodeError::InvalidControl)?);
+                present |= bit;
             }
         }
-        Ok(Self { values })
+        Ok(Self { values, present })
     }
 }
 
-fn key_index(key: u8) -> Option<usize> {
+const fn key_index(key: u8) -> Option<usize> {
     match key {
-        b'A'..=b'Z' => Some(usize::from(key - b'A')),
-        b'a'..=b'z' => Some(26 + usize::from(key - b'a')),
+        b'A'..=b'Z' => Some((key - b'A') as usize),
+        b'a'..=b'z' => Some(26 + (key - b'a') as usize),
         _ => None,
     }
+}
+
+const fn control_keys(keys: &[u8]) -> u64 {
+    let mut allowed = 0;
+    let mut offset = 0;
+    while offset < keys.len() {
+        let Some(index) = key_index(keys[offset]) else {
+            panic!("Invalid control key")
+        };
+        allowed |= 1 << index;
+        offset += 1;
+    }
+    allowed
 }
 
 fn parse_value(raw: &[u8]) -> Option<Value> {
@@ -123,6 +158,7 @@ enum State {
     Selector,
     Control,
     Payload,
+    PayloadOverflow,
     Ignore,
     Failed(DecodeError),
 }
@@ -189,22 +225,32 @@ impl Decoder {
         if matches!(self.state, State::Payload)
             && !append(&mut self.payload, &mut self.payload_len, bytes)
         {
-            self.state = State::Failed(DecodeError::PayloadTooLong);
+            self.state = State::PayloadOverflow;
         }
     }
 
     pub fn finish(&mut self) -> Option<Result<Command<'_>, DecodeError>> {
-        match core::mem::replace(&mut self.state, State::Idle) {
-            State::Control | State::Payload => Some(
+        let state = core::mem::replace(&mut self.state, State::Idle);
+        match state {
+            State::Control | State::Payload | State::PayloadOverflow => Some(
                 Controls::parse(&self.control[..self.control_len]).and_then(|controls| {
-                    if self.payload_len > MAX_DIRECT_PAYLOAD_BYTES
-                        && !matches!(controls.get(b't'), Some(Value::Letter(b'f' | b't' | b's')))
-                    {
-                        return Err(DecodeError::PayloadTooLong);
-                    }
+                    let oversized = matches!(state, State::PayloadOverflow)
+                        || (self.payload_len > MAX_DIRECT_PAYLOAD_BYTES
+                            && !matches!(
+                                controls.get(b't'),
+                                Some(Value::Letter(b'f' | b't' | b's'))
+                            ));
+                    let payload = if oversized {
+                        if !controls.is_feature_query() {
+                            return Err(DecodeError::PayloadTooLong);
+                        }
+                        &[][..]
+                    } else {
+                        &self.payload[..self.payload_len]
+                    };
                     Ok(Command {
                         controls,
-                        encoded_payload: &self.payload[..self.payload_len],
+                        encoded_payload: payload,
                     })
                 }),
             ),

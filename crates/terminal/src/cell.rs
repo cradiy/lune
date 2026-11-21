@@ -119,12 +119,18 @@ impl Cell {
     }
 
     /// Returns the leading scalar of a display unit, or `None` for a continuation.
+    #[inline]
     pub fn character(self) -> Option<char> {
         if self.is_continuation() {
             None
         } else {
             char::from_u32(self.text & SCALAR_MASK)
         }
+    }
+
+    #[inline]
+    pub(crate) fn has_character(self, character: char) -> bool {
+        self.text & (SCALAR_MASK | CONTINUATION) == character as u32
     }
 
     /// Returns one or two for a leading cell, and zero for a continuation.
