@@ -344,11 +344,19 @@ impl Screen {
     }
 
     pub(crate) fn has_graphics_orphans(&self) -> bool {
-        !self.graphics.orphaned().is_empty() || !self.inactive.graphics.orphaned().is_empty()
+        self.graphics.has_orphans() || self.inactive.graphics.has_orphans()
+    }
+
+    pub(crate) fn retain_unreferenced_graphics_orphans(&mut self) {
+        self.graphics
+            .retain_unreferenced_orphans(&self.inactive.graphics);
+        self.inactive
+            .graphics
+            .retain_unreferenced_orphans(&self.graphics);
     }
 
     pub(crate) fn graphics_orphaned(&self, id: u32) -> bool {
-        self.graphics.orphaned().contains(&id) || self.inactive.graphics.orphaned().contains(&id)
+        self.graphics.is_orphaned(id) || self.inactive.graphics.is_orphaned(id)
     }
 
     pub(crate) fn clear_graphics_orphans(&mut self) {

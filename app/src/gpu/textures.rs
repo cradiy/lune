@@ -4,6 +4,8 @@ use wgpu::{
     TextureDescriptor, TextureDimension, TextureFormat, TextureUsages, TextureView,
 };
 
+const FILTER_BORDER: u32 = 1;
+
 #[derive(Clone, Copy)]
 pub(super) struct PixelRegion {
     pub origin: [u32; 2],
@@ -41,6 +43,7 @@ impl TextureBinding {
         format: GraphicsImageFormat,
         sampler: &Sampler,
         palette_view: &TextureView,
+        rgba_sampling: &wgpu::Buffer,
         region: TileRegion,
     ) -> Self {
         let (format, image_binding, source_binding, source) = match format {
@@ -66,19 +69,28 @@ impl TextureBinding {
         let [width, height] = region.storage.size;
         let texture = make_texture(device, width, height, format);
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let entries = [
+            wgpu::BindGroupEntry {
+                binding: image_binding,
+                resource: wgpu::BindingResource::TextureView(&view),
+            },
+            wgpu::BindGroupEntry {
+                binding: source_binding,
+                resource: source,
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: rgba_sampling.as_entire_binding(),
+            },
+        ];
         let binding = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: image_binding,
-                    resource: wgpu::BindingResource::TextureView(&view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: source_binding,
-                    resource: source,
-                },
-            ],
+            entries: if image_binding == 0 {
+                &entries
+            } else {
+                &entries[..2]
+            },
         });
         Self {
             region,
@@ -90,7 +102,41 @@ impl TextureBinding {
 
 pub(super) enum ImageTextures {
     Single(TextureBinding),
-    Tiled(Vec<TextureBinding>),
+    Tiled(TextureTiles),
+}
+
+pub(super) struct TextureTiles {
+    tiles: Vec<TextureBinding>,
+    step: [u32; 2],
+    count: [u32; 2],
+}
+
+impl TextureTiles {
+    pub fn candidates(
+        &self,
+        region: PixelRegion,
+        border: u32,
+    ) -> impl Iterator<Item = (usize, &TextureBinding)> {
+        let columns = self.count[0];
+        let [first_col, first_row] = std::array::from_fn(|axis| {
+            (region.origin[axis].saturating_sub(border) / self.step[axis]).min(self.count[axis])
+        });
+        let [end_col, end_row] = std::array::from_fn(|axis| {
+            region.origin[axis]
+                .saturating_add(region.size[axis])
+                .saturating_add(border)
+                .div_ceil(self.step[axis])
+                .min(self.count[axis])
+        });
+        (first_row..end_row).flat_map(move |row| {
+            let start = (row * columns + first_col) as usize;
+            let end = (row * columns + end_col) as usize;
+            self.tiles[start..end]
+                .iter()
+                .enumerate()
+                .map(move |(offset, tile)| (start + offset, tile))
+        })
+    }
 }
 
 impl ImageTextures {
@@ -113,37 +159,43 @@ impl ImageTextures {
         // Include a neighboring texel at internal edges for linear filtering.
         let [step_x, step_y] = size.map(|dimension| {
             if dimension > limit {
-                limit - 2
+                limit - 2 * FILTER_BORDER
             } else {
                 dimension
             }
         });
-        let count = width.div_ceil(step_x) * height.div_ceil(step_y);
-        let mut tiles = Vec::with_capacity(count as usize);
+        let count = [width.div_ceil(step_x), height.div_ceil(step_y)];
+        let mut tiles = Vec::with_capacity((count[0] * count[1]) as usize);
         for y in (0..height).step_by(step_y as usize) {
             for x in (0..width).step_by(step_x as usize) {
                 let visible = PixelRegion {
                     origin: [x, y],
                     size: [(width - x).min(step_x), (height - y).min(step_y)],
                 };
-                let origin = visible.origin.map(|edge| edge.saturating_sub(1));
+                let origin = visible
+                    .origin
+                    .map(|edge| edge.saturating_sub(FILTER_BORDER));
                 let storage = PixelRegion {
                     origin,
                     size: std::array::from_fn(|axis| {
-                        (visible.origin[axis] + visible.size[axis] + 1).min(size[axis])
+                        (visible.origin[axis] + visible.size[axis] + FILTER_BORDER).min(size[axis])
                             - origin[axis]
                     }),
                 };
                 tiles.push(create_tile(TileRegion { visible, storage }));
             }
         }
-        Self::Tiled(tiles)
+        Self::Tiled(TextureTiles {
+            tiles,
+            step: [step_x, step_y],
+            count,
+        })
     }
 
     pub fn get(&self, index: usize) -> &TextureBinding {
         match self {
             Self::Single(tile) => tile,
-            Self::Tiled(tiles) => &tiles[index],
+            Self::Tiled(tiles) => &tiles.tiles[index],
         }
     }
 
@@ -158,7 +210,8 @@ impl ImageTextures {
         match self {
             Self::Single(tile) => write_region(queue, &tile.texture, region, bytes, bytes_per_row),
             Self::Tiled(tiles) => {
-                for tile in tiles {
+                // Filter borders share texels with neighboring tiles.
+                for (_, tile) in tiles.candidates(region, FILTER_BORDER) {
                     let storage = tile.region.storage;
                     let Some(mut clip) = storage.intersection(region) else {
                         continue;

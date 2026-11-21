@@ -6,7 +6,7 @@ use std::sync::{
 use std::time::Instant;
 
 use crate::{
-    Controls, PixelUpdate, Value, control_keys,
+    Controls, PixelUpdate, PixelUpdates, Value, control_keys,
     pixels::{INVALID, ImageFormat, Pixels, QUOTA},
 };
 
@@ -15,6 +15,7 @@ use playback::{Playback, PlaybackMode};
 
 const MAX_PATCH_DEPTH: u8 = 24;
 const DEFAULT_GAP_MS: u32 = 40;
+const MIN_SPLIT_SAVINGS_PIXELS: usize = 1024;
 pub(crate) const LOAD_FIELDS: &[u8] = b"xycrzXY";
 pub(crate) const CONTROL_FIELDS: &[u8] = b"svrcz";
 pub(crate) const COMPOSE_FIELDS: &[u8] = b"rcxywhXYC";
@@ -25,7 +26,7 @@ pub(crate) const INDEXED: &[u8] = b"EINVAL:Animation requires RGB or RGBA image 
 #[derive(Clone, Copy)]
 pub(crate) struct FrameUpload {
     origin: (u32, u32),
-    number: u32,
+    pub(crate) number: u32,
     base: u32,
     gap_ms: Option<u32>,
     background: [u8; 4],
@@ -42,6 +43,14 @@ impl FrameUpload {
             background: unsigned(controls, b'Y')?.to_be_bytes(),
             overwrite: overwrite(controls, b'X')?,
         })
+    }
+
+    pub(crate) fn resolve_number(&mut self, animation: Option<&Animation>) {
+        let extra = animation.map_or(0, |animation| animation.extra.len());
+        let append = u32::try_from(extra.saturating_add(2)).unwrap_or(u32::MAX);
+        if self.number == 0 || self.number > append {
+            self.number = append;
+        }
     }
 }
 
@@ -191,13 +200,46 @@ pub(crate) struct Animation {
     pub(crate) scheduled_at: Option<Instant>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PixelRevision {
+    revision: u64,
+    patch: Option<(u64, Region)>,
+}
+
+impl PixelRevision {
+    pub fn id(&self) -> u64 {
+        self.revision
+    }
+
+    pub(crate) fn full(revision: u64) -> Self {
+        Self {
+            revision,
+            patch: None,
+        }
+    }
+}
+
 impl Animation {
     pub(crate) fn uses_original(&self) -> bool {
         self.root.surface.is_none() || self.original_users != 0
     }
 
     pub(crate) fn revision(&self) -> Option<u64> {
-        Some(self.frame(self.current)?.surface.as_ref()?.revision)
+        self.current_surface().map(|surface| surface.revision)
+    }
+
+    pub(crate) fn pixel_revision(&self, original_revision: u64) -> PixelRevision {
+        let Some(surface) = self.current_surface() else {
+            return PixelRevision::full(original_revision);
+        };
+        let mut revision = PixelRevision::full(surface.revision);
+        if let SurfaceData::Patch(patch) = &surface.data {
+            revision.patch = patch
+                .base
+                .revision(original_revision)
+                .map(|base| (base, patch.region));
+        }
+        revision
     }
 
     pub(crate) fn pixels<'a>(
@@ -206,51 +248,90 @@ impl Animation {
         dimensions: (u32, u32),
         scratch: &'a mut Vec<u8>,
     ) -> Result<&'a [u8], &'static [u8]> {
-        match self
-            .frame(self.current)
-            .and_then(|frame| frame.surface.as_deref())
-        {
+        match self.current_surface() {
             Some(surface) => surface.data.pixels(original, dimensions, scratch),
             None => Ok(original),
         }
     }
 
-    pub(crate) fn pixel_update<'a>(
+    pub(crate) fn pixel_updates<'a>(
         &'a self,
         original: &'a [u8],
         dimensions: (u32, u32),
         original_revision: u64,
-        previous: u64,
+        previous: Option<&PixelRevision>,
         scratch: &'a mut Vec<u8>,
-    ) -> Result<PixelUpdate<'a>, &'static [u8]> {
-        let data = self
-            .frame(self.current)
-            .and_then(|frame| frame.surface.as_ref())
-            .map(|surface| &surface.data);
-        if let Some(data @ SurfaceData::Patch(patch)) = data
-            && patch.base.revision(original_revision) == Some(previous)
-        {
-            let region = patch.region;
-            let mut update = PixelUpdate {
-                origin: [region.x as u32, region.y as u32],
-                size: [region.width as u32, region.height as u32],
-                bytes_per_row: patch.stride as u32,
-                bytes: &patch.pixels,
-            };
-            if patch.blend && region.width != 0 && region.height != 0 {
-                let stride = region.width * 4;
-                resize_scratch(scratch, stride * region.height)?;
-                data.render(original, dimensions.0 as usize, region, scratch);
-                update.bytes = scratch;
-                update.bytes_per_row = stride as u32;
+    ) -> Result<PixelUpdates<'a>, &'static [u8]> {
+        let surface = self.current_surface();
+        let data = surface.map(|surface| &surface.data);
+        if let Some(previous) = previous {
+            let mut region = None;
+            if let Some(data @ SurfaceData::Patch(patch)) = data
+                && let Some(base) = patch.base.revision(original_revision)
+            {
+                if base == previous.revision {
+                    if !patch.blend {
+                        return Ok(PixelUpdates::One(
+                            patch.region.update(&patch.pixels, patch.stride),
+                        ));
+                    }
+                    region = Some(patch.region);
+                } else if let Some((previous_base, previous_region)) = previous.patch
+                    && base == previous_base
+                {
+                    let union = patch.region.union(previous_region);
+                    let separate_area = patch.region.area() + previous_region.area();
+                    if !patch.region.is_empty()
+                        && !previous_region.is_empty()
+                        && union.area().saturating_sub(separate_area) >= MIN_SPLIT_SAVINGS_PIXELS
+                    {
+                        return data.update_two_regions(
+                            original,
+                            dimensions.0 as usize,
+                            [previous_region, patch.region],
+                            scratch,
+                        );
+                    }
+                    region = Some(union);
+                }
             }
-            return Ok(update);
+            if let Some((base, previous_region)) = previous.patch
+                && base == surface.map_or(original_revision, |surface| surface.revision)
+            {
+                region = Some(previous_region);
+            }
+            if let Some(region) = region {
+                let width = dimensions.0 as usize;
+                if region.is_empty() {
+                    return Ok(PixelUpdates::One(region.update(&[], 0)));
+                }
+                return match data {
+                    None => Ok(PixelUpdates::One(region.update_from(original, width))),
+                    Some(SurfaceData::Full(bytes)) => {
+                        Ok(PixelUpdates::One(region.update_from(bytes, width)))
+                    }
+                    Some(data) => {
+                        let stride = region.width * 4;
+                        resize_scratch(scratch, stride * region.height)?;
+                        data.render(original, width, region, scratch);
+                        Ok(PixelUpdates::One(region.update(scratch, stride)))
+                    }
+                };
+            }
         }
         let bytes = match data {
             Some(data) => data.pixels(original, dimensions, scratch)?,
             None => original,
         };
-        Ok(PixelUpdate::full(bytes, dimensions, ImageFormat::Rgba))
+        Ok(PixelUpdates::One(PixelUpdate::full(
+            bytes,
+            dimensions,
+            ImageFormat::Rgba,
+        )))
+    }
+
+    fn current_surface(&self) -> Option<&Surface> {
+        self.frame(self.current)?.surface.as_deref()
     }
 
     pub(crate) fn upload(
@@ -258,7 +339,7 @@ impl Animation {
         upload: FrameUpload,
         pixels: Pixels,
         canvas: Canvas<'_>,
-    ) -> Result<u32, &'static [u8]> {
+    ) -> Result<(), &'static [u8]> {
         let Canvas {
             dimensions,
             original,
@@ -272,18 +353,19 @@ impl Animation {
         if pixels.dimensions.0 > width || pixels.dimensions.1 > height {
             return Err(INVALID_REGION);
         }
-        let append_index = self.extra.len() + 1;
-        let index = upload
-            .number
-            .checked_sub(1)
-            .map_or(append_index, |index| (index as usize).min(append_index));
-        let number = u32::try_from(index + 1).map_err(|_| QUOTA)?;
+        let index = upload.number.checked_sub(1).ok_or(NO_FRAME)? as usize;
+        if index > self.extra.len() + 1 {
+            return Err(NO_FRAME);
+        }
         let base = if let Some(frame) = self.frame(index) {
             Base::from_frame(frame)
         } else if upload.base == 0 {
             Base::Color(upload.background)
         } else {
-            Base::from_frame(self.frame(upload.base as usize - 1).ok_or(NO_FRAME)?)
+            Base::from_frame(
+                self.frame(upload.base as usize - 1)
+                    .ok_or(b"EINVAL:Animation base frame not found".as_slice())?,
+            )
         };
         let (x, y) = upload.origin;
         let (patch_width, patch_height) = pixels.dimensions;
@@ -339,6 +421,9 @@ impl Animation {
             if let Some(gap_ms) = upload.gap_ms {
                 self.set_gap(index, gap_ms);
             }
+            if index == self.current {
+                self.playback.restart_frame();
+            }
         } else {
             self.extra.try_reserve(1).map_err(|_| QUOTA)?;
             let gap_ms = upload.gap_ms.unwrap_or(DEFAULT_GAP_MS);
@@ -349,7 +434,7 @@ impl Animation {
             self.total_gap_ms += u64::from(gap_ms);
         }
         self.original_users += original_user;
-        Ok(number)
+        Ok(())
     }
 
     pub(crate) fn compose(
@@ -410,27 +495,25 @@ impl Animation {
                 bytes,
             },
             canvas,
-        )?;
-        Ok(())
+        )
     }
 
-    pub(crate) fn control(&mut self, command: FrameControl) -> Result<(), &'static [u8]> {
+    pub(crate) fn control(&mut self, command: FrameControl) {
         let select = command.select.checked_sub(1).map(|index| index as usize);
         let gap = command.gap_index.checked_sub(1).map(|index| index as usize);
-        if select.is_some_and(|index| self.frame(index).is_none())
-            || (command.gap_ms.is_some() && gap.is_some_and(|index| self.frame(index).is_none()))
+        if let Some((index, gap_ms)) = gap.zip(command.gap_ms)
+            && index <= self.extra.len()
         {
-            return Err(NO_FRAME);
-        }
-        if let Some((index, gap_ms)) = gap.zip(command.gap_ms) {
             self.set_gap(index, gap_ms);
         }
-        if let Some(index) = select {
+        if let Some(index) = select
+            && index != self.current
+            && index <= self.extra.len()
+        {
             self.current = index;
             self.playback.restart_frame();
         }
         self.playback.configure(command.mode, command.loops);
-        Ok(())
     }
 
     pub(crate) fn delete_frame(&mut self, number: u32) -> bool {
@@ -507,6 +590,24 @@ enum SurfaceData {
 }
 
 impl SurfaceData {
+    fn update_two_regions<'a>(
+        &self,
+        original: &[u8],
+        width: usize,
+        [first, second]: [Region; 2],
+        scratch: &'a mut Vec<u8>,
+    ) -> Result<PixelUpdates<'a>, &'static [u8]> {
+        let first_len = first.area() * 4;
+        resize_scratch(scratch, first_len + second.area() * 4)?;
+        let (first_bytes, second_bytes) = scratch.split_at_mut(first_len);
+        self.render(original, width, first, first_bytes);
+        self.render(original, width, second, second_bytes);
+        Ok(PixelUpdates::Two([
+            first.update(first_bytes, first.width * 4),
+            second.update(second_bytes, second.width * 4),
+        ]))
+    }
+
     fn uses_original(&self) -> bool {
         matches!(self, Self::Patch(patch) if patch.uses_original)
     }
@@ -657,7 +758,7 @@ impl Patch {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Region {
     x: usize,
     y: usize,
@@ -666,6 +767,47 @@ struct Region {
 }
 
 impl Region {
+    fn area(self) -> usize {
+        self.width * self.height
+    }
+
+    fn is_empty(self) -> bool {
+        self.width == 0 || self.height == 0
+    }
+
+    fn union(self, other: Self) -> Self {
+        if self.is_empty() {
+            return other;
+        }
+        if other.is_empty() {
+            return self;
+        }
+        let x = self.x.min(other.x);
+        let y = self.y.min(other.y);
+        Self {
+            x,
+            y,
+            width: (self.x + self.width).max(other.x + other.width) - x,
+            height: (self.y + self.height).max(other.y + other.height) - y,
+        }
+    }
+
+    fn update(self, bytes: &[u8], stride: usize) -> PixelUpdate<'_> {
+        PixelUpdate {
+            origin: [self.x as u32, self.y as u32],
+            size: [self.width as u32, self.height as u32],
+            bytes_per_row: stride as u32,
+            bytes,
+        }
+    }
+
+    fn update_from(self, pixels: &[u8], width: usize) -> PixelUpdate<'_> {
+        let stride = width * 4;
+        let start = self.y * stride + self.x * 4;
+        let len = (self.height - 1) * stride + self.width * 4;
+        self.update(&pixels[start..start + len], stride)
+    }
+
     fn checked(
         (x, y): (u32, u32),
         (width, height): (u32, u32),

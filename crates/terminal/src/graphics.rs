@@ -296,7 +296,22 @@ pub(crate) struct GraphicsPlacements {
     virtual_count: usize,
     virtual_parents: bool,
     anchors: HashMap<u64, usize>,
-    orphaned: Vec<u32>,
+    orphaned: Vec<OrphanedImage>,
+}
+
+#[derive(Debug)]
+struct OrphanedImage {
+    id: u32,
+    referenced: bool,
+}
+
+impl OrphanedImage {
+    fn new(id: u32) -> Self {
+        Self {
+            id,
+            referenced: false,
+        }
+    }
 }
 
 pub(crate) struct GraphicsAnchor {
@@ -332,7 +347,7 @@ impl GraphicsPlacements {
     }
 
     pub(crate) fn clear(&mut self) {
-        self.clear_buffer();
+        self.clear_placements();
         self.orphaned.clear();
     }
 
@@ -414,6 +429,20 @@ impl GraphicsPlacements {
     }
 
     pub(crate) fn clear_buffer(&mut self) {
+        if !self.anchors.is_empty() {
+            self.orphaned.extend(
+                self.images
+                    .iter()
+                    .filter(|image| image.parent.is_some())
+                    .map(|image| image.placement.image.id())
+                    .filter(|&id| id != 0)
+                    .map(OrphanedImage::new),
+            );
+        }
+        self.clear_placements();
+    }
+
+    fn clear_placements(&mut self) {
         self.images.clear();
         self.anchors.clear();
         self.virtual_count = 0;
@@ -875,7 +904,7 @@ impl GraphicsPlacements {
                 }
                 let id = image.placement.image.id();
                 if id != 0 {
-                    orphaned.push(id);
+                    orphaned.push(OrphanedImage::new(id));
                 }
                 false
             });
@@ -889,8 +918,29 @@ impl GraphicsPlacements {
         }
     }
 
-    pub(crate) fn orphaned(&self) -> &[u32] {
-        &self.orphaned
+    pub(crate) fn has_orphans(&self) -> bool {
+        !self.orphaned.is_empty()
+    }
+
+    pub(crate) fn retain_unreferenced_orphans(&mut self, other: &Self) {
+        if self.orphaned.is_empty() {
+            return;
+        }
+        self.orphaned.sort_unstable_by_key(|orphan| orphan.id);
+        self.orphaned.dedup_by_key(|orphan| orphan.id);
+        for placement in self.images.iter().chain(&other.images) {
+            let id = placement.placement.image.id();
+            if let Ok(index) = self.orphaned.binary_search_by_key(&id, |orphan| orphan.id) {
+                self.orphaned[index].referenced = true;
+            }
+        }
+        self.orphaned.retain(|orphan| !orphan.referenced);
+    }
+
+    pub(crate) fn is_orphaned(&self, id: u32) -> bool {
+        self.orphaned
+            .binary_search_by_key(&id, |orphan| orphan.id)
+            .is_ok()
     }
 
     pub(crate) fn clear_orphaned(&mut self) {
@@ -1029,12 +1079,8 @@ impl Graphics {
 
     #[cold]
     fn reap_orphans_inner(&mut self, screen: &mut Screen) {
-        self.images.retain_ids(|id| {
-            !screen.graphics_orphaned(id)
-                || screen
-                    .all_graphics_placements()
-                    .any(|placement| placement.placement.image.id() == id)
-        });
+        screen.retain_unreferenced_graphics_orphans();
+        self.images.retain_ids(|id| !screen.graphics_orphaned(id));
         screen.clear_graphics_orphans();
     }
 }

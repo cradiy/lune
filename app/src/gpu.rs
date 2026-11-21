@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::ops::Range;
 
 use lune_terminal::{
-    GraphicsImage, GraphicsImageFormat, GraphicsImageKey, GraphicsPlacement, PixelSize, Row,
-    RowRevision, graphics_parent_origins,
+    GraphicsImage, GraphicsImageFormat, GraphicsImageKey, GraphicsPixelRevision, GraphicsPlacement,
+    PixelSize, Row, RowRevision, graphics_parent_origins,
 };
 use wgpu::{Buffer, Device, Queue, RenderPipeline, Sampler, Texture, TextureFormat, TextureView};
 
@@ -46,9 +46,42 @@ impl GraphicsLayer {
 
 struct CachedImage {
     source_revision: u64,
-    revision: u64,
+    revision: GraphicsPixelRevision,
     format: GraphicsImageFormat,
     textures: ImageTextures,
+}
+
+impl CachedImage {
+    fn update_pixels(
+        &mut self,
+        queue: &Queue,
+        image: &GraphicsImage,
+        scratch: &mut Vec<u8>,
+    ) -> bool {
+        if self.revision.id() != image.revision() {
+            let Some(updates) = image.pixel_updates(Some(&self.revision), scratch) else {
+                return false;
+            };
+            for update in updates
+                .as_slice()
+                .iter()
+                .filter(|update| !update.size.contains(&0))
+            {
+                self.textures.write(
+                    queue,
+                    PixelRegion {
+                        origin: update.origin,
+                        size: update.size,
+                    },
+                    update.bytes,
+                    update.bytes_per_row,
+                    self.format.bytes_per_pixel(),
+                );
+            }
+            self.revision = image.pixel_revision();
+        }
+        true
+    }
 }
 
 struct Draw {
@@ -70,6 +103,7 @@ pub struct ImageRenderer {
     indexed: RenderPipeline,
     indexed_alpha: RenderPipeline,
     sampler: Sampler,
+    rgba_sampling: [Buffer; 2],
     palette: Texture,
     palette_view: TextureView,
     palette_revision: Option<u64>,
@@ -78,6 +112,7 @@ pub struct ImageRenderer {
     buffer: Option<Buffer>,
     instances: Vec<ImageInstance>,
     draws: Vec<Draw>,
+    visible_images: Vec<GraphicsImageKey>,
     prepared: Option<PreparedImages>,
     placeholder_rows: Vec<RowRevision>,
     pixel_scratch: Vec<u8>,
@@ -107,7 +142,10 @@ impl ImageRenderer {
             )
         };
         Self {
-            pipeline: pipeline("fragment_main", wgpu::BlendState::ALPHA_BLENDING),
+            pipeline: pipeline(
+                "fragment_main",
+                wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING,
+            ),
             indexed: pipeline(
                 "indexed_main",
                 wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING,
@@ -121,6 +159,14 @@ impl ImageRenderer {
                 min_filter: wgpu::FilterMode::Linear,
                 ..Default::default()
             }),
+            rgba_sampling: [0u32, 1].map(|mode| {
+                use wgpu::util::{BufferInitDescriptor, DeviceExt};
+                device.create_buffer_init(&BufferInitDescriptor {
+                    label: None,
+                    contents: bytemuck::bytes_of(&mode),
+                    usage: wgpu::BufferUsages::UNIFORM,
+                })
+            }),
             palette,
             palette_view,
             palette_revision: None,
@@ -129,6 +175,7 @@ impl ImageRenderer {
             buffer: None,
             instances: Vec::new(),
             draws: Vec::new(),
+            visible_images: Vec::new(),
             prepared: None,
             placeholder_rows: Vec::new(),
             pixel_scratch: Vec::new(),
@@ -166,9 +213,14 @@ impl ImageRenderer {
     ) -> usize {
         let stamp = frame.graphics_stamp();
         let storage_revision = frame.graphics_storage_revision();
-        if let Some(prepared) = &mut self.prepared
+        if let Some(prepared) = &self.prepared
             && prepared.geometry == frame.geometry
-            && prepared.stamp == stamp
+            && (prepared.stamp == stamp
+                || (prepared.rejected == 0
+                    && prepared
+                        .stamp
+                        .zip(stamp)
+                        .is_some_and(|(previous, current)| previous.same_layout(current))))
             && (!frame.has_virtual_graphics()
                 || frame
                     .viewport
@@ -176,13 +228,16 @@ impl ImageRenderer {
                     .map(Row::revision)
                     .chain(frame.offscreen_graphics_rows())
                     .eq(self.placeholder_rows.iter().copied()))
+            && (prepared.stamp == stamp || self.refresh_visible_pixels(queue, frame))
         {
+            let prepared = self.prepared.as_mut().expect("A layout was prepared");
             if prepared.storage_revision != storage_revision {
                 self.images.retain(|&id, cached| {
                     frame.graphics_image_source_revision(id) == Some(cached.source_revision)
                 });
                 prepared.storage_revision = storage_revision;
             }
+            prepared.stamp = stamp;
             let rejected = prepared.rejected;
             self.update_palette(queue, frame);
             return rejected;
@@ -208,6 +263,23 @@ impl ImageRenderer {
         rejected
     }
 
+    fn refresh_visible_pixels(&mut self, queue: &Queue, frame: &PresentationFrame<'_>) -> bool {
+        for &key in &self.visible_images {
+            let Some((image, cached)) = frame
+                .graphics_named_image(key)
+                .zip(self.images.get_mut(&key))
+            else {
+                return false;
+            };
+            if cached.source_revision != image.source_revision()
+                || !cached.update_pixels(queue, image, &mut self.pixel_scratch)
+            {
+                return false;
+            }
+        }
+        true
+    }
+
     fn prepare_changed(
         &mut self,
         device: &Device,
@@ -216,6 +288,7 @@ impl ImageRenderer {
     ) -> usize {
         self.draws.clear();
         self.instances.clear();
+        self.visible_images.clear();
         self.has_indexed = false;
         self.images.retain(|&id, cached| {
             frame.graphics_image_source_revision(id) == Some(cached.source_revision)
@@ -249,6 +322,7 @@ impl ImageRenderer {
             let Some(image) = frame.graphics_image(placement) else {
                 continue;
             };
+            let previous_instances = self.instances.len();
             let mut uploaded = None;
             let mut push = |location: &ImageLocation| {
                 let Some(quad) = ImageQuad::new(placement, cell, area, location) else {
@@ -274,10 +348,12 @@ impl ImageRenderer {
                     unreachable!("Oversized images are tiled");
                 };
                 tile_instances.clear();
-                tile_instances.extend(tiles.iter().enumerate().filter_map(|(index, tile)| {
-                    quad.tile_instance(tile.region)
-                        .map(|vertices| (index as u32, vertices))
-                }));
+                tile_instances.extend(tiles.candidates(quad.source_region(), 0).filter_map(
+                    |(index, tile)| {
+                        quad.tile_instance(tile.region)
+                            .map(|vertices| (index as u32, vertices))
+                    },
+                ));
                 if tile_instances.len() > max_instances - self.instances.len() {
                     rejected += 1;
                     return;
@@ -292,20 +368,23 @@ impl ImageRenderer {
                         push(location);
                     }
                 }
-                continue;
+            } else if let Some(origin) = placement
+                .origin_in_view(frame.viewport.offset(), |parent| {
+                    parents.get(&parent).copied().flatten()
+                })
+            {
+                let unbounded = i64::MIN..i64::MAX;
+                push(&ImageLocation {
+                    origin,
+                    clip: [unbounded.clone(), unbounded],
+                });
             }
-            let offset = frame.viewport.offset();
-            let Some(origin) =
-                placement.origin_in_view(offset, |parent| parents.get(&parent).copied().flatten())
-            else {
-                continue;
-            };
-            let unbounded = i64::MIN..i64::MAX;
-            push(&ImageLocation {
-                origin,
-                clip: [unbounded.clone(), unbounded],
-            });
+            if image_id.id() != 0 && self.instances.len() != previous_instances {
+                self.visible_images.push(image_id);
+            }
         }
+        self.visible_images.sort_unstable();
+        self.visible_images.dedup();
         write_instances(device, queue, &mut self.buffer, &self.instances);
         rejected
     }
@@ -358,30 +437,10 @@ impl ImageRenderer {
         id: GraphicsImageKey,
         image: &GraphicsImage,
     ) -> bool {
-        let revision = image.revision();
         if let Some(cached) = self.images.get_mut(&id)
             && cached.source_revision == image.source_revision()
         {
-            if cached.revision != revision {
-                let Some(update) = image.pixel_update(cached.revision, &mut self.pixel_scratch)
-                else {
-                    return false;
-                };
-                if !update.size.contains(&0) {
-                    cached.textures.write(
-                        queue,
-                        PixelRegion {
-                            origin: update.origin,
-                            size: update.size,
-                        },
-                        update.bytes,
-                        update.bytes_per_row,
-                        cached.format.bytes_per_pixel(),
-                    );
-                }
-                cached.revision = revision;
-            }
-            return true;
+            return cached.update_pixels(queue, image, &mut self.pixel_scratch);
         }
         let Some(pixels) = image.pixels(&mut self.pixel_scratch) else {
             return false;
@@ -394,6 +453,7 @@ impl ImageRenderer {
             GraphicsImageFormat::IndexedAlpha => &self.indexed_alpha,
         };
         let layout = pipeline.get_bind_group_layout(0);
+        let gather_first = format == GraphicsImageFormat::Rgba && prefer_alpha_gather(pixels);
         let textures = ImageTextures::new(
             [width, height],
             device.limits().max_texture_dimension_2d,
@@ -404,6 +464,7 @@ impl ImageRenderer {
                     format,
                     &self.sampler,
                     &self.palette_view,
+                    &self.rgba_sampling[usize::from(gather_first)],
                     region,
                 )
             },
@@ -422,7 +483,7 @@ impl ImageRenderer {
             id,
             CachedImage {
                 source_revision: image.source_revision(),
-                revision,
+                revision: image.pixel_revision(),
                 format,
                 textures,
             },
@@ -555,6 +616,16 @@ impl ImageQuad {
         Some(quad)
     }
 
+    fn source_region(&self) -> PixelRegion {
+        let origin = self.source.map(|[start, _]| start.floor() as u32);
+        PixelRegion {
+            origin,
+            size: std::array::from_fn(|axis| {
+                (self.source[axis][1].ceil() as u32).saturating_sub(origin[axis])
+            }),
+        }
+    }
+
     fn instance(&self, dimensions: [u32; 2]) -> ImageInstance {
         let [[left, right], [top, bottom]] = self.bounds;
         let [[x0, x1], [y0, y1]] = self.source;
@@ -599,4 +670,18 @@ impl ImageQuad {
         }
         Some(quad.instance(tile.storage.size))
     }
+}
+
+fn prefer_alpha_gather(bytes: &[u8]) -> bool {
+    let pixels = bytes.as_chunks::<4>().0;
+    let mut compared = 0;
+    let mut different = 0;
+    // Compare neighbors in short spans spread across the texture.
+    for span in pixels.chunks(pixels.len().div_ceil(8).max(4)) {
+        for adjacent in span[..span.len().min(4)].windows(2) {
+            compared += 1;
+            different += usize::from(adjacent[0][3] != adjacent[1][3]);
+        }
+    }
+    different != 0 && different * 2 >= compared
 }

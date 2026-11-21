@@ -8,6 +8,7 @@ struct VertexOutput {
 @group(0) @binding(1) var pixel_sampler: sampler;
 @group(0) @binding(2) var indices: texture_2d<u32>;
 @group(0) @binding(3) var palette: texture_2d<f32>;
+@group(0) @binding(4) var<uniform> gather_first: u32;
 
 fn quad_position(bounds: vec4<f32>, corner: vec2<f32>) -> vec4<f32> {
     return vec4<f32>(mix(bounds.xy, bounds.zw, corner), 0.0, 1.0);
@@ -51,7 +52,68 @@ fn solid_fragment(input: SolidQuad) -> @location(0) vec4<f32> {
 @fragment
 fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let y = clamp(input.uv.y, input.sample_rows.x, input.sample_rows.y);
-    return textureSampleLevel(pixels, pixel_sampler, vec2<f32>(input.uv.x, y), 0.0);
+    let uv = vec2<f32>(input.uv.x, y);
+    var sample: vec4<f32>;
+    if gather_first == 0u {
+        sample = textureSampleLevel(pixels, pixel_sampler, uv, 0.0);
+        if sample.a == 1.0 {
+            return sample;
+        }
+        if sample.a == 0.0 {
+            return vec4<f32>(0.0);
+        }
+    }
+    let position = uv * vec2<f32>(textureDimensions(pixels));
+    if all(abs(fract(position) - 0.5) < vec2<f32>(0.0001)) {
+        if gather_first != 0u {
+            sample = textureSampleLevel(pixels, pixel_sampler, uv, 0.0);
+        }
+        return premultiply(sample);
+    }
+    let alpha = textureGather(3, pixels, pixel_sampler, uv);
+    if all(alpha == vec4<f32>(alpha.x)) {
+        if alpha.x == 0.0 {
+            return vec4<f32>(0.0);
+        }
+        if gather_first != 0u {
+            sample = textureSampleLevel(pixels, pixel_sampler, uv, 0.0);
+        }
+        return premultiply(sample);
+    }
+    let weight = fract(position - 0.5);
+    let inverse = 1.0 - weight;
+    // Gather order is bottom left, bottom right, top right, top left.
+    let weights = vec4<f32>(
+        inverse.x * weight.y,
+        weight.x * weight.y,
+        weight.x * inverse.y,
+        inverse.x * inverse.y,
+    );
+    let weighted_alpha = weights * alpha;
+    return vec4<f32>(
+        dot(textureGather(0, pixels, pixel_sampler, uv), weighted_alpha),
+        dot(textureGather(1, pixels, pixel_sampler, uv), weighted_alpha),
+        dot(textureGather(2, pixels, pixel_sampler, uv), weighted_alpha),
+        dot(alpha, weights),
+    );
+}
+
+fn premultiply(color: vec4<f32>) -> vec4<f32> {
+    return vec4<f32>(color.rgb * color.a, color.a);
+}
+
+struct BilinearFilter {
+    first: vec2<i32>,
+    last: vec2<i32>,
+    weight: vec2<f32>,
+};
+
+fn bilinear_filter(position: vec2<f32>, dimensions: vec2<u32>) -> BilinearFilter {
+    let centered = position - 0.5;
+    let base = vec2<i32>(floor(centered));
+    let low = vec2<i32>(0);
+    let high = vec2<i32>(dimensions) - 1;
+    return BilinearFilter(clamp(base, low, high), clamp(base + 1, low, high), fract(centered));
 }
 
 fn indexed_color(texel: vec2<i32>, has_alpha: bool) -> vec4<f32> {
@@ -74,22 +136,18 @@ fn sample_indexed(input: VertexOutput, has_alpha: bool) -> vec4<f32> {
         return indexed_color(clamp(vec2<i32>(position), low, high), has_alpha);
     }
 
-    let centered = position - 0.5;
-    let base = vec2<i32>(floor(centered));
-    let first = clamp(base, low, high);
-    let last = clamp(base + 1, low, high);
-    let weight = fract(centered);
+    let taps = bilinear_filter(position, dimensions);
     let top = mix(
-        indexed_color(first, has_alpha),
-        indexed_color(vec2<i32>(last.x, first.y), has_alpha),
-        weight.x,
+        indexed_color(taps.first, has_alpha),
+        indexed_color(vec2<i32>(taps.last.x, taps.first.y), has_alpha),
+        taps.weight.x,
     );
     let bottom = mix(
-        indexed_color(vec2<i32>(first.x, last.y), has_alpha),
-        indexed_color(last, has_alpha),
-        weight.x,
+        indexed_color(vec2<i32>(taps.first.x, taps.last.y), has_alpha),
+        indexed_color(taps.last, has_alpha),
+        taps.weight.x,
     );
-    return mix(top, bottom, weight.y);
+    return mix(top, bottom, taps.weight.y);
 }
 
 @fragment

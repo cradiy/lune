@@ -44,6 +44,7 @@ pub use input::{InputModes, Key, KeySequence, Modifiers};
 pub use lines::{LogicalLine, LogicalLines};
 pub use lune_kitty_graphics::{
     Image as GraphicsImage, ImageFormat as GraphicsImageFormat, ImageKey as GraphicsImageKey,
+    PixelRevision as GraphicsPixelRevision,
 };
 pub use lune_kitty_graphics::{
     PLACEHOLDER as GRAPHICS_PLACEHOLDER, Placeholder as GraphicsPlaceholder,

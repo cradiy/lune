@@ -57,6 +57,15 @@ pub(crate) struct GraphicsStamp {
     history_endpoints: Option<[RowRevision; 2]>,
 }
 
+#[cfg(feature = "wgpu-renderer")]
+impl GraphicsStamp {
+    pub(crate) fn same_layout(self, other: Self) -> bool {
+        self.placement_revision == other.placement_revision
+            && self.viewport_offset == other.viewport_offset
+            && self.history_endpoints == other.history_endpoints
+    }
+}
+
 /// Borrowed state for one presentation pass.
 pub struct PresentationFrame<'a> {
     pub viewport: Viewport<'a>,
@@ -82,6 +91,14 @@ impl<'a> PresentationFrame<'a> {
             self.processor
                 .graphics_image(placement.placement.image.id())
         })
+    }
+
+    #[cfg(feature = "wgpu-renderer")]
+    pub(crate) fn graphics_named_image(
+        &self,
+        key: lune_terminal::GraphicsImageKey,
+    ) -> Option<&'a GraphicsImage> {
+        self.processor.graphics_image(key.id())
     }
 
     #[cfg(feature = "wgpu-renderer")]

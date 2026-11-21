@@ -7,12 +7,11 @@ use std::time::Instant;
 
 use super::{
     Command, Controls, Delete, DeleteTarget, EvictionRanking, FeatureReply, INLINE_DECODED_BYTES,
-    INLINE_ENCODED_BYTES, ImageChange, MAX_DIRECT_PAYLOAD_BYTES, Placement, PlacementError, Value,
-    control_keys,
+    INLINE_ENCODED_BYTES, ImageChange, Placement, PlacementError, Value, control_keys,
 };
 use crate::animation::{
     Animation, Canvas, FrameBudget, FrameComposition, FrameControl, FrameUpload, INDEXED,
-    LOAD_FIELDS,
+    LOAD_FIELDS, PixelRevision,
 };
 use crate::pixels::{INVALID, ImageFormat, PixelTransfer, Pixels, QUOTA, UNSUPPORTED};
 use crate::source::{BAD_SOURCE, LocalSource};
@@ -50,6 +49,20 @@ pub struct PixelUpdate<'a> {
     pub size: [u32; 2],
     pub bytes_per_row: u32,
     pub bytes: &'a [u8],
+}
+
+pub enum PixelUpdates<'a> {
+    One(PixelUpdate<'a>),
+    Two([PixelUpdate<'a>; 2]),
+}
+
+impl<'a> PixelUpdates<'a> {
+    pub fn as_slice(&self) -> &[PixelUpdate<'a>] {
+        match self {
+            Self::One(update) => std::slice::from_ref(update),
+            Self::Two(updates) => updates,
+        }
+    }
 }
 
 impl<'a> PixelUpdate<'a> {
@@ -92,15 +105,22 @@ impl Image {
         self.revision
     }
 
-    /// Returns a replacement region for a pixel buffer at the given revision.
-    pub fn pixel_update<'a>(
+    pub fn pixel_revision(&self) -> PixelRevision {
+        self.animation.as_ref().map_or_else(
+            || PixelRevision::full(self.revision),
+            |animation| animation.pixel_revision(self.revision),
+        )
+    }
+
+    /// Returns replacement regions for `previous`, or the full image when it is absent.
+    pub fn pixel_updates<'a>(
         &'a self,
-        previous: u64,
+        previous: Option<&PixelRevision>,
         scratch: &'a mut Vec<u8>,
-    ) -> Option<PixelUpdate<'a>> {
+    ) -> Option<PixelUpdates<'a>> {
         if let Some(animation) = &self.animation {
             return animation
-                .pixel_update(
+                .pixel_updates(
                     &self.bytes,
                     self.dimensions(),
                     self.revision,
@@ -109,17 +129,17 @@ impl Image {
                 )
                 .ok();
         }
-        Some(PixelUpdate::full(
+        Some(PixelUpdates::One(PixelUpdate::full(
             &self.bytes,
             self.dimensions(),
             self.format,
-        ))
+        )))
     }
 
-    fn update_animation<T>(
+    fn update_animation(
         &mut self,
-        operation: impl FnOnce(&mut Animation, &[u8]) -> Result<T, &'static [u8]>,
-    ) -> Result<T, &'static [u8]> {
+        operation: impl FnOnce(&mut Animation, &[u8]) -> Result<(), &'static [u8]>,
+    ) -> Result<(), &'static [u8]> {
         if self.format != ImageFormat::Rgba {
             return Err(INDEXED);
         }
@@ -127,9 +147,9 @@ impl Image {
             return operation(animation, &self.bytes);
         }
         let mut animation = Animation::default();
-        let result = operation(&mut animation, &self.bytes)?;
+        operation(&mut animation, &self.bytes)?;
         self.animation = Some(Box::new(animation));
-        Ok(result)
+        Ok(())
     }
 
     fn release_unused_original(&mut self) -> usize {
@@ -188,6 +208,11 @@ impl StoredImage {
     }
 }
 
+struct NumberedImage {
+    number: u32,
+    id: u32,
+}
+
 /// Stores image data and resolves Kitty image IDs and numbers.
 pub struct ImageStore {
     max_bytes: usize,
@@ -195,8 +220,9 @@ pub struct ImageStore {
     stored_bytes: usize,
     anonymous_images: usize,
     images: HashMap<ImageKey, StoredImage>,
+    // Sorted by image number, with matching entries in upload order.
+    numbered: Vec<NumberedImage>,
     pending: Option<Transfer>,
-    decode_scratch: Vec<u8>,
     next_id: u32,
     next_anonymous: u64,
     frame_budget: OnceLock<Arc<FrameBudget>>,
@@ -213,8 +239,8 @@ impl ImageStore {
             stored_bytes: 0,
             anonymous_images: 0,
             images: HashMap::new(),
+            numbered: Vec::new(),
             pending: None,
-            decode_scratch: Vec::new(),
             next_id: 1,
             next_anonymous: u64::from(u32::MAX) + 1,
             frame_budget: OnceLock::new(),
@@ -260,20 +286,16 @@ impl ImageStore {
     }
 
     pub fn newest_id(&self, number: u32) -> Option<u32> {
-        self.images
-            .iter()
-            .filter_map(|(key, entry)| match entry {
-                StoredImage::Named(image) if image.number == number && number != 0 => {
-                    Some((image.revision, key.id()))
-                }
-                _ => None,
-            })
-            .max()
-            .map(|(_, id)| id)
+        let end = self
+            .numbered
+            .partition_point(|entry| entry.number <= number);
+        let last = self.numbered.get(end.checked_sub(1)?)?;
+        (last.number == number).then_some(last.id)
     }
 
     pub fn retain_ids(&mut self, mut keep: impl FnMut(u32) -> bool) {
         let before = self.images.len();
+        let mut removed_numbered = false;
         self.images.retain(|&key, image| {
             let retain = match image {
                 StoredImage::Named(_) => keep(key.id()),
@@ -282,14 +304,19 @@ impl ImageStore {
             if !retain {
                 self.stored_bytes -= image.storage_bytes();
                 self.anonymous_images -= usize::from(key.id() == 0);
-                if let StoredImage::Named(image) = image
-                    && let Some(animation) = image.animation.as_mut()
-                {
-                    self.animation_wakes.remove(key, animation);
+                if let StoredImage::Named(image) = image {
+                    removed_numbered |= image.number != 0;
+                    if let Some(animation) = image.animation.as_mut() {
+                        self.animation_wakes.remove(key, animation);
+                    }
                 }
             }
             retain
         });
+        if removed_numbered {
+            self.numbered
+                .retain(|entry| self.images.contains_key(&ImageKey(u64::from(entry.id))));
+        }
         self.storage_revision = self
             .storage_revision
             .wrapping_add(u64::from(before != self.images.len()));
@@ -346,6 +373,7 @@ impl ImageStore {
             .storage_revision
             .wrapping_add(u64::from(!self.images.is_empty()));
         self.images.clear();
+        self.numbered.clear();
         self.stored_bytes = 0;
         self.anonymous_images = 0;
         self.animation_wakes = AnimationWakes::default();
@@ -368,6 +396,7 @@ impl ImageStore {
             let mut response = reply(
                 id,
                 image_number.unwrap_or_default(),
+                0,
                 0,
                 quiet.unwrap_or_default().unwrap_or_default(),
                 quiet.and(result),
@@ -393,7 +422,15 @@ impl ImageStore {
                 } else {
                     0
                 };
-                return reply(id, pending.number, placement, pending.quiet, Err(INVALID));
+                let frame = pending.frame.map_or(0, |upload| upload.number);
+                return reply(
+                    id,
+                    pending.number,
+                    placement,
+                    frame,
+                    pending.quiet,
+                    Err(INVALID),
+                );
             }
         } else {
             let id_field = number(controls, b'i');
@@ -407,7 +444,7 @@ impl ImageStore {
                 || id_field.is_none()
                 || number_field.is_none()
             {
-                return reply(id, image_number, placement_id, quiet_value, Err(INVALID));
+                return reply(id, image_number, placement_id, 0, quiet_value, Err(INVALID));
             }
             if controls.get(b'a') == Some(Value::Letter(b'p')) {
                 let id = if image_number == 0 {
@@ -416,19 +453,27 @@ impl ImageStore {
                     self.newest_id(image_number).unwrap_or_default()
                 };
                 let result = self.place(&command, id, apply);
-                return reply(id, image_number, placement_id, quiet_value, result);
+                return reply(id, image_number, placement_id, 0, quiet_value, result);
             }
             if let Some(Value::Letter(action @ (b'a' | b'c'))) = action {
                 let result = self.animation_action(&command, id, image_number, action);
                 if action == b'a' && result.is_ok() {
                     return None;
                 }
-                return reply(id, image_number, 0, quiet_value, result);
+                return reply(id, image_number, 0, 0, quiet_value, result);
             }
-            match self.begin(controls, id, image_number, quiet_value) {
+            let mut frame_number = 0;
+            match self.begin(controls, id, image_number, quiet_value, &mut frame_number) {
                 Ok(transfer) => transfer,
                 Err(message) => {
-                    return reply(id, image_number, placement_id, quiet_value, Err(message));
+                    return reply(
+                        id,
+                        image_number,
+                        placement_id,
+                        frame_number,
+                        quiet_value,
+                        Err(message),
+                    );
                 }
             }
         };
@@ -436,53 +481,41 @@ impl ImageStore {
         let id = transfer.key.id();
         let image_number = transfer.number;
         let placement_id = transfer.placement.map_or(0, |placement| placement.id);
+        let frame_number = transfer.frame.map_or(0, |upload| upload.number);
         let quiet_value = transfer.quiet;
         let result = (|| {
             quiet?;
             let local = transfer.local.is_some();
             let format_error = |error| if local { BAD_SOURCE } else { error };
-            let length = command.encoded_payload.len();
-            let mut inline = [0; INLINE_DECODED_BYTES];
-            let decoded = if length <= INLINE_ENCODED_BYTES {
-                &mut inline[..]
-            } else {
-                if local || length > MAX_DIRECT_PAYLOAD_BYTES {
-                    return Err(format_error(INVALID));
-                }
-                let size = base64::decoded_len_estimate(length);
-                self.decode_scratch
-                    .try_reserve_exact(size.saturating_sub(self.decode_scratch.len()))
-                    .map_err(|_| QUOTA)?;
-                self.decode_scratch.resize(size, 0);
-                &mut self.decode_scratch[..]
-            };
-            let written = command
-                .decode_payload(decoded)
-                .map_err(|_| format_error(INVALID))?;
             if let Some(source) = transfer.local.take() {
+                if command.encoded_payload.len() > INLINE_ENCODED_BYTES {
+                    return Err(BAD_SOURCE);
+                }
+                let mut decoded = [0; INLINE_DECODED_BYTES];
+                let written = command
+                    .decode_payload(&mut decoded)
+                    .map_err(|_| BAD_SOURCE)?;
                 if written > crate::MAX_PATH_BYTES {
                     return Err(BAD_SOURCE);
                 }
                 transfer.pixels.load(source, &decoded[..written])?;
             } else {
-                transfer.pixels.append(&decoded[..written])?;
+                transfer.pixels.append_payload(&command)?;
             }
 
             if controls.get(b'm') == Some(Value::Unsigned(1)) {
                 self.pending = Some(transfer);
-                return Ok(None);
+                return Ok(false);
             }
             let pixels = transfer
                 .pixels
                 .finish(self.max_bytes)
                 .map_err(format_error)?;
             if let Some(frame) = transfer.frame {
-                let frame = self.apply_frame(transfer.key, |animation, canvas| {
+                self.apply_frame(transfer.key, |animation, canvas| {
                     animation.upload(frame, pixels, canvas)
                 })?;
-                return Ok(Some(frame));
-            }
-            if transfer.action != b'q' && (id != 0 || transfer.placement.is_some()) {
+            } else if transfer.action != b'q' && (id != 0 || transfer.placement.is_some()) {
                 self.store(
                     transfer.key,
                     transfer.number,
@@ -492,19 +525,27 @@ impl ImageStore {
                     &mut apply,
                 )?;
             }
-            Ok(Some(0))
+            Ok(true)
         })();
         match result {
-            Ok(None) => None,
-            Ok(Some(frame_number)) => {
-                let mut reply = reply(id, image_number, placement_id, quiet_value, Ok(()))?;
-                reply.frame_number = frame_number;
-                Some(reply)
-            }
+            Ok(false) => None,
+            Ok(true) => reply(
+                if frame_number == 0 || image_number == 0 {
+                    id
+                } else {
+                    0
+                },
+                image_number,
+                placement_id,
+                frame_number,
+                quiet_value,
+                Ok(()),
+            ),
             Err(message) => reply(
                 if image_number == 0 { id } else { 0 },
                 image_number,
                 placement_id,
+                frame_number,
                 quiet_value,
                 Err(message),
             ),
@@ -524,7 +565,10 @@ impl ImageStore {
         let key = self.existing_key(id, image_number)?;
         if action == b'a' {
             let control = FrameControl::parse(&command.controls)?;
-            self.apply_frame(key, |animation, _| animation.control(control))
+            self.apply_frame(key, |animation, _| {
+                animation.control(control);
+                Ok(())
+            })
         } else {
             let composition = FrameComposition::parse(&command.controls)?;
             self.apply_frame(key, |animation, canvas| {
@@ -533,11 +577,11 @@ impl ImageStore {
         }
     }
 
-    fn apply_frame<T>(
+    fn apply_frame(
         &mut self,
         key: ImageKey,
-        apply: impl FnOnce(&mut Animation, Canvas<'_>) -> Result<T, &'static [u8]>,
-    ) -> Result<T, &'static [u8]> {
+        apply: impl FnOnce(&mut Animation, Canvas<'_>) -> Result<(), &'static [u8]>,
+    ) -> Result<(), &'static [u8]> {
         let Some(StoredImage::Named(image)) = self.images.get_mut(&key) else {
             return Err(MISSING);
         };
@@ -547,7 +591,7 @@ impl ImageStore {
         let previous = image.revision();
         let dimensions = image.dimensions();
         let revision = NEXT_IMAGE_REVISION.fetch_add(1, Ordering::Relaxed);
-        let result = image.update_animation(|animation, original| {
+        image.update_animation(|animation, original| {
             apply(
                 animation,
                 Canvas {
@@ -563,7 +607,7 @@ impl ImageStore {
             self.visual_revision = self.visual_revision.wrapping_add(1);
         }
         self.animation_wakes.update(key, image);
-        Ok(result)
+        Ok(())
     }
 
     fn existing_key(&self, id: u32, image_number: u32) -> Result<ImageKey, &'static [u8]> {
@@ -615,6 +659,7 @@ impl ImageStore {
         id: u32,
         image_number: u32,
         quiet: u32,
+        frame_number: &mut u32,
     ) -> Result<Transfer, &'static [u8]> {
         let action = match controls.get(b'a') {
             None => b't',
@@ -623,6 +668,9 @@ impl ImageStore {
         };
         let display = action == b'T';
         let frame = action == b'f';
+        if frame {
+            *frame_number = number(controls, b'r').unwrap_or_default();
+        }
         let extra = if display {
             Placement::KEYS
         } else if frame {
@@ -636,14 +684,17 @@ impl ImageStore {
         if action == b'q' && id == 0 {
             return Err(INVALID);
         }
-        let frame = frame.then(|| FrameUpload::parse(controls)).transpose()?;
-        let frame_key = if frame.is_some() {
+        let mut frame = frame.then(|| FrameUpload::parse(controls)).transpose()?;
+        let frame_key = if let Some(upload) = frame.as_mut() {
             let key = self.existing_key(id, image_number)?;
-            if self.get(key.id()).ok_or(MISSING)?.format() != ImageFormat::Rgba
+            let image = self.get(key.id()).ok_or(MISSING)?;
+            if image.format() != ImageFormat::Rgba
                 || matches!(controls.get(b'f'), Some(Value::Unsigned(8 | 16)))
             {
                 return Err(INDEXED);
             }
+            upload.resolve_number(image.animation.as_deref());
+            *frame_number = upload.number;
             Some(key)
         } else {
             None
@@ -716,6 +767,9 @@ impl ImageStore {
         if !replaces_image {
             self.images.try_reserve(1).map_err(|_| QUOTA)?;
         }
+        if number != 0 {
+            self.numbered.try_reserve(1).map_err(|_| QUOTA)?;
+        }
         let revision = NEXT_IMAGE_REVISION.fetch_add(1, Ordering::Relaxed);
         let image = Image {
             width: pixels.dimensions.0,
@@ -773,6 +827,25 @@ impl ImageStore {
         if let Some(previous) = self.images.insert(key, entry) {
             self.release_stored(key, previous);
         }
+        if number != 0 {
+            let index = if self
+                .numbered
+                .last()
+                .is_none_or(|entry| entry.number <= number)
+            {
+                self.numbered.len()
+            } else {
+                self.numbered
+                    .partition_point(|entry| entry.number <= number)
+            };
+            self.numbered.insert(
+                index,
+                NumberedImage {
+                    number,
+                    id: key.id(),
+                },
+            );
+        }
         self.stored_bytes += bytes;
         self.anonymous_images += usize::from(key.id() == 0);
         Ok(())
@@ -788,10 +861,20 @@ impl ImageStore {
         self.storage_revision = self.storage_revision.wrapping_add(1);
         self.stored_bytes -= entry.storage_bytes();
         self.anonymous_images -= usize::from(key.id() == 0);
-        if let StoredImage::Named(image) = &mut entry
-            && let Some(animation) = image.animation.as_mut()
-        {
-            self.animation_wakes.remove(key, animation);
+        if let StoredImage::Named(image) = &mut entry {
+            if image.number != 0 {
+                let end = self
+                    .numbered
+                    .partition_point(|entry| entry.number <= image.number);
+                let index = self.numbered[..end]
+                    .iter()
+                    .rposition(|entry| entry.id == key.id())
+                    .expect("Stored numbered image has an index entry");
+                self.numbered.remove(index);
+            }
+            if let Some(animation) = image.animation.as_mut() {
+                self.animation_wakes.remove(key, animation);
+            }
         }
     }
 }
@@ -818,6 +901,7 @@ fn reply(
     id: u32,
     number: u32,
     placement_id: u32,
+    frame_number: u32,
     quiet: u32,
     result: Result<(), &'static [u8]>,
 ) -> Option<Reply> {
@@ -830,7 +914,7 @@ fn reply(
         id,
         number,
         placement_id,
-        frame_number: 0,
+        frame_number,
         message,
         features: None,
     })

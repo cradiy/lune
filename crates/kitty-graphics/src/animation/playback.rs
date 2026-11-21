@@ -16,7 +16,7 @@ enum Timing {
     #[default]
     Start,
     Showing(Instant),
-    Waiting,
+    Waiting(Instant),
 }
 
 #[derive(Debug, Default)]
@@ -63,22 +63,16 @@ impl Animation {
     }
 
     fn advance_to(&mut self, now: Instant) -> Option<Instant> {
-        if !self.playing() || self.playback.loops_finished() {
+        if !self.playing() {
             return None;
         }
-        let shown = match self.playback.timing {
-            Timing::Start => {
-                self.playback.timing = Timing::Showing(now);
-                Some(now)
-            }
-            Timing::Showing(shown) => Some(shown),
-            Timing::Waiting => None,
-        };
-        if self.extra.is_empty() {
-            return None;
-        }
-        if self.total_gap_ms == 0 {
-            self.playback.timing = Timing::Waiting;
+        let timing = self.playback.timing;
+        if self.playback.loops_finished() || self.extra.is_empty() || self.total_gap_ms == 0 {
+            let shown = match timing {
+                Timing::Start => now,
+                Timing::Showing(shown) | Timing::Waiting(shown) => shown,
+            };
+            self.playback.timing = Timing::Waiting(shown);
             return None;
         }
 
@@ -86,20 +80,29 @@ impl Animation {
             .frame(self.current)
             .expect("Current animation frame")
             .gap_ms;
-        let mut next_at = match shown {
-            Some(shown) => shown.checked_add(Duration::from_millis(u64::from(gap)))?,
-            None => now,
+        let gap = Duration::from_millis(u64::from(gap));
+        let (mut shown, mut next_at) = match timing {
+            Timing::Showing(shown) => (shown, shown.checked_add(gap)?),
+            Timing::Start => (now, now.checked_add(gap)?),
+            Timing::Waiting(shown) => {
+                // Keep the current frame's remaining gap and start new frames at this wake.
+                let deadline = shown.checked_add(gap)?;
+                if deadline > now {
+                    return Some(deadline);
+                }
+                (shown, now)
+            }
         };
         let mut index = self.current + 1;
         while next_at <= now {
             if index > self.extra.len() {
                 if self.playback.mode == PlaybackMode::Loading {
-                    self.playback.timing = Timing::Waiting;
+                    self.playback.timing = Timing::Waiting(shown);
                     return None;
                 }
                 self.playback.completed_loops = self.playback.completed_loops.saturating_add(1);
                 if self.playback.loops_finished() {
-                    self.playback.timing = Timing::Waiting;
+                    self.playback.timing = Timing::Waiting(shown);
                     return None;
                 }
                 next_at = self.skip_elapsed_loops(next_at, now)?;
@@ -109,11 +112,12 @@ impl Animation {
             let gap = self.frame(index).expect("Animation frame").gap_ms;
             if gap != 0 {
                 self.current = index;
-                self.playback.timing = Timing::Showing(next_at);
+                shown = next_at;
                 next_at = next_at.checked_add(Duration::from_millis(u64::from(gap)))?;
             }
             index += 1;
         }
+        self.playback.timing = Timing::Showing(shown);
         Some(next_at)
     }
 
@@ -126,18 +130,27 @@ impl Animation {
             return Some(at);
         }
         let loops = u32::try_from(skipped).unwrap_or(u32::MAX);
-        self.playback.completed_loops = self.playback.completed_loops.saturating_add(loops);
-        if self.playback.loops_finished() {
-            self.current = self
+        if let Some(limit) = self.playback.loop_limit
+            && loops >= limit.get() - self.playback.completed_loops
+        {
+            let remaining = limit.get() - self.playback.completed_loops;
+            let end =
+                at.checked_add(Duration::from_millis(self.total_gap_ms).checked_mul(remaining)?)?;
+            let (last, gap) = self
                 .extra
                 .iter()
-                .rposition(|frame| frame.gap_ms != 0)
-                .map_or(0, |index| index + 1);
-            self.playback.completed_loops =
-                self.playback.loop_limit.expect("Finite animation").get();
-            self.playback.timing = Timing::Waiting;
+                .enumerate()
+                .rfind(|(_, frame)| frame.gap_ms != 0)
+                .map_or((0, self.root.gap_ms), |(index, frame)| {
+                    (index + 1, frame.gap_ms)
+                });
+            self.current = last;
+            self.playback.completed_loops = limit.get();
+            self.playback.timing =
+                Timing::Waiting(end.checked_sub(Duration::from_millis(u64::from(gap)))?);
             return None;
         }
+        self.playback.completed_loops = self.playback.completed_loops.saturating_add(loops);
         let remainder = Duration::from_millis((elapsed_ms % loop_ms) as u64)
             + Duration::from_nanos(u64::from(elapsed.subsec_nanos() % 1_000_000));
         now.checked_sub(remainder)

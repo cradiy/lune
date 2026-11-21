@@ -15,9 +15,10 @@ mod placeholder;
 mod placement;
 mod source;
 
+pub use animation::PixelRevision;
 pub use delete::{Delete, DeleteTarget};
 pub use features::{FeatureReply, MAX_FEATURE_REPLY_BYTES};
-pub use images::{Image, ImageKey, ImageStore, PixelUpdate, Reply};
+pub use images::{Image, ImageKey, ImageStore, PixelUpdate, PixelUpdates, Reply};
 pub use pixels::ImageFormat;
 pub use placeholder::{PLACEHOLDER, Placeholder};
 pub use placement::{

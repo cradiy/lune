@@ -100,6 +100,56 @@ fn quota_and_query_preserve_stored_pixels() {
 }
 
 #[test]
+fn numbered_images_follow_committed_replacement_and_eviction() {
+    let mut images = ImageStore::new(8, 2);
+    let mut protected = None;
+    feed(b"\x1b_Ga=T,I=17,s=1,v=1;AAAA/w==\x1b\\", 7, |command| {
+        let reply = images.receive(command.unwrap(), |change| {
+            if let ImageChange::Place { placement, .. } = change {
+                protected = Some(placement.image);
+            }
+            Ok(())
+        });
+        assert_eq!(reply.unwrap().id, 1);
+    });
+    let receive = |images: &mut ImageStore, wire: &[u8]| {
+        let mut reply = None;
+        feed(wire, 7, |command| {
+            reply = images.receive(command.unwrap(), |change| match change {
+                ImageChange::RankEvictions { ranking, .. } => ranking.protect(protected.unwrap()),
+                ImageChange::Place { .. } => Err(PlacementError::InvalidRegion),
+                ImageChange::Remove { .. } => Ok(()),
+            });
+        });
+        reply.unwrap()
+    };
+    assert_eq!(
+        receive(&mut images, b"\x1b_GI=17,s=1,v=1;AQID/w==\x1b\\").id,
+        2
+    );
+    assert!(
+        receive(&mut images, b"\x1b_Ga=T,I=17,s=1,v=1;AAAA/w==\x1b\\")
+            .message
+            .starts_with(b"EINVAL")
+    );
+    assert_eq!(images.newest_id(17), Some(2));
+
+    assert_eq!(
+        receive(&mut images, b"\x1b_Gi=99,s=1,v=1;AAAA/w==\x1b\\").message,
+        b"OK"
+    );
+    assert!(images.get(2).is_none());
+    assert_eq!(images.newest_id(17), Some(1));
+
+    assert_eq!(
+        receive(&mut images, b"\x1b_Gi=1,s=1,v=1;AAAA/w==\x1b\\").message,
+        b"OK"
+    );
+    assert!(images.get(1).is_some());
+    assert_eq!(images.newest_id(17), None);
+}
+
+#[test]
 fn animation_frames_commit_complete_patches_and_keep_the_current_surface_on_failure() {
     let receive = |images: &mut ImageStore, input: &[u8]| {
         let mut reply = None;
@@ -132,22 +182,27 @@ fn animation_frames_commit_complete_patches_and_keep_the_current_surface_on_fail
         b"\x1b_Ga=f,I=17,c=1,x=1,s=1,v=1,m=1;AP8A\x1b\\\x1b_Ga=f,m=0;gA==\x1b\\",
     )
     .unwrap();
-    assert_eq!((reply.id, reply.number, reply.frame_number), (1, 17, 2));
+    assert_eq!((reply.id, reply.number, reply.frame_number), (0, 17, 2));
     assert_eq!(images.visual_revision(), before);
 
     let mut scratch = Vec::new();
-    let original_revision = images.get(1).unwrap().revision();
+    let original_revision = images.get(1).unwrap().pixel_revision();
     assert!(receive(&mut images, b"\x1b_Ga=a,i=1,c=2\x1b\\").is_none());
     let selected = images.visual_revision();
     assert_ne!(selected, before);
     let image = images.get(1).unwrap();
-    let update = image.pixel_update(original_revision, &mut scratch).unwrap();
+    let PixelUpdates::One(update) = image
+        .pixel_updates(Some(&original_revision), &mut scratch)
+        .unwrap()
+    else {
+        panic!("Expected one new patch");
+    };
     assert_eq!(
         (update.origin, update.size, update.bytes_per_row),
         ([1, 0], [1, 1], 4)
     );
     assert_eq!(update.bytes, &[0, 128, 127, 255]);
-    let selected_revision = image.revision();
+    let selected_revision = image.pixel_revision();
     assert_eq!(
         images.get(1).unwrap().pixels(&mut scratch).unwrap(),
         &[255, 0, 0, 255, 0, 128, 127, 255],
@@ -187,11 +242,14 @@ fn animation_frames_commit_complete_patches_and_keep_the_current_surface_on_fail
         &[0, 128, 127, 255, 0, 128, 127, 255],
     );
     assert!(receive(&mut images, b"\x1b_Ga=a,i=1,c=1\x1b\\").is_none());
-    let update = images
+    let PixelUpdates::One(update) = images
         .get(1)
         .unwrap()
-        .pixel_update(selected_revision, &mut scratch)
-        .unwrap();
+        .pixel_updates(Some(&selected_revision), &mut scratch)
+        .unwrap()
+    else {
+        panic!("Expected the full image after the base changed");
+    };
     assert_eq!((update.origin, update.size), ([0, 0], [2, 1]));
     assert_eq!(update.bytes, &[0, 0, 0, 0, 0, 0, 255, 255]);
 
@@ -285,19 +343,101 @@ fn deleting_the_last_dependent_frame_releases_original_pixels() {
     );
     let root = images.get(1).unwrap();
     assert_eq!(&root.pixels(&mut scratch).unwrap()[..4], &[0, 255, 0, 255]);
-    let root_revision = root.revision();
+    let root_revision = root.pixel_revision();
 
     let patch = b"\x1b_Ga=f,i=1,c=1,f=24,s=1,v=1;AAD/\x1b\\";
     assert_eq!(receive(&mut images, patch).unwrap().message, b"OK");
     receive(&mut images, b"\x1b_Ga=a,i=1,c=2\x1b\\");
     let image = images.get(1).unwrap();
-    let patch = image.pixel_update(root_revision, &mut scratch).unwrap();
+    let PixelUpdates::One(patch) = image
+        .pixel_updates(Some(&root_revision), &mut scratch)
+        .unwrap()
+    else {
+        panic!("Expected one new patch");
+    };
     assert_eq!((patch.origin, patch.size), ([0, 0], [1, 1]));
     assert_eq!(patch.bytes, &[0, 0, 255, 255]);
-    let surface = image.pixel_update(0, &mut scratch).unwrap();
+    let PixelUpdates::One(surface) = image.pixel_updates(None, &mut scratch).unwrap() else {
+        panic!("Expected the full image without a previous revision");
+    };
     assert_eq!(surface.size, [16, 16]);
     assert_eq!(surface.bytes.len(), 1024);
     assert_eq!(&surface.bytes[..8], &[0, 0, 255, 255, 0, 255, 0, 255]);
+}
+
+#[test]
+fn patch_transitions_restore_pixels_from_a_shared_base() {
+    let mut images = ImageStore::new(16384, 1);
+    let base = format!("\x1b_Gi=1,f=24,s=64,v=64,q=2;{}\x1b\\", "/wAA".repeat(4096));
+    let apply = |images: &mut ImageStore, wire| {
+        feed(wire, 5, |command| {
+            let command = command.unwrap();
+            if let Some(delete) = command.decode_delete() {
+                images.delete_frame(delete.unwrap(), |_| Ok(()));
+            } else {
+                assert!(images.receive(command, |_| Ok(())).is_none());
+            }
+        });
+    };
+    apply(&mut images, base.as_bytes());
+    apply(
+        &mut images,
+        b"\x1b_Ga=f,i=1,c=1,x=1,f=24,s=1,v=2,X=1,q=2;AAD/AAD/\x1b\\",
+    );
+    apply(
+        &mut images,
+        b"\x1b_Ga=f,i=1,c=1,x=2,y=1,f=24,s=1,v=1,X=1,q=2;AP8A\x1b\\",
+    );
+    apply(
+        &mut images,
+        b"\x1b_Ga=f,i=1,c=1,x=63,y=63,s=1,v=1,q=2;AP8AgA==\x1b\\",
+    );
+    apply(&mut images, b"\x1b_Ga=a,i=1,c=2,q=2\x1b\\");
+    let first = images.get(1).unwrap().pixel_revision();
+
+    apply(&mut images, b"\x1b_Ga=a,i=1,c=3,q=2\x1b\\");
+    let mut scratch = Vec::new();
+    let image = images.get(1).unwrap();
+    let PixelUpdates::One(update) = image.pixel_updates(Some(&first), &mut scratch).unwrap() else {
+        panic!("Expected nearby patches to share one update");
+    };
+    assert_eq!(
+        (update.origin, update.size, update.bytes_per_row),
+        ([1, 0], [2, 2], 8)
+    );
+    let red = [255, 0, 0, 255];
+    let green = [0, 255, 0, 255];
+    assert_eq!(update.bytes.as_chunks::<4>().0, &[red, red, red, green]);
+
+    apply(&mut images, b"\x1b_Ga=a,i=1,c=4,q=2\x1b\\");
+    let image = images.get(1).unwrap();
+    let PixelUpdates::Two([restored, blended]) =
+        image.pixel_updates(Some(&first), &mut scratch).unwrap()
+    else {
+        panic!("Expected two updates for distant patches");
+    };
+    assert_eq!((restored.origin, restored.size), ([1, 0], [1, 2]));
+    assert_eq!(restored.bytes.as_chunks::<4>().0, &[red, red]);
+    assert_eq!((blended.origin, blended.size), ([63, 63], [1, 1]));
+    assert_eq!(blended.bytes, &[127, 128, 0, 255]);
+
+    apply(
+        &mut images,
+        b"\x1b_Ga=d,d=f,i=1,r=2\x1b\\\x1b_Ga=a,i=1,c=1,q=2\x1b\\",
+    );
+    let mut scratch = Vec::new();
+    let image = images.get(1).unwrap();
+    let PixelUpdates::One(update) = image.pixel_updates(Some(&first), &mut scratch).unwrap() else {
+        panic!("Expected only the restored region");
+    };
+    assert_eq!(
+        (update.origin, update.size, update.bytes_per_row),
+        ([1, 0], [1, 2], 256)
+    );
+    assert_eq!(update.bytes.len(), 260);
+    assert_eq!(update.bytes[..4], red);
+    assert_eq!(update.bytes[256..], red);
+    assert!(scratch.is_empty());
 }
 
 #[test]
@@ -449,6 +589,14 @@ fn local_transfers_use_checked_ranges_and_unlink_only_tagged_temp_files() {
     assert_eq!(
         images.get(1).unwrap().pixels(&mut Vec::new()).unwrap(),
         &[1, 2, 3, 4]
+    );
+    assert_eq!(
+        local_reply(&mut images, "i=3,t=f,f=24,s=2,v=1,S=6,O=1", &b(&link)).message,
+        b"OK"
+    );
+    assert_eq!(
+        images.get(3).unwrap().pixels(&mut Vec::new()).unwrap(),
+        &[9, 1, 2, 255, 3, 4, 8, 255]
     );
     assert_eq!(
         local_reply(&mut images, "i=1,t=t,s=1,v=1,S=4,O=2", &b(&file)).message,

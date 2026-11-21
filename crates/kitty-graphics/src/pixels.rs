@@ -4,7 +4,7 @@ use flate2::{Decompress, FlushDecompress, Status};
 use png::{BitDepth, ColorType, DecodingError, Transformations};
 
 use crate::source::LocalSource;
-use crate::{Controls, Value};
+use crate::{Command, Controls, MAX_DIRECT_PAYLOAD_BYTES, PayloadError, Value};
 
 pub(crate) const INVALID: &[u8] = b"EINVAL:Invalid image data";
 pub(crate) const QUOTA: &[u8] = b"ENOSPC:Image quota exceeded";
@@ -114,15 +114,14 @@ impl PixelTransfer {
         })
     }
 
-    pub(crate) fn append(&mut self, bytes: &[u8]) -> Result<(), &'static [u8]> {
-        if bytes.len() > self.wire_limit - self.bytes.len() {
-            return Err(if self.compressed || self.expected.is_none() {
-                QUOTA
-            } else {
-                INVALID
-            });
+    pub(crate) fn append_payload(&mut self, command: &Command<'_>) -> Result<(), &'static [u8]> {
+        let encoded = command.encoded_payload.len();
+        if encoded > MAX_DIRECT_PAYLOAD_BYTES {
+            return Err(INVALID);
         }
-        let needed = self.bytes.len() + bytes.len();
+        let start = self.bytes.len();
+        let decoded = base64::decoded_len_estimate(encoded).min(self.wire_limit - start);
+        let needed = start + decoded;
         if needed > self.bytes.capacity() {
             let capacity = self
                 .bytes
@@ -131,11 +130,27 @@ impl PixelTransfer {
                 .max(needed)
                 .min(self.wire_limit);
             self.bytes
-                .try_reserve_exact(capacity - self.bytes.len())
+                .try_reserve_exact(capacity - start)
                 .map_err(|_| QUOTA)?;
         }
-        self.bytes.extend_from_slice(bytes);
-        Ok(())
+        self.bytes.resize(needed, 0);
+        match command.decode_payload(&mut self.bytes[start..]) {
+            Ok(written) => {
+                self.bytes.truncate(start + written);
+                Ok(())
+            }
+            Err(error) => {
+                self.bytes.truncate(start);
+                if matches!(
+                    error,
+                    PayloadError::Base64(base64::DecodeSliceError::OutputSliceTooSmall)
+                ) && (self.compressed || self.expected.is_none())
+                {
+                    return Err(QUOTA);
+                }
+                Err(INVALID)
+            }
+        }
     }
 
     pub(crate) fn load(&mut self, source: LocalSource, name: &[u8]) -> Result<(), &'static [u8]> {
@@ -312,22 +327,22 @@ fn expand(bytes: &[u8], color: ColorType) -> Result<Vec<u8>, &'static [u8]> {
     let size = (bytes.len() / color.samples())
         .checked_mul(4)
         .ok_or(QUOTA)?;
-    let mut rgba = Vec::new();
-    rgba.try_reserve_exact(size).map_err(|_| QUOTA)?;
+    let mut rgba = zeroed(size)?;
+    let pixels = rgba.as_chunks_mut::<4>().0;
     match color {
         ColorType::Rgb => {
-            for &[r, g, b] in bytes.as_chunks::<3>().0 {
-                rgba.extend_from_slice(&[r, g, b, 255]);
+            for (out, &[r, g, b]) in pixels.iter_mut().zip(bytes.as_chunks::<3>().0) {
+                *out = [r, g, b, 255];
             }
         }
         ColorType::Grayscale => {
-            for &value in bytes {
-                rgba.extend_from_slice(&[value, value, value, 255]);
+            for (out, &value) in pixels.iter_mut().zip(bytes) {
+                *out = [value, value, value, 255];
             }
         }
         ColorType::GrayscaleAlpha => {
-            for &[value, alpha] in bytes.as_chunks::<2>().0 {
-                rgba.extend_from_slice(&[value, value, value, alpha]);
+            for (out, &[value, alpha]) in pixels.iter_mut().zip(bytes.as_chunks::<2>().0) {
+                *out = [value, value, value, alpha];
             }
         }
         ColorType::Rgba | ColorType::Indexed => return Err(INVALID),
