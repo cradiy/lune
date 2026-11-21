@@ -9,6 +9,7 @@ use crate::{Controls, Value};
 pub(crate) const INVALID: &[u8] = b"EINVAL:Invalid image data";
 pub(crate) const QUOTA: &[u8] = b"ENOSPC:Image quota exceeded";
 pub(crate) const UNSUPPORTED: &[u8] = b"ENOTSUP:Unsupported graphics command";
+const SHORT: &[u8] = b"ENODATA:Insufficient image data";
 
 const ENCODED_OVERHEAD: usize = 64 * 1024;
 
@@ -153,8 +154,14 @@ impl PixelTransfer {
                 inflate_limited(&self.bytes, self.wire_limit)?
             }
         } else {
-            if self.expected.is_some_and(|size| size != self.bytes.len()) {
-                return Err(INVALID);
+            if let Some(size) = self.expected
+                && self.bytes.len() != size
+            {
+                return Err(if self.bytes.len() < size {
+                    SHORT
+                } else {
+                    INVALID
+                });
             }
             self.bytes
         };

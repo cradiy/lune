@@ -13,7 +13,9 @@ use lune_vt::ApcEvent;
 use crate::{CellPosition, Cursor, Grid, PixelSize, Screen, ScreenView, StorageError, StyleTable};
 
 mod placeholders;
-pub use placeholders::{GraphicsPlaceholderCell, visit_graphics_placeholders};
+pub use placeholders::{
+    GraphicsPlaceholderCell, graphics_parent_origins, visit_graphics_placeholders,
+};
 
 const MAX_PLACEMENTS: usize = 4096;
 const MAX_PARENT_DEPTH: usize = 16;
@@ -67,7 +69,11 @@ impl GraphicsPlacement {
     ) -> Option<[i64; 2]> {
         if let Some(parent) = self.virtual_parent() {
             let [x, y] = virtual_origin(parent)?;
-            return Some([x.saturating_add(self.column), y.saturating_add(self.row)]);
+            return Some([
+                x.saturating_add(self.column),
+                y.saturating_add(self.row)
+                    .saturating_add(history_offset as i64),
+            ]);
         }
         Some([self.column, self.row.saturating_add(history_offset as i64)])
     }
@@ -199,6 +205,7 @@ pub(crate) struct GraphicsPlacements {
     revision: u64,
     next_serial: u64,
     virtual_count: usize,
+    virtual_parents: bool,
     anchors: HashMap<u64, usize>,
     orphaned: Vec<u32>,
 }
@@ -222,6 +229,10 @@ impl GraphicsPlacements {
 
     pub(crate) fn has_virtual(&self) -> bool {
         self.virtual_count != 0
+    }
+
+    pub(crate) fn has_virtual_parents(&self) -> bool {
+        self.virtual_parents
     }
 
     pub(crate) fn revision(&self) -> Option<u64> {
@@ -318,10 +329,15 @@ impl GraphicsPlacements {
         self.images.clear();
         self.anchors.clear();
         self.virtual_count = 0;
+        self.virtual_parents = false;
     }
 
-    pub(crate) fn clear_live(&mut self, grid: &Grid, styles: &StyleTable) {
-        let origins = self.virtual_origins(grid, styles).unwrap_or_default();
+    pub(crate) fn clear_live(&mut self, view: ScreenView<'_>, styles: &StyleTable) {
+        let origins = if self.virtual_parents {
+            graphics_parent_origins(&self.images, view, styles).unwrap_or_default()
+        } else {
+            HashMap::new()
+        };
         self.remove_matching(|image| {
             if image.is_virtual() {
                 return false;
@@ -329,7 +345,7 @@ impl GraphicsPlacements {
             if image.virtual_parent().is_some() {
                 return image
                     .origin_in_view(0, |parent| origins.get(&parent).copied().flatten())
-                    .is_some_and(|origin| image.intersects_display(origin, grid));
+                    .is_some_and(|origin| image.intersects_display(origin, view.live_grid()));
             }
             image.rows().end > 0
         });
@@ -354,8 +370,25 @@ impl GraphicsPlacements {
         }
     }
 
-    #[cold]
     pub(crate) fn scroll(&mut self, source: Range<i64>, destination: Range<i64>, delta: i64) {
+        self.scroll_matching(destination, delta, |rows| {
+            rows.start >= source.start && rows.end <= source.end
+        });
+    }
+
+    pub(crate) fn reverse_page(&mut self, first_retained_row: i64, delta: i64) {
+        // The live portion carries the whole placement. Placements entirely in
+        // scrollback keep their position.
+        self.scroll_matching(first_retained_row..i64::MAX, delta, |rows| rows.end > 0);
+    }
+
+    #[cold]
+    fn scroll_matching(
+        &mut self,
+        destination: Range<i64>,
+        delta: i64,
+        mut moves: impl FnMut(&Range<i64>) -> bool,
+    ) {
         let count = self.images.len();
         let mut changed = false;
         self.images.retain_mut(|image| {
@@ -363,7 +396,7 @@ impl GraphicsPlacements {
                 return true;
             }
             let rows = image.rows();
-            if rows.start < source.start || rows.end > source.end {
+            if !moves(&rows) {
                 return true;
             }
             changed = true;
@@ -421,7 +454,7 @@ impl GraphicsPlacements {
         &mut self,
         target: DeleteTarget,
         cursor: Cursor,
-        grid: &Grid,
+        view: ScreenView<'_>,
         styles: &StyleTable,
         mut removed: impl FnMut(u32),
     ) {
@@ -433,8 +466,8 @@ impl GraphicsPlacements {
                 | DeleteTarget::Column(_)
                 | DeleteTarget::Row(_)
         );
-        let origins = if coordinates {
-            let Ok(origins) = self.virtual_origins(grid, styles) else {
+        let origins = if coordinates && self.virtual_parents {
+            let Ok(origins) = graphics_parent_origins(&self.images, view, styles) else {
                 return;
             };
             origins
@@ -458,9 +491,8 @@ impl GraphicsPlacements {
                 })
             };
             let matches = match target {
-                DeleteTarget::Visible => {
-                    origin().is_some_and(|origin| image.intersects_display(origin, grid))
-                }
+                DeleteTarget::Visible => origin()
+                    .is_some_and(|origin| image.intersects_display(origin, view.live_grid())),
                 DeleteTarget::Image { id, placement_id } => {
                     placement.image.id() == id
                         && (placement_id == 0 || placement.id == placement_id)
@@ -484,36 +516,6 @@ impl GraphicsPlacements {
             }
             matches
         });
-    }
-
-    fn virtual_origins(
-        &self,
-        grid: &Grid,
-        styles: &StyleTable,
-    ) -> Result<HashMap<u64, Option<[i64; 2]>>, StorageError> {
-        let mut origins = HashMap::new();
-        if !self.has_virtual() || self.anchors.is_empty() {
-            return Ok(origins);
-        }
-        for placement in &self.images {
-            if let Some(parent) = placement.virtual_parent()
-                && !origins.contains_key(&parent)
-            {
-                origins.try_reserve(1).map_err(StorageError::from)?;
-                origins.insert(parent, None);
-            }
-        }
-        if origins.is_empty() {
-            return Ok(origins);
-        }
-        visit_graphics_placeholders(&self.images, grid.iter_rows(), styles, |tile| {
-            if let Some(origin) = origins.get_mut(&tile.placement) {
-                let minimum = origin.get_or_insert(tile.position);
-                minimum[0] = minimum[0].min(tile.position[0]);
-                minimum[1] = minimum[1].min(tile.position[1]);
-            }
-        })?;
-        Ok(origins)
     }
 
     fn remove_matching(&mut self, mut matches: impl FnMut(&GraphicsPlacement) -> bool) {
@@ -709,6 +711,7 @@ impl GraphicsPlacements {
             return;
         }
         self.reindex();
+        self.virtual_parents = false;
         let mut invalid = false;
         let mut relative = false;
         for index in 0..self.images.len() {
@@ -718,6 +721,7 @@ impl GraphicsPlacements {
             match self.resolve(&self.images[index], None, false) {
                 Ok(([column, row], root)) => {
                     relative = true;
+                    self.virtual_parents |= root.is_virtual;
                     let image = &mut self.images[index];
                     image.column = column;
                     image.row = row;
@@ -784,8 +788,8 @@ impl Graphics {
         self.images.get(id)
     }
 
-    pub(crate) fn image_revision(&self, key: ImageKey) -> Option<u64> {
-        self.images.revision(key)
+    pub(crate) fn image_source_revision(&self, key: ImageKey) -> Option<u64> {
+        self.images.source_revision(key)
     }
 
     pub(crate) fn visual_revision(&self) -> u64 {

@@ -3,7 +3,7 @@ use std::ops::Range;
 
 use lune_terminal::{
     GraphicsImage, GraphicsImageFormat, GraphicsImageKey, GraphicsPlacement, PixelSize, Row,
-    RowRevision,
+    RowRevision, graphics_parent_origins,
 };
 use wgpu::{
     BindGroup, Buffer, Device, Extent3d, Queue, RenderPipeline, Sampler, TexelCopyBufferLayout,
@@ -12,7 +12,10 @@ use wgpu::{
 
 use crate::{GridGeometry, PresentationFrame};
 
+mod backgrounds;
 mod placeholders;
+
+pub use backgrounds::{BackgroundPrepareError, CellBackgroundRenderer};
 
 type Instance = [f32; 8];
 
@@ -41,8 +44,10 @@ impl GraphicsLayer {
 }
 
 struct CachedImage {
+    source_revision: u64,
     revision: u64,
     format: GraphicsImageFormat,
+    texture: Texture,
     binding: BindGroup,
 }
 
@@ -85,10 +90,20 @@ impl ImageRenderer {
         });
         let palette = make_texture(device, 256, 1, TextureFormat::Rgba8UnormSrgb);
         let palette_view = palette.create_view(&wgpu::TextureViewDescriptor::default());
+        let pipeline = |fragment| {
+            create_quad_pipeline(
+                device,
+                &module,
+                format,
+                "vertex_main",
+                fragment,
+                Some(wgpu::BlendState::ALPHA_BLENDING),
+            )
+        };
         Self {
-            pipeline: Self::create_pipeline(device, &module, format, "fragment_main"),
-            indexed: Self::create_pipeline(device, &module, format, "indexed_main"),
-            indexed_alpha: Self::create_pipeline(device, &module, format, "indexed_alpha_main"),
+            pipeline: pipeline("fragment_main"),
+            indexed: pipeline("indexed_main"),
+            indexed_alpha: pipeline("indexed_alpha_main"),
             sampler: device.create_sampler(&wgpu::SamplerDescriptor::default()),
             palette,
             palette_view,
@@ -104,46 +119,6 @@ impl ImageRenderer {
         }
     }
 
-    fn create_pipeline(
-        device: &Device,
-        module: &wgpu::ShaderModule,
-        format: TextureFormat,
-        fragment: &str,
-    ) -> RenderPipeline {
-        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: None,
-            layout: None,
-            vertex: wgpu::VertexState {
-                module,
-                entry_point: Some("vertex_main"),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                buffers: &[Some(wgpu::VertexBufferLayout {
-                    array_stride: size_of::<Instance>() as u64,
-                    step_mode: wgpu::VertexStepMode::Instance,
-                    attributes: &wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4],
-                })],
-            },
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleStrip,
-                ..Default::default()
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            fragment: Some(wgpu::FragmentState {
-                module,
-                entry_point: Some(fragment),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            multiview_mask: None,
-            cache: None,
-        })
-    }
-
     fn pipeline(&self, format: GraphicsImageFormat) -> &RenderPipeline {
         match format {
             GraphicsImageFormat::Rgba => &self.pipeline,
@@ -157,8 +132,14 @@ impl ImageRenderer {
         self.images.contains_key(&key)
     }
 
+    #[cfg(test)]
+    pub(crate) fn cached_texture(&self, key: GraphicsImageKey) -> Option<&Texture> {
+        self.images.get(&key).map(|entry| &entry.texture)
+    }
+
     /// Builds the image pass for a viewport. Returns the number of placements
-    /// whose textures exceeded the device limits.
+    /// whose pixels could not be uploaded. Submit the pass before preparing
+    /// another frame with the same renderer.
     pub fn prepare(
         &mut self,
         device: &Device,
@@ -175,11 +156,12 @@ impl ImageRenderer {
                     .viewport
                     .iter_rows()
                     .map(Row::revision)
+                    .chain(frame.offscreen_graphics_rows())
                     .eq(self.placeholder_rows.iter().copied()))
         {
             if prepared.storage_revision != storage_revision {
                 self.images.retain(|&id, cached| {
-                    frame.graphics_image_revision(id) == Some(cached.revision)
+                    frame.graphics_image_source_revision(id) == Some(cached.source_revision)
                 });
                 prepared.storage_revision = storage_revision;
             }
@@ -190,8 +172,13 @@ impl ImageRenderer {
         let rejected = self.prepare_changed(device, queue, frame);
         self.placeholder_rows.clear();
         if frame.has_virtual_graphics() {
-            self.placeholder_rows
-                .extend(frame.viewport.iter_rows().map(Row::revision));
+            self.placeholder_rows.extend(
+                frame
+                    .viewport
+                    .iter_rows()
+                    .map(Row::revision)
+                    .chain(frame.offscreen_graphics_rows()),
+            );
         }
         self.update_palette(queue, frame);
         self.prepared = Some(PreparedImages {
@@ -212,8 +199,9 @@ impl ImageRenderer {
         self.draws.clear();
         self.instances.clear();
         self.has_indexed = false;
-        self.images
-            .retain(|&id, cached| frame.graphics_image_revision(id) == Some(cached.revision));
+        self.images.retain(|&id, cached| {
+            frame.graphics_image_source_revision(id) == Some(cached.source_revision)
+        });
         let Some((cell, area)) = frame
             .geometry
             .cell_pixels()
@@ -223,6 +211,16 @@ impl ImageRenderer {
         };
         let mut rejected = 0;
         let placeholders = placeholders::collect(frame);
+        let parents = if frame.has_virtual_parents() {
+            graphics_parent_origins(
+                frame.graphics_placements(),
+                frame.viewport.source(),
+                frame.styles,
+            )
+            .unwrap_or_default()
+        } else {
+            HashMap::new()
+        };
         let buffer_limit = device.limits().max_buffer_size;
         let max_instances = (buffer_limit / size_of::<Instance>() as u64) as usize;
         for placement in frame.graphics_placements() {
@@ -245,16 +243,16 @@ impl ImageRenderer {
             };
             if placement.is_virtual() {
                 if let Some(runs) = placeholders.get(&placement.serial()) {
-                    for location in &runs.locations {
+                    for location in runs {
                         push(location);
                     }
                 }
                 continue;
             }
             let offset = frame.viewport.offset();
-            let Some(origin) = placement.origin_in_view(offset, |parent| {
-                placeholders.get(&parent).map(|runs| runs.top_left)
-            }) else {
+            let Some(origin) =
+                placement.origin_in_view(offset, |parent| parents.get(&parent).copied().flatten())
+            else {
                 continue;
             };
             let unbounded = i64::MIN..i64::MAX;
@@ -270,27 +268,7 @@ impl ImageRenderer {
                 clip: [unbounded, rows],
             });
         }
-        let bytes = bytemuck::cast_slice(self.instances.as_slice());
-        if !bytes.is_empty() {
-            let needed = bytes.len() as u64;
-            if self
-                .buffer
-                .as_ref()
-                .is_none_or(|buffer| buffer.size() < needed)
-            {
-                self.buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
-                    label: None,
-                    size: needed.next_power_of_two().min(buffer_limit),
-                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                }));
-            }
-            queue.write_buffer(
-                self.buffer.as_ref().expect("Instances have a buffer"),
-                0,
-                bytes,
-            );
-        }
+        write_instances(device, queue, &mut self.buffer, &self.instances);
         rejected
     }
 
@@ -339,7 +317,38 @@ impl ImageRenderer {
         id: GraphicsImageKey,
         image: &GraphicsImage,
     ) -> bool {
-        if self.images.contains_key(&id) {
+        let revision = image.revision();
+        if let Some(cached) = self.images.get_mut(&id)
+            && cached.source_revision == image.source_revision()
+        {
+            if cached.revision != revision {
+                let Some(update) = image.pixel_update(cached.revision, &mut self.pixel_scratch)
+                else {
+                    return false;
+                };
+                if !update.size.contains(&0) {
+                    let [x, y] = update.origin;
+                    let [width, height] = update.size;
+                    queue.write_texture(
+                        wgpu::TexelCopyTextureInfo {
+                            origin: wgpu::Origin3d { x, y, z: 0 },
+                            ..cached.texture.as_image_copy()
+                        },
+                        update.bytes,
+                        TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(update.bytes_per_row),
+                            rows_per_image: None,
+                        },
+                        Extent3d {
+                            width,
+                            height,
+                            depth_or_array_layers: 1,
+                        },
+                    );
+                }
+                cached.revision = revision;
+            }
             return true;
         }
         let Some(texture) = upload_graphics_image(device, queue, image, &mut self.pixel_scratch)
@@ -370,8 +379,10 @@ impl ImageRenderer {
         self.images.insert(
             id,
             CachedImage {
-                revision: image.revision(),
+                source_revision: image.source_revision(),
+                revision,
                 format: image.format(),
+                texture,
                 binding,
             },
         );
@@ -397,6 +408,74 @@ impl ImageRenderer {
             pass.draw(0..4, draw.instances.clone());
         }
     }
+}
+
+fn create_quad_pipeline(
+    device: &Device,
+    module: &wgpu::ShaderModule,
+    format: TextureFormat,
+    vertex: &str,
+    fragment: &str,
+    blend: Option<wgpu::BlendState>,
+) -> RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: None,
+        layout: None,
+        vertex: wgpu::VertexState {
+            module,
+            entry_point: Some(vertex),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            buffers: &[Some(wgpu::VertexBufferLayout {
+                array_stride: size_of::<Instance>() as u64,
+                step_mode: wgpu::VertexStepMode::Instance,
+                attributes: &wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4],
+            })],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleStrip,
+            ..Default::default()
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module,
+            entry_point: Some(fragment),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+fn write_instances(
+    device: &Device,
+    queue: &Queue,
+    buffer: &mut Option<Buffer>,
+    instances: &[Instance],
+) {
+    let bytes = bytemuck::cast_slice(instances);
+    if bytes.is_empty() {
+        return;
+    }
+    let needed = bytes.len() as u64;
+    if buffer.as_ref().is_none_or(|buffer| buffer.size() < needed) {
+        *buffer = Some(
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: needed
+                    .next_power_of_two()
+                    .min(device.limits().max_buffer_size),
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+        );
+    }
+    queue.write_buffer(buffer.as_ref().expect("Instances have a buffer"), 0, bytes);
 }
 
 fn instance(

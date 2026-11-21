@@ -35,7 +35,8 @@ mod tests;
 pub use cell::{Cell, CellText, CellWidth, MAX_CELL_TEXT_BYTES, StyleId};
 pub use error::StorageError;
 pub use graphics::{
-    GraphicsLayout, GraphicsPlaceholderCell, GraphicsPlacement, visit_graphics_placeholders,
+    GraphicsLayout, GraphicsPlaceholderCell, GraphicsPlacement, graphics_parent_origins,
+    visit_graphics_placeholders,
 };
 pub use grid::{Grid, MAX_CELLS, MAX_DIMENSION};
 pub use history::{HistoryLimits, MAX_HISTORY_BYTES, MAX_HISTORY_ROWS, RowHistory};

@@ -1,6 +1,6 @@
-use std::collections::VecDeque;
+use std::{collections::VecDeque, sync::OnceLock};
 
-use crate::{Cell, CellWidth, Grid, Row, StorageError, StyleId};
+use crate::{Cell, CellWidth, GRAPHICS_PLACEHOLDER, Grid, Row, StorageError, StyleId};
 
 /// Maximum retained physical rows.
 pub const MAX_HISTORY_ROWS: usize = u16::MAX as usize;
@@ -30,6 +30,7 @@ impl HistoryLimits {
 struct Entry {
     row: Row,
     bytes: usize,
+    has_placeholder: OnceLock<bool>,
 }
 
 /// Bounded chronological physical rows owned by a [`crate::Screen`].
@@ -88,13 +89,19 @@ impl RowHistory {
         }
         self.reserve_entry()?;
         self.bytes += bytes;
-        self.rows.push_back(Entry { row, bytes });
+        self.rows.push_back(Entry {
+            row,
+            bytes,
+            has_placeholder: OnceLock::new(),
+        });
         self.warm_count += usize::from(warm);
         Ok(true)
     }
 
     pub(crate) fn row_mut(&mut self, index: usize) -> Option<&mut Row> {
-        self.rows.get_mut(index).map(|entry| &mut entry.row)
+        let entry = self.rows.get_mut(index)?;
+        entry.has_placeholder.take();
+        Some(&mut entry.row)
     }
 
     pub fn limits(&self) -> HistoryLimits {
@@ -119,6 +126,21 @@ impl RowHistory {
 
     pub fn iter_rows(&self) -> impl ExactSizeIterator<Item = &Row> + DoubleEndedIterator {
         self.rows.iter().map(|entry| &entry.row)
+    }
+
+    pub(crate) fn placeholder_rows(&self) -> impl Iterator<Item = (usize, &Row)> {
+        self.rows.iter().enumerate().filter_map(|(index, entry)| {
+            entry
+                .has_placeholder
+                .get_or_init(|| {
+                    entry
+                        .row
+                        .cells()
+                        .iter()
+                        .any(|cell| cell.has_character(GRAPHICS_PLACEHOLDER))
+                })
+                .then_some((index, &entry.row))
+        })
     }
 
     /// Style owners for collection while these rows remain retained.
@@ -336,7 +358,11 @@ impl RowHistory {
         if self.warm_columns != 0 && row.fits_columns(self.warm_columns) {
             self.warm_count += 1;
         }
-        self.rows.push_back(Entry { row, bytes });
+        self.rows.push_back(Entry {
+            row,
+            bytes,
+            has_placeholder: OnceLock::new(),
+        });
         self.bytes += bytes;
         if grid.rows() > 1
             && let Some(end) = wrap

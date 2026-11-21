@@ -18,6 +18,7 @@ pub struct Rgb {
 pub struct GraphicsColors {
     pub selection_background: Option<Rgb>,
     pub selection_foreground: Option<Rgb>,
+    pub cursor_depends_on_cell: bool,
     pub cursor_text: Option<Rgb>,
     pub url_hover: Option<Rgb>,
 }
@@ -84,10 +85,25 @@ impl Palette {
             249 | 255 => foreground,
             250 => self.graphics.selection_background.unwrap_or(foreground),
             251 => self.graphics.selection_foreground.unwrap_or(background),
+            252 if self.graphics_cursor_uses_cell_colors() => foreground,
             252 => self.color(PaletteEntry::Cursor),
+            253 if self.graphics_cursor_uses_cell_colors() => background,
             253 => self.graphics.cursor_text.unwrap_or(background),
             254 => self.graphics.url_hover.unwrap_or(foreground),
         }
+    }
+
+    fn graphics_cursor_uses_cell_colors(&self) -> bool {
+        self.graphics.cursor_depends_on_cell && !self.is_overridden(PaletteEntry::Cursor)
+    }
+
+    fn cursor_override_changes_graphics_colors(&self, cursor: Rgb) -> bool {
+        self.graphics.cursor_depends_on_cell
+            && (cursor != self.color(PaletteEntry::Foreground)
+                || self
+                    .graphics
+                    .cursor_text
+                    .is_some_and(|text| text != self.color(PaletteEntry::Background)))
     }
 
     pub fn set_graphics_colors(&mut self, colors: GraphicsColors) -> bool {
@@ -129,27 +145,42 @@ impl Palette {
 
     pub fn set_override(&mut self, entry: PaletteEntry, color: Rgb) -> bool {
         let index = entry.index();
-        self.overrides[index / 64] |= 1 << (index % 64);
-        let changed = self.current[index] != color;
+        let bit = 1 << (index % 64);
+        let word = &mut self.overrides[index / 64];
+        let previous = *word;
+        *word |= bit;
+        let changed = self.current[index] != color
+            || (index == PaletteEntry::Cursor.index()
+                && previous & bit == 0
+                && self.cursor_override_changes_graphics_colors(color));
         self.current[index] = color;
         self.record_change(changed)
     }
 
     pub fn reset(&mut self, entry: PaletteEntry) -> bool {
         let index = entry.index();
-        self.overrides[index / 64] &= !(1 << (index % 64));
-        let changed = self.current[index] != self.base[index];
+        let bit = 1 << (index % 64);
+        let word = &mut self.overrides[index / 64];
+        let previous = *word;
+        *word &= !bit;
+        let changed = self.current[index] != self.base[index]
+            || (index == PaletteEntry::Cursor.index()
+                && previous & bit != 0
+                && self.cursor_override_changes_graphics_colors(self.current[index]));
         self.current[index] = self.base[index];
         self.record_change(changed)
     }
 
     /// Restores the indexed table while retaining default role overrides.
     pub fn reset_indexed(&mut self) -> bool {
-        self.reset_words(4)
+        self.reset_words(4, false)
     }
 
     pub fn reset_all(&mut self) -> bool {
-        self.reset_words(WORDS)
+        let cursor = PaletteEntry::Cursor;
+        let cursor_changed = self.is_overridden(cursor)
+            && self.cursor_override_changes_graphics_colors(self.color(cursor));
+        self.reset_words(WORDS, cursor_changed)
     }
 
     /// Replaces theme colors while preserving every runtime override.
@@ -180,8 +211,7 @@ impl Palette {
         self.record_change(changed)
     }
 
-    fn reset_words(&mut self, end: usize) -> bool {
-        let mut changed = false;
+    fn reset_words(&mut self, end: usize, mut changed: bool) -> bool {
         for (word_index, word) in self.overrides[..end].iter_mut().enumerate() {
             let mut bits = std::mem::take(word);
             while bits != 0 {

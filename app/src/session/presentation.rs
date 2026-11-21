@@ -256,6 +256,7 @@ pub struct PresentationTracker {
     indexed_graphics: bool,
     graphics_palette: u64,
     revisions: Vec<RowRevision>,
+    offscreen_graphics_rows: Vec<RowRevision>,
     changed_rows: Vec<usize>,
     palette: Option<Palette>,
     reverse_video: bool,
@@ -363,6 +364,11 @@ impl PresentationTracker {
             self.changed_rows
                 .try_reserve_exact(rows - self.changed_rows.len())?;
         }
+        let offscreen_rows = frame.offscreen_graphics_rows().len();
+        if offscreen_rows > self.offscreen_graphics_rows.len() {
+            self.offscreen_graphics_rows
+                .try_reserve_exact(offscreen_rows - self.offscreen_graphics_rows.len())?;
+        }
 
         let colors_changed = self
             .palette
@@ -371,16 +377,19 @@ impl PresentationTracker {
         // Row cache entries can be reused only after the staged frame commits.
         let committed_geometry = self.committed_geometry.take();
         let graphics = frame.graphics_stamp();
-        let indexed_graphics =
-            if graphics.map(|stamp| stamp.0) == self.committed_graphics.map(|stamp| stamp.0) {
-                self.indexed_graphics
-            } else {
-                frame.graphics_placements().iter().any(|placement| {
-                    frame
-                        .graphics_image(placement)
-                        .is_some_and(|image| image.format() != GraphicsImageFormat::Rgba)
-                })
-            };
+        let indexed_graphics = if graphics.map(|stamp| stamp.placement_revision)
+            == self
+                .committed_graphics
+                .map(|stamp| stamp.placement_revision)
+        {
+            self.indexed_graphics
+        } else {
+            frame.graphics_placements().iter().any(|placement| {
+                frame
+                    .graphics_image(placement)
+                    .is_some_and(|image| image.format() != GraphicsImageFormat::Rgba)
+            })
+        };
         let graphics_palette = frame.palette.revision();
         let mut graphics_changed = graphics != self.committed_graphics
             || (graphics.is_some() && committed_geometry != Some(frame.geometry))
@@ -414,6 +423,15 @@ impl PresentationTracker {
         }
         graphics_changed |=
             frame.has_virtual_graphics() && (all_rows || !self.changed_rows.is_empty());
+        if !frame
+            .offscreen_graphics_rows()
+            .eq(self.offscreen_graphics_rows.iter().copied())
+        {
+            self.offscreen_graphics_rows.clear();
+            self.offscreen_graphics_rows
+                .extend(frame.offscreen_graphics_rows());
+            graphics_changed = true;
+        }
 
         let source = frame
             .viewport

@@ -6,8 +6,9 @@ use std::sync::{
 use std::time::Instant;
 
 use super::{
-    Command, Controls, Delete, DeleteTarget, EvictionRanking, FeatureReply, ImageChange,
-    MAX_DECODED_PAYLOAD_BYTES, Placement, PlacementError, Value, control_keys,
+    Command, Controls, Delete, DeleteTarget, EvictionRanking, FeatureReply, INLINE_DECODED_BYTES,
+    INLINE_ENCODED_BYTES, ImageChange, MAX_DIRECT_PAYLOAD_BYTES, Placement, PlacementError, Value,
+    control_keys,
 };
 use crate::animation::{
     Animation, Canvas, FrameBudget, FrameComposition, FrameControl, FrameUpload, INDEXED,
@@ -44,6 +45,24 @@ pub struct Image {
     animation: Option<Box<Animation>>,
 }
 
+pub struct PixelUpdate<'a> {
+    pub origin: [u32; 2],
+    pub size: [u32; 2],
+    pub bytes_per_row: u32,
+    pub bytes: &'a [u8],
+}
+
+impl<'a> PixelUpdate<'a> {
+    pub(crate) fn full(bytes: &'a [u8], (width, height): (u32, u32), format: ImageFormat) -> Self {
+        Self {
+            origin: [0, 0],
+            size: [width, height],
+            bytes_per_row: width * format.bytes_per_pixel(),
+            bytes,
+        }
+    }
+}
+
 impl Image {
     pub fn dimensions(&self) -> (u32, u32) {
         (self.width, self.height)
@@ -65,6 +84,34 @@ impl Image {
             .as_ref()
             .and_then(|animation| animation.revision())
             .unwrap_or(self.revision)
+    }
+
+    pub fn source_revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Returns a replacement region for a pixel buffer at the given revision.
+    pub fn pixel_update<'a>(
+        &'a self,
+        previous: u64,
+        scratch: &'a mut Vec<u8>,
+    ) -> Option<PixelUpdate<'a>> {
+        if let Some(animation) = &self.animation {
+            return animation
+                .pixel_update(
+                    &self.bytes,
+                    self.dimensions(),
+                    self.revision,
+                    previous,
+                    scratch,
+                )
+                .ok();
+        }
+        Some(PixelUpdate::full(
+            &self.bytes,
+            self.dimensions(),
+            self.format,
+        ))
     }
 
     fn update_animation<T>(
@@ -101,7 +148,7 @@ struct Transfer {
     number: u32,
     quiet: u32,
     transient: bool,
-    query: bool,
+    action: u8,
     placement: Option<Placement>,
     frame: Option<FrameUpload>,
     pixels: PixelTransfer,
@@ -135,6 +182,7 @@ pub struct ImageStore {
     anonymous_images: usize,
     images: HashMap<ImageKey, StoredImage>,
     pending: Option<Transfer>,
+    decode_scratch: Vec<u8>,
     next_id: u32,
     next_anonymous: u64,
     frame_budget: OnceLock<Arc<FrameBudget>>,
@@ -152,6 +200,7 @@ impl ImageStore {
             anonymous_images: 0,
             images: HashMap::new(),
             pending: None,
+            decode_scratch: Vec::new(),
             next_id: 1,
             next_anonymous: u64::from(u32::MAX) + 1,
             frame_budget: OnceLock::new(),
@@ -168,9 +217,9 @@ impl ImageStore {
         }
     }
 
-    pub fn revision(&self, key: ImageKey) -> Option<u64> {
+    pub fn source_revision(&self, key: ImageKey) -> Option<u64> {
         match self.images.get(&key)? {
-            StoredImage::Named(image) => Some(image.revision()),
+            StoredImage::Named(image) => Some(image.source_revision()),
             StoredImage::Anonymous {
                 owner, revision, ..
             } => (owner.strong_count() != 0).then_some(*revision),
@@ -293,18 +342,16 @@ impl ImageStore {
         mut apply: impl FnMut(ImageChange<'_>) -> Result<(), PlacementError>,
     ) -> Option<Reply> {
         let controls = &command.controls;
-        let quiet = match controls.get(b'q') {
-            None => Ok(None),
-            Some(Value::Unsigned(value @ 0..=2)) => Ok(Some(value)),
-            _ => Err(INVALID),
-        };
+        let quiet = controls.quiet().map_err(|_| INVALID);
         if controls.is_feature_query() {
-            let valid = matches!(controls.get(b'e'), Some(Value::Letter(_)))
+            let id = number(controls, b'i').unwrap_or_default();
+            let valid = id != 0
+                && matches!(controls.get(b'e'), Some(Value::Letter(_)))
                 && controls.get(b'I').is_none();
             let result = if valid { Ok(()) } else { Err(INVALID) };
             let mut response = reply(
-                number(controls, b'i').unwrap_or_default(),
-                0,
+                id,
+                number(controls, b'I').unwrap_or_default(),
                 0,
                 quiet.unwrap_or_default().unwrap_or_default(),
                 quiet.and(result),
@@ -316,10 +363,8 @@ impl ImageStore {
         }
         let action = controls.get(b'a');
         let mut transfer = if let Some(mut pending) = self.pending.take() {
-            let continuation = controls.only(const { control_keys(b"mq") })
-                || (pending.frame.is_some()
-                    && action == Some(Value::Letter(b'f'))
-                    && controls.only(const { control_keys(b"amq") }));
+            let continuation = controls.only(const { control_keys(b"amq") })
+                && action.is_none_or(|action| action == Value::Letter(pending.action));
             if continuation {
                 if let Ok(Some(quiet)) = quiet {
                     pending.quiet = quiet;
@@ -335,16 +380,16 @@ impl ImageStore {
                 return reply(id, pending.number, placement, pending.quiet, Err(INVALID));
             }
         } else {
-            let id = number(controls, b'i').unwrap_or_default();
-            let image_number = number(controls, b'I').unwrap_or_default();
+            let id_field = number(controls, b'i');
+            let number_field = number(controls, b'I');
+            let id = id_field.unwrap_or_default();
+            let image_number = number_field.unwrap_or_default();
             let quiet_value = quiet.ok().flatten().unwrap_or_default();
             let placement_id = number(controls, b'p').unwrap_or_default();
             if quiet.is_err()
-                || (id != 0 && image_number != 0)
-                || b"iI"
-                    .iter()
-                    .copied()
-                    .any(|key| controls.get(key).is_some() && number(controls, key).is_none())
+                || controls.has_conflicting_image_selectors()
+                || id_field.is_none()
+                || number_field.is_none()
             {
                 return reply(id, image_number, placement_id, quiet_value, Err(INVALID));
             }
@@ -378,11 +423,25 @@ impl ImageStore {
         let quiet_value = transfer.quiet;
         let result = (|| {
             quiet?;
-            let mut decoded = [0; MAX_DECODED_PAYLOAD_BYTES];
             let local = transfer.local.is_some();
             let format_error = |error| if local { BAD_SOURCE } else { error };
+            let length = command.encoded_payload.len();
+            let mut inline = [0; INLINE_DECODED_BYTES];
+            let decoded = if length <= INLINE_ENCODED_BYTES {
+                &mut inline[..]
+            } else {
+                if local || length > MAX_DIRECT_PAYLOAD_BYTES {
+                    return Err(format_error(INVALID));
+                }
+                let size = base64::decoded_len_estimate(length);
+                self.decode_scratch
+                    .try_reserve_exact(size.saturating_sub(self.decode_scratch.len()))
+                    .map_err(|_| QUOTA)?;
+                self.decode_scratch.resize(size, 0);
+                &mut self.decode_scratch[..]
+            };
             let written = command
-                .decode_payload(&mut decoded)
+                .decode_payload(decoded)
                 .map_err(|_| format_error(INVALID))?;
             if let Some(source) = transfer.local.take() {
                 if written > crate::MAX_PATH_BYTES {
@@ -407,7 +466,7 @@ impl ImageStore {
                 })?;
                 return Ok(Some(frame));
             }
-            if !transfer.query && (id != 0 || transfer.placement.is_some()) {
+            if transfer.action != b'q' && (id != 0 || transfer.placement.is_some()) {
                 self.store(
                     transfer.key,
                     transfer.number,
@@ -540,9 +599,13 @@ impl ImageStore {
         image_number: u32,
         quiet: u32,
     ) -> Result<Transfer, &'static [u8]> {
-        let action = controls.get(b'a');
-        let display = action == Some(Value::Letter(b'T'));
-        let frame = action == Some(Value::Letter(b'f'));
+        let action = match controls.get(b'a') {
+            None => b't',
+            Some(Value::Letter(action @ (b't' | b'T' | b'f' | b'q'))) => action,
+            _ => return Err(UNSUPPORTED),
+        };
+        let display = action == b'T';
+        let frame = action == b'f';
         let extra = if display {
             Placement::KEYS
         } else if frame {
@@ -553,12 +616,9 @@ impl ImageStore {
         if !controls.only(const { control_keys(b"aIfimqstovNSO") } | extra) {
             return Err(UNSUPPORTED);
         }
-        let query = match action {
-            None | Some(Value::Letter(b't' | b'T' | b'f')) => false,
-            Some(Value::Letter(b'q')) if id != 0 => true,
-            Some(Value::Letter(b'q')) => return Err(INVALID),
-            _ => return Err(UNSUPPORTED),
-        };
+        if action == b'q' && id == 0 {
+            return Err(INVALID);
+        }
         let frame = frame.then(|| FrameUpload::parse(controls)).transpose()?;
         let frame_key = if frame.is_some() {
             let key = self.existing_key(id, image_number)?;
@@ -599,7 +659,7 @@ impl ImageStore {
             number: image_number,
             quiet,
             transient,
-            query,
+            action,
             placement,
             frame,
             pixels,
@@ -721,6 +781,7 @@ impl ImageStore {
 
 fn number(controls: &Controls, key: u8) -> Option<u32> {
     match controls.get(key) {
+        None => Some(0),
         Some(Value::Unsigned(value)) => Some(value),
         _ => None,
     }

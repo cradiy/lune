@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 
-use crate::{Color, GRAPHICS_PLACEHOLDER, GraphicsPlaceholder, Row, StorageError, StyleTable};
+use crate::{
+    Color, GRAPHICS_PLACEHOLDER, GraphicsPlaceholder, Row, ScreenView, StorageError, StyleTable,
+};
 
 use super::GraphicsPlacement;
 
@@ -11,10 +13,54 @@ pub struct GraphicsPlaceholderCell {
     pub origin: [i64; 2],
 }
 
+/// Resolves virtual parents in live-buffer coordinates, including retained history.
+pub fn graphics_parent_origins(
+    placements: &[GraphicsPlacement],
+    view: ScreenView<'_>,
+    styles: &StyleTable,
+) -> Result<HashMap<u64, Option<[i64; 2]>>, StorageError> {
+    let mut origins = HashMap::new();
+    for parent in placements
+        .iter()
+        .filter_map(GraphicsPlacement::virtual_parent)
+    {
+        if !origins.contains_key(&parent) {
+            origins.try_reserve(1).map_err(StorageError::from)?;
+            origins.insert(parent, None);
+        }
+    }
+    if !origins.is_empty() {
+        visit_placeholder_rows(placements, view.placeholder_rows(), styles, |tile| {
+            if let Some(origin) = origins.get_mut(&tile.placement) {
+                let minimum = origin.get_or_insert(tile.position);
+                minimum[0] = minimum[0].min(tile.position[0]);
+                minimum[1] = minimum[1].min(tile.position[1]);
+            }
+        })?;
+    }
+    Ok(origins)
+}
+
 /// Visits the valid placeholder tiles in view order. Coordinates are local to the supplied rows.
 pub fn visit_graphics_placeholders<'a>(
     placements: &[GraphicsPlacement],
     rows: impl IntoIterator<Item = &'a Row>,
+    styles: &StyleTable,
+    visit: impl FnMut(GraphicsPlaceholderCell),
+) -> Result<(), StorageError> {
+    visit_placeholder_rows(
+        placements,
+        rows.into_iter()
+            .enumerate()
+            .map(|(index, row)| (index as i64, row)),
+        styles,
+        visit,
+    )
+}
+
+fn visit_placeholder_rows<'a>(
+    placements: &[GraphicsPlacement],
+    rows: impl IntoIterator<Item = (i64, &'a Row)>,
     styles: &StyleTable,
     mut visit: impl FnMut(GraphicsPlaceholderCell),
 ) -> Result<(), StorageError> {
@@ -39,7 +85,7 @@ pub fn visit_graphics_placeholders<'a>(
             lookup.insert((image, placement.placement.id), placement);
         }
     }
-    for (row_index, row) in rows.into_iter().enumerate() {
+    for (row_index, row) in rows {
         let mut previous: Option<(usize, [Color; 2], GraphicsPlaceholder)> = None;
         let mut next_extended = 0;
         for (column, cell) in row.cells().iter().enumerate() {
@@ -76,7 +122,7 @@ pub fn visit_graphics_placeholders<'a>(
             if u32::from(glyph.column) >= columns || u32::from(glyph.row) >= rows {
                 continue;
             }
-            let position = [column as i64, row_index as i64];
+            let position = [column as i64, row_index];
             visit(GraphicsPlaceholderCell {
                 placement: placement.serial(),
                 position,

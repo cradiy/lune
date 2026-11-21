@@ -97,6 +97,7 @@ fn colors_preserve_palette_identity_and_decode_both_extended_forms() {
         "38;2;0;128;255;48:2::255:0:1;58;2;2;3;4;4:3;1",
         "38:2::0:128:255;48;2;255;0;1;58:2::2:3:4;4:3;1",
         "38:2:0:0:128:255;48:2:0:255:0:1;58:2:0:2:3:4;4:3;1",
+        "38:2:0:128:255;48:2:255:0:1;58:2:2:3:4;4:3;1",
     ] {
         let mut style = Style::default();
         assert!(sgr(&mut style, parameters));
@@ -172,7 +173,8 @@ fn rejected_groups_preserve_rendition_without_reinterpreting_color_components() 
         "0;38;5;",
         "0;48;5;65535",
         "0;38;3;1;2;3",
-        "0;38:2::1:2",
+        "0;38:2:1:2",
+        "0;38:2::1:2:256",
         "0;38:2:1:1:2:3",
         "0;38:2::1::3",
         "0;38;2;1:2:3",

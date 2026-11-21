@@ -1,4 +1,4 @@
-use crate::{Color, Palette, PaletteEntry, Rgb, Screen, Style, StyleTable};
+use crate::{Color, GraphicsColors, Palette, PaletteEntry, Rgb, Screen, Style, StyleTable};
 
 fn entries() -> impl Iterator<Item = PaletteEntry> {
     (0..=u8::MAX).map(PaletteEntry::Indexed).chain([
@@ -114,6 +114,31 @@ fn palette_mutations_match_an_independent_optional_override_model() {
             assert_eq!(palette.is_overridden(entry), overrides[index].is_some());
         }
     }
+}
+
+#[test]
+fn bulk_reset_restores_cell_derived_graphics_cursor_colors() {
+    let base = colors(0);
+    let mut palette = palette(&base);
+    let cursor = PaletteEntry::Cursor;
+    palette.set_graphics_colors(GraphicsColors {
+        cursor_depends_on_cell: true,
+        cursor_text: Some(base[1]),
+        ..GraphicsColors::default()
+    });
+
+    assert!(palette.set_override(cursor, base[258]));
+    assert_eq!(palette.graphics_color(252), base[258]);
+    assert_eq!(palette.graphics_color(253), base[1]);
+    assert!(!palette.reset_indexed());
+    assert!(palette.is_overridden(cursor));
+
+    let revision = palette.revision();
+    assert!(palette.reset_all());
+    assert_ne!(palette.revision(), revision);
+    assert_eq!(palette.graphics_color(252), base[256]);
+    assert_eq!(palette.graphics_color(253), base[257]);
+    assert!(!palette.reset_all());
 }
 
 #[test]

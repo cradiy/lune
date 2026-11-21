@@ -58,12 +58,13 @@ impl Command<'_> {
         if self.controls.get(b'a') != Some(Value::Letter(b'd')) {
             return None;
         }
-        let result = self
-            .encoded_payload
-            .is_empty()
-            .then(|| parse(&self.controls))
-            .flatten();
-        Some(result.ok_or(DecodeError::InvalidControl))
+        if !self.encoded_payload.is_empty()
+            || self.controls.has_conflicting_image_selectors()
+            || self.controls.quiet().is_err()
+        {
+            return Some(Err(DecodeError::InvalidControl));
+        }
+        Some(parse(&self.controls).ok_or(DecodeError::InvalidControl))
     }
 }
 
@@ -78,9 +79,9 @@ fn parse(controls: &Controls) -> Option<Delete> {
         _ => None,
     };
     let coordinate = |key| unsigned(key)?.checked_sub(1);
-    let placement_id = || match controls.get(b'p') {
+    let unsigned_or_zero = |key| match controls.get(key) {
         None => Some(0),
-        _ => unsigned(b'p'),
+        _ => unsigned(key),
     };
     let z = || match controls.get(b'z') {
         None => Some(0),
@@ -93,20 +94,20 @@ fn parse(controls: &Controls) -> Option<Delete> {
         b'i' => (
             DeleteTarget::Image {
                 id: unsigned(b'i').filter(|&id| id != 0)?,
-                placement_id: placement_id()?,
+                placement_id: unsigned_or_zero(b'p')?,
             },
             b"ip",
         ),
         b'n' => (
             DeleteTarget::Number {
                 number: unsigned(b'I').filter(|&number| number != 0)?,
-                placement_id: placement_id()?,
+                placement_id: unsigned_or_zero(b'p')?,
             },
             b"Ip",
         ),
         b'r' => {
-            let first = unsigned(b'x')?;
-            let last = unsigned(b'y')?;
+            let first = unsigned_or_zero(b'x')?;
+            let last = unsigned_or_zero(b'y')?;
             if first > last {
                 return None;
             }
@@ -114,12 +115,8 @@ fn parse(controls: &Controls) -> Option<Delete> {
         }
         b'c' => (DeleteTarget::Cursor, b""),
         b'f' => {
-            let optional = |key| match controls.get(key) {
-                None => Some(0),
-                _ => unsigned(key),
-            };
-            let id = optional(b'i')?;
-            let image_number = optional(b'I')?;
+            let id = unsigned_or_zero(b'i')?;
+            let image_number = unsigned_or_zero(b'I')?;
             if (id == 0) == (image_number == 0) {
                 return None;
             }
@@ -127,7 +124,7 @@ fn parse(controls: &Controls) -> Option<Delete> {
                 DeleteTarget::Frame {
                     id,
                     image_number,
-                    number: optional(b'r')?,
+                    number: unsigned_or_zero(b'r')?,
                 },
                 b"iIr",
             )

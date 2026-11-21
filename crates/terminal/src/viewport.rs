@@ -36,6 +36,10 @@ impl<'a> Viewport<'a> {
         self.start..self.start + self.height
     }
 
+    pub fn source(&self) -> ScreenView<'a> {
+        self.view
+    }
+
     pub fn rows(&self) -> usize {
         self.height
     }

@@ -243,8 +243,8 @@ impl Processor {
         self.state.graphics.get(id)
     }
 
-    pub fn graphics_image_revision(&self, key: crate::GraphicsImageKey) -> Option<u64> {
-        self.state.graphics.image_revision(key)
+    pub fn graphics_image_source_revision(&self, key: crate::GraphicsImageKey) -> Option<u64> {
+        self.state.graphics.image_source_revision(key)
     }
 
     pub fn graphics_visual_revision(&self) -> u64 {

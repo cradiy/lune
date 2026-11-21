@@ -10,7 +10,7 @@ mod session;
 #[cfg(target_os = "linux")]
 pub use geometry::{GridGeometry, PixelRect};
 #[cfg(all(target_os = "linux", feature = "wgpu-renderer"))]
-pub use gpu::{GraphicsLayer, ImageRenderer};
+pub use gpu::{BackgroundPrepareError, CellBackgroundRenderer, GraphicsLayer, ImageRenderer};
 #[cfg(target_os = "linux")]
 pub use raster::{CoverageMask, GlyphMask, GlyphSource, PixelRegion, RasterSurface, RasterText};
 #[cfg(target_os = "linux")]

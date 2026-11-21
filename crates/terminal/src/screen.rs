@@ -246,16 +246,16 @@ impl Screen {
     fn scroll_graphics_nonempty(&mut self, start: usize, count: usize, down: bool) {
         let end = self.scroll_region.end;
         let whole_screen = start == 0 && end == self.grid.rows();
-        let source = start as i64..if whole_screen { i64::MAX } else { end as i64 };
-        let destination_end = if whole_screen && !down {
-            i64::MAX
-        } else {
-            end as i64
-        };
         let moves = count.min(end - start) as i64;
-        let delta = if down { moves } else { -moves };
-        self.graphics
-            .scroll(source, start as i64..destination_end, delta);
+        if whole_screen && down {
+            let first_retained_row = -(self.view().history_rows() as i64);
+            self.graphics.reverse_page(first_retained_row, moves);
+        } else {
+            let end = if whole_screen { i64::MAX } else { end as i64 };
+            let region = start as i64..end;
+            let delta = if down { moves } else { -moves };
+            self.graphics.scroll(region.clone(), region, delta);
+        }
     }
 
     fn disconnect_top(&mut self, top: usize) {
@@ -356,7 +356,9 @@ impl Screen {
     #[inline]
     pub(crate) fn clear_live_graphics(&mut self, styles: &crate::StyleTable) {
         if !self.graphics.is_empty() {
-            self.graphics.clear_live(&self.grid, styles);
+            let history = (self.active_buffer == ScreenBuffer::Primary).then_some(&self.history);
+            self.graphics
+                .clear_live(ScreenView::new(&self.grid, history), styles);
         }
     }
 
@@ -375,8 +377,10 @@ impl Screen {
         styles: &crate::StyleTable,
         removed: impl FnMut(u32),
     ) {
+        let history = (self.active_buffer == ScreenBuffer::Primary).then_some(&self.history);
+        let view = ScreenView::new(&self.grid, history);
         self.graphics
-            .delete(target, self.cursor, &self.grid, styles, removed);
+            .delete(target, self.cursor, view, styles, removed);
     }
 
     pub fn graphics_revision(&self) -> Option<u64> {
@@ -385,6 +389,10 @@ impl Screen {
 
     pub fn has_virtual_graphics(&self) -> bool {
         self.graphics.has_virtual()
+    }
+
+    pub fn has_virtual_graphics_parents(&self) -> bool {
+        self.graphics.has_virtual_parents()
     }
 
     pub(crate) fn set_graphics_cell(&mut self, cell: Option<PixelSize>) {

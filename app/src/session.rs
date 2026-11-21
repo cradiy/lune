@@ -9,8 +9,9 @@ use lune_terminal::{
     CellPosition, Color, ColorScheme, CursorAppearance, DisplayUnit, GRAPHICS_PLACEHOLDER,
     GraphicsImage, GraphicsPlacement, HistoryLimits, Key, KeySequence, MAX_STYLES, Modifiers,
     MouseEvent, MouseFormat, MouseSequence, MouseTracking, Palette, PaletteEntry, PixelPosition,
-    ProcessFailure, Processor, Rgb, Row, Screen, ScreenBuffer, StorageError, Style, StyleError,
-    StyleId, StyleRun, StyleTable, TerminalNotifications, TextSink, UnicodeWriter, Viewport,
+    ProcessFailure, Processor, Rgb, Row, RowRevision, Screen, ScreenBuffer, StorageError, Style,
+    StyleError, StyleId, StyleRun, StyleTable, TerminalNotifications, TextSink, UnicodeWriter,
+    Viewport,
 };
 
 use crate::{GridGeometry, PixelRect};
@@ -48,7 +49,13 @@ pub enum MouseInputOutcome {
     HistoryScrolled,
 }
 
-pub(crate) type GraphicsStamp = (u64, u64, usize);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct GraphicsStamp {
+    placement_revision: u64,
+    pixel_revision: u64,
+    viewport_offset: usize,
+    history_endpoints: Option<[RowRevision; 2]>,
+}
 
 /// Borrowed state for one presentation pass.
 pub struct PresentationFrame<'a> {
@@ -61,6 +68,7 @@ pub struct PresentationFrame<'a> {
     graphics: &'a [GraphicsPlacement],
     graphics_revision: Option<u64>,
     virtual_graphics: bool,
+    virtual_parents: bool,
     processor: &'a Processor,
 }
 
@@ -77,11 +85,11 @@ impl<'a> PresentationFrame<'a> {
     }
 
     #[cfg(feature = "wgpu-renderer")]
-    pub(crate) fn graphics_image_revision(
+    pub(crate) fn graphics_image_source_revision(
         &self,
         key: lune_terminal::GraphicsImageKey,
     ) -> Option<u64> {
-        self.processor.graphics_image_revision(key)
+        self.processor.graphics_image_source_revision(key)
     }
 
     #[cfg(feature = "wgpu-renderer")]
@@ -90,17 +98,41 @@ impl<'a> PresentationFrame<'a> {
     }
 
     pub(crate) fn graphics_stamp(&self) -> Option<GraphicsStamp> {
-        self.graphics_revision.map(|revision| {
-            (
-                revision,
-                self.processor.graphics_visual_revision(),
-                self.viewport.offset(),
-            )
-        })
+        self.graphics_revision
+            .map(|placement_revision| GraphicsStamp {
+                placement_revision,
+                pixel_revision: self.processor.graphics_visual_revision(),
+                viewport_offset: self.viewport.offset(),
+                history_endpoints: self
+                    .virtual_parents
+                    .then(|| self.viewport.source().history_endpoints())
+                    .flatten(),
+            })
     }
 
     pub(crate) fn has_virtual_graphics(&self) -> bool {
         self.virtual_graphics
+    }
+
+    #[cfg(feature = "wgpu-renderer")]
+    pub(crate) fn has_virtual_parents(&self) -> bool {
+        self.virtual_parents
+    }
+
+    pub(crate) fn offscreen_graphics_rows(
+        &self,
+    ) -> impl ExactSizeIterator<Item = RowRevision> + '_ {
+        let height = self.viewport.rows();
+        let hidden = if self.virtual_parents {
+            self.viewport.offset().min(height)
+        } else {
+            0
+        };
+        self.viewport
+            .source()
+            .iter_live_rows()
+            .skip(height - hidden)
+            .map(Row::revision)
     }
 }
 
@@ -399,6 +431,7 @@ impl<T: Read + Write> Session<T> {
             graphics: screen.graphics_placements(),
             graphics_revision: screen.graphics_revision(),
             virtual_graphics: screen.has_virtual_graphics(),
+            virtual_parents: screen.has_virtual_graphics_parents(),
             processor: &self.processor,
         })
     }

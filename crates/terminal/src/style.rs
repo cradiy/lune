@@ -52,8 +52,8 @@ impl Style {
     ///
     /// Supports 0-5, 7-9, 21-25, 27-29, 30-37, 39, 40-47, 49, 59, 90-97,
     /// 100-107, and extended colors through 38/48/58. Indexed colors accept
-    /// `38;5;n` or `38:5:n`; RGB accepts `38;2;r;g;b` or
-    /// `38:2:space:r:g:b`, with an omitted or zero color-space identifier.
+    /// `38;5;n` or `38:5:n`; RGB accepts `38;2;r;g;b`, `38:2:r:g:b`, and
+    /// `38:2:space:r:g:b` with an empty or zero color-space identifier.
     /// The same forms apply to background and underline colors. All indices and RGB
     /// components must be explicit values through 255. `4:0` through `4:5`
     /// select underline styles. The caller validates the CSI header.
@@ -168,6 +168,9 @@ fn rgb(parameters: &[Parameter]) -> Option<Color> {
 fn colon_color(parameters: &[Parameter]) -> Option<Color> {
     match parameters {
         [mode, index] if mode.value == Some(5) => Some(Color::Indexed(byte(index)?)),
+        [mode, components @ ..] if mode.value == Some(2) && components.len() == 3 => {
+            rgb(components)
+        }
         [mode, space, components @ ..]
             if mode.value == Some(2)
                 && matches!(space.value, None | Some(0))

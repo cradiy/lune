@@ -202,10 +202,15 @@ mod linux {
         let available = u64::try_from(stat.st_size)
             .ok()?
             .checked_sub(source.offset)?;
-        let len = match source.size {
-            Some(size) => size,
-            None if fixed => limit,
-            None => usize::try_from(available).ok()?,
+        let len = if fixed {
+            if source.size.is_some_and(|size| size < limit) {
+                return None;
+            }
+            limit
+        } else if let Some(size) = source.size {
+            size
+        } else {
+            usize::try_from(available).ok()?
         };
         if len == 0 || len > limit || len as u64 > available {
             return None;

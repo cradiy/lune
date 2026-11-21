@@ -8,6 +8,10 @@ struct VertexOutput {
 @group(0) @binding(2) var indices: texture_2d<u32>;
 @group(0) @binding(3) var palette: texture_2d<f32>;
 
+fn quad_position(bounds: vec4<f32>, corner: vec2<f32>) -> vec4<f32> {
+    return vec4<f32>(mix(bounds.xy, bounds.zw, corner), 0.0, 1.0);
+}
+
 @vertex
 fn vertex_main(
     @builtin(vertex_index) vertex: u32,
@@ -16,9 +20,29 @@ fn vertex_main(
 ) -> VertexOutput {
     let corner = vec2<f32>(f32(vertex & 1u), f32(vertex >> 1u));
     var output: VertexOutput;
-    output.position = vec4<f32>(mix(bounds.xy, bounds.zw, corner), 0.0, 1.0);
+    output.position = quad_position(bounds, corner);
     output.uv = mix(source.xy, source.zw, corner);
     return output;
+}
+
+struct SolidQuad {
+    @builtin(position) position: vec4<f32>,
+    @location(0) @interpolate(flat) color: vec4<f32>,
+};
+
+@vertex
+fn solid_vertex(
+    @builtin(vertex_index) vertex: u32,
+    @location(0) bounds: vec4<f32>,
+    @location(1) color: vec4<f32>,
+) -> SolidQuad {
+    let corner = vec2<f32>(f32(vertex & 1u), f32(vertex >> 1u));
+    return SolidQuad(quad_position(bounds, corner), color);
+}
+
+@fragment
+fn solid_fragment(input: SolidQuad) -> @location(0) vec4<f32> {
+    return input.color;
 }
 
 @fragment

@@ -17,7 +17,7 @@ mod source;
 
 pub use delete::{Delete, DeleteTarget};
 pub use features::{FeatureReply, MAX_FEATURE_REPLY_BYTES};
-pub use images::{Image, ImageKey, ImageStore, Reply};
+pub use images::{Image, ImageKey, ImageStore, PixelUpdate, Reply};
 pub use pixels::ImageFormat;
 pub use placeholder::{PLACEHOLDER, Placeholder};
 pub use placement::{
@@ -26,10 +26,11 @@ pub use placement::{
 
 const KEY_COUNT: usize = 52;
 const MAX_CONTROL_BYTES: usize = KEY_COUNT * 14;
-pub const MAX_DIRECT_PAYLOAD_BYTES: usize = 4096;
+pub const MAX_DIRECT_PAYLOAD_BYTES: usize = 128 * 1024;
 const MAX_PATH_BYTES: usize = 4096;
-const MAX_ENCODED_PAYLOAD_BYTES: usize = MAX_PATH_BYTES.div_ceil(3) * 4;
-pub const MAX_DECODED_PAYLOAD_BYTES: usize = MAX_ENCODED_PAYLOAD_BYTES / 4 * 3;
+const INLINE_ENCODED_BYTES: usize = MAX_PATH_BYTES.div_ceil(3) * 4;
+const INLINE_DECODED_BYTES: usize = INLINE_ENCODED_BYTES / 4 * 3;
+pub const MAX_DECODED_PAYLOAD_BYTES: usize = MAX_DIRECT_PAYLOAD_BYTES / 4 * 3;
 const PAYLOAD_ENGINE: GeneralPurpose = GeneralPurpose::new(
     &STANDARD,
     GeneralPurposeConfig::new().with_decode_padding_mode(DecodePaddingMode::Indifferent),
@@ -60,6 +61,19 @@ impl Controls {
     fn is_feature_query(&self) -> bool {
         self.present & const { control_keys(b"e") } != 0
             && self.get(b'a') == Some(Value::Letter(b'q'))
+    }
+
+    fn has_conflicting_image_selectors(&self) -> bool {
+        const SELECTORS: u64 = control_keys(b"iI");
+        self.present & SELECTORS == SELECTORS
+    }
+
+    fn quiet(&self) -> Result<Option<u32>, DecodeError> {
+        match self.get(b'q') {
+            None => Ok(None),
+            Some(Value::Unsigned(value @ 0..=2)) => Ok(Some(value)),
+            _ => Err(DecodeError::InvalidControl),
+        }
     }
 
     fn parse(header: &[u8]) -> Result<Self, DecodeError> {
@@ -123,6 +137,7 @@ pub enum DecodeError {
     PayloadTooLong,
     InvalidControl,
     DuplicateKey(u8),
+    PayloadAllocation,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -158,6 +173,7 @@ enum State {
     Selector,
     Control,
     Payload,
+    LargePayload,
     PayloadOverflow,
     Ignore,
     Failed(DecodeError),
@@ -168,8 +184,9 @@ pub struct Decoder {
     state: State,
     control: [u8; MAX_CONTROL_BYTES],
     control_len: usize,
-    payload: [u8; MAX_ENCODED_PAYLOAD_BYTES],
+    payload: [u8; INLINE_ENCODED_BYTES],
     payload_len: usize,
+    large_payload: Vec<u8>,
 }
 
 impl Default for Decoder {
@@ -178,8 +195,9 @@ impl Default for Decoder {
             state: State::Idle,
             control: [0; MAX_CONTROL_BYTES],
             control_len: 0,
-            payload: [0; MAX_ENCODED_PAYLOAD_BYTES],
+            payload: [0; INLINE_ENCODED_BYTES],
             payload_len: 0,
+            large_payload: Vec::new(),
         }
     }
 }
@@ -189,6 +207,7 @@ impl Decoder {
         self.state = State::Selector;
         self.control_len = 0;
         self.payload_len = 0;
+        self.large_payload.clear();
     }
 
     pub fn cancel(&mut self) {
@@ -222,29 +241,68 @@ impl Decoder {
             self.state = State::Payload;
             bytes = &bytes[end + 1..];
         }
-        if matches!(self.state, State::Payload)
-            && !append(&mut self.payload, &mut self.payload_len, bytes)
-        {
-            self.state = State::PayloadOverflow;
+        match self.state {
+            State::Payload if !append(&mut self.payload, &mut self.payload_len, bytes) => {
+                self.push_large_payload(bytes);
+            }
+            State::LargePayload => self.push_large_payload(bytes),
+            _ => {}
         }
+    }
+
+    #[cold]
+    fn push_large_payload(&mut self, bytes: &[u8]) {
+        let needed = self.payload_len.saturating_add(bytes.len());
+        if needed > MAX_DIRECT_PAYLOAD_BYTES {
+            self.state = State::PayloadOverflow;
+            return;
+        }
+        let first = matches!(self.state, State::Payload);
+        if first {
+            let controls = match Controls::parse(&self.control[..self.control_len]) {
+                Ok(controls) => controls,
+                Err(error) => {
+                    self.state = State::Failed(error);
+                    return;
+                }
+            };
+            if controls.is_feature_query()
+                || matches!(controls.get(b't'), Some(Value::Letter(b'f' | b't' | b's')))
+            {
+                self.state = State::PayloadOverflow;
+                return;
+            }
+        }
+        if needed > self.large_payload.capacity()
+            && self
+                .large_payload
+                .try_reserve_exact(needed.next_power_of_two() - self.large_payload.len())
+                .is_err()
+        {
+            self.state = State::Failed(DecodeError::PayloadAllocation);
+            return;
+        }
+        if first {
+            self.large_payload
+                .extend_from_slice(&self.payload[..self.payload_len]);
+        }
+        self.large_payload.extend_from_slice(bytes);
+        self.payload_len = needed;
+        self.state = State::LargePayload;
     }
 
     pub fn finish(&mut self) -> Option<Result<Command<'_>, DecodeError>> {
         let state = core::mem::replace(&mut self.state, State::Idle);
         match state {
-            State::Control | State::Payload | State::PayloadOverflow => Some(
+            State::Control | State::Payload | State::LargePayload | State::PayloadOverflow => Some(
                 Controls::parse(&self.control[..self.control_len]).and_then(|controls| {
-                    let oversized = matches!(state, State::PayloadOverflow)
-                        || (self.payload_len > MAX_DIRECT_PAYLOAD_BYTES
-                            && !matches!(
-                                controls.get(b't'),
-                                Some(Value::Letter(b'f' | b't' | b's'))
-                            ));
-                    let payload = if oversized {
+                    let payload = if matches!(state, State::PayloadOverflow) {
                         if !controls.is_feature_query() {
                             return Err(DecodeError::PayloadTooLong);
                         }
                         &[][..]
+                    } else if matches!(state, State::LargePayload) {
+                        &self.large_payload
                     } else {
                         &self.payload[..self.payload_len]
                     };

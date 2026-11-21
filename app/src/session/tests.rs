@@ -80,6 +80,9 @@ fn kitty_images_commit_after_the_last_chunk_and_keep_reply_order() {
         concat!(
             "\x1b_Ga=q,i=31,e=T,U=1,C=1,f=32,N=1,P=2,H=-3,m=1;%%ignored%%\x1b\\",
             "\x1b_Ga=q,i=32,e=a,s=3,c=2\x1b\\",
+            "\x1b_Ga=q,i=33,e=f,r=1,X=1,f=16\x1b\\",
+            "\x1b_Ga=q,i=34,e=W,c=2\x1b\\",
+            "\x1b_Ga=q,i=35,I=0,e=T\x1b\\",
             "\x1b_Gm=0;AAD/\x1b\\\x1b[c"
         )
         .as_bytes(),
@@ -102,7 +105,10 @@ fn kitty_images_commit_after_the_last_chunk_and_keep_reply_order() {
         concat!(
             "\x1b_Gi=31,e=T,N=1,C=1,U=1,P=2,H=-3;OK\x1b\\",
             "\x1b_Gi=32,e=a,c=2,s=3;OK\x1b\\",
-            "\x1b_Gi=7;OK\x1b\\\x1b[?6c"
+            "\x1b_Gi=33,e=f,r=1,X=1;OK\x1b\\",
+            "\x1b_Gi=34;OK\x1b\\",
+            "\x1b_Gi=35;EINVAL:Invalid image data\x1b\\",
+            "\x1b_Gi=7;OK\x1b\\\x1b[?62;22c"
         )
         .as_bytes(),
     );
@@ -214,7 +220,12 @@ fn kitty_history_preserves_visible_fragments_until_their_rows_are_evicted() {
     assert_eq!(placement.row + frame.viewport.offset() as i64, 0);
     assert_eq!(placement.row_clip().start, -1);
     let key = placement.placement.image;
-    assert!(session.processor().graphics_image_revision(key).is_some());
+    assert!(
+        session
+            .processor()
+            .graphics_image_source_revision(key)
+            .is_some()
+    );
 
     session.transport.source = Cursor::new(b"\n\x1b[2J");
     session.pump().unwrap();
@@ -234,7 +245,56 @@ fn kitty_history_preserves_visible_fragments_until_their_rows_are_evicted() {
     session.transport.source = Cursor::new(b"\x1b[3J");
     session.pump().unwrap();
     assert!(session.screen().graphics_placements().is_empty());
-    assert!(session.processor().graphics_image_revision(key).is_none());
+    assert!(
+        session
+            .processor()
+            .graphics_image_source_revision(key)
+            .is_none()
+    );
+}
+
+#[test]
+fn kitty_full_page_reverse_scroll_preserves_history_and_offscreen_pixels() {
+    let size = PtySize {
+        pixel_width: 16,
+        pixel_height: 6,
+        ..PtySize::new(3, 8)
+    };
+    let mut session = session_with_size(
+        concat!(
+            "\x1b_Ga=T,i=1,s=1,v=1,C=1,q=2;/wAA/w==\x1b\\",
+            "\x1b[1;2H\x1b_Ga=T,i=2,s=1,v=4,C=1,q=2;/wAA//8AAP8A/wD/AAD//w==\x1b\\",
+            "\x1b[3;1H\x1bD\x1b_Ga=T,i=3,s=1,v=1,C=1,q=2;/wAA/w==\x1b\\",
+        )
+        .as_bytes(),
+        size,
+    );
+    session
+        .set_history_limits(HistoryLimits {
+            max_rows: 2,
+            max_bytes: 4096,
+        })
+        .unwrap();
+    session.pump().unwrap();
+    let rows = |session: &Session<Transport>| {
+        session
+            .screen()
+            .graphics_placements()
+            .iter()
+            .map(|image| (image.placement.image.id(), image.row))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(rows(&session), [(1, -1), (2, -1), (3, 2)]);
+    assert_eq!(session.screen().history().len(), 1);
+
+    session.transport.source = Cursor::new(b"\x1b[H\x1bM");
+    session.pump().unwrap();
+    assert_eq!(rows(&session), [(1, -1), (2, 0), (3, 3)]);
+    assert_eq!(session.screen().history().len(), 1);
+
+    session.transport.source = Cursor::new(b"\x1b[3;1H\x1bD");
+    session.pump().unwrap();
+    assert_eq!(rows(&session), [(1, -2), (2, -1), (3, 2)]);
 }
 
 #[test]
@@ -277,6 +337,17 @@ fn kitty_delete_preserves_surviving_references_and_cancels_pending_uploads() {
         );
     }
     assert!(session.transport.written.is_empty());
+
+    session.transport.source = Cursor::new(
+        concat!(
+            "\x1b_Ga=T,i=4294967295,C=1,s=1,v=1,q=1;AAAA/w==\x1b\\",
+            "\x1b_Ga=d,d=R,y=4294967295\x1b\\",
+        )
+        .as_bytes(),
+    );
+    session.pump().unwrap();
+    assert!(session.screen().graphics_placements().is_empty());
+    assert!(session.processor().graphics_image(u32::MAX).is_none());
 }
 
 #[test]
@@ -302,6 +373,40 @@ fn kitty_numbered_images_use_the_newest_live_id() {
             .image
             .id(),
         3
+    );
+
+    session.transport.source = Cursor::new(
+        concat!(
+            "\x1b_Ga=d,d=N,I=13,q=3\x1b\\",
+            "\x1b_Ga=d,d=F,i=0,I=13,q=2\x1b\\",
+            "\x1b_Ga=p,i=0,I=13,p=10,C=1\x1b\\",
+            "\x1b_Ga=T,i=3,I=0,s=1,v=1,C=1,q=1;/////w==\x1b\\",
+        )
+        .as_bytes(),
+    );
+    session.transport.written.clear();
+    session.pump().unwrap();
+    assert_eq!(
+        session.transport.written,
+        concat!(
+            "\x1b_GI=13;EINVAL:Invalid image data\x1b\\",
+            "\x1b_GI=13,p=10;EINVAL:Invalid image data\x1b\\",
+            "\x1b_Gi=3;EINVAL:Invalid image data\x1b\\",
+        )
+        .as_bytes()
+    );
+    let [placement] = session.screen().graphics_placements() else {
+        panic!("Expected the original placement")
+    };
+    assert_eq!(placement.placement.id, 9);
+    assert_eq!(
+        session
+            .processor()
+            .graphics_image(3)
+            .unwrap()
+            .pixels(&mut Vec::new())
+            .unwrap(),
+        &[4, 5, 6, 255]
     );
 
     session.transport.source = Cursor::new(
@@ -424,7 +529,7 @@ fn kitty_images_compose_in_an_offscreen_wgpu_pass() {
             "\x1b[1;6H\x1b_Ga=T,i=12,f=16,s=2,v=1,C=1,q=1;A4D4/w==\x1b\\",
             "\x1b_Ga=T,i=33554474,p=9,U=1,c=2,r=1,s=2,v=1,q=1;//8A/wD///8=\x1b\\",
             "\x1b_Ga=T,i=13,p=1,P=33554474,Q=9,H=3,s=1,v=1,q=1;/wD//w==\x1b\\",
-            "\x1b[5;1H\x1b[38;5;42;58;5;9m\u{10eeee}\u{305}\u{305}\u{30e}\u{10eeee}\x1b[0m"
+            "\x1b[5;1H\x1b[38:2:0:0:42;58;5;9m\u{10eeee}\u{305}\u{305}\u{30e}\u{10eeee}\x1b[0m"
         )
         .as_bytes(),
         size,
@@ -479,7 +584,8 @@ fn kitty_images_compose_in_an_offscreen_wgpu_pass() {
         usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
-    let read_frame = |renderer: &crate::ImageRenderer| {
+    let read_layers = |renderer: &crate::ImageRenderer,
+                       backgrounds: Option<&crate::CellBackgroundRenderer>| {
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         {
             let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -495,6 +601,10 @@ fn kitty_images_compose_in_an_offscreen_wgpu_pass() {
                 })],
                 ..Default::default()
             });
+            renderer.draw(&mut pass, crate::GraphicsLayer::BehindBackground);
+            if let Some(backgrounds) = backgrounds {
+                backgrounds.draw(&mut pass);
+            }
             renderer.draw(&mut pass, crate::GraphicsLayer::BehindText);
             renderer.draw(&mut pass, crate::GraphicsLayer::AboveText);
         }
@@ -529,6 +639,7 @@ fn kitty_images_compose_in_an_offscreen_wgpu_pass() {
         buffer.unmap();
         mapped
     };
+    let read_frame = |renderer: &crate::ImageRenderer| read_layers(renderer, None);
     let pixel = |mapped: &[u8], x: usize, y: usize| {
         let start = y * stride as usize + x * 4;
         <[u8; 4]>::try_from(&mapped[start..start + 4]).unwrap()
@@ -584,6 +695,14 @@ fn kitty_images_compose_in_an_offscreen_wgpu_pass() {
     assert_eq!(pixel(&after, 4, 8), [255, 255, 0, 255]);
     assert_eq!(pixel(&after, 6, 8), [0, 255, 255, 255]);
     assert_eq!(pixel(&after, 10, 8), [255, 0, 255, 255]);
+    let animation_key = frame
+        .graphics_placements()
+        .iter()
+        .find(|placement| placement.placement.image.id() == 33554474)
+        .unwrap()
+        .placement
+        .image;
+    let animation_texture = renderer.cached_texture(animation_key).unwrap().clone();
 
     session.transport.source =
         Cursor::new(b"\x1b_Ga=d,d=p,x=4,y=5\x1b\\\x1b_Ga=d,d=q,x=6,y=5,z=8\x1b\\");
@@ -609,6 +728,10 @@ fn kitty_images_compose_in_an_offscreen_wgpu_pass() {
     assert!(prepared.damage().graphics_changed);
     prepared.commit();
     assert_eq!(renderer.prepare(&device, &queue, &frame), 0);
+    assert_eq!(
+        renderer.cached_texture(animation_key),
+        Some(&animation_texture)
+    );
     let selected = read_frame(&renderer);
     assert_eq!(pixel(&selected, 4, 8), [255, 255, 0, 255]);
     assert_eq!(pixel(&selected, 6, 8), [0, 255, 0, 255]);
@@ -624,6 +747,24 @@ fn kitty_images_compose_in_an_offscreen_wgpu_pass() {
     let composed = read_frame(&renderer);
     assert_eq!(pixel(&composed, 4, 8), [0, 255, 0, 255]);
     assert_eq!(pixel(&composed, 6, 8), [0, 255, 0, 255]);
+
+    for (command, color) in [
+        (
+            b"\x1b_Ga=a,i=33554474,c=1,q=1\x1b\\".as_slice(),
+            [255, 255, 0, 255],
+        ),
+        (b"\x1b_Ga=a,i=33554474,c=2,q=1\x1b\\", [0, 255, 0, 255]),
+    ] {
+        session.transport.source = Cursor::new(command);
+        session.pump_with_clock(|| next).unwrap();
+        let frame = session.presentation_frame().unwrap();
+        assert_eq!(renderer.prepare(&device, &queue, &frame), 0);
+        assert_eq!(
+            renderer.cached_texture(animation_key),
+            Some(&animation_texture)
+        );
+        assert_eq!(pixel(&read_frame(&renderer), 4, 8), color);
+    }
 
     session.transport.source = Cursor::new(b"\x1b_Ga=d,d=Q,x=6,y=5,z=0\x1b\\");
     session.pump().unwrap();
@@ -646,6 +787,7 @@ fn kitty_images_compose_in_an_offscreen_wgpu_pass() {
     session.pump().unwrap();
     let frame = session.presentation_frame().unwrap();
     assert_eq!(renderer.prepare(&device, &queue, &frame), 0);
+    assert!(!renderer.has_cached_image(animation_key));
     let deleted = read_frame(&renderer);
     assert_eq!(pixel(&deleted, 4, 8), [0, 0, 0, 0]);
     assert_eq!(pixel(&deleted, 10, 8), [0, 0, 0, 0]);
@@ -724,6 +866,221 @@ fn kitty_images_compose_in_an_offscreen_wgpu_pass() {
     let cleared = read_frame(&renderer);
     assert_eq!(pixel(&cleared, 1, 8), [255, 255, 255, 255]);
     assert_eq!(pixel(&cleared, 4, 8), [0, 0, 0, 0]);
+
+    let rgb = |[red, green, blue]: [u8; 3]| Rgb { red, green, blue };
+    let red = [255, 0, 0];
+    let green = [0, 255, 0];
+    let blue = [0, 0, 255];
+    let yellow = [255, 255, 0];
+    let magenta = [255, 0, 255];
+    let cyan = [0, 255, 255];
+    let mut theme = Palette::new([Rgb::default(); 256], rgb(green), rgb(blue), rgb(red));
+    theme.set_graphics_colors(lune_terminal::GraphicsColors {
+        selection_foreground: Some(rgb(magenta)),
+        cursor_depends_on_cell: true,
+        cursor_text: Some(rgb(yellow)),
+        url_hover: Some(rgb(cyan)),
+        ..Default::default()
+    });
+    session.set_theme(&theme, None);
+    session.transport.source = Cursor::new(
+        b"\x1bc\x1b[38;2;255;255;255;48;2;255;0;0mXX\x1b[0m\x1b[H\x1b_Ga=T,i=44,f=8,s=8,v=1,C=1,q=1;+Pn6+/z9/v8=\x1b\\",
+    );
+    session.pump().unwrap();
+    let frame = session.presentation_frame().unwrap();
+    let stamp = frame.graphics_stamp();
+    tracker.prepare(&frame, now).unwrap().commit();
+    assert_eq!(renderer.prepare(&device, &queue, &frame), 0);
+
+    let assert_roles = |renderer: &crate::ImageRenderer, cursor, cursor_text| {
+        let mapped = read_frame(renderer);
+        for (x, [r, g, b]) in [
+            blue,
+            green,
+            green,
+            magenta,
+            cursor,
+            cursor_text,
+            cyan,
+            green,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(
+                pixel(&mapped, x, 0),
+                [r, g, b, 255],
+                "Palette index {}",
+                248 + x
+            );
+        }
+    };
+    assert_roles(&renderer, green, blue);
+    for (command, cursor, cursor_text) in [
+        (b"\x1b]12;#ff0000\x07".as_slice(), red, yellow),
+        (b"\x1b]112\x07", green, blue),
+    ] {
+        session.transport.source = Cursor::new(command);
+        session.pump().unwrap();
+        let frame = session.presentation_frame().unwrap();
+        assert_eq!(frame.graphics_stamp(), stamp);
+        let prepared = tracker.prepare(&frame, now).unwrap();
+        assert_eq!(prepared.damage().rows, RowDamage::Rows(&[]));
+        assert!(prepared.damage().graphics_changed);
+        prepared.commit();
+        assert_eq!(renderer.prepare(&device, &queue, &frame), 0);
+        assert_roles(&renderer, cursor, cursor_text);
+    }
+
+    session.transport.source = Cursor::new(
+        concat!(
+            "\x1bc\x1b[1;2H\x1b[48;2;0;0;255m \x1b[48;2;0;128;64m  \x1b[0m",
+            "\x1b[1;1H\x1b_Ga=T,i=45,z=-1073741825,s=1,v=1,C=1,q=1;/wAA/w==\x1b\\",
+            "\x1b[1;2H\x1b_Ga=p,i=45,z=-1073741825,C=1,q=1\x1b\\",
+            "\x1b[1;3H\x1b_Ga=p,i=45,z=-1073741825,C=1,q=1\x1b\\",
+            "\x1b[1;4H\x1b_Ga=p,i=45,z=-1073741824,C=1,q=1\x1b\\",
+        )
+        .as_bytes(),
+    );
+    session.pump().unwrap();
+    let frame = session.presentation_frame().unwrap();
+    let stamp = frame.graphics_stamp();
+    let mut backgrounds = crate::CellBackgroundRenderer::new(&device, format);
+    backgrounds.prepare(&device, &queue, &frame).unwrap();
+    assert_eq!(renderer.prepare(&device, &queue, &frame), 0);
+    let composed = read_layers(&renderer, Some(&backgrounds));
+    assert_eq!(pixel(&composed, 0, 0), [255, 0, 0, 255]);
+    assert_eq!(pixel(&composed, 4, 0), [255, 0, 0, 255]);
+    assert_eq!(pixel(&composed, 8, 0), [0, 128, 64, 255]);
+    assert_eq!(pixel(&composed, 12, 0), [255, 0, 0, 255]);
+    assert_eq!(pixel(&composed, 13, 0), [0, 128, 64, 255]);
+
+    session.transport.source = Cursor::new(b"\x1b]11;#008040\x07");
+    session.pump().unwrap();
+    let frame = session.presentation_frame().unwrap();
+    assert_eq!(frame.graphics_stamp(), stamp);
+    backgrounds.prepare(&device, &queue, &frame).unwrap();
+    assert_eq!(renderer.prepare(&device, &queue, &frame), 0);
+    let recolored = read_layers(&renderer, Some(&backgrounds));
+    assert_eq!(pixel(&recolored, 4, 0), [0, 0, 255, 255]);
+    assert_eq!(pixel(&recolored, 8, 0), [255, 0, 0, 255]);
+    assert_eq!(pixel(&recolored, 13, 0), [0, 0, 0, 0]);
+
+    session.transport.source = Cursor::new(b"\x1b[1;2H\x1b[X");
+    session.pump().unwrap();
+    let frame = session.presentation_frame().unwrap();
+    assert_eq!(frame.graphics_stamp(), stamp);
+    backgrounds.prepare(&device, &queue, &frame).unwrap();
+    let erased = read_layers(&renderer, Some(&backgrounds));
+    assert_eq!(pixel(&erased, 4, 0), [255, 0, 0, 255]);
+
+    session.transport.source = Cursor::new(
+        concat!(
+            "\x1bc\x1b[2;4r",
+            "\x1b[1;1H\x1b_Ga=T,i=1,s=1,v=4,C=1,q=2;/wAA//8AAP8A/wD/AAD//w==\x1b\\",
+            "\x1b[3;2H\x1b_Ga=T,i=2,f=24,s=1,v=2,c=1,r=2,C=1,q=2;AP8AAAD/\x1b\\",
+            "\x1b[5;3H\x1b_Ga=T,i=3,s=1,v=1,C=1,q=2;/wAA/w==\x1b\\",
+            "\x1b[2;1H\x1bM",
+        )
+        .as_bytes(),
+    );
+    session.pump().unwrap();
+    let frame = session.presentation_frame().unwrap();
+    assert_eq!(renderer.prepare(&device, &queue, &frame), 0);
+    let reversed = read_frame(&renderer);
+    assert_eq!(pixel(&reversed, 0, 0), [255, 0, 0, 255]);
+    assert_eq!(pixel(&reversed, 0, 2), [0, 255, 0, 255]);
+    assert_eq!(pixel(&reversed, 5, 6), [0, 255, 0, 255]);
+    assert_eq!(pixel(&reversed, 5, 8), [0, 0, 0, 0]);
+    assert_eq!(pixel(&reversed, 8, 8), [255, 0, 0, 255]);
+
+    session.transport.source = Cursor::new(b"\x1b[4;1H\x1bD");
+    session.pump().unwrap();
+    let frame = session.presentation_frame().unwrap();
+    assert_eq!(renderer.prepare(&device, &queue, &frame), 0);
+    let forwarded = read_frame(&renderer);
+    assert_eq!(pixel(&forwarded, 0, 2), pixel(&reversed, 0, 2));
+    assert_eq!(pixel(&forwarded, 5, 4), [0, 255, 0, 255]);
+    assert_eq!(pixel(&forwarded, 5, 6), [0, 0, 0, 0]);
+    assert_eq!(pixel(&forwarded, 8, 8), pixel(&reversed, 8, 8));
+
+    session
+        .set_history_limits(HistoryLimits {
+            max_rows: 2,
+            max_bytes: 4096,
+        })
+        .unwrap();
+    session.transport.source = Cursor::new(
+        concat!(
+            "\x1bc\x1b_Ga=T,i=42,U=1,c=1,r=1,s=1,v=1,q=2;AAAAAA==\x1b\\",
+            "\x1b_Ga=T,i=43,P=42,H=1,V=1,s=1,v=1,q=2;/wD//w==\x1b\\",
+            "\x1b[38;5;42m\u{10eeee}\x1b[0m\x1b[5;1H\x1bD",
+        )
+        .as_bytes(),
+    );
+    session.pump().unwrap();
+    assert_eq!(session.screen().history().len(), 1);
+    let frame = session.presentation_frame().unwrap();
+    assert_eq!(renderer.prepare(&device, &queue, &frame), 0);
+    assert_eq!(pixel(&read_frame(&renderer), 4, 0), [255, 0, 255, 255]);
+
+    assert!(session.scroll_history(1));
+    let frame = session.presentation_frame().unwrap();
+    assert_eq!(renderer.prepare(&device, &queue, &frame), 0);
+    let scrolled = read_frame(&renderer);
+    assert_eq!(pixel(&scrolled, 4, 0), [0, 0, 0, 0]);
+    assert_eq!(pixel(&scrolled, 4, 2), [255, 0, 255, 255]);
+
+    session.screen.scroll_viewport_to_bottom();
+    session.transport.source = Cursor::new(
+        b"\x1b_Ga=d,d=P,x=2,y=1\x1b\\\x1b_Ga=T,i=44,P=42,H=1,V=1,s=1,v=1,q=2;/wD//w==\x1b\\",
+    );
+    session.pump().unwrap();
+    assert!(session.processor().graphics_image(43).is_none());
+    let frame = session.presentation_frame().unwrap();
+    tracker.prepare(&frame, now).unwrap().commit();
+    assert_eq!(renderer.prepare(&device, &queue, &frame), 0);
+    assert_eq!(pixel(&read_frame(&renderer), 4, 0), [255, 0, 255, 255]);
+
+    session.transport.source = Cursor::new(b"\x1b[3J");
+    session.pump().unwrap();
+    let frame = session.presentation_frame().unwrap();
+    let prepared = tracker.prepare(&frame, now).unwrap();
+    assert_eq!(prepared.damage().rows, RowDamage::Rows(&[]));
+    assert!(prepared.damage().graphics_changed);
+    prepared.commit();
+    assert_eq!(renderer.prepare(&device, &queue, &frame), 0);
+    assert_eq!(pixel(&read_frame(&renderer), 4, 0), [0, 0, 0, 0]);
+
+    session.transport.source = Cursor::new(
+        concat!(
+            "\x1b[5;1H\x1bD\x1b_Ga=d,d=I,i=44\x1b\\",
+            "\x1b_Ga=T,i=45,P=42,H=1,V=-1,s=1,v=1,q=2;/wD//w==\x1b\\",
+            "\x1b[38;5;42m\u{10eeee}\x1b[0m",
+        )
+        .as_bytes(),
+    );
+    session.pump().unwrap();
+    assert!(session.scroll_history(1));
+    let frame = session.presentation_frame().unwrap();
+    let stamp = frame.graphics_stamp();
+    tracker.prepare(&frame, now).unwrap().commit();
+    assert_eq!(renderer.prepare(&device, &queue, &frame), 0);
+    assert_eq!(pixel(&read_frame(&renderer), 4, 8), [255, 0, 255, 255]);
+
+    session.transport.source =
+        Cursor::new("\x1b[5;1H\x1b[X\x1b[5;3H\x1b[38;5;42m\u{10eeee}\x1b[0m".as_bytes());
+    session.pump().unwrap();
+    let frame = session.presentation_frame().unwrap();
+    assert_eq!(frame.graphics_stamp(), stamp);
+    let prepared = tracker.prepare(&frame, now).unwrap();
+    assert_eq!(prepared.damage().rows, RowDamage::Rows(&[]));
+    assert!(prepared.damage().graphics_changed);
+    prepared.commit();
+    assert_eq!(renderer.prepare(&device, &queue, &frame), 0);
+    let moved = read_frame(&renderer);
+    assert_eq!(pixel(&moved, 4, 8), [0, 0, 0, 0]);
+    assert_eq!(pixel(&moved, 12, 8), [255, 0, 255, 255]);
 }
 
 #[test]

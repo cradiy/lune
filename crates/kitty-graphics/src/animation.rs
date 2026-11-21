@@ -6,7 +6,7 @@ use std::sync::{
 use std::time::Instant;
 
 use crate::{
-    Controls, Value, control_keys,
+    Controls, PixelUpdate, Value, control_keys,
     pixels::{INVALID, ImageFormat, Pixels, QUOTA},
 };
 
@@ -200,6 +200,44 @@ impl Animation {
             Some(surface) => surface.data.pixels(original, width as usize, scratch),
             None => Ok(original),
         }
+    }
+
+    pub(crate) fn pixel_update<'a>(
+        &'a self,
+        original: &'a [u8],
+        dimensions: (u32, u32),
+        original_revision: u64,
+        previous: u64,
+        scratch: &'a mut Vec<u8>,
+    ) -> Result<PixelUpdate<'a>, &'static [u8]> {
+        let data = self
+            .frame(self.current)
+            .and_then(|frame| frame.surface.as_ref())
+            .map(|surface| &surface.data);
+        if let Some(data @ SurfaceData::Patch(patch)) = data
+            && patch.base.revision(original_revision) == Some(previous)
+        {
+            let region = patch.region;
+            let mut update = PixelUpdate {
+                origin: [region.x as u32, region.y as u32],
+                size: [region.width as u32, region.height as u32],
+                bytes_per_row: patch.stride as u32,
+                bytes: &patch.pixels,
+            };
+            if patch.blend && region.width != 0 && region.height != 0 {
+                let stride = region.width * 4;
+                resize_scratch(scratch, stride * region.height)?;
+                data.render(original, dimensions.0 as usize, region, scratch);
+                update.bytes = scratch;
+                update.bytes_per_row = stride as u32;
+            }
+            return Ok(update);
+        }
+        let bytes = match data {
+            Some(data) => data.pixels(original, dimensions.0 as usize, scratch)?,
+            None => original,
+        };
+        Ok(PixelUpdate::full(bytes, dimensions, ImageFormat::Rgba))
     }
 
     pub(crate) fn upload(
@@ -465,12 +503,7 @@ impl SurfaceData {
         match self {
             Self::Full(pixels) => Ok(pixels),
             Self::Patch(_) => {
-                if scratch.len() < original.len() {
-                    scratch
-                        .try_reserve_exact(original.len() - scratch.len())
-                        .map_err(|_| QUOTA)?;
-                }
-                scratch.resize(original.len(), 0);
+                resize_scratch(scratch, original.len())?;
                 let region = Region {
                     x: 0,
                     y: 0,
@@ -503,6 +536,14 @@ impl SurfaceData {
     }
 }
 
+fn resize_scratch(scratch: &mut Vec<u8>, len: usize) -> Result<(), &'static [u8]> {
+    scratch
+        .try_reserve_exact(len.saturating_sub(scratch.len()))
+        .map_err(|_| QUOTA)?;
+    scratch.resize(len, 0);
+    Ok(())
+}
+
 #[derive(Clone)]
 enum Base {
     Color([u8; 4]),
@@ -511,6 +552,14 @@ enum Base {
 }
 
 impl Base {
+    fn revision(&self, original: u64) -> Option<u64> {
+        match self {
+            Self::Color(_) => None,
+            Self::Original => Some(original),
+            Self::Frame(surface) => Some(surface.revision),
+        }
+    }
+
     fn from_frame(frame: &Frame) -> Self {
         match &frame.surface {
             Some(surface) => Self::Frame(Arc::clone(surface)),

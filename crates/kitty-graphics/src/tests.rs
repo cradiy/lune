@@ -85,7 +85,7 @@ fn quota_and_query_preserve_stored_pixels() {
             .collect::<Vec<_>>(),
         [
             (2, b"ENOSPC:Image quota exceeded".as_slice()),
-            (1, b"EINVAL:Invalid image data".as_slice()),
+            (1, b"ENODATA:Insufficient image data".as_slice()),
             (1, b"OK".as_slice()),
         ]
     );
@@ -133,9 +133,18 @@ fn animation_frames_commit_complete_patches_and_keep_the_current_surface_on_fail
     assert_eq!(images.visual_revision(), before);
 
     let mut scratch = Vec::new();
+    let original_revision = images.get(1).unwrap().revision();
     assert!(receive(&mut images, b"\x1b_Ga=a,i=1,c=2\x1b\\").is_none());
     let selected = images.visual_revision();
     assert_ne!(selected, before);
+    let image = images.get(1).unwrap();
+    let update = image.pixel_update(original_revision, &mut scratch).unwrap();
+    assert_eq!(
+        (update.origin, update.size, update.bytes_per_row),
+        ([1, 0], [1, 1], 4)
+    );
+    assert_eq!(update.bytes, &[0, 128, 127, 255]);
+    let selected_revision = image.revision();
     assert_eq!(
         images.get(1).unwrap().pixels(&mut scratch).unwrap(),
         &[255, 0, 0, 255, 0, 128, 127, 255],
@@ -175,9 +184,26 @@ fn animation_frames_commit_complete_patches_and_keep_the_current_surface_on_fail
         &[0, 128, 127, 255, 0, 128, 127, 255],
     );
     assert!(receive(&mut images, b"\x1b_Ga=a,i=1,c=1\x1b\\").is_none());
+    let update = images
+        .get(1)
+        .unwrap()
+        .pixel_update(selected_revision, &mut scratch)
+        .unwrap();
+    assert_eq!((update.origin, update.size), ([0, 0], [2, 1]));
+    assert_eq!(update.bytes, &[0, 0, 0, 0, 0, 0, 255, 255]);
+
+    let revision = images.visual_revision();
+    assert!(receive(&mut images, b"\x1b_Ga=f,i=1,r=2,s=1,v=1,m=1,q=1;AAAA\x1b\\").is_none());
+    let reply = receive(&mut images, b"\x1b_Ga=f,m=0\x1b\\").unwrap();
+    assert_eq!(
+        (reply.id, reply.message),
+        (1, b"ENODATA:Insufficient image data".as_slice())
+    );
+    assert!(receive(&mut images, b"\x1b_Ga=a,i=1,c=2\x1b\\").is_none());
+    assert_ne!(images.visual_revision(), revision);
     assert_eq!(
         images.get(1).unwrap().pixels(&mut scratch).unwrap(),
-        &[0, 0, 0, 0, 0, 0, 255, 255],
+        &[0, 128, 127, 255, 0, 128, 127, 255]
     );
 }
 
@@ -249,7 +275,7 @@ fn anonymous_pixels_live_with_their_placement_and_release_quota() {
         pixels.as_ref().unwrap().pixels(&mut Vec::new()).unwrap(),
         &[1, 2, 3, 4]
     );
-    assert!(images.revision(key).is_some());
+    assert!(images.source_revision(key).is_some());
     let named = b"\x1b_Gi=1,s=1,v=1;AQIDBA==\x1b\\";
     feed(named, named.len(), |command| {
         assert_eq!(
@@ -266,7 +292,7 @@ fn anonymous_pixels_live_with_their_placement_and_release_quota() {
         );
     });
     drop(pixels.take());
-    assert!(images.revision(key).is_none());
+    assert!(images.source_revision(key).is_none());
     feed(named, named.len(), |command| {
         assert_eq!(
             images
@@ -353,8 +379,12 @@ fn local_transfers_use_checked_ranges_and_unlink_only_tagged_temp_files() {
     let mut images = ImageStore::new(16, 4);
     let b = |path: &std::path::Path| path.as_os_str().as_encoded_bytes().to_vec();
     assert_eq!(
-        local_reply(&mut images, "i=1,t=f,s=1,v=1,S=4,O=2", &b(&link)).message,
+        local_reply(&mut images, "i=1,t=f,s=1,v=1,S=23,O=2", &b(&link)).message,
         b"OK"
+    );
+    assert_eq!(
+        local_reply(&mut images, "a=q,i=1,t=f,s=1,v=1,S=3,O=2", &b(&link)).message,
+        b"EBADF:Failed to read image file"
     );
     for path in [&fifo, &directory.0.join("missing"), &file] {
         let reply = local_reply(&mut images, "i=1,t=f,s=1,v=1,S=4,O=5", &b(path));
@@ -419,7 +449,12 @@ fn posix_shared_transfer_reads_and_unlinks_the_object() {
     File::from(file).write_all(&[0, 3, 17, 0]).unwrap();
     let mut images = ImageStore::new(4, 1);
     assert_eq!(
-        local_reply(&mut images, "i=1,t=s,f=16,s=1,v=1,O=1,S=2", name.as_bytes()).message,
+        local_reply(
+            &mut images,
+            "i=1,t=s,f=16,s=1,v=1,O=1,S=19",
+            name.as_bytes()
+        )
+        .message,
         b"OK"
     );
     let image = images.get(1).unwrap();
@@ -436,11 +471,17 @@ fn payload_bounds_and_nonfinal_block_alignment_are_enforced() {
     let mut decoder = Decoder::default();
     decoder.start();
     decoder.push(b"Gm=1;");
-    decoder.push(&[b'A'; MAX_DIRECT_PAYLOAD_BYTES]);
+    let first = vec![b'A'; MAX_DIRECT_PAYLOAD_BYTES];
+    for piece in first.chunks(2047) {
+        decoder.push(piece);
+    }
     let command = decoder.finish().unwrap().unwrap();
-    let mut output = [0xff; MAX_DECODED_PAYLOAD_BYTES];
-    assert_eq!(command.decode_payload(&mut output), Ok(3072));
-    assert_eq!(&output[..3072], &[0; 3072]);
+    let mut output = vec![0xff; MAX_DECODED_PAYLOAD_BYTES];
+    assert_eq!(
+        command.decode_payload(&mut output),
+        Ok(MAX_DECODED_PAYLOAD_BYTES)
+    );
+    assert!(output.iter().all(|&byte| byte == 0));
 
     decoder.start();
     decoder.push(b"G;");
@@ -449,7 +490,7 @@ fn payload_bounds_and_nonfinal_block_alignment_are_enforced() {
 
     decoder.start();
     decoder.push(b"Ga=q,e=T,i=19;");
-    decoder.push(&[b'%'; MAX_ENCODED_PAYLOAD_BYTES + 1]);
+    decoder.push(&[b'%'; INLINE_ENCODED_BYTES + 1]);
     decoder.push(b"ignored");
     assert!(
         decoder
@@ -467,6 +508,10 @@ fn payload_bounds_and_nonfinal_block_alignment_are_enforced() {
     let command = decoder.finish().unwrap().unwrap();
     assert_eq!(command.decode_payload(&mut output), Ok(path.len()));
     assert_eq!(&output[..path.len()], &path);
+    decoder.start();
+    decoder.push(b"Gt=f;");
+    decoder.push(&[b'A'; INLINE_ENCODED_BYTES + 1]);
+    assert_eq!(decoder.finish(), Some(Err(DecodeError::PayloadTooLong)));
 
     decoder.start();
     decoder.push(b"Gm=1;AQ==");
@@ -494,4 +539,37 @@ fn payload_bounds_and_nonfinal_block_alignment_are_enforced() {
     decoder.push(b"G");
     decoder.push(&[b'x'; MAX_CONTROL_BYTES + 1]);
     assert_eq!(decoder.finish(), Some(Err(DecodeError::ControlTooLong)));
+}
+
+#[test]
+fn large_direct_transfer_commits_on_matching_action_in_the_final_chunk() {
+    let mut wire = b"\x1b_Ga=T,i=1,f=24,s=128,v=257,m=1;".to_vec();
+    wire.extend(std::iter::repeat_n(b'A', MAX_DIRECT_PAYLOAD_BYTES));
+    wire.extend(b"\x1b\\\x1b_Ga=T;");
+    wire.extend(std::iter::repeat_n(b'/', 512));
+    wire.extend(b"\x1b\\");
+
+    let mut images = ImageStore::new(256 * 1024, 1);
+    let mut placed = 0;
+    let mut replies = 0;
+    feed(&wire, 2047, |command| {
+        if let Some(reply) = images.receive(command.unwrap(), |change| {
+            placed += usize::from(matches!(change, ImageChange::Place { .. }));
+            Ok(())
+        }) {
+            assert_eq!(reply.message, b"OK");
+            replies += 1;
+        }
+    });
+    assert_eq!((replies, placed), (1, 1));
+    let mut scratch = Vec::new();
+    let image = images.get(1).unwrap();
+    let pixels = image.pixels(&mut scratch).unwrap();
+    assert_eq!(image.dimensions(), (128, 257));
+    assert_eq!(&pixels[..4], &[0, 0, 0, 255]);
+    assert!(
+        pixels[pixels.len() - 128 * 4..]
+            .iter()
+            .all(|&byte| byte == 255)
+    );
 }
