@@ -35,8 +35,8 @@ mod tests;
 pub use cell::{Cell, CellText, CellWidth, MAX_CELL_TEXT_BYTES, StyleId};
 pub use error::StorageError;
 pub use graphics::{
-    GraphicsLayout, GraphicsPlaceholderCell, GraphicsPlacement, graphics_parent_origins,
-    visit_graphics_placeholders,
+    GraphicsLayout, GraphicsPlaceholderRun, GraphicsPlacement, visit_graphics_placeholders,
+    visit_graphics_placeholders_with_parents,
 };
 pub use grid::{Grid, MAX_CELLS, MAX_DIMENSION};
 pub use history::{HistoryLimits, MAX_HISTORY_BYTES, MAX_HISTORY_ROWS, RowHistory};
@@ -45,6 +45,7 @@ pub use lines::{LogicalLine, LogicalLines};
 pub use lune_kitty_graphics::{
     Image as GraphicsImage, ImageFormat as GraphicsImageFormat, ImageKey as GraphicsImageKey,
     ImageStore as GraphicsImageStore, PixelRevision as GraphicsPixelRevision,
+    PixelUpdate as GraphicsPixelUpdate, PixelUpdates as GraphicsPixelUpdates,
 };
 pub use lune_kitty_graphics::{
     PLACEHOLDER as GRAPHICS_PLACEHOLDER, Placeholder as GraphicsPlaceholder,

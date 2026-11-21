@@ -334,6 +334,59 @@ fn animation_base_edits_follow_live_links_and_deletion_freezes_dependents() {
 }
 
 #[test]
+fn playback_follows_gap_changes_and_frame_removal() {
+    let mut images = ImageStore::new(4096, 1);
+    let start = std::time::Instant::now();
+    let at = |millis| start + std::time::Duration::from_millis(millis);
+    let mut step = |millis, wire: &[u8], expected: [u8; 4], deadline: Option<u64>| {
+        feed(wire, 13, |command| {
+            let command = command.unwrap();
+            if let Some(delete) = command.decode_delete() {
+                images.delete_frame(delete.unwrap(), |_| Ok(()));
+            } else if let Some(reply) = images.receive(command, |_| Ok(())) {
+                assert_eq!(reply.message, b"OK");
+            }
+        });
+        images.poll_animations(|| at(millis));
+        assert_eq!(
+            images.get(1).unwrap().pixels(&mut Vec::new()).unwrap(),
+            expected
+        );
+        assert_eq!(images.animation_deadline(), deadline.map(at));
+    };
+    let red = [255, 0, 0, 255];
+    let green = [0, 255, 0, 255];
+    let blue = [0, 0, 255, 255];
+    let mut animation = concat!(
+        "\x1b_Gi=1,s=1,v=1;/wAA/w==\x1b\\",
+        "\x1b_Ga=f,i=1,s=1,v=1,z=-1;AAAA/w==\x1b\\",
+        "\x1b_Ga=f,i=1,s=1,v=1,z=-1;AP8A/w==\x1b\\",
+    )
+    .to_owned();
+    animation.push_str(&"\x1b_Ga=f,i=1,s=1,v=1,z=-1;AAAA/w==\x1b\\".repeat(63));
+    animation.push_str(concat!(
+        "\x1b_Ga=f,i=1,s=1,v=1,z=20;AAD//w==\x1b\\",
+        "\x1b_Ga=f,i=1,s=1,v=1,z=30;/////w==\x1b\\",
+        "\x1b_Ga=a,i=1,r=1,z=10,s=3\x1b\\",
+    ));
+    step(0, animation.as_bytes(), red, Some(10));
+    step(10, b"", blue, Some(30));
+    step(
+        11,
+        b"\x1b_Ga=a,i=1,r=3,z=8\x1b\\\x1b_Ga=d,d=f,i=1,r=2\x1b\\",
+        blue,
+        Some(30),
+    );
+    step(12, b"\x1b_Ga=a,i=1,r=67,z=-1\x1b\\", blue, Some(30));
+    step(30, b"", red, Some(40));
+    step(40, b"", green, Some(48));
+    step(48, b"", blue, Some(68));
+    step(50, b"\x1b_Ga=d,d=f,i=1,r=1\x1b\\", blue, Some(68));
+    step(51, b"\x1b_Ga=a,i=1,s=3,v=3\x1b\\", blue, Some(68));
+    step(200, b"", blue, None);
+}
+
+#[test]
 fn removing_an_animation_releases_shared_frame_storage() {
     let receive = |images: &mut ImageStore, input: &[u8]| {
         let mut reply = None;
@@ -422,12 +475,13 @@ fn deleting_the_last_dependent_frame_releases_original_pixels() {
     };
     assert_eq!((patch.origin, patch.size), ([0, 0], [1, 1]));
     assert_eq!(patch.bytes, &[0, 0, 255, 255]);
-    let PixelUpdates::One(surface) = image.pixel_updates(None, &mut scratch).unwrap() else {
-        panic!("Expected the full image without a previous revision");
-    };
-    assert_eq!(surface.size, [16, 16]);
-    assert_eq!(surface.bytes.len(), 1024);
-    assert_eq!(&surface.bytes[..8], &[0, 0, 255, 255, 0, 255, 0, 255]);
+    assert!(matches!(
+        image.pixel_updates(None, &mut scratch),
+        Some(PixelUpdates::Rasterize)
+    ));
+    let surface = image.pixels(&mut scratch).unwrap();
+    assert_eq!(surface.len(), 1024);
+    assert_eq!(&surface[..8], &[0, 0, 255, 255, 0, 255, 0, 255]);
 }
 
 #[test]
@@ -609,14 +663,67 @@ fn anonymous_pixels_live_with_their_placement_and_release_quota() {
 }
 
 #[test]
+fn direct_rgb_chunks_preserve_pixel_order_at_the_storage_limit() {
+    use std::io::Write as _;
+
+    let rgb: Vec<_> = (0..257 * 64)
+        .map(|index| [index as u8, (index >> 8) as u8, (index % 17) as u8])
+        .collect();
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+    encoder.write_all(rgb.as_flattened()).unwrap();
+    let compressed = encoder.finish().unwrap();
+    let expected: Vec<_> = rgb.iter().map(|&[r, g, b]| [r, g, b, 255]).collect();
+    for (bytes, compression) in [(rgb.as_flattened(), ""), (&compressed, "o=z,")] {
+        let encoded = PAYLOAD_ENGINE.encode(bytes);
+        let mut wire = String::new();
+        for (index, chunk) in encoded.as_bytes().chunks(52).enumerate() {
+            let more = u8::from((index + 1) * 52 < encoded.len());
+            wire.push_str("\x1b_G");
+            if index == 0 {
+                wire.push_str("i=1,f=24,s=257,v=64,");
+                wire.push_str(compression);
+            }
+            wire.push_str(&format!(
+                "m={more};{}\x1b\\",
+                str::from_utf8(chunk).unwrap()
+            ));
+        }
+        wire.push_str("\x1b_Gi=1,f=24,s=1,v=1;AQI=\x1b\\");
+
+        let mut images = ImageStore::new(rgb.len() * 4, 1);
+        let mut replies = Vec::new();
+        feed(wire.as_bytes(), 11, |command| {
+            let command = command.unwrap();
+            let more = command.controls.get(b'm') == Some(Value::Unsigned(1));
+            let reply = images.receive(command, |_| Ok(()));
+            if more {
+                assert!(reply.is_none() && images.get(1).is_none());
+            }
+            replies.extend(reply.map(|reply| reply.message));
+        });
+        assert_eq!(
+            replies,
+            [b"OK".as_slice(), b"ENODATA:Insufficient image data"]
+        );
+        let mut scratch = Vec::new();
+        let rgba = images.get(1).unwrap().pixels(&mut scratch).unwrap();
+        assert_eq!(rgba, expected.as_flattened());
+    }
+}
+
+#[test]
 fn zlib_checks_stream_boundaries_and_png_expands_paletted_alpha() {
     let mut images = ImageStore::new(8, 2);
     let wire = concat!(
         "\x1b_Gi=1,s=1,v=1,o=z,m=1;eJxj\x1b\\\x1b_Gm=0;ZGJmAQAAGAAL\x1b\\",
         "\x1b_Gi=1,s=1,v=1,o=z;eJxjZGJmAQAAGAALWg==\x1b\\",
-        "\x1b_Gi=1,s=1,v=1,o=z;eJxjZGJmAQAAGAA=\x1b\\",
-        "\x1b_Gi=1,s=1,v=1,o=z;eJxjZGJmYQUAACgAEA==\x1b\\",
-        "\x1b_Gi=2,f=100,o=z,S=99;eJzrDPBz5+WS4mJgYOD19HAJYmBgYARhRmYGBgbV22GnGBgY2AJ8QlwZGBgElYwXPAzfx8DAwFQS5Bf8v4GDf3MWAwMDl6eLY0jFnOQMBgaGJobG8rNF2xgYGBg8Xf1c1jklNAEAsUoWww==\x1b\\"
+        "\x1b_Gi=1,s=1,v=1,o=z,m=1;eJxj\x1b\\\x1b_Gm=0;ZGJmAQAAGAA=\x1b\\",
+        "\x1b_Gi=1,s=1,v=1,o=z,m=1;eJxj\x1b\\\x1b_Gm=0;ZGJmAQAAGAAM\x1b\\",
+        "\x1b_Gi=1,s=1,v=1,o=z,m=1;eJxj\x1b\\\x1b_Gm=0;ZGJmYQUAACgAEA==\x1b\\",
+        "\x1b_Gi=1,s=1,v=1,o=z,m=1;eJxjZGJmAQAAGAAL\x1b\\\x1b_Gm=0\x1b\\",
+        "\x1b_Gi=1,s=1,v=1,o=z,m=1;eJxjZGJmAQAAGAAL\x1b\\\x1b_Gm=0;Wg==\x1b\\",
+        "\x1b_Gi=2,f=100,o=z,S=99,m=1;eJzrDPBz5+WS4mJg\x1b\\",
+        "\x1b_Gm=0;YOD19HAJYmBgYARhRmYGBgbV22GnGBgY2AJ8QlwZGBgElYwXPAzfx8DAwFQS5Bf8v4GDf3MWAwMDl6eLY0jFnOQMBgaGJobG8rNF2xgYGBg8Xf1c1jklNAEAsUoWww==\x1b\\",
     );
     let mut replies = Vec::new();
     feed(wire.as_bytes(), 7, |command| {
@@ -627,7 +734,8 @@ fn zlib_checks_stream_boundaries_and_png_expands_paletted_alpha() {
         );
     });
     let bad = b"EINVAL:Invalid image data".as_slice();
-    assert_eq!(replies, [b"OK".as_slice(), bad, bad, bad, b"OK".as_slice()]);
+    let ok = b"OK".as_slice();
+    assert_eq!(replies, [ok, bad, bad, bad, bad, ok, bad, ok]);
     assert_eq!(
         images.get(1).unwrap().pixels(&mut Vec::new()).unwrap(),
         &[1, 2, 3, 4]

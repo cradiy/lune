@@ -5,8 +5,8 @@ use std::sync::{
 use std::{collections::HashMap, ops::Range};
 
 use lune_kitty_graphics::{
-    DecodeError, Decoder, Delete, DeleteTarget, Image, ImageKey, ImageStore, Placement,
-    PlacementError, PlacementPosition, RelativePlacement, Reply,
+    Decoder, Delete, DeleteTarget, Image, ImageKey, ImageStore, Placement, PlacementError,
+    PlacementPosition, RelativePlacement, Reply,
 };
 use lune_vt::ApcEvent;
 
@@ -17,7 +17,7 @@ use crate::{
 
 mod placeholders;
 pub use placeholders::{
-    GraphicsPlaceholderCell, graphics_parent_origins, visit_graphics_placeholders,
+    GraphicsPlaceholderRun, visit_graphics_placeholders, visit_graphics_placeholders_with_parents,
 };
 
 const MAX_PLACEMENTS: usize = 4096;
@@ -33,7 +33,9 @@ pub struct GraphicsPlacement {
     pub column: i64,
     // Retained vertical edges in units of the requested source rectangle height.
     vertical_crop: [f64; 2],
+    // Virtual spans count image-covered cells from virtual_start.
     span: [usize; 2],
+    virtual_start: [u32; 2],
     anonymous: Option<Arc<Image>>,
     serial: u64,
     parent: Option<u64>,
@@ -132,11 +134,12 @@ impl GraphicsPlacement {
             size[1] *= fraction;
             let first = source_origin[1] + start * source_size[1];
             if top > 0.0 {
-                sample_bounds[0][1] = snap_texel_edge(first).floor() + 0.5;
+                sample_bounds[0][1] = snap_integer_edge(first).floor() + 0.5;
             }
             if bottom < 1.0 {
                 let last = source_origin[1] + bottom * source_size[1];
-                sample_bounds[1][1] = (snap_texel_edge(last).ceil() - 0.5).max(sample_bounds[0][1]);
+                sample_bounds[1][1] =
+                    (snap_integer_edge(last).ceil() - 0.5).max(sample_bounds[0][1]);
             }
             source_origin[1] = first;
         }
@@ -192,12 +195,19 @@ impl GraphicsPlacement {
     }
 
     fn set_cell_size(&mut self, cell: PixelSize) {
-        if self.is_virtual() {
-            self.span = self.virtual_cells(cell).map(|count| count as usize);
-            return;
-        }
         let (offset, size, _) = self.uncropped_geometry(cell);
         let cell_size = [cell.width.get(), cell.height.get()].map(f64::from);
+        if self.is_virtual() {
+            self.virtual_start = std::array::from_fn(|axis| {
+                snap_integer_edge(offset[axis] / cell_size[axis]).floor() as u32
+            });
+            self.span = std::array::from_fn(|axis| {
+                let end =
+                    snap_integer_edge((offset[axis] + size[axis]) / cell_size[axis]).ceil() as u32;
+                end.saturating_sub(self.virtual_start[axis]) as usize
+            });
+            return;
+        }
         self.span = std::array::from_fn(|axis| {
             let count = self.placement.cells[axis];
             if count == 0 {
@@ -298,6 +308,7 @@ impl GraphicsPlacement {
             },
             vertical_crop: UNCROPPED,
             span: [0; 2],
+            virtual_start: [0; 2],
             anonymous,
             serial: 0,
             parent: None,
@@ -308,7 +319,7 @@ impl GraphicsPlacement {
     }
 }
 
-fn snap_texel_edge(pixel: f64) -> f64 {
+fn snap_integer_edge(pixel: f64) -> f64 {
     let rounded = pixel.round();
     if (pixel - rounded).abs() < 1e-9 {
         rounded
@@ -470,7 +481,8 @@ impl GraphicsPlacements {
 
     pub(crate) fn clear_live(&mut self, view: ScreenView<'_>, styles: &StyleTable) {
         let origins = if self.virtual_parents {
-            graphics_parent_origins(&self.images, view, styles).unwrap_or_default()
+            visit_graphics_placeholders_with_parents(&self.images, view, styles, |_| {})
+                .unwrap_or_default()
         } else {
             HashMap::new()
         };
@@ -609,7 +621,9 @@ impl GraphicsPlacements {
                 | DeleteTarget::Row(_)
         );
         let origins = if coordinates && self.virtual_parents {
-            let Ok(origins) = graphics_parent_origins(&self.images, view, styles) else {
+            let Ok(origins) =
+                visit_graphics_placeholders_with_parents(&self.images, view, styles, |_| {})
+            else {
                 return;
             };
             origins
@@ -1105,10 +1119,12 @@ impl Graphics {
                         });
                         return self.reply.is_some();
                     }
-                    Some(Err(DecodeError::PayloadTooLong | DecodeError::PayloadAllocation)) => {
-                        images.abort_transfer();
+                    Some(Err(error)) => {
+                        debug_assert!(self.reply.is_none());
+                        self.reply = images.reject_chunk(error);
+                        return self.reply.is_some();
                     }
-                    Some(Err(_)) | None => {}
+                    None => {}
                 }
             }
             ApcEvent::Cancel => {

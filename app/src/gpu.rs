@@ -2,8 +2,9 @@ use std::collections::HashMap;
 use std::ops::Range;
 
 use lune_terminal::{
-    GraphicsImage, GraphicsImageFormat, GraphicsImageKey, GraphicsPixelRevision, GraphicsPlacement,
-    PixelSize, Row, RowRevision, ScreenBuffer, graphics_parent_origins,
+    GraphicsImage, GraphicsImageFormat, GraphicsImageKey, GraphicsPixelRevision,
+    GraphicsPixelUpdate, GraphicsPixelUpdates, GraphicsPlacement, PixelSize, Row, RowRevision,
+    ScreenBuffer,
 };
 use wgpu::{Buffer, Device, Queue, RenderPipeline, Sampler, Texture, TextureFormat, TextureView};
 
@@ -15,7 +16,8 @@ mod textures;
 
 pub use backgrounds::{BackgroundPrepareError, CellBackgroundRenderer};
 use textures::{
-    ImageTextures, PixelRegion, TextureBinding, TileRegion, make_texture, write_texture,
+    ImageTextures, PixelRegion, TextureBinding, TextureTiles, TileRegion, make_texture,
+    write_texture,
 };
 
 type ImageInstance = [f32; 12];
@@ -62,21 +64,28 @@ impl CachedImage {
             let Some(updates) = image.pixel_updates(Some(&self.revision), scratch) else {
                 return false;
             };
-            for update in updates
-                .as_slice()
-                .iter()
-                .filter(|update| !update.size.contains(&0))
-            {
-                self.textures.write(
-                    queue,
-                    PixelRegion {
-                        origin: update.origin,
-                        size: update.size,
-                    },
-                    update.bytes,
-                    update.bytes_per_row,
-                    self.format.bytes_per_pixel(),
-                );
+            let write = |update: &GraphicsPixelUpdate<'_>| {
+                if !update.size.contains(&0) {
+                    self.textures.write(
+                        queue,
+                        PixelRegion {
+                            origin: update.origin,
+                            size: update.size,
+                        },
+                        update.bytes,
+                        update.bytes_per_row,
+                        self.format.bytes_per_pixel(),
+                    );
+                }
+            };
+            match updates {
+                GraphicsPixelUpdates::One(update) => write(&update),
+                GraphicsPixelUpdates::Two(updates) => updates.iter().for_each(write),
+                GraphicsPixelUpdates::Rasterize => {
+                    if !self.textures.rasterize(queue, image, scratch) {
+                        return false;
+                    }
+                }
             }
             self.revision = image.pixel_revision();
         }
@@ -98,14 +107,116 @@ struct PreparedImages {
     rejected: usize,
 }
 
-pub struct ImageRenderer {
+struct ImagePipeline {
     pipeline: RenderPipeline,
-    indexed: RenderPipeline,
-    indexed_alpha: RenderPipeline,
+    layout: wgpu::BindGroupLayout,
+}
+
+struct ImageTextureResources {
+    rgba: ImagePipeline,
+    indexed: ImagePipeline,
+    indexed_alpha: ImagePipeline,
     sampler: Sampler,
     rgba_sampling: [Buffer; 2],
-    palette: Texture,
     palette_view: TextureView,
+}
+
+impl ImageTextureResources {
+    fn pipeline(&self, format: GraphicsImageFormat) -> &ImagePipeline {
+        match format {
+            GraphicsImageFormat::Rgba => &self.rgba,
+            GraphicsImageFormat::Indexed => &self.indexed,
+            GraphicsImageFormat::IndexedAlpha => &self.indexed_alpha,
+        }
+    }
+
+    fn bindings(
+        &self,
+        device: &Device,
+        format: GraphicsImageFormat,
+        pixels: &[u8],
+    ) -> impl Fn([u32; 2]) -> TextureBinding {
+        let gather_first = format == GraphicsImageFormat::Rgba && prefer_alpha_gather(pixels);
+        let layout = &self.pipeline(format).layout;
+        move |size| {
+            TextureBinding::new(
+                device,
+                layout,
+                format,
+                &self.sampler,
+                &self.palette_view,
+                &self.rgba_sampling[usize::from(gather_first)],
+                size,
+            )
+        }
+    }
+
+    fn upload_tiles(
+        &self,
+        device: &Device,
+        queue: &Queue,
+        image: &GraphicsImage,
+        tiles: &mut TextureTiles,
+        instances: &[(usize, ImageInstance)],
+        scratch: &mut Vec<u8>,
+    ) -> bool {
+        if instances.len() == tiles.tiles.len()
+            && tiles.tiles.iter().all(|tile| tile.resident.is_none())
+        {
+            return self.upload_all_tiles(device, queue, image, tiles, scratch);
+        }
+        let format = image.format();
+        for &(index, _) in instances {
+            let tile = &mut tiles.tiles[index];
+            if tile.resident.is_some() {
+                continue;
+            }
+            let region = tile.region.storage;
+            let Some(update) = image.pixel_region(region.origin, region.size, scratch) else {
+                return false;
+            };
+            let texture = self.bindings(device, format, update.bytes)(region.size);
+            write_texture(queue, &texture.texture, update.bytes, update.bytes_per_row);
+            tile.resident = Some(texture);
+        }
+        true
+    }
+
+    fn upload_all_tiles(
+        &self,
+        device: &Device,
+        queue: &Queue,
+        image: &GraphicsImage,
+        tiles: &mut TextureTiles,
+        scratch: &mut Vec<u8>,
+    ) -> bool {
+        let Some(pixels) = image.pixels(scratch) else {
+            return false;
+        };
+        let format = image.format();
+        let bind = self.bindings(device, format, pixels);
+        for tile in &mut tiles.tiles {
+            tile.resident = Some(bind(tile.region.storage.size));
+        }
+        let (width, height) = image.dimensions();
+        let bytes_per_pixel = format.bytes_per_pixel();
+        tiles.write(
+            queue,
+            PixelRegion {
+                origin: [0, 0],
+                size: [width, height],
+            },
+            pixels,
+            width * bytes_per_pixel,
+            bytes_per_pixel,
+        );
+        true
+    }
+}
+
+pub struct ImageRenderer {
+    texture_resources: ImageTextureResources,
+    palette: Texture,
     palette_revision: Option<u64>,
     has_indexed: bool,
     images: HashMap<GraphicsImageKey, CachedImage>,
@@ -129,34 +240,27 @@ impl ImageRenderer {
         });
         let palette = make_texture(device, 256, 1, TextureFormat::Rgba8UnormSrgb);
         let palette_view = palette.create_view(&wgpu::TextureViewDescriptor::default());
-        let pipeline = |fragment, blend| {
-            create_quad_pipeline(
+        let pipeline = |fragment| {
+            let pipeline = create_quad_pipeline(
                 device,
                 &module,
                 format,
                 "vertex_main",
                 fragment,
-                Some(blend),
+                Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
                 wgpu::VertexBufferLayout {
                     array_stride: size_of::<ImageInstance>() as u64,
                     step_mode: wgpu::VertexStepMode::Instance,
                     attributes: &wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4, 2 => Float32x4],
                 },
-            )
+            );
+            let layout = pipeline.get_bind_group_layout(0);
+            ImagePipeline { pipeline, layout }
         };
-        Self {
-            pipeline: pipeline(
-                "fragment_main",
-                wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING,
-            ),
-            indexed: pipeline(
-                "indexed_main",
-                wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING,
-            ),
-            indexed_alpha: pipeline(
-                "indexed_alpha_main",
-                wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING,
-            ),
+        let texture_resources = ImageTextureResources {
+            rgba: pipeline("fragment_main"),
+            indexed: pipeline("indexed_main"),
+            indexed_alpha: pipeline("indexed_alpha_main"),
             sampler: device.create_sampler(&wgpu::SamplerDescriptor {
                 mag_filter: wgpu::FilterMode::Linear,
                 min_filter: wgpu::FilterMode::Linear,
@@ -170,8 +274,11 @@ impl ImageRenderer {
                     usage: wgpu::BufferUsages::UNIFORM,
                 })
             }),
-            palette,
             palette_view,
+        };
+        Self {
+            texture_resources,
+            palette,
             palette_revision: None,
             has_indexed: false,
             images: HashMap::new(),
@@ -188,14 +295,6 @@ impl ImageRenderer {
         }
     }
 
-    fn pipeline(&self, format: GraphicsImageFormat) -> &RenderPipeline {
-        match format {
-            GraphicsImageFormat::Rgba => &self.pipeline,
-            GraphicsImageFormat::Indexed => &self.indexed,
-            GraphicsImageFormat::IndexedAlpha => &self.indexed_alpha,
-        }
-    }
-
     #[cfg(test)]
     pub(crate) fn has_cached_image(&self, key: GraphicsImageKey) -> bool {
         self.images.contains_key(&key)
@@ -205,7 +304,31 @@ impl ImageRenderer {
     pub(crate) fn cached_texture(&self, key: GraphicsImageKey) -> Option<&Texture> {
         self.images
             .get(&key)
-            .map(|entry| &entry.textures.get(0).texture)
+            .and_then(|entry| entry.textures.get(0))
+            .map(|texture| &texture.texture)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn resident_image_tiles(&self, key: GraphicsImageKey) -> usize {
+        match self.images.get(&key).map(|image| &image.textures) {
+            Some(ImageTextures::Single(_)) => 1,
+            Some(ImageTextures::Tiled(tiles)) => tiles
+                .tiles
+                .iter()
+                .filter(|tile| tile.resident.is_some())
+                .count(),
+            None => 0,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pixel_scratch_capacity(&self) -> usize {
+        self.pixel_scratch.capacity()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn image_instance_count(&self) -> usize {
+        self.instances.len()
     }
 
     /// Builds the image pass for a viewport. Returns the number of placements
@@ -322,16 +445,6 @@ impl ImageRenderer {
         };
         let mut rejected = 0;
         let placeholders = placeholders::collect(frame);
-        let parents = if frame.has_virtual_parents() {
-            graphics_parent_origins(
-                frame.graphics_placements(),
-                frame.viewport.source(),
-                frame.styles,
-            )
-            .unwrap_or_default()
-        } else {
-            HashMap::new()
-        };
         let limits = device.limits();
         let buffer_limit = limits.max_buffer_size;
         let max_instances =
@@ -364,33 +477,44 @@ impl ImageRenderer {
                     );
                     return;
                 }
-                let ImageTextures::Tiled(tiles) = &self.images[&image_id].textures else {
+                let ImageTextures::Tiled(tiles) =
+                    &mut self.images.get_mut(&image_id).unwrap().textures
+                else {
                     unreachable!("Oversized images are tiled");
                 };
                 tile_instances.clear();
                 tile_instances.extend(tiles.candidates(quad.source_region(), 0).filter_map(
                     |(index, tile)| {
                         quad.tile_instance(tile.region)
-                            .map(|vertices| (index as u32, vertices))
+                            .map(|vertices| (index, vertices))
                     },
                 ));
-                if tile_instances.len() > max_instances - self.instances.len() {
+                if tile_instances.len() > max_instances - self.instances.len()
+                    || !self.texture_resources.upload_tiles(
+                        device,
+                        queue,
+                        image,
+                        tiles,
+                        &tile_instances,
+                        &mut self.pixel_scratch,
+                    )
+                {
                     rejected += 1;
                     return;
                 }
                 for &(tile, vertices) in &tile_instances {
-                    self.push_instance(placement, image.format(), tile, vertices);
+                    self.push_instance(placement, image.format(), tile as u32, vertices);
                 }
             };
             if placement.is_virtual() {
-                if let Some(runs) = placeholders.get(&placement.serial()) {
+                if let Some(runs) = placeholders.pieces.get(&placement.serial()) {
                     for location in runs {
                         push(location);
                     }
                 }
             } else if let Some(origin) = placement
                 .origin_in_view(frame.viewport.offset(), |parent| {
-                    parents.get(&parent).copied().flatten()
+                    placeholders.parents.get(&parent).copied().flatten()
                 })
             {
                 let unbounded = i64::MIN..i64::MAX;
@@ -462,53 +586,50 @@ impl ImageRenderer {
         {
             return cached.update_pixels(queue, image, &mut self.pixel_scratch);
         }
-        let Some(pixels) = image.pixels(&mut self.pixel_scratch) else {
-            return false;
-        };
         let (width, height) = image.dimensions();
-        let format = image.format();
-        let pipeline = match format {
-            GraphicsImageFormat::Rgba => &self.pipeline,
-            GraphicsImageFormat::Indexed => &self.indexed,
-            GraphicsImageFormat::IndexedAlpha => &self.indexed_alpha,
+        let limit = device.limits().max_texture_dimension_2d;
+        let textures = if width.max(height) > limit {
+            ImageTextures::Tiled(TextureTiles::new([width, height], limit))
+        } else {
+            let Some(pixels) = image.pixels(&mut self.pixel_scratch) else {
+                return false;
+            };
+            let format = image.format();
+            let texture = self.texture_resources.bindings(device, format, pixels)([width, height]);
+            write_texture(
+                queue,
+                &texture.texture,
+                pixels,
+                width * format.bytes_per_pixel(),
+            );
+            ImageTextures::Single(texture)
         };
-        let layout = pipeline.get_bind_group_layout(0);
-        let gather_first = format == GraphicsImageFormat::Rgba && prefer_alpha_gather(pixels);
-        let textures = ImageTextures::new(
-            [width, height],
-            device.limits().max_texture_dimension_2d,
-            |region| {
-                TextureBinding::new(
-                    device,
-                    &layout,
-                    format,
-                    &self.sampler,
-                    &self.palette_view,
-                    &self.rgba_sampling[usize::from(gather_first)],
-                    region,
-                )
-            },
-        );
-        textures.write(
-            queue,
-            PixelRegion {
-                origin: [0, 0],
-                size: [width, height],
-            },
-            pixels,
-            width * format.bytes_per_pixel(),
-            format.bytes_per_pixel(),
-        );
         self.images.insert(
             id,
             CachedImage {
                 source_revision: image.source_revision(),
                 revision: image.pixel_revision(),
-                format,
+                format: image.format(),
                 textures,
             },
         );
         true
+    }
+
+    /// Draws the prepared layers over the pass's base background.
+    /// The foreground callback draws glyphs, decorations, and the cursor
+    /// and restores the viewport and scissor if it changes them.
+    pub fn draw_frame(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        backgrounds: &CellBackgroundRenderer,
+        draw_foreground: impl FnOnce(&mut wgpu::RenderPass<'_>),
+    ) {
+        self.draw(pass, GraphicsLayer::BehindBackground);
+        backgrounds.draw(pass);
+        self.draw(pass, GraphicsLayer::BehindText);
+        draw_foreground(pass);
+        self.draw(pass, GraphicsLayer::AboveText);
     }
 
     pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>, layer: GraphicsLayer) {
@@ -523,10 +644,14 @@ impl ImageRenderer {
         for draw in draws.iter().take_while(|draw| draw.layer == layer) {
             let image = &self.images[&draw.image_id];
             if format != Some(image.format) {
-                pass.set_pipeline(self.pipeline(image.format));
+                pass.set_pipeline(&self.texture_resources.pipeline(image.format).pipeline);
                 format = Some(image.format);
             }
-            pass.set_bind_group(0, &image.textures.get(draw.tile as usize).binding, &[]);
+            let texture = image
+                .textures
+                .get(draw.tile as usize)
+                .expect("Draw tiles are resident");
+            pass.set_bind_group(0, &texture.binding, &[]);
             pass.draw(0..4, draw.instances.clone());
         }
     }

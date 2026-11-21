@@ -6,12 +6,13 @@ use std::sync::{
 use std::time::Instant;
 
 use super::{
-    Command, Controls, Delete, DeleteTarget, EvictionRanking, FeatureReply, INLINE_DECODED_BYTES,
-    INLINE_ENCODED_BYTES, ImageChange, Placement, PlacementError, Value, control_keys,
+    Command, Controls, DecodeError, Delete, DeleteTarget, EvictionRanking, FeatureReply,
+    INLINE_DECODED_BYTES, INLINE_ENCODED_BYTES, ImageChange, Placement, PlacementError, Value,
+    control_keys,
 };
 use crate::animation::{
     Animation, Canvas, FrameBudget, FrameComposition, FrameControl, FrameUpload, INDEXED,
-    LOAD_FIELDS, PixelRevision,
+    LOAD_FIELDS, PixelRevision, Region,
 };
 use crate::pixels::{INVALID, ImageFormat, PixelTransfer, Pixels, QUOTA, UNSUPPORTED};
 use crate::source::{BAD_SOURCE, LocalSource};
@@ -58,15 +59,8 @@ pub struct PixelUpdate<'a> {
 pub enum PixelUpdates<'a> {
     One(PixelUpdate<'a>),
     Two([PixelUpdate<'a>; 2]),
-}
-
-impl<'a> PixelUpdates<'a> {
-    pub fn as_slice(&self) -> &[PixelUpdate<'a>] {
-        match self {
-            Self::One(update) => std::slice::from_ref(update),
-            Self::Two(updates) => updates,
-        }
-    }
+    /// The current frame needs to be rasterized, either whole or by region.
+    Rasterize,
 }
 
 impl<'a> PixelUpdate<'a> {
@@ -98,6 +92,29 @@ impl Image {
         Some(&self.bytes)
     }
 
+    /// Returns a nonempty rectangle of the current frame with its row stride.
+    pub fn pixel_region<'a>(
+        &'a self,
+        origin: [u32; 2],
+        size: [u32; 2],
+        scratch: &'a mut Vec<u8>,
+    ) -> Option<PixelUpdate<'a>> {
+        let region = Region::checked(origin.into(), size.into(), self.dimensions()).ok()?;
+        if region.is_empty() {
+            return None;
+        }
+        if let Some(animation) = &self.animation {
+            return animation
+                .pixel_region(&self.bytes, self.width as usize, region, scratch)
+                .ok();
+        }
+        Some(region.update_from(
+            &self.bytes,
+            self.width as usize,
+            self.format.bytes_per_pixel() as usize,
+        ))
+    }
+
     pub fn revision(&self) -> u64 {
         self.animation
             .as_ref()
@@ -116,7 +133,7 @@ impl Image {
         )
     }
 
-    /// Returns replacement regions for `previous`, or the full image when it is absent.
+    /// Returns replacement pixels or a request to rasterize the current frame.
     pub fn pixel_updates<'a>(
         &'a self,
         previous: Option<&PixelRevision>,
@@ -192,6 +209,19 @@ struct Transfer {
     frame: Option<FrameUpload>,
     pixels: PixelTransfer,
     local: Option<LocalSource>,
+}
+
+impl Transfer {
+    fn error_reply(&self, message: &'static [u8]) -> Option<Reply> {
+        reply(
+            if self.number == 0 { self.key.id() } else { 0 },
+            self.number,
+            self.reply_placement_id,
+            self.frame.map_or(0, |upload| upload.number),
+            self.quiet,
+            Err(message),
+        )
+    }
 }
 
 enum StoredImage {
@@ -376,6 +406,15 @@ impl ImageStore {
         self.pending = None;
     }
 
+    /// Rejects an in-progress transfer when a Kitty APC fails decoding.
+    pub fn reject_chunk(&mut self, error: DecodeError) -> Option<Reply> {
+        let transfer = self.pending.take()?;
+        transfer.error_reply(match error {
+            DecodeError::PayloadAllocation => QUOTA,
+            _ => INVALID,
+        })
+    }
+
     pub fn clear(&mut self) {
         self.abort_transfer();
         self.storage_revision = self
@@ -428,20 +467,7 @@ impl ImageStore {
                 }
                 pending
             } else {
-                let id = if pending.number == 0 {
-                    pending.key.id()
-                } else {
-                    0
-                };
-                let frame = pending.frame.map_or(0, |upload| upload.number);
-                return reply(
-                    id,
-                    pending.number,
-                    pending.reply_placement_id,
-                    frame,
-                    pending.quiet,
-                    Err(INVALID),
-                );
+                return pending.error_reply(INVALID);
             }
         } else {
             let id_field = number(controls, b'i');

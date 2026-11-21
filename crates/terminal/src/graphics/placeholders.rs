@@ -7,17 +7,20 @@ use crate::{
 use super::GraphicsPlacement;
 
 #[derive(Clone, Copy, Debug)]
-pub struct GraphicsPlaceholderCell {
+pub struct GraphicsPlaceholderRun {
     pub placement: u64,
     pub position: [i64; 2],
     pub origin: [i64; 2],
+    pub columns: u32,
 }
 
-/// Resolves virtual parents in live-buffer coordinates, including retained history.
-pub fn graphics_parent_origins(
+/// Visits placeholders and resolves virtual parents in live-buffer coordinates,
+/// including retained history.
+pub fn visit_graphics_placeholders_with_parents(
     placements: &[GraphicsPlacement],
     view: ScreenView<'_>,
     styles: &StyleTable,
+    mut visit: impl FnMut(GraphicsPlaceholderRun),
 ) -> Result<HashMap<u64, Option<[i64; 2]>>, StorageError> {
     let mut origins = HashMap::new();
     for parent in placements
@@ -29,24 +32,24 @@ pub fn graphics_parent_origins(
             origins.insert(parent, None);
         }
     }
-    if !origins.is_empty() {
-        visit_placeholder_rows(placements, view.placeholder_rows(), styles, |tile| {
-            if let Some(origin) = origins.get_mut(&tile.placement) {
-                let minimum = origin.get_or_insert(tile.position);
-                minimum[0] = minimum[0].min(tile.position[0]);
-                minimum[1] = minimum[1].min(tile.position[1]);
-            }
-        })?;
-    }
+    visit_placeholder_rows(placements, view.placeholder_rows(), styles, |tile| {
+        if let Some(origin) = origins.get_mut(&tile.placement) {
+            let minimum = origin.get_or_insert(tile.position);
+            minimum[0] = minimum[0].min(tile.position[0]);
+            minimum[1] = minimum[1].min(tile.position[1]);
+        }
+        visit(tile);
+    })?;
     Ok(origins)
 }
 
-/// Visits the valid placeholder tiles in view order. Coordinates are local to the supplied rows.
+/// Visits runs of adjacent placeholder cells covered by the image in view order.
+/// Coordinates are local to the supplied rows.
 pub fn visit_graphics_placeholders<'a>(
     placements: &[GraphicsPlacement],
     rows: impl IntoIterator<Item = &'a Row>,
     styles: &StyleTable,
-    visit: impl FnMut(GraphicsPlaceholderCell),
+    visit: impl FnMut(GraphicsPlaceholderRun),
 ) -> Result<(), StorageError> {
     visit_placeholder_rows(
         placements,
@@ -62,7 +65,7 @@ fn visit_placeholder_rows<'a>(
     placements: &[GraphicsPlacement],
     rows: impl IntoIterator<Item = (i64, &'a Row)>,
     styles: &StyleTable,
-    mut visit: impl FnMut(GraphicsPlaceholderCell),
+    mut visit: impl FnMut(GraphicsPlaceholderRun),
 ) -> Result<(), StorageError> {
     let virtual_placements = placements.iter().filter(|placement| placement.is_virtual());
     let count = virtual_placements.clone().count();
@@ -85,8 +88,11 @@ fn visit_placeholder_rows<'a>(
             lookup.insert((image, placement.placement.id), placement);
         }
     }
+    let mut last_key = None;
+    let mut last_placement = None;
     for (row_index, row) in rows {
         let mut previous: Option<(usize, [Color; 2], GraphicsPlaceholder)> = None;
+        let mut pending: Option<GraphicsPlaceholderRun> = None;
         let mut next_extended = 0;
         for (column, cell) in row.cells().iter().enumerate() {
             if !cell.has_character(GRAPHICS_PLACEHOLDER) {
@@ -115,22 +121,45 @@ fn visit_placeholder_rows<'a>(
                 continue;
             };
             previous = Some((column, colors, glyph));
-            let Some(placement) = lookup.get(&(glyph.image_id, glyph.placement_id)) else {
+            let key = (glyph.image_id, glyph.placement_id);
+            if last_key != Some(key) {
+                last_placement = lookup.get(&key).copied();
+                last_key = Some(key);
+            }
+            let Some(placement) = last_placement else {
                 continue;
             };
+            let [first_column, first_row] = placement.virtual_start;
+            let column_in_content = u32::from(glyph.column).wrapping_sub(first_column) as usize;
+            let row_in_content = u32::from(glyph.row).wrapping_sub(first_row) as usize;
             let [columns, rows] = placement.span;
-            if usize::from(glyph.column) >= columns || usize::from(glyph.row) >= rows {
+            if column_in_content >= columns || row_in_content >= rows {
                 continue;
             }
             let position = [column as i64, row_index];
-            visit(GraphicsPlaceholderCell {
+            let origin = [
+                position[0] - i64::from(glyph.column),
+                position[1] - i64::from(glyph.row),
+            ];
+            if let Some(run) = &mut pending
+                && run.placement == placement.serial()
+                && run.origin == origin
+                && run.position[0] + i64::from(run.columns) == position[0]
+            {
+                run.columns += 1;
+                continue;
+            }
+            if let Some(run) = pending.replace(GraphicsPlaceholderRun {
                 placement: placement.serial(),
                 position,
-                origin: [
-                    position[0] - i64::from(glyph.column),
-                    position[1] - i64::from(glyph.row),
-                ],
-            });
+                origin,
+                columns: 1,
+            }) {
+                visit(run);
+            }
+        }
+        if let Some(run) = pending {
+            visit(run);
         }
     }
     Ok(())

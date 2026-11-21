@@ -125,12 +125,11 @@ fn indexed_color(texel: vec2<i32>, has_alpha: bool) -> vec4<f32> {
 fn sample_indexed(input: VertexOutput, has_alpha: bool) -> vec4<f32> {
     let dimensions = textureDimensions(indices);
     let extent = vec2<f32>(dimensions);
-    let step = abs(vec2<f32>(dpdx(input.uv.x), dpdy(input.uv.y))) * extent;
     let position = clamp(input.uv, input.sample_bounds.xy, input.sample_bounds.zw) * extent;
     let low = vec2<i32>(0);
     let high = vec2<i32>(dimensions) - 1;
-    if all(abs(step - 1.0) * vec2<f32>(dimensions) < vec2<f32>(0.01))
-        || all(dimensions == vec2<u32>(1u)) {
+    // A unit scale can still place the image between pixel centers.
+    if all(abs(fract(position) - 0.5) < vec2<f32>(0.0001)) {
         return indexed_color(clamp(vec2<i32>(position), low, high), has_alpha);
     }
 

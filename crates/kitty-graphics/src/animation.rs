@@ -14,7 +14,7 @@ use crate::{
 mod damage;
 mod playback;
 use damage::{DamageLink, damage_between, split_saves_pixels};
-use playback::{Playback, PlaybackMode};
+use playback::{Playback, PlaybackMode, TimedFrames};
 
 const MAX_PATCH_DEPTH: u8 = 24;
 const DEFAULT_GAP_MS: u32 = 40;
@@ -227,6 +227,7 @@ impl Frame {
 pub(crate) struct Animation {
     root: Frame,
     extra: Vec<Frame>,
+    timed_extra: TimedFrames,
     current: usize,
     original_users: usize,
     linked_frames: usize,
@@ -305,6 +306,22 @@ impl Animation {
         }
     }
 
+    pub(crate) fn pixel_region<'a>(
+        &'a self,
+        original: &'a [u8],
+        width: usize,
+        region: Region,
+        scratch: &'a mut Vec<u8>,
+    ) -> Result<PixelUpdate<'a>, &'static [u8]> {
+        render_region(
+            self.current_surface().map(|surface| &surface.data),
+            original,
+            width,
+            region,
+            scratch,
+        )
+    }
+
     pub(crate) fn pixel_updates<'a>(
         &'a self,
         original: &'a [u8],
@@ -371,26 +388,13 @@ impl Animation {
                 region = Some(first);
             }
             if let Some(region) = region {
-                let width = dimensions.0 as usize;
-                if region.is_empty() {
-                    return Ok(PixelUpdates::One(region.update(&[], 0)));
-                }
-                return match data {
-                    None => Ok(PixelUpdates::One(region.update_from(original, width))),
-                    Some(SurfaceData::Full(bytes)) => {
-                        Ok(PixelUpdates::One(region.update_from(bytes, width)))
-                    }
-                    Some(data) => {
-                        let stride = region.width * 4;
-                        resize_scratch(scratch, stride * region.height)?;
-                        data.render(original, width, region, scratch);
-                        Ok(PixelUpdates::One(region.update(scratch, stride)))
-                    }
-                };
+                return render_region(data, original, dimensions.0 as usize, region, scratch)
+                    .map(PixelUpdates::One);
             }
         }
         let bytes = match data {
-            Some(data) => data.pixels(original, dimensions, scratch)?,
+            Some(SurfaceData::Full(bytes)) => bytes,
+            Some(SurfaceData::Patch(_)) => return Ok(PixelUpdates::Rasterize),
             None => original,
         };
         Ok(PixelUpdates::One(PixelUpdate::full(
@@ -498,6 +502,7 @@ impl Animation {
         } else {
             self.extra.try_reserve(1).map_err(|_| QUOTA)?;
             let gap_ms = upload.gap_ms.unwrap_or(DEFAULT_GAP_MS);
+            self.timed_extra.push(index - 1, gap_ms != 0)?;
             self.original_users += usize::from(surface.data.uses_original());
             self.linked_frames += usize::from(parent.is_some());
             self.extra.push(Frame {
@@ -675,6 +680,8 @@ impl Animation {
         } else {
             self.extra.remove(index - 1)
         };
+        self.timed_extra
+            .remove(index.saturating_sub(1), self.extra.len());
         self.original_users -= usize::from(removed.uses_original_surface());
         self.linked_frames -= usize::from(removed.parent.is_some());
         if self.linked_frames != 0 {
@@ -694,6 +701,7 @@ impl Animation {
         self.total_gap_ms -= u64::from(removed.gap_ms);
         if self.extra.capacity() > self.extra.len().saturating_mul(4).max(8) {
             self.extra.shrink_to_fit();
+            self.timed_extra.shrink_to_fit();
         }
         if self.current > index {
             self.current -= 1;
@@ -707,6 +715,9 @@ impl Animation {
     fn set_gap(&mut self, index: usize, gap_ms: u32) {
         let frame = self.frame_mut(index).expect("Frame index was validated");
         let old = std::mem::replace(&mut frame.gap_ms, gap_ms);
+        if index != 0 && (old == 0) != (gap_ms == 0) {
+            self.timed_extra.set(index - 1, gap_ms != 0);
+        }
         self.total_gap_ms = self.total_gap_ms - u64::from(old) + u64::from(gap_ms);
     }
 
@@ -843,6 +854,28 @@ impl SurfaceData {
     }
 }
 
+fn render_region<'a>(
+    data: Option<&'a SurfaceData>,
+    original: &'a [u8],
+    width: usize,
+    region: Region,
+    scratch: &'a mut Vec<u8>,
+) -> Result<PixelUpdate<'a>, &'static [u8]> {
+    if region.is_empty() {
+        return Ok(region.update(&[], 0));
+    }
+    match data {
+        None => Ok(region.update_from(original, width, 4)),
+        Some(SurfaceData::Full(bytes)) => Ok(region.update_from(bytes, width, 4)),
+        Some(data) => {
+            let stride = region.width * 4;
+            resize_scratch(scratch, stride * region.height)?;
+            data.render(original, width, region, scratch);
+            Ok(region.update(scratch, stride))
+        }
+    }
+}
+
 fn render_two_regions<'a>(
     data: Option<&'a SurfaceData>,
     original: &'a [u8],
@@ -852,10 +885,10 @@ fn render_two_regions<'a>(
 ) -> Result<PixelUpdates<'a>, &'static [u8]> {
     match data {
         None => Ok(PixelUpdates::Two(
-            regions.map(|region| region.update_from(original, width)),
+            regions.map(|region| region.update_from(original, width, 4)),
         )),
         Some(SurfaceData::Full(pixels)) => Ok(PixelUpdates::Two(
-            regions.map(|region| region.update_from(pixels, width)),
+            regions.map(|region| region.update_from(pixels, width, 4)),
         )),
         Some(data) => data.update_two_regions(original, width, regions, scratch),
     }
@@ -1031,7 +1064,7 @@ impl Patch {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct Region {
+pub(crate) struct Region {
     x: usize,
     y: usize,
     width: usize,
@@ -1043,7 +1076,7 @@ impl Region {
         self.width * self.height
     }
 
-    fn is_empty(self) -> bool {
+    pub(crate) fn is_empty(self) -> bool {
         self.width == 0 || self.height == 0
     }
 
@@ -1073,14 +1106,19 @@ impl Region {
         }
     }
 
-    fn update_from(self, pixels: &[u8], width: usize) -> PixelUpdate<'_> {
-        let stride = width * 4;
-        let start = self.y * stride + self.x * 4;
-        let len = (self.height - 1) * stride + self.width * 4;
+    pub(crate) fn update_from(
+        self,
+        pixels: &[u8],
+        width: usize,
+        bytes_per_pixel: usize,
+    ) -> PixelUpdate<'_> {
+        let stride = width * bytes_per_pixel;
+        let start = self.y * stride + self.x * bytes_per_pixel;
+        let len = (self.height - 1) * stride + self.width * bytes_per_pixel;
         self.update(&pixels[start..start + len], stride)
     }
 
-    fn checked(
+    pub(crate) fn checked(
         (x, y): (u32, u32),
         (width, height): (u32, u32),
         (canvas_width, canvas_height): (u32, u32),
