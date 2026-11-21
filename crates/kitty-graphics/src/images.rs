@@ -13,7 +13,9 @@ use crate::animation::{
     Animation, Canvas, FrameBudget, FrameComposition, FrameControl, FrameUpload, INDEXED,
     LOAD_FIELDS, PixelRevision, Region,
 };
-use crate::pixels::{INVALID, ImageFormat, PixelTransfer, Pixels, PngProfiles, QUOTA, UNSUPPORTED};
+use crate::pixels::{
+    INVALID, ImageFormat, Inflater, PixelTransfer, Pixels, PngProfiles, QUOTA, UNSUPPORTED,
+};
 use crate::source::{BAD_SOURCE, LocalSource};
 
 mod quota;
@@ -262,6 +264,7 @@ pub struct ImageStore {
     // Sorted by image number, with matching entries in upload order.
     numbered: Vec<NumberedImage>,
     pending: Option<Transfer>,
+    inflater: Inflater,
     png_profiles: PngProfiles,
     next_id: u32,
     next_anonymous: u64,
@@ -282,6 +285,7 @@ impl ImageStore {
             images: HashMap::new(),
             numbered: Vec::new(),
             pending: None,
+            inflater: Inflater::default(),
             png_profiles: PngProfiles::default(),
             next_id: 1,
             next_anonymous: u64::from(u32::MAX) + 1,
@@ -471,6 +475,7 @@ impl ImageStore {
         }
         self.images.clear();
         self.numbered.clear();
+        self.inflater = Inflater::default();
         self.png_profiles = PngProfiles::default();
         self.stored_bytes = 0;
         self.anonymous_images = 0;
@@ -603,16 +608,20 @@ impl ImageStore {
                 }
                 transfer.pixels.load(source, &decoded[..written])?;
             } else {
-                transfer.pixels.append_payload(&command)?;
+                transfer
+                    .pixels
+                    .append_payload(&command, &mut self.inflater)?;
             }
 
             if controls.get(b'm') == Some(Value::Unsigned(1)) {
                 self.pending = Some(transfer);
                 return Ok(false);
             }
-            let pixels = transfer
-                .pixels
-                .finish(self.max_bytes, &mut self.png_profiles)?;
+            let pixels = transfer.pixels.finish(
+                self.max_bytes,
+                &mut self.png_profiles,
+                &mut self.inflater,
+            )?;
             if let Some(frame) = transfer.frame {
                 self.apply_frame(transfer.key, |animation, canvas| {
                     animation.upload(frame, pixels, canvas)

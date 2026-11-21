@@ -294,6 +294,8 @@ pub struct ImageRenderer {
     instances: Vec<ImageInstance>,
     draws: Vec<Draw>,
     visible_images: Vec<GraphicsImageKey>,
+    visible_animations: Vec<GraphicsImageKey>,
+    animation_membership: Option<u64>,
     prepared: Option<PreparedImages>,
     layout_generation: u64,
     placeholder_rows: Vec<Option<RowRevision>>,
@@ -358,6 +360,8 @@ impl ImageRenderer {
             instances: Vec::new(),
             draws: Vec::new(),
             visible_images: Vec::new(),
+            visible_animations: Vec::new(),
+            animation_membership: None,
             prepared: None,
             layout_generation: 0,
             placeholder_rows: Vec::new(),
@@ -453,7 +457,12 @@ impl ImageRenderer {
             && frame
                 .graphics_placeholder_revisions()
                 .eq(self.placeholder_rows.iter().copied())
-            && (prepared.stamp == stamp || self.refresh_visible_pixels(queue, frame))
+            && (prepared.stamp == stamp
+                || self.refresh_visible_pixels(
+                    queue,
+                    store,
+                    previous_texture == Some(texture_stamp),
+                ))
         {
             let prepared = self.prepared.as_mut().expect("A layout was prepared");
             prepared.texture_stamp = texture_stamp;
@@ -476,13 +485,24 @@ impl ImageRenderer {
         rejected
     }
 
-    fn refresh_visible_pixels(&mut self, queue: &Queue, frame: &PresentationFrame<'_>) -> bool {
-        for &key in &self.visible_images {
-            let Some((image, cached)) = frame
-                .image_store()
-                .get(key.id())
-                .zip(self.images.get_mut(&key))
-            else {
+    fn refresh_visible_pixels(
+        &mut self,
+        queue: &Queue,
+        store: &GraphicsImageStore,
+        same_sources: bool,
+    ) -> bool {
+        let visible = if same_sources {
+            let membership = store.animation_membership();
+            if self.animation_membership != membership {
+                self.rebuild_visible_animations(store, membership);
+            }
+            &self.visible_animations
+        } else {
+            // A source change can invalidate a static image's draw bindings.
+            &self.visible_images
+        };
+        for &key in visible {
+            let Some((image, cached)) = store.get(key.id()).zip(self.images.get_mut(&key)) else {
                 return false;
             };
             if cached.source_revision != image.source_revision()
@@ -500,6 +520,20 @@ impl ImageRenderer {
         true
     }
 
+    #[cold]
+    fn rebuild_visible_animations(&mut self, store: &GraphicsImageStore, membership: Option<u64>) {
+        self.animation_membership = membership;
+        self.visible_animations.clear();
+        if membership.is_some() {
+            self.visible_animations.extend(
+                self.visible_images
+                    .iter()
+                    .copied()
+                    .filter(|&key| store.is_animated(key)),
+            );
+        }
+    }
+
     fn prepare_changed(
         &mut self,
         device: &Device,
@@ -511,6 +545,8 @@ impl ImageRenderer {
         self.draws.clear();
         self.instances.clear();
         self.visible_images.clear();
+        self.visible_animations.clear();
+        self.animation_membership = None;
         self.has_indexed = false;
         let Some((cell, area)) = frame
             .geometry
@@ -577,20 +613,17 @@ impl ImageRenderer {
                     return;
                 }
                 let Some(tiled) = *uploaded.get_or_insert_with(|| {
-                    self.cache(device, queue, image_id, image, |max_pixels| {
-                        let mut region = quad.source_region();
-                        if region.pixel_count() > max_pixels {
-                            return None;
-                        }
-                        for piece in locations.iter().skip(1) {
-                            if let Some(quad) = project(piece) {
-                                region = region.bounding_rect(quad.source_region());
-                                if region.pixel_count() > max_pixels {
-                                    return None;
-                                }
-                            }
-                        }
-                        Some(region)
+                    self.cache(device, queue, image_id, image, |dimensions| {
+                        TextureTiles::for_crop(
+                            dimensions,
+                            CROP_TILE_EDGE,
+                            quad.source_region(),
+                            locations
+                                .iter()
+                                .skip(1)
+                                .filter_map(project)
+                                .map(|quad| quad.source_region()),
+                        )
                     })
                 }) else {
                     rejected += 1;
@@ -701,7 +734,7 @@ impl ImageRenderer {
         queue: &Queue,
         id: GraphicsImageKey,
         image: &GraphicsImage,
-        crop: impl FnOnce(u32) -> Option<PixelRegion>,
+        crop: impl FnOnce([u32; 2]) -> Option<TextureTiles>,
     ) -> Option<bool> {
         if let Some(cached) = self.images.get_mut(&id)
             && cached.source_revision == image.source_revision()
@@ -721,14 +754,7 @@ impl ImageRenderer {
         let pixels = width * height;
         let crop_tiles = if pixels >= 4 * CROP_TILE_EDGE * CROP_TILE_EDGE && limit > CROP_TILE_EDGE
         {
-            crop(pixels / 4).and_then(|region| {
-                let tiles = TextureTiles::new([width, height], CROP_TILE_EDGE);
-                let covered: u32 = tiles
-                    .candidates(region, 0)
-                    .map(|(_, tile)| tile.region.storage.pixel_count())
-                    .sum();
-                (covered <= pixels / 2).then_some(tiles)
-            })
+            crop([width, height])
         } else {
             None
         };

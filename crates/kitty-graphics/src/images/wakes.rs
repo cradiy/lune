@@ -182,8 +182,9 @@ fn advance(
     let Some(StoredImage::Named(image)) = images.get_mut(&key) else {
         return None;
     };
+    let original_revision = image.source_revision();
     let animation = image.animation.as_mut()?;
-    let (next, frame_changed) = animation.advance(now);
+    let (next, frame_changed) = animation.advance(now, original_revision);
     animation.scheduled_at = next;
     *changed |= frame_changed;
     next

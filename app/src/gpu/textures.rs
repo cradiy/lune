@@ -185,6 +185,43 @@ impl TextureTile {
 }
 
 impl TextureTiles {
+    pub fn for_crop(
+        size: [u32; 2],
+        limit: u32,
+        first: PixelRegion,
+        mut rest: impl Iterator<Item = PixelRegion>,
+    ) -> Option<Self> {
+        let pixels = size[0] * size[1];
+        if first.pixel_count() > pixels / 4 {
+            return None;
+        }
+        let tiles = Self::new(size, limit);
+        let max_pixels = pixels / 2;
+        if let Some(second) = rest.next() {
+            let mut visited = vec![false; tiles.tiles.len()];
+            let mut covered = 0;
+            for region in [first, second].into_iter().chain(rest) {
+                for (index, tile) in tiles.candidates(region, 0) {
+                    if !std::mem::replace(&mut visited[index], true) {
+                        covered += tile.region.storage.pixel_count();
+                        if covered > max_pixels {
+                            return None;
+                        }
+                    }
+                }
+            }
+        } else {
+            let covered: u32 = tiles
+                .candidates(first, 0)
+                .map(|(_, tile)| tile.region.storage.pixel_count())
+                .sum();
+            if covered > max_pixels {
+                return None;
+            }
+        }
+        Some(tiles)
+    }
+
     pub fn candidates(
         &self,
         region: PixelRegion,

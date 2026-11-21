@@ -36,7 +36,7 @@ impl Format {
 enum Compression {
     None,
     Zlib,
-    Streaming(Box<ZlibTransfer>),
+    Streaming,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -135,19 +135,25 @@ impl PixelTransfer {
         })
     }
 
-    pub(crate) fn append_payload(&mut self, command: &Command<'_>) -> Result<(), &'static [u8]> {
+    pub(crate) fn append_payload(
+        &mut self,
+        command: &Command<'_>,
+        inflater: &mut Inflater,
+    ) -> Result<(), &'static [u8]> {
         let encoded = command.encoded_payload().map_err(|_| INVALID)?.len();
         if matches!(self.compression, Compression::Zlib)
             && command.controls.get(b'm') == Some(Value::Unsigned(1))
         {
-            self.compression = Compression::Streaming(Box::new(ZlibTransfer::new()));
+            inflater.restart();
+            self.compression = Compression::Streaming;
         }
-        if let Compression::Streaming(stream) = &mut self.compression {
+        if matches!(self.compression, Compression::Streaming) {
             let size = self
                 .expected
                 .expect("Direct zlib transfers have a decoded size");
-            return stream.append(
+            return inflater.active().append(
                 command,
+                encoded,
                 self.wire_limit,
                 size,
                 self.format.output_capacity(size),
@@ -208,14 +214,23 @@ impl PixelTransfer {
         self,
         max_bytes: usize,
         profiles: &mut PngProfiles,
+        inflater: &mut Inflater,
     ) -> Result<Pixels, &'static [u8]> {
         let bytes = match self.compression {
-            Compression::Zlib => match self.expected {
-                Some(size) => inflate(&self.bytes, size, self.format.output_capacity(size))?,
-                None => inflate_limited(&self.bytes, self.wire_limit)?,
-            },
-            Compression::Streaming(stream) if stream.ended => self.bytes,
-            Compression::Streaming(_) => return Err(INVALID),
+            Compression::Zlib => {
+                let decoder = &mut inflater.restart().decoder;
+                match self.expected {
+                    Some(size) => inflate(
+                        decoder,
+                        &self.bytes,
+                        size,
+                        self.format.output_capacity(size),
+                    )?,
+                    None => inflate_limited(decoder, &self.bytes, self.wire_limit)?,
+                }
+            }
+            Compression::Streaming if inflater.active().ended => self.bytes,
+            Compression::Streaming => return Err(INVALID),
             Compression::None => {
                 if let Some(size) = self.expected
                     && self.bytes.len() != size
@@ -280,31 +295,49 @@ fn zeroed(size: usize, capacity: usize) -> Result<Vec<u8>, &'static [u8]> {
     Ok(bytes)
 }
 
-struct ZlibTransfer {
+#[derive(Default)]
+pub(crate) struct Inflater(Option<Box<InflateState>>);
+
+impl Inflater {
+    fn restart(&mut self) -> &mut InflateState {
+        match &mut self.0 {
+            Some(state) => {
+                state.decoder.reset(true);
+                state.ended = false;
+                state
+            }
+            empty => empty.insert(Box::new(InflateState {
+                decoder: Decompress::new(true),
+                input: Vec::new(),
+                ended: false,
+            })),
+        }
+    }
+
+    fn active(&mut self) -> &mut InflateState {
+        self.0
+            .as_deref_mut()
+            .expect("A streaming transfer has an active inflater")
+    }
+}
+
+struct InflateState {
     decoder: Decompress,
     input: Vec<u8>,
     ended: bool,
 }
 
-impl ZlibTransfer {
-    fn new() -> Self {
-        Self {
-            decoder: Decompress::new(true),
-            input: Vec::new(),
-            ended: false,
-        }
-    }
-
+impl InflateState {
     fn append(
         &mut self,
         command: &Command<'_>,
+        encoded: usize,
         wire_limit: usize,
         size: usize,
         capacity: usize,
         output: &mut Vec<u8>,
     ) -> Result<(), &'static [u8]> {
         let remaining = wire_limit - self.decoder.total_in() as usize;
-        let encoded = command.encoded_payload().map_err(|_| INVALID)?.len();
         let estimated = base64::decoded_len_estimate(encoded).min(remaining);
         self.input
             .try_reserve_exact(estimated.saturating_sub(self.input.len()))
@@ -368,25 +401,26 @@ fn inflate_chunk(
     Ok(false)
 }
 
-fn inflate(bytes: &[u8], size: usize, capacity: usize) -> Result<Vec<u8>, &'static [u8]> {
+fn inflate(
+    decoder: &mut Decompress,
+    bytes: &[u8],
+    size: usize,
+    capacity: usize,
+) -> Result<Vec<u8>, &'static [u8]> {
     // Grow large outputs as the decoder produces bytes.
     let mut inflated = Vec::new();
     if size <= MAX_EAGER_INFLATE_BYTES {
         inflated.try_reserve_exact(capacity).map_err(|_| QUOTA)?;
     }
-    inflate_chunk(
-        &mut Decompress::new(true),
-        bytes,
-        size,
-        capacity,
-        &mut inflated,
-        false,
-    )?;
+    inflate_chunk(decoder, bytes, size, capacity, &mut inflated, false)?;
     Ok(inflated)
 }
 
-fn inflate_limited(bytes: &[u8], limit: usize) -> Result<Vec<u8>, &'static [u8]> {
-    let mut decoder = Decompress::new(true);
+fn inflate_limited(
+    decoder: &mut Decompress,
+    bytes: &[u8],
+    limit: usize,
+) -> Result<Vec<u8>, &'static [u8]> {
     let mut output = Vec::new();
     let initial = bytes.len().clamp(256, MAX_EAGER_INFLATE_BYTES);
     loop {
@@ -397,7 +431,7 @@ fn inflate_limited(bytes: &[u8], limit: usize) -> Result<Vec<u8>, &'static [u8]>
             let additional = filled.max(initial).min(limit - filled);
             output.try_reserve_exact(additional).map_err(|_| QUOTA)?;
         }
-        let status = decompress_into(&mut decoder, input_bytes, &mut output, filled, limit)?;
+        let status = decompress_into(decoder, input_bytes, &mut output, filled, limit)?;
         let decoded = decoder.total_out() as usize;
         if decoded > limit {
             return Err(QUOTA);
@@ -470,7 +504,7 @@ mod tests {
 
     use flate2::{Compression, write::ZlibEncoder};
 
-    use super::{INVALID, QUOTA, inflate_limited};
+    use super::{INVALID, Inflater, QUOTA, inflate_limited};
 
     #[test]
     fn bounded_inflation_checks_the_trailer_at_its_output_limit() {
@@ -479,14 +513,15 @@ mod tests {
         encoder.write_all(&data).unwrap();
         let stream = encoder.finish().unwrap();
         let limit = data.len();
-        assert_eq!(inflate_limited(&stream, limit).unwrap(), data);
-        assert_eq!(inflate_limited(&stream, limit - 1), Err(QUOTA));
-        assert_eq!(
-            inflate_limited(&stream[..stream.len() - 1], limit),
-            Err(INVALID)
-        );
-        let mut trailing = stream;
+        let mut inflater = Inflater::default();
+        let mut inflate =
+            |bytes: &[u8], limit| inflate_limited(&mut inflater.restart().decoder, bytes, limit);
+        assert_eq!(inflate(&stream, limit).unwrap(), data);
+        assert_eq!(inflate(&stream, limit - 1), Err(QUOTA));
+        assert_eq!(inflate(&stream[..stream.len() - 1], limit), Err(INVALID));
+        let mut trailing = stream.clone();
         trailing.push(0);
-        assert_eq!(inflate_limited(&trailing, limit), Err(INVALID));
+        assert_eq!(inflate(&trailing, limit), Err(INVALID));
+        assert_eq!(inflate(&stream, limit).unwrap(), data);
     }
 }

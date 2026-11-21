@@ -122,10 +122,17 @@ impl Animation {
         self.playback.mode != PlaybackMode::Stopped
     }
 
-    pub(crate) fn advance(&mut self, now: Instant) -> (Option<Instant>, bool) {
+    pub(crate) fn advance(
+        &mut self,
+        now: Instant,
+        original_revision: u64,
+    ) -> (Option<Instant>, bool) {
         let previous = self.current;
         let next = self.advance_to(now);
-        (next, self.current != previous)
+        let changed = self.current != previous
+            && self.frame_revision(previous).unwrap_or(original_revision)
+                != self.revision().unwrap_or(original_revision);
+        (next, changed)
     }
 
     fn advance_to(&mut self, now: Instant) -> Option<Instant> {

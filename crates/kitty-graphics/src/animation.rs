@@ -13,7 +13,7 @@ use crate::{
 
 mod damage;
 mod playback;
-use damage::{DamageLink, damage_between, split_saves_pixels};
+use damage::{DamageLink, InheritedDamage, damage_between, split_saves_pixels};
 use playback::{Playback, PlaybackMode, TimedFrames};
 
 const MAX_PATCH_DEPTH: u8 = 24;
@@ -206,13 +206,50 @@ struct FrameReplacement {
     index: usize,
     parent: Option<NonZeroU32>,
     surface: Arc<Surface>,
+    flat_base: Option<Arc<Surface>>,
 }
 
-#[derive(Debug)]
-struct InheritedChange {
-    previous: u64,
-    current: u64,
-    region: Region,
+impl FrameReplacement {
+    fn new(index: usize, parent: Option<NonZeroU32>, surface: Arc<Surface>) -> Self {
+        Self {
+            index,
+            parent,
+            surface,
+            flat_base: None,
+        }
+    }
+
+    fn rebase(&mut self, patch: &Patch, canvas: &Canvas<'_>) -> Result<SurfaceData, &'static [u8]> {
+        let base = self.flat_base.as_ref().unwrap_or(&self.surface);
+        let mut patch = Patch::new(
+            Base::Frame(Arc::clone(base)),
+            patch.region,
+            patch.stride,
+            patch.pixels.share(),
+            patch.blend,
+        );
+        if patch.depth > MAX_PATCH_DEPTH {
+            // Flatten the shared base so the dependent retains its live patch.
+            let mut pixels = Vec::new();
+            self.surface
+                .data
+                .pixels(canvas.original, canvas.dimensions, &mut pixels)?;
+            let base = canvas.budget.store(
+                SurfaceData::Full(pixels),
+                self.surface.revision,
+                canvas.original_revision,
+            )?;
+            if self.parent.is_none() {
+                self.surface = Arc::clone(&base);
+            } else {
+                self.flat_base = Some(Arc::clone(&base));
+            }
+            patch.base = Base::Frame(base);
+            patch.depth = 1;
+            patch.uses_original = false;
+        }
+        Ok(SurfaceData::Patch(patch))
+    }
 }
 
 impl Frame {
@@ -233,7 +270,7 @@ pub(crate) struct Animation {
     linked_frames: usize,
     total_gap_ms: u64,
     playback: Playback,
-    inherited_change: Option<InheritedChange>,
+    inherited_damage: InheritedDamage,
     pub(crate) scheduled_at: Option<Instant>,
 }
 
@@ -280,7 +317,14 @@ impl Animation {
     }
 
     pub(crate) fn revision(&self) -> Option<u64> {
-        self.current_surface().map(|surface| surface.revision)
+        self.frame_revision(self.current)
+    }
+
+    fn frame_revision(&self, index: usize) -> Option<u64> {
+        self.frame(index)?
+            .surface
+            .as_ref()
+            .map(|surface| surface.revision)
     }
 
     pub(crate) fn pixel_revision(&self, original_revision: u64) -> PixelRevision {
@@ -333,14 +377,24 @@ impl Animation {
         let surface = self.current_surface();
         let data = surface.map(|surface| &surface.data);
         if let Some(previous) = previous {
-            let mut region = self
-                .inherited_change
-                .as_ref()
-                .filter(|change| {
-                    change.previous == previous.revision
-                        && surface.is_some_and(|surface| surface.revision == change.current)
-                })
-                .map(|change| change.region);
+            if let Some([first, second]) = surface.and_then(|surface| {
+                self.inherited_damage
+                    .since(previous.revision, surface.revision)
+            }) {
+                return if second.is_empty() {
+                    render_region(data, original, dimensions.0 as usize, first, scratch)
+                        .map(PixelUpdates::One)
+                } else {
+                    render_two_regions(
+                        data,
+                        original,
+                        dimensions.0 as usize,
+                        [first, second],
+                        scratch,
+                    )
+                };
+            }
+            let mut region = None;
             if let Some(data @ SurfaceData::Patch(patch)) = data
                 && let Some(base) = patch.base.revision(original_revision)
             {
@@ -478,11 +532,7 @@ impl Animation {
         }
         let surface = budget.store(data, revision, canvas.original_revision)?;
         if existing.is_some() {
-            let replacement = FrameReplacement {
-                index,
-                parent,
-                surface,
-            };
+            let replacement = FrameReplacement::new(index, parent, surface);
             self.edit_frame(replacement, region, upload.gap_ms, &canvas)?;
         } else {
             self.extra.try_reserve(1).map_err(|_| QUOTA)?;
@@ -524,7 +574,7 @@ impl Animation {
 
     fn replace_with_dependents(
         &mut self,
-        edited: FrameReplacement,
+        mut edited: FrameReplacement,
         region: Region,
         canvas: &Canvas<'_>,
     ) -> Result<(), &'static [u8]> {
@@ -534,11 +584,11 @@ impl Animation {
             let Some(parent) = frame.parent else { continue };
             let parent_index = parent.get() as usize - 1;
             let base = if parent_index == edited.index {
-                &edited.surface
+                &mut edited
             } else if let Ok(other) =
                 replacements.binary_search_by_key(&parent_index, |entry| entry.index)
             {
-                &replacements[other].surface
+                &mut replacements[other]
             } else {
                 continue;
             };
@@ -549,34 +599,22 @@ impl Animation {
             else {
                 unreachable!("A dependent frame has a patch surface");
             };
-            let data = Patch::new(
-                Base::Frame(Arc::clone(base)),
-                patch.region,
-                patch.stride,
-                patch.pixels.share(),
-                patch.blend,
-            )
-            .into_data(canvas)?;
-            let parent = matches!(data, SurfaceData::Patch(_)).then_some(parent);
+            let data = base.rebase(patch, canvas)?;
             let surface =
                 canvas
                     .budget
                     .store(data, next_image_revision(), canvas.original_revision)?;
             replacements.try_reserve(1).map_err(|_| QUOTA)?;
-            replacements.push(FrameReplacement {
-                index: position + 1,
-                parent,
-                surface,
-            });
+            replacements.push(FrameReplacement::new(position + 1, Some(parent), surface));
         }
         if let Ok(current) =
             replacements.binary_search_by_key(&self.current, |replacement| replacement.index)
         {
-            self.inherited_change = Some(InheritedChange {
-                previous: self.revision().expect("A dependent frame has a revision"),
-                current: replacements[current].surface.revision,
+            self.inherited_damage.record(
+                self.revision().expect("A dependent frame has a revision"),
+                replacements[current].surface.revision,
                 region,
-            });
+            );
         }
         self.replace_surface(edited);
         for replacement in replacements {
@@ -638,11 +676,7 @@ impl Animation {
                     canvas.original_revision,
                 )?,
             };
-            let replacement = FrameReplacement {
-                index: target,
-                parent: None,
-                surface,
-            };
+            let replacement = FrameReplacement::new(target, None, surface);
             return self.edit_frame(replacement, target_region, None, &canvas);
         }
         let mut bytes = Vec::new();

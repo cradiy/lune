@@ -1,6 +1,59 @@
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use super::{FrameBudget, FrameCharge, MIN_SPLIT_SAVINGS_PIXELS, PixelRevision, Region, Surface};
+
+const MAX_INHERITED_EDITS: usize = 8;
+
+#[derive(Debug, Default)]
+pub(super) struct InheritedDamage(VecDeque<InheritedEdit>);
+
+#[derive(Debug)]
+struct InheritedEdit {
+    previous: u64,
+    current: u64,
+    region: Region,
+}
+
+impl InheritedDamage {
+    pub(super) fn record(&mut self, previous: u64, current: u64, region: Region) {
+        let edits = &mut self.0;
+        if edits.capacity() == 0 && edits.try_reserve_exact(MAX_INHERITED_EDITS).is_err() {
+            return;
+        }
+        if edits.back().is_some_and(|edit| edit.current != previous) {
+            edits.clear();
+        } else if edits.len() == MAX_INHERITED_EDITS {
+            edits.pop_front();
+        }
+        edits.push_back(InheritedEdit {
+            previous,
+            current,
+            region,
+        });
+    }
+
+    #[inline]
+    pub(super) fn since(&self, previous: u64, current: u64) -> Option<[Region; 2]> {
+        let latest = self.0.back().filter(|edit| edit.current == current)?;
+        if latest.previous == previous {
+            return Some([latest.region, Region::default()]);
+        }
+        self.merge_since(previous)
+    }
+
+    #[cold]
+    fn merge_since(&self, previous: u64) -> Option<[Region; 2]> {
+        let mut damage = Damage::default();
+        for edit in self.0.iter().rev() {
+            damage.add(edit.region);
+            if edit.previous == previous {
+                return Some(damage.regions);
+            }
+        }
+        None
+    }
+}
 
 pub(super) struct DamageLink {
     edge: (u64, Region),

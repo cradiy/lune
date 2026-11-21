@@ -344,6 +344,7 @@ pub(crate) struct GraphicsPlacements {
     virtual_parents: bool,
     parent_origins: VirtualParentOrigins,
     anchors: HashMap<u64, usize>,
+    relative_indices: Vec<u16>,
     orphaned: Vec<OrphanedImage>,
 }
 
@@ -386,6 +387,11 @@ impl GraphicsPlacements {
         self.virtual_parents
     }
 
+    #[inline]
+    fn has_cursor_placements(&self) -> bool {
+        self.images.len() > self.virtual_count + self.relative_indices.len()
+    }
+
     pub(crate) fn revision(&self) -> Option<u64> {
         (!self.images.is_empty()).then_some(self.revision)
     }
@@ -410,6 +416,9 @@ impl GraphicsPlacements {
         view: ScreenView<'_>,
         columns: usize,
     ) -> Result<Vec<GraphicsAnchor>, StorageError> {
+        if !self.has_cursor_placements() {
+            return Ok(Vec::new());
+        }
         let history = view.history_rows() as i64;
         let live_rows = view.live_grid().rows() as i64;
         let end = CellPosition {
@@ -488,6 +497,9 @@ impl GraphicsPlacements {
     }
 
     pub(crate) fn crop_alternate(&mut self, columns: usize, rows: usize) {
+        if !self.has_cursor_placements() {
+            return;
+        }
         self.remove_matching(|image| {
             image.placement.position == PlacementPosition::Cursor
                 && (image.column >= columns as i64 || image.row >= rows as i64)
@@ -501,6 +513,7 @@ impl GraphicsPlacements {
     fn clear_placements(&mut self) {
         self.images.clear();
         self.anchors.clear();
+        self.relative_indices.clear();
         self.virtual_count = 0;
         self.virtual_parents = false;
     }
@@ -520,6 +533,9 @@ impl GraphicsPlacements {
     }
 
     pub(crate) fn discard_history_before(&mut self, first_row: i64, cell: PixelSize) {
+        if !self.has_cursor_placements() {
+            return;
+        }
         let count = self.images.len();
         let mut changed = false;
         self.images.retain_mut(|image| {
@@ -565,6 +581,10 @@ impl GraphicsPlacements {
         cell: PixelSize,
         mut moves: impl FnMut(&Range<i64>) -> bool,
     ) {
+        // Virtual roots move with the text that contains their placeholders.
+        if !self.has_cursor_placements() {
+            return;
+        }
         let count = self.images.len();
         let mut changed = false;
         self.images.retain_mut(|image| {
@@ -808,6 +828,9 @@ impl GraphicsPlacements {
             self.anchors
                 .try_reserve(self.images.len() + 1 - self.anchors.len())
                 .map_err(|_| PlacementError::Quota)?;
+            self.relative_indices
+                .try_reserve(usize::from(image.parent.is_some()))
+                .map_err(|_| PlacementError::Quota)?;
             self.orphaned
                 .try_reserve(MAX_PLACEMENTS - self.orphaned.len())
                 .map_err(|_| PlacementError::Quota)?;
@@ -851,29 +874,35 @@ impl GraphicsPlacements {
 
     fn reindex(&mut self) {
         self.anchors.clear();
-        self.anchors.extend(
-            self.images
-                .iter()
-                .enumerate()
-                .map(|(index, image)| (image.serial, index)),
-        );
+        self.relative_indices.clear();
+        for (index, image) in self.images.iter().enumerate() {
+            self.anchors.insert(image.serial, index);
+            if image.parent.is_some() {
+                self.relative_indices.push(index as u16);
+            }
+        }
     }
 
     fn refresh_root_indices(&mut self) {
-        for image in &mut self.images {
-            if let Some(root) = &mut image.root {
-                root.index = self.anchors[&root.serial] as u16;
-            }
+        for &index in &self.relative_indices {
+            let root = self.images[usize::from(index)]
+                .root
+                .as_mut()
+                .expect("A retained relative placement has a root");
+            root.index = self.anchors[&root.serial] as u16;
         }
     }
 
     fn index_inserted(&mut self, index: usize) {
         if index + 1 == self.images.len() {
             self.anchors.insert(self.images[index].serial, index);
+            if self.images[index].parent.is_some() {
+                self.relative_indices.push(index as u16);
+            }
         } else {
             self.reindex();
-            for image in &mut self.images {
-                if let Some(root) = &mut image.root
+            for &relative in &self.relative_indices {
+                if let Some(root) = &mut self.images[usize::from(relative)].root
                     && usize::from(root.index) >= index
                 {
                     root.index += 1;
@@ -894,8 +923,9 @@ impl GraphicsPlacements {
     ) -> Result<(), PlacementError> {
         self.resolve(image, Some(image), replaces_image)?;
         if preserves_serial {
-            for entry in &self.images {
-                if entry.parent.is_some() && entry.serial != image.serial {
+            for &index in &self.relative_indices {
+                let entry = &self.images[usize::from(index)];
+                if entry.serial != image.serial {
                     self.resolve(entry, Some(image), false)?;
                 }
             }
@@ -977,16 +1007,29 @@ impl GraphicsPlacements {
             return;
         }
         if !membership_changed {
-            for index in 0..self.images.len() {
-                let Some(root) = self.images[index].root else {
-                    continue;
-                };
-                let anchor = &self.images[usize::from(root.index)];
+            fn follow_root(images: &mut [GraphicsPlacement], index: usize, root: PlacementRoot) {
+                let anchor = &images[usize::from(root.index)];
                 let column = anchor.column + root.offset[0];
                 let row = anchor.row + root.offset[1];
-                let image = &mut self.images[index];
+                let image = &mut images[index];
                 image.column = column;
                 image.row = row;
+            }
+            if self.relative_indices.len() * 2 <= self.images.len() {
+                for &index in &self.relative_indices {
+                    let index = usize::from(index);
+                    let root = self.images[index]
+                        .root
+                        .expect("A relative placement has a root");
+                    follow_root(&mut self.images, index, root);
+                }
+            } else {
+                // Dense graphs benefit from traversing the placements in order.
+                for index in 0..self.images.len() {
+                    if let Some(root) = self.images[index].root {
+                        follow_root(&mut self.images, index, root);
+                    }
+                }
             }
             return;
         }
@@ -994,10 +1037,8 @@ impl GraphicsPlacements {
         self.virtual_parents = false;
         let mut invalid = false;
         let mut relative = false;
-        for index in 0..self.images.len() {
-            if self.images[index].parent.is_none() {
-                continue;
-            }
+        for relative_index in 0..self.relative_indices.len() {
+            let index = usize::from(self.relative_indices[relative_index]);
             if self.resolve_root(index).is_ok() {
                 relative = true;
             } else {
@@ -1024,6 +1065,7 @@ impl GraphicsPlacements {
         }
         if !relative {
             self.anchors.clear();
+            self.relative_indices.clear();
         }
     }
 

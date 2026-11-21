@@ -699,6 +699,79 @@ fn patch_transitions_restore_pixels_from_a_shared_base() {
 }
 
 #[test]
+fn batched_base_edits_upload_only_changed_parts_of_the_displayed_frame() {
+    let mut images = ImageStore::new(16384, 1);
+    let send = |images: &mut ImageStore, wire: &[u8]| {
+        feed(wire, 17, |command| {
+            if let Some(reply) = images.receive(command.unwrap(), |_| Ok(())) {
+                assert_eq!(reply.message, b"OK");
+            }
+        });
+    };
+    let base = format!("\x1b_Gi=1,f=24,s=64,v=64;{}\x1b\\", "/wAA".repeat(4096));
+    send(&mut images, base.as_bytes());
+    send(
+        &mut images,
+        b"\x1b_Ga=f,i=1,c=1,x=32,y=32,f=24,s=1,v=1,X=1;AP8A\x1b\\\x1b_Ga=a,i=1,c=2\x1b\\",
+    );
+    let before = images.get(1).unwrap().pixel_revision();
+    send(
+        &mut images,
+        b"\x1b_Ga=f,i=1,r=1,f=24,s=1,v=1,X=1;AAD/\x1b\\",
+    );
+    let intermediate = images.get(1).unwrap().pixel_revision();
+    send(
+        &mut images,
+        b"\x1b_Ga=f,i=1,r=1,x=63,y=63,f=24,s=1,v=1,X=1;////\x1b\\",
+    );
+
+    let image = images.get(1).unwrap();
+    let mut scratch = Vec::new();
+    let PixelUpdates::Two([far, near]) = image.pixel_updates(Some(&before), &mut scratch).unwrap()
+    else {
+        panic!("Expected separate updates for the two edited corners");
+    };
+    assert_eq!((far.origin, far.size), ([63, 63], [1, 1]));
+    assert_eq!(far.bytes, &[255; 4]);
+    assert_eq!((near.origin, near.size), ([0, 0], [1, 1]));
+    assert_eq!(near.bytes, &[0, 0, 255, 255]);
+    let PixelUpdates::One(update) = image
+        .pixel_updates(Some(&intermediate), &mut scratch)
+        .unwrap()
+    else {
+        panic!("Expected only the second edit after the intermediate revision");
+    };
+    assert_eq!((update.origin, update.size), ([63, 63], [1, 1]));
+    assert_eq!(update.bytes, &[255; 4]);
+
+    for (payload, color) in [("AP//", [0, 255, 255, 255]), ("/wD/", [255, 0, 255, 255])]
+        .into_iter()
+        .cycle()
+        .take(32)
+    {
+        let wire = format!(
+            "\x1b_Ga=f,i=1,r=1,f=24,s=1,v=1,X=1;{payload}\x1b\\\x1b_Ga=f,i=1,r=1,x=63,y=63,f=24,s=1,v=1,X=1;////\x1b\\"
+        );
+        send(&mut images, wire.as_bytes());
+        let image = images.get(1).unwrap();
+        assert_eq!(
+            image
+                .pixel_region([0, 0], [1, 1], &mut scratch)
+                .unwrap()
+                .bytes,
+            color
+        );
+        assert_eq!(
+            image
+                .pixel_region([32, 32], [1, 1], &mut scratch)
+                .unwrap()
+                .bytes,
+            &[0, 255, 0, 255]
+        );
+    }
+}
+
+#[test]
 fn anonymous_pixels_live_with_their_placement_and_release_quota() {
     let mut images = ImageStore::new(4, 1);
     let mut pixels = None;
