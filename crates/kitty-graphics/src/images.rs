@@ -22,6 +22,10 @@ use wakes::AnimationWakes;
 
 static NEXT_IMAGE_REVISION: AtomicU64 = AtomicU64::new(1);
 
+pub(crate) fn next_image_revision() -> u64 {
+    NEXT_IMAGE_REVISION.fetch_add(1, Ordering::Relaxed)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ImageKey(u64);
 
@@ -181,6 +185,7 @@ struct Transfer {
     key: ImageKey,
     number: u32,
     quiet: u32,
+    reply_placement_id: u32,
     transient: bool,
     action: u8,
     placement: Option<Placement>,
@@ -255,6 +260,10 @@ impl ImageStore {
             StoredImage::Named(image) => Some(image),
             StoredImage::Anonymous { .. } => None,
         }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.images.is_empty()
     }
 
     pub fn source_revision(&self, key: ImageKey) -> Option<u64> {
@@ -414,9 +423,11 @@ impl ImageStore {
                 if let Ok(Some(quiet @ 1..=2)) = quiet {
                     pending.quiet = quiet;
                 }
+                if pending.frame.is_some() {
+                    pending.reply_placement_id = 0;
+                }
                 pending
             } else {
-                let placement = pending.placement.map_or(0, |placement| placement.id);
                 let id = if pending.number == 0 {
                     pending.key.id()
                 } else {
@@ -426,7 +437,7 @@ impl ImageStore {
                 return reply(
                     id,
                     pending.number,
-                    placement,
+                    pending.reply_placement_id,
                     frame,
                     pending.quiet,
                     Err(INVALID),
@@ -438,11 +449,17 @@ impl ImageStore {
             let id = id_field.unwrap_or_default();
             let image_number = number_field.unwrap_or_default();
             let quiet_value = quiet.ok().flatten().unwrap_or_default();
-            let placement_id = number(controls, b'p').unwrap_or_default();
+            let placement_field = number(controls, b'p');
+            let placement_id = if action == Some(Value::Letter(b'q')) {
+                0
+            } else {
+                placement_field.unwrap_or_default()
+            };
             if quiet.is_err()
                 || controls.has_conflicting_image_selectors()
                 || id_field.is_none()
                 || number_field.is_none()
+                || placement_field.is_none()
             {
                 return reply(id, image_number, placement_id, 0, quiet_value, Err(INVALID));
             }
@@ -463,7 +480,14 @@ impl ImageStore {
                 return reply(id, image_number, 0, 0, quiet_value, result);
             }
             let mut frame_number = 0;
-            match self.begin(controls, id, image_number, quiet_value, &mut frame_number) {
+            match self.begin(
+                controls,
+                id,
+                image_number,
+                quiet_value,
+                placement_id,
+                &mut frame_number,
+            ) {
                 Ok(transfer) => transfer,
                 Err(message) => {
                     return reply(
@@ -480,7 +504,7 @@ impl ImageStore {
 
         let id = transfer.key.id();
         let image_number = transfer.number;
-        let placement_id = transfer.placement.map_or(0, |placement| placement.id);
+        let placement_id = transfer.reply_placement_id;
         let frame_number = transfer.frame.map_or(0, |upload| upload.number);
         let quiet_value = transfer.quiet;
         let result = (|| {
@@ -590,13 +614,15 @@ impl ImageStore {
             .get_or_init(|| Arc::new(FrameBudget::new(self.max_bytes.saturating_mul(5))));
         let previous = image.revision();
         let dimensions = image.dimensions();
-        let revision = NEXT_IMAGE_REVISION.fetch_add(1, Ordering::Relaxed);
+        let revision = next_image_revision();
+        let original_revision = image.source_revision();
         image.update_animation(|animation, original| {
             apply(
                 animation,
                 Canvas {
                     dimensions,
                     original,
+                    original_revision,
                     budget,
                     revision,
                 },
@@ -629,11 +655,11 @@ impl ImageStore {
     ) -> Result<(), &'static [u8]> {
         if !command
             .controls
-            .only(const { control_keys(b"aIiq") | Placement::KEYS })
+            .only(const { control_keys(b"aIiqN") | Placement::KEYS })
         {
             return Err(UNSUPPORTED);
         }
-        if !command.encoded_payload.is_empty() {
+        if !command.encoded_payload.is_empty() || number(&command.controls, b'N').is_none() {
             return Err(INVALID);
         }
         let key = ImageKey(u64::from(id));
@@ -649,7 +675,7 @@ impl ImageStore {
             evicted: &[],
         })
         .map_err(placement_error)?;
-        image.age = NEXT_IMAGE_REVISION.fetch_add(1, Ordering::Relaxed);
+        image.age = next_image_revision();
         Ok(())
     }
 
@@ -659,6 +685,7 @@ impl ImageStore {
         id: u32,
         image_number: u32,
         quiet: u32,
+        placement_id: u32,
         frame_number: &mut u32,
     ) -> Result<Transfer, &'static [u8]> {
         let action = match controls.get(b'a') {
@@ -678,7 +705,7 @@ impl ImageStore {
         } else {
             0
         };
-        if !controls.only(const { control_keys(b"aIfimqstovNSO") } | extra) {
+        if !controls.only(const { control_keys(b"aIfimqstovNSOp") } | extra) {
             return Err(UNSUPPORTED);
         }
         if action == b'q' && id == 0 {
@@ -726,6 +753,7 @@ impl ImageStore {
             key,
             number: image_number,
             quiet,
+            reply_placement_id: placement_id,
             transient,
             action,
             placement,
@@ -770,7 +798,7 @@ impl ImageStore {
         if number != 0 {
             self.numbered.try_reserve(1).map_err(|_| QUOTA)?;
         }
-        let revision = NEXT_IMAGE_REVISION.fetch_add(1, Ordering::Relaxed);
+        let revision = next_image_revision();
         let image = Image {
             width: pixels.dimensions.0,
             height: pixels.dimensions.1,

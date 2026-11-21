@@ -118,8 +118,8 @@ fn visit_placeholder_rows<'a>(
             let Some(placement) = lookup.get(&(glyph.image_id, glyph.placement_id)) else {
                 continue;
             };
-            let [columns, rows] = placement.placement.cells;
-            if u32::from(glyph.column) >= columns || u32::from(glyph.row) >= rows {
+            let [columns, rows] = placement.span;
+            if usize::from(glyph.column) >= columns || usize::from(glyph.row) >= rows {
                 continue;
             }
             let position = [column as i64, row_index];

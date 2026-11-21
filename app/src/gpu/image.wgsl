@@ -1,7 +1,7 @@
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
     @location(0) uv: vec2<f32>,
-    @location(1) @interpolate(flat) sample_rows: vec2<f32>,
+    @location(1) @interpolate(flat) sample_bounds: vec4<f32>,
 };
 
 @group(0) @binding(0) var pixels: texture_2d<f32>;
@@ -19,13 +19,13 @@ fn vertex_main(
     @builtin(vertex_index) vertex: u32,
     @location(0) bounds: vec4<f32>,
     @location(1) source: vec4<f32>,
-    @location(2) sample_rows: vec2<f32>,
+    @location(2) sample_bounds: vec4<f32>,
 ) -> VertexOutput {
     let corner = vec2<f32>(f32(vertex & 1u), f32(vertex >> 1u));
     var output: VertexOutput;
     output.position = quad_position(bounds, corner);
     output.uv = mix(source.xy, source.zw, corner);
-    output.sample_rows = sample_rows;
+    output.sample_bounds = sample_bounds;
     return output;
 }
 
@@ -51,8 +51,7 @@ fn solid_fragment(input: SolidQuad) -> @location(0) vec4<f32> {
 
 @fragment
 fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
-    let y = clamp(input.uv.y, input.sample_rows.x, input.sample_rows.y);
-    let uv = vec2<f32>(input.uv.x, y);
+    let uv = clamp(input.uv, input.sample_bounds.xy, input.sample_bounds.zw);
     var sample: vec4<f32>;
     if gather_first == 0u {
         sample = textureSampleLevel(pixels, pixel_sampler, uv, 0.0);
@@ -127,8 +126,7 @@ fn sample_indexed(input: VertexOutput, has_alpha: bool) -> vec4<f32> {
     let dimensions = textureDimensions(indices);
     let extent = vec2<f32>(dimensions);
     let step = abs(vec2<f32>(dpdx(input.uv.x), dpdy(input.uv.y))) * extent;
-    let y = clamp(input.uv.y, input.sample_rows.x, input.sample_rows.y);
-    let position = vec2<f32>(input.uv.x, y) * extent;
+    let position = clamp(input.uv, input.sample_bounds.xy, input.sample_bounds.zw) * extent;
     let low = vec2<i32>(0);
     let high = vec2<i32>(dimensions) - 1;
     if all(abs(step - 1.0) * vec2<f32>(dimensions) < vec2<f32>(0.01))

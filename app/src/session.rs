@@ -7,11 +7,11 @@ use std::time::{Duration, Instant};
 use lune_pty::{ChildExit, Pty, PtySize};
 use lune_terminal::{
     CellPosition, Color, ColorScheme, CursorAppearance, DisplayUnit, GRAPHICS_PLACEHOLDER,
-    GraphicsImage, GraphicsPlacement, HistoryLimits, Key, KeySequence, MAX_STYLES, Modifiers,
-    MouseEvent, MouseFormat, MouseSequence, MouseTracking, Palette, PaletteEntry, PixelPosition,
-    ProcessFailure, Processor, Rgb, Row, RowRevision, Screen, ScreenBuffer, StorageError, Style,
-    StyleError, StyleId, StyleRun, StyleTable, TerminalNotifications, TextSink, UnicodeWriter,
-    Viewport,
+    GraphicsImage, GraphicsImageStore, GraphicsPlacement, HistoryLimits, Key, KeySequence,
+    MAX_STYLES, Modifiers, MouseEvent, MouseFormat, MouseSequence, MouseTracking, Palette,
+    PaletteEntry, PixelPosition, ProcessFailure, Processor, Rgb, Row, RowRevision, Screen,
+    ScreenBuffer, StorageError, Style, StyleError, StyleId, StyleRun, StyleTable,
+    TerminalNotifications, TextSink, UnicodeWriter, Viewport,
 };
 
 use crate::{GridGeometry, PixelRect};
@@ -78,6 +78,7 @@ pub struct PresentationFrame<'a> {
     graphics_revision: Option<u64>,
     virtual_graphics: bool,
     virtual_parents: bool,
+    buffer: ScreenBuffer,
     processor: &'a Processor,
 }
 
@@ -87,38 +88,34 @@ impl<'a> PresentationFrame<'a> {
     }
 
     pub fn graphics_image(&self, placement: &'a GraphicsPlacement) -> Option<&'a GraphicsImage> {
-        placement.anonymous_image().or_else(|| {
-            self.processor
-                .graphics_image(placement.placement.image.id())
-        })
+        placement
+            .anonymous_image()
+            .or_else(|| self.image_store().get(placement.placement.image.id()))
     }
 
     #[cfg(feature = "wgpu-renderer")]
-    pub(crate) fn graphics_named_image(
-        &self,
-        key: lune_terminal::GraphicsImageKey,
-    ) -> Option<&'a GraphicsImage> {
-        self.processor.graphics_image(key.id())
+    pub(crate) fn graphics_buffer(&self) -> ScreenBuffer {
+        self.buffer
+    }
+
+    pub(crate) fn image_store(&self) -> &'a GraphicsImageStore {
+        self.processor.graphics_images(self.buffer)
     }
 
     #[cfg(feature = "wgpu-renderer")]
-    pub(crate) fn graphics_image_source_revision(
-        &self,
-        key: lune_terminal::GraphicsImageKey,
-    ) -> Option<u64> {
-        self.processor.graphics_image_source_revision(key)
-    }
-
-    #[cfg(feature = "wgpu-renderer")]
-    pub(crate) fn graphics_storage_revision(&self) -> u64 {
-        self.processor.graphics_storage_revision()
+    pub(crate) fn inactive_image_store(&self) -> &'a GraphicsImageStore {
+        let inactive = match self.buffer {
+            ScreenBuffer::Primary => ScreenBuffer::Alternate,
+            ScreenBuffer::Alternate => ScreenBuffer::Primary,
+        };
+        self.processor.graphics_images(inactive)
     }
 
     pub(crate) fn graphics_stamp(&self) -> Option<GraphicsStamp> {
         self.graphics_revision
             .map(|placement_revision| GraphicsStamp {
                 placement_revision,
-                pixel_revision: self.processor.graphics_visual_revision(),
+                pixel_revision: self.image_store().visual_revision(),
                 viewport_offset: self.viewport.offset(),
                 history_endpoints: self
                     .virtual_parents
@@ -449,6 +446,7 @@ impl<T: Read + Write> Session<T> {
             graphics_revision: screen.graphics_revision(),
             virtual_graphics: screen.has_virtual_graphics(),
             virtual_parents: screen.has_virtual_graphics_parents(),
+            buffer: screen.active_buffer(),
             processor: &self.processor,
         })
     }
@@ -460,7 +458,9 @@ impl<T: Read + Write> Session<T> {
         }
         match (
             self.presentation_deadline,
-            self.processor.graphics_animation_deadline(),
+            self.processor
+                .graphics_images(self.screen.active_buffer())
+                .animation_deadline(),
         ) {
             (Some(sync), Some(animation)) => Some(sync.min(animation)),
             (sync, animation) => sync.or(animation),
@@ -469,6 +469,12 @@ impl<T: Read + Write> Session<T> {
 
     pub fn processor(&self) -> &Processor {
         &self.processor
+    }
+
+    pub fn graphics_image(&self, id: u32) -> Option<&GraphicsImage> {
+        self.processor
+            .graphics_images(self.screen.active_buffer())
+            .get(id)
     }
 
     pub fn take_notifications(&mut self) -> TerminalNotifications<'_> {
@@ -717,7 +723,8 @@ impl<T: Read + Write> Session<T> {
         {
             self.processor.end_synchronized_output();
             self.presentation_deadline = None;
-            self.processor.poll_graphics_animations(&now);
+            self.processor
+                .poll_graphics_animations(self.screen.active_buffer(), &now);
             return Ok(());
         }
 
@@ -729,7 +736,8 @@ impl<T: Read + Write> Session<T> {
             self.presentation_deadline = None;
         }
         if !self.finished {
-            self.processor.poll_graphics_animations(now);
+            self.processor
+                .poll_graphics_animations(self.screen.active_buffer(), now);
         }
         result
     }

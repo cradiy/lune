@@ -239,28 +239,16 @@ pub struct Processor {
 }
 
 impl Processor {
-    pub fn graphics_image(&self, id: u32) -> Option<&crate::GraphicsImage> {
-        self.state.graphics.get(id)
+    pub fn graphics_images(&self, buffer: ScreenBuffer) -> &crate::GraphicsImageStore {
+        self.state.graphics.images(buffer)
     }
 
-    pub fn graphics_image_source_revision(&self, key: crate::GraphicsImageKey) -> Option<u64> {
-        self.state.graphics.image_source_revision(key)
-    }
-
-    pub fn graphics_visual_revision(&self) -> u64 {
-        self.state.graphics.visual_revision()
-    }
-
-    pub fn graphics_storage_revision(&self) -> u64 {
-        self.state.graphics.storage_revision()
-    }
-
-    pub fn graphics_animation_deadline(&self) -> Option<std::time::Instant> {
-        self.state.graphics.animation_deadline()
-    }
-
-    pub fn poll_graphics_animations(&mut self, clock: impl FnOnce() -> std::time::Instant) {
-        self.state.graphics.poll_animations(clock);
+    pub fn poll_graphics_animations(
+        &mut self,
+        buffer: ScreenBuffer,
+        clock: impl FnOnce() -> std::time::Instant,
+    ) {
+        self.state.graphics.poll_animations(buffer, clock);
     }
 
     /// Starts with default rendition and a bounded style table. Construction
@@ -1423,23 +1411,23 @@ fn set_modes(
             (true, Some(7)) => screen.set_auto_wrap(enabled),
             (true, Some(8)) => state.auto_repeat = enabled,
             (true, Some(47 | 1047 | 1049)) => {
-                if parameter.value == Some(1049) && enabled {
-                    save_cursor(screen, state);
-                }
-                if parameter.value == Some(1047)
-                    && !enabled
-                    && screen.active_buffer() == ScreenBuffer::Alternate
-                {
-                    screen.clear_alternate_display(state.style);
-                }
-                screen.select_buffer(if enabled {
+                let target = if enabled {
                     ScreenBuffer::Alternate
                 } else {
                     ScreenBuffer::Primary
-                });
-                if parameter.value == Some(1049) {
+                };
+                if screen.active_buffer() == target {
+                    continue;
+                }
+                let save = parameter.value == Some(1049);
+                if save && enabled {
+                    save_cursor(screen, state);
+                }
+                screen.select_buffer(target);
+                if save {
                     if enabled {
                         screen.clear_alternate_display(state.style);
+                        state.graphics.clear_unplaced(screen);
                     } else {
                         restore_cursor(screen, state);
                     }
@@ -1575,6 +1563,7 @@ fn csi(
             if sequence.final_byte == b'J' {
                 if mode == EraseMode::All {
                     screen.clear_live_graphics(styles);
+                    state.graphics.clear_unplaced(screen);
                 }
                 screen.erase_display(mode, style);
             } else {

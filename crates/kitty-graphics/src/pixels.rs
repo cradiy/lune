@@ -189,7 +189,7 @@ impl PixelTransfer {
                 let (format, bytes) = match channels {
                     1 => (ImageFormat::Indexed, bytes),
                     2 => (ImageFormat::IndexedAlpha, bytes),
-                    3 => (ImageFormat::Rgba, expand(&bytes, ColorType::Rgb)?),
+                    3 => (ImageFormat::Rgba, expand_rgb(&bytes)?),
                     _ => (ImageFormat::Rgba, bytes),
                 };
                 Ok(Pixels {
@@ -299,21 +299,38 @@ fn decode_png(bytes: &[u8], max_bytes: usize) -> Result<Pixels, &'static [u8]> {
         .output_buffer_size()
         .filter(|&size| size <= rgba_size)
         .ok_or(QUOTA)?;
-    let mut rgba = zeroed(size)?;
-    let output = reader.next_frame(&mut rgba).map_err(png_error)?;
+    let mut rgba = zeroed(rgba_size)?;
+    let input_start = rgba_size - size;
+    let output = reader
+        .next_frame(&mut rgba[input_start..])
+        .map_err(png_error)?;
     reader.finish().map_err(png_error)?;
     if (output.width, output.height) != dimensions || output.bit_depth != BitDepth::Eight {
         return Err(INVALID);
     }
-    rgba.truncate(output.buffer_size());
-    if output.color_type != ColorType::Rgba {
-        rgba = expand(&rgba, output.color_type)?;
+    match output.color_type {
+        ColorType::Grayscale => expand_png_pixels(&mut rgba, |[v]| [v, v, v, 255]),
+        ColorType::GrayscaleAlpha => expand_png_pixels(&mut rgba, |[v, a]| [v, v, v, a]),
+        ColorType::Rgb => expand_png_pixels(&mut rgba, |[r, g, b]| [r, g, b, 255]),
+        ColorType::Rgba => {}
+        ColorType::Indexed => return Err(INVALID),
     }
     Ok(Pixels {
         dimensions,
         format: ImageFormat::Rgba,
         bytes: rgba,
     })
+}
+
+fn expand_png_pixels<const N: usize>(rgba: &mut [u8], expand: impl Fn([u8; N]) -> [u8; 4]) {
+    // Packed decoded pixels occupy the tail. Each output pixel ends at or before the next input.
+    let count = rgba.len() / 4;
+    let start = count * (4 - N);
+    for index in 0..count {
+        let input = start + index * N;
+        let pixel = rgba[input..][..N].try_into().expect("A full input pixel");
+        rgba[index * 4..][..4].copy_from_slice(&expand(pixel));
+    }
 }
 
 fn png_error(error: DecodingError) -> &'static [u8] {
@@ -323,29 +340,12 @@ fn png_error(error: DecodingError) -> &'static [u8] {
     }
 }
 
-fn expand(bytes: &[u8], color: ColorType) -> Result<Vec<u8>, &'static [u8]> {
-    let size = (bytes.len() / color.samples())
-        .checked_mul(4)
-        .ok_or(QUOTA)?;
+fn expand_rgb(bytes: &[u8]) -> Result<Vec<u8>, &'static [u8]> {
+    let size = (bytes.len() / 3).checked_mul(4).ok_or(QUOTA)?;
     let mut rgba = zeroed(size)?;
     let pixels = rgba.as_chunks_mut::<4>().0;
-    match color {
-        ColorType::Rgb => {
-            for (out, &[r, g, b]) in pixels.iter_mut().zip(bytes.as_chunks::<3>().0) {
-                *out = [r, g, b, 255];
-            }
-        }
-        ColorType::Grayscale => {
-            for (out, &value) in pixels.iter_mut().zip(bytes) {
-                *out = [value, value, value, 255];
-            }
-        }
-        ColorType::GrayscaleAlpha => {
-            for (out, &[value, alpha]) in pixels.iter_mut().zip(bytes.as_chunks::<2>().0) {
-                *out = [value, value, value, alpha];
-            }
-        }
-        ColorType::Rgba | ColorType::Indexed => return Err(INVALID),
+    for (out, &[r, g, b]) in pixels.iter_mut().zip(bytes.as_chunks::<3>().0) {
+        *out = [r, g, b, 255];
     }
     Ok(rgba)
 }

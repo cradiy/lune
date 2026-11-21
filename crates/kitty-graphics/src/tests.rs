@@ -222,10 +222,21 @@ fn animation_frames_commit_complete_patches_and_keep_the_current_surface_on_fail
         )
         .is_none()
     );
-    assert_eq!(images.visual_revision(), selected);
+    let rebased = images.visual_revision();
+    assert_ne!(rebased, selected);
+    let PixelUpdates::One(update) = images
+        .get(1)
+        .unwrap()
+        .pixel_updates(Some(&selected_revision), &mut scratch)
+        .unwrap()
+    else {
+        panic!("A base edit updates only its affected region");
+    };
+    assert_eq!((update.origin, update.size), ([0, 0], [1, 1]));
+    assert_eq!(update.bytes, &[0; 4]);
     assert_eq!(
         images.get(1).unwrap().pixels(&mut scratch).unwrap(),
-        &[255, 0, 0, 255, 0, 128, 127, 255],
+        &[0, 0, 0, 0, 0, 128, 127, 255],
     );
     let reply = receive(
         &mut images,
@@ -233,10 +244,10 @@ fn animation_frames_commit_complete_patches_and_keep_the_current_surface_on_fail
     )
     .unwrap();
     assert_eq!(reply.message, b"EINVAL:Invalid animation frame region");
-    assert_eq!(images.visual_revision(), selected);
+    assert_eq!(images.visual_revision(), rebased);
     let reply = receive(&mut images, b"\x1b_Ga=c,i=1,r=2,c=2,X=1,w=1,h=1,C=1\x1b\\").unwrap();
     assert_eq!(reply.message, b"OK");
-    assert_ne!(images.visual_revision(), selected);
+    assert_ne!(images.visual_revision(), rebased);
     assert_eq!(
         images.get(1).unwrap().pixels(&mut scratch).unwrap(),
         &[0, 128, 127, 255, 0, 128, 127, 255],
@@ -265,6 +276,60 @@ fn animation_frames_commit_complete_patches_and_keep_the_current_surface_on_fail
     assert_eq!(
         images.get(1).unwrap().pixels(&mut scratch).unwrap(),
         &[0, 128, 127, 255, 0, 128, 127, 255]
+    );
+}
+
+#[test]
+fn animation_base_edits_follow_live_links_and_deletion_freezes_dependents() {
+    let mut images = ImageStore::new(4096, 1);
+    let mut receive = |wire: &[u8]| {
+        feed(wire, 5, |command| {
+            let command = command.unwrap();
+            if let Some(delete) = command.decode_delete() {
+                images.delete_frame(delete.unwrap(), |_| Ok(()));
+            } else if let Some(reply) = images.receive(command, |_| Ok(())) {
+                assert_eq!(reply.message, b"OK");
+            }
+        });
+        images
+            .get(1)
+            .unwrap()
+            .pixels(&mut Vec::new())
+            .unwrap()
+            .to_vec()
+    };
+
+    assert_eq!(
+        receive(
+            concat!(
+                "\x1b_Gi=1,f=24,s=3,v=1;/wAA/////wD/\x1b\\",
+                "\x1b_Ga=f,i=1,c=1,f=24,x=1,s=1,v=1,X=1;AP8A\x1b\\",
+                "\x1b_Ga=f,i=1,c=2,f=24,x=2,s=1,v=1,X=1;AAD/\x1b\\",
+                "\x1b_Ga=f,i=1,c=1,f=24,x=2,s=1,v=1,X=1;////\x1b\\",
+                "\x1b_Ga=a,i=1,c=3\x1b\\",
+                "\x1b_Ga=f,i=1,r=1,f=24,s=1,v=1,X=1;//8A\x1b\\",
+            )
+            .as_bytes(),
+        ),
+        [255, 255, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255]
+    );
+    let detached = [255, 255, 0, 255, 0, 255, 255, 255, 0, 0, 255, 255];
+    assert_eq!(
+        receive(b"\x1b_Ga=f,i=1,r=2,f=24,x=1,s=1,v=1,X=1;AP//\x1b\\"),
+        detached,
+    );
+    assert_eq!(
+        receive(b"\x1b_Ga=f,i=1,r=1,f=24,s=1,v=1,X=1;/wAA\x1b\\"),
+        detached,
+    );
+    assert_eq!(receive(b"\x1b_Ga=d,d=f,i=1,r=2\x1b\\"), detached);
+    assert_eq!(
+        receive(b"\x1b_Ga=a,i=1,c=3\x1b\\"),
+        [255, 0, 0, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+    );
+    assert_eq!(
+        receive(b"\x1b_Ga=d,d=F,i=1,r=1\x1b\\\x1b_Ga=f,i=1,r=1,f=24,s=1,v=1,X=1;/wD/\x1b\\"),
+        [255, 0, 0, 255, 255, 255, 255, 255, 255, 255, 255, 255],
     );
 }
 
@@ -392,6 +457,7 @@ fn patch_transitions_restore_pixels_from_a_shared_base() {
         &mut images,
         b"\x1b_Ga=f,i=1,c=1,x=63,y=63,s=1,v=1,q=2;AP8AgA==\x1b\\",
     );
+    let root = images.get(1).unwrap().pixel_revision();
     apply(&mut images, b"\x1b_Ga=a,i=1,c=2,q=2\x1b\\");
     let first = images.get(1).unwrap().pixel_revision();
 
@@ -420,6 +486,47 @@ fn patch_transitions_restore_pixels_from_a_shared_base() {
     assert_eq!(restored.bytes.as_chunks::<4>().0, &[red, red]);
     assert_eq!((blended.origin, blended.size), ([63, 63], [1, 1]));
     assert_eq!(blended.bytes, &[127, 128, 0, 255]);
+
+    apply(
+        &mut images,
+        concat!(
+            "\x1b_Ga=f,i=1,c=2,x=63,y=63,s=1,v=1,q=2;AP8AgA==\x1b\\",
+            "\x1b_Ga=a,i=1,c=5,q=2\x1b\\",
+        )
+        .as_bytes(),
+    );
+    let edited = images.get(1).unwrap();
+    let chained = edited.pixel_revision();
+    let PixelUpdates::Two([far, near]) = edited.pixel_updates(Some(&root), &mut scratch).unwrap()
+    else {
+        panic!("Expected two updates after jumping over the intermediate frame");
+    };
+    assert_eq!(
+        (far.origin, far.size, far.bytes),
+        ([63, 63], [1, 1], &[127, 128, 0, 255][..])
+    );
+    assert_eq!((near.origin, near.size), ([1, 0], [1, 2]));
+    assert_eq!(near.bytes.as_chunks::<4>().0, &[[0, 0, 255, 255]; 2]);
+
+    apply(
+        &mut images,
+        b"\x1b_Ga=d,d=f,i=1,r=5\x1b\\\x1b_Ga=a,i=1,c=1,q=2\x1b\\",
+    );
+    scratch.clear();
+    let restored = images.get(1).unwrap();
+    let PixelUpdates::Two([far, near]) = restored
+        .pixel_updates(Some(&chained), &mut scratch)
+        .unwrap()
+    else {
+        panic!("Expected both regions to be restored after deleting the selected frame");
+    };
+    assert_eq!(
+        (far.origin, far.size, far.bytes),
+        ([63, 63], [1, 1], &red[..])
+    );
+    assert_eq!((near.origin, near.size), ([1, 0], [1, 2]));
+    assert_eq!([&near.bytes[..4], &near.bytes[256..]], [&red[..]; 2]);
+    assert!(scratch.is_empty());
 
     apply(
         &mut images,
@@ -529,6 +636,57 @@ fn zlib_checks_stream_boundaries_and_png_expands_paletted_alpha() {
         images.get(2).unwrap().pixels(&mut Vec::new()).unwrap(),
         &[17, 34, 51, 128]
     );
+}
+
+#[test]
+fn png_expansion_preserves_pixels_across_rows() {
+    let cases = [
+        (
+            png::ColorType::Rgb,
+            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12].as_slice(),
+            [
+                [1, 2, 3, 255],
+                [4, 5, 6, 255],
+                [7, 8, 9, 255],
+                [10, 11, 12, 255],
+            ],
+        ),
+        (
+            png::ColorType::Grayscale,
+            &[1, 2, 3, 4],
+            [
+                [1, 1, 1, 255],
+                [2, 2, 2, 255],
+                [3, 3, 3, 255],
+                [4, 4, 4, 255],
+            ],
+        ),
+        (
+            png::ColorType::GrayscaleAlpha,
+            &[1, 0, 2, 128, 3, 192, 4, 255],
+            [[1, 1, 1, 0], [2, 2, 2, 128], [3, 3, 3, 192], [4, 4, 4, 255]],
+        ),
+    ];
+    for (color, input, expected) in cases {
+        let mut png = Vec::new();
+        let mut encoder = png::Encoder::new(&mut png, 2, 2);
+        encoder.set_color(color);
+        encoder
+            .write_header()
+            .unwrap()
+            .write_image_data(input)
+            .unwrap();
+        let wire = format!("\x1b_Gi=1,f=100;{}\x1b\\", PAYLOAD_ENGINE.encode(&png));
+        let mut images = ImageStore::new(16, 1);
+        feed(wire.as_bytes(), 7, |command| {
+            let reply = images.receive(command.unwrap(), |_| Ok(())).unwrap();
+            assert_eq!(reply.message, b"OK");
+        });
+        assert_eq!(
+            images.get(1).unwrap().pixels(&mut Vec::new()).unwrap(),
+            expected.as_flattened()
+        );
+    }
 }
 
 #[cfg(target_os = "linux")]

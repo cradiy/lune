@@ -97,7 +97,7 @@ fn buffers_keep_contents_wraps_and_save_slots_while_live_state_is_shared() {
 
 #[test]
 fn alternate_modes_preserve_primary_saves_and_validate_whole_lists_across_splits() {
-    let input = b"\x1b[31m\x1b(0q\x1b[2;3H\x1b[?1049h\x1b(B\x1b[34mA\x1b[?1048h\x1b[32m\x1b(0\x1b[?1049hqx\x1b[?1049lq\x1b[?47h\x1b[?1048lq\x1b[?47l\x1b[?1047h\x1b[?1047l\x1b[?47;1048;999h\x1b[?1049lq\x1b[6n";
+    let input = b"\x1b[31m\x1b(0q\x1b[2;3H\x1b[?1049h\x1b(B\x1b[34mA\x1b[?1048h\x1b[32m\x1b(0\x1b[?1049hqx\x1b[?1049lq\x1b[?47h\x1b[?1048lq\x1b[?47l\x1b[?1047h\x1b[?1047l\x1b[?47;1048;999h\x1b[?1049l\x1b8q\x1b[6n";
     for split in 0..=input.len() {
         let mut processor = support::processor();
         let mut screen = Screen::new(8, 4).unwrap();
@@ -124,17 +124,20 @@ fn alternate_modes_preserve_primary_saves_and_validate_whole_lists_across_splits
             (processor.parse_errors(), processor.ignored_sequences()),
             (0, 1)
         );
-        for row in screen.buffer(Alternate).iter_rows() {
-            for cell in row.cells() {
-                assert!(cell.is_erased());
-                assert_eq!(
-                    processor.styles().get(cell.style()).unwrap().foreground,
-                    Color::Indexed(2)
-                );
-            }
-        }
+        let row = screen.buffer(Alternate).row(1).unwrap();
+        assert_eq!(row.text(2), Some(CellText::Scalar('A')));
+        assert_eq!(row.text(3), Some(CellText::Scalar('q')));
+        assert_eq!(row.text(4), Some(CellText::Scalar('│')));
+        assert_eq!(
+            processor
+                .styles()
+                .get(row.cells()[4].style())
+                .unwrap()
+                .foreground,
+            Color::Indexed(2)
+        );
         processor.collect_styles(&screen, []).unwrap();
-        assert_eq!(processor.styles().style_count(), 3);
+        assert_eq!(processor.styles().style_count(), 4);
         let primary = super::snapshot(screen.buffer(Primary));
         let alternate = super::snapshot(screen.buffer(Alternate));
         let cursor = screen.cursor();

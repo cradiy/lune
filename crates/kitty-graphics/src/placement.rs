@@ -56,12 +56,7 @@ impl Placement {
                 placement_id: parent_placement,
                 offset,
             }),
-            (1, 0)
-                if parent_placement == 0
-                    && offset == [0, 0]
-                    && image.id() != 0
-                    && !cells.contains(&0) =>
-            {
+            (1, 0) if parent_placement == 0 && offset == [0, 0] && image.id() != 0 => {
                 PlacementPosition::Virtual
             }
             _ => return None,

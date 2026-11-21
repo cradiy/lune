@@ -3,7 +3,7 @@ use std::ops::Range;
 
 use lune_terminal::{
     GraphicsImage, GraphicsImageFormat, GraphicsImageKey, GraphicsPixelRevision, GraphicsPlacement,
-    PixelSize, Row, RowRevision, graphics_parent_origins,
+    PixelSize, Row, RowRevision, ScreenBuffer, graphics_parent_origins,
 };
 use wgpu::{Buffer, Device, Queue, RenderPipeline, Sampler, Texture, TextureFormat, TextureView};
 
@@ -18,7 +18,7 @@ use textures::{
     ImageTextures, PixelRegion, TextureBinding, TileRegion, make_texture, write_texture,
 };
 
-type ImageInstance = [f32; 10];
+type ImageInstance = [f32; 12];
 
 struct ImageLocation {
     origin: [i64; 2],
@@ -109,6 +109,9 @@ pub struct ImageRenderer {
     palette_revision: Option<u64>,
     has_indexed: bool,
     images: HashMap<GraphicsImageKey, CachedImage>,
+    inactive_images: HashMap<GraphicsImageKey, CachedImage>,
+    inactive_storage_revision: Option<u64>,
+    graphics_buffer: ScreenBuffer,
     buffer: Option<Buffer>,
     instances: Vec<ImageInstance>,
     draws: Vec<Draw>,
@@ -137,7 +140,7 @@ impl ImageRenderer {
                 wgpu::VertexBufferLayout {
                     array_stride: size_of::<ImageInstance>() as u64,
                     step_mode: wgpu::VertexStepMode::Instance,
-                    attributes: &wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4, 2 => Float32x2],
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4, 2 => Float32x4],
                 },
             )
         };
@@ -172,6 +175,9 @@ impl ImageRenderer {
             palette_revision: None,
             has_indexed: false,
             images: HashMap::new(),
+            inactive_images: HashMap::new(),
+            inactive_storage_revision: None,
+            graphics_buffer: ScreenBuffer::Primary,
             buffer: None,
             instances: Vec::new(),
             draws: Vec::new(),
@@ -211,8 +217,21 @@ impl ImageRenderer {
         queue: &Queue,
         frame: &PresentationFrame<'_>,
     ) -> usize {
+        if self.graphics_buffer != frame.graphics_buffer() {
+            self.graphics_buffer = frame.graphics_buffer();
+            std::mem::swap(&mut self.images, &mut self.inactive_images);
+            self.inactive_storage_revision = self.prepared.take().map(|p| p.storage_revision);
+        }
+        let inactive_store = frame.inactive_image_store();
+        let inactive_revision = Some(inactive_store.storage_revision());
+        if self.inactive_storage_revision != inactive_revision {
+            self.inactive_images.retain(|&id, cached| {
+                inactive_store.source_revision(id) == Some(cached.source_revision)
+            });
+            self.inactive_storage_revision = inactive_revision;
+        }
         let stamp = frame.graphics_stamp();
-        let storage_revision = frame.graphics_storage_revision();
+        let storage_revision = frame.image_store().storage_revision();
         if let Some(prepared) = &self.prepared
             && prepared.geometry == frame.geometry
             && (prepared.stamp == stamp
@@ -233,7 +252,7 @@ impl ImageRenderer {
             let prepared = self.prepared.as_mut().expect("A layout was prepared");
             if prepared.storage_revision != storage_revision {
                 self.images.retain(|&id, cached| {
-                    frame.graphics_image_source_revision(id) == Some(cached.source_revision)
+                    frame.image_store().source_revision(id) == Some(cached.source_revision)
                 });
                 prepared.storage_revision = storage_revision;
             }
@@ -266,7 +285,8 @@ impl ImageRenderer {
     fn refresh_visible_pixels(&mut self, queue: &Queue, frame: &PresentationFrame<'_>) -> bool {
         for &key in &self.visible_images {
             let Some((image, cached)) = frame
-                .graphics_named_image(key)
+                .image_store()
+                .get(key.id())
                 .zip(self.images.get_mut(&key))
             else {
                 return false;
@@ -291,7 +311,7 @@ impl ImageRenderer {
         self.visible_images.clear();
         self.has_indexed = false;
         self.images.retain(|&id, cached| {
-            frame.graphics_image_source_revision(id) == Some(cached.source_revision)
+            frame.image_store().source_revision(id) == Some(cached.source_revision)
         });
         let Some((cell, area)) = frame
             .geometry
@@ -580,7 +600,7 @@ fn write_instances<T: bytemuck::Pod>(
 struct ImageQuad {
     bounds: [[f64; 2]; 2],
     source: [[f64; 2]; 2],
-    sample_rows: [f64; 2],
+    sample_bounds: [[f64; 2]; 2],
 }
 
 impl ImageQuad {
@@ -596,7 +616,7 @@ impl ImageQuad {
         let mut quad = Self {
             bounds: [[0.0; 2]; 2],
             source: [[0.0; 2]; 2],
-            sample_rows: layout.sample_rows,
+            sample_bounds: layout.sample_bounds,
         };
         for axis in 0..2 {
             let origin = location.origin[axis] as f64 * cell[axis] + layout.offset[axis];
@@ -629,32 +649,37 @@ impl ImageQuad {
     fn instance(&self, dimensions: [u32; 2]) -> ImageInstance {
         let [[left, right], [top, bottom]] = self.bounds;
         let [[x0, x1], [y0, y1]] = self.source;
-        let [width, height] = dimensions.map(f64::from);
-        let [first_row, last_row] = self.sample_rows.map(|row| row.clamp(0.0, height) / height);
+        let [u, v] = dimensions.map(|extent| f64::from(extent).recip());
+        let [[u_min, v_min], [u_max, v_max]] = self
+            .sample_bounds
+            .map(|[x, y]| [(x * u).clamp(0.0, 1.0), (y * v).clamp(0.0, 1.0)]);
         [
             left,
             top,
             right,
             bottom,
-            x0 / width,
-            y0 / height,
-            x1 / width,
-            y1 / height,
-            first_row,
-            last_row,
+            x0 * u,
+            y0 * v,
+            x1 * u,
+            y1 * v,
+            u_min,
+            v_min,
+            u_max,
+            v_max,
         ]
         .map(|v| v as f32)
     }
 
     fn tile_instance(&self, tile: TileRegion) -> Option<ImageInstance> {
+        let storage_origin = tile.storage.origin.map(f64::from);
         let mut quad = Self {
             bounds: [[0.0; 2]; 2],
             source: [[0.0; 2]; 2],
-            sample_rows: self
-                .sample_rows
-                .map(|row| row - f64::from(tile.storage.origin[1])),
+            sample_bounds: self
+                .sample_bounds
+                .map(|[x, y]| [x - storage_origin[0], y - storage_origin[1]]),
         };
-        for axis in 0..2 {
+        for (axis, storage_start) in storage_origin.into_iter().enumerate() {
             let tile_origin = f64::from(tile.visible.origin[axis]);
             let [start, end] = self.source[axis];
             let first = start.max(tile_origin);
@@ -665,8 +690,7 @@ impl ImageQuad {
             let [lower, upper] = self.bounds[axis];
             let scale = (upper - lower) / (end - start);
             quad.bounds[axis] = [first, last].map(|pixel| lower + (pixel - start) * scale);
-            let storage_origin = f64::from(tile.storage.origin[axis]);
-            quad.source[axis] = [first - storage_origin, last - storage_origin];
+            quad.source[axis] = [first - storage_start, last - storage_start];
         }
         Some(quad.instance(tile.storage.size))
     }

@@ -1,7 +1,7 @@
 use std::{num::NonZeroU32, ops::Range};
 
 use lune_kitty_graphics::{
-    DeleteTarget, EvictionRanking, ImageChange, PlacementError, PlacementPosition,
+    DeleteTarget, EvictionRanking, ImageChange, ImageStore, PlacementError, PlacementPosition,
 };
 
 mod reflow;
@@ -336,6 +336,7 @@ impl Screen {
         self.graphics.as_slice()
     }
 
+    #[cfg(test)]
     pub(crate) fn all_graphics_placements(&self) -> impl Iterator<Item = &GraphicsPlacement> {
         self.graphics
             .as_slice()
@@ -343,25 +344,10 @@ impl Screen {
             .chain(self.inactive.graphics.as_slice())
     }
 
-    pub(crate) fn has_graphics_orphans(&self) -> bool {
-        self.graphics.has_orphans() || self.inactive.graphics.has_orphans()
-    }
-
-    pub(crate) fn retain_unreferenced_graphics_orphans(&mut self) {
-        self.graphics
-            .retain_unreferenced_orphans(&self.inactive.graphics);
-        self.inactive
-            .graphics
-            .retain_unreferenced_orphans(&self.graphics);
-    }
-
-    pub(crate) fn graphics_orphaned(&self, id: u32) -> bool {
-        self.graphics.is_orphaned(id) || self.inactive.graphics.is_orphaned(id)
-    }
-
-    pub(crate) fn clear_graphics_orphans(&mut self) {
-        self.graphics.clear_orphaned();
-        self.inactive.graphics.clear_orphaned();
+    pub(crate) fn reap_graphics_orphans(&mut self, images: &mut [ImageStore; 2]) {
+        let active = self.active_buffer as usize;
+        self.graphics.reap_orphans(&mut images[active]);
+        self.inactive.graphics.reap_orphans(&mut images[1 - active]);
     }
 
     #[inline]
@@ -377,7 +363,7 @@ impl Screen {
     pub(crate) fn clear_alternate_display(&mut self, style: StyleId) {
         debug_assert_eq!(self.active_buffer, ScreenBuffer::Alternate);
         if !self.graphics.is_empty() {
-            self.graphics.clear_buffer();
+            self.graphics.clear_nonvirtual();
         }
         self.erase_display(EraseMode::All, style);
     }
@@ -432,7 +418,6 @@ impl Screen {
             }
             ImageChange::Remove { replaced, evicted } => {
                 self.graphics.remove_images(replaced, evicted);
-                self.inactive.graphics.remove_images(replaced, evicted);
             }
             ImageChange::Place {
                 placement,
@@ -450,11 +435,6 @@ impl Screen {
                 )?;
                 let [columns, rows] = image.cursor_travel(self.graphics_cell.is_some());
                 self.graphics.insert(image, replaces_image, evicted)?;
-                if replaces_image || !evicted.is_empty() {
-                    self.inactive
-                        .graphics
-                        .remove_images(replaces_image.then_some(placement.image), evicted);
-                }
                 if placement.position == PlacementPosition::Cursor && !placement.keep_cursor {
                     self.move_cursor_right(columns);
                     self.move_cursor_down(rows);
@@ -470,7 +450,7 @@ impl Screen {
         position: Option<PlacementPosition>,
         ranking: &mut EvictionRanking,
     ) -> Result<(), PlacementError> {
-        for placement in self.all_graphics_placements() {
+        for placement in self.graphics_placements() {
             ranking.mark_placed(placement.placement.image)?;
         }
         if let Some(PlacementPosition::Relative(parent)) = position {

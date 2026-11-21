@@ -10,7 +10,10 @@ use lune_kitty_graphics::{
 };
 use lune_vt::ApcEvent;
 
-use crate::{CellPosition, Cursor, Grid, PixelSize, Screen, ScreenView, StorageError, StyleTable};
+use crate::{
+    CellPosition, Cursor, Grid, PixelSize, Screen, ScreenBuffer, ScreenView, StorageError,
+    StyleTable,
+};
 
 mod placeholders;
 pub use placeholders::{
@@ -51,7 +54,8 @@ pub struct GraphicsLayout {
     pub size: [f64; 2],
     pub source_origin: [f64; 2],
     pub source_per_pixel: f64,
-    pub sample_rows: [f64; 2],
+    /// Inclusive texel centers at the top-left and bottom-right of the source region.
+    pub sample_bounds: [[f64; 2]; 2],
 }
 
 impl GraphicsPlacement {
@@ -113,7 +117,11 @@ impl GraphicsPlacement {
     pub fn layout(&self, cell: PixelSize) -> GraphicsLayout {
         let (mut offset, mut size, scale) = self.uncropped_geometry(cell);
         let mut source_origin = self.placement.source_origin.map(f64::from);
-        let mut sample_rows = UNCROPPED;
+        let source_size = self.placement.source_size.map(f64::from);
+        let mut sample_bounds = [
+            source_origin.map(|start| start + 0.5),
+            std::array::from_fn(|axis| source_origin[axis] + source_size[axis] - 0.5),
+        ];
         if self.vertical_crop != UNCROPPED {
             let [top, bottom] = self.vertical_crop;
             let start = top.max(0.0);
@@ -122,14 +130,13 @@ impl GraphicsPlacement {
                 offset[1] = (start - top) * size[1];
             }
             size[1] *= fraction;
-            let source_height = f64::from(self.placement.source_size[1]);
-            let first = source_origin[1] + start * source_height;
+            let first = source_origin[1] + start * source_size[1];
             if top > 0.0 {
-                sample_rows[0] = snap_texel_edge(first).floor() + 0.5;
+                sample_bounds[0][1] = snap_texel_edge(first).floor() + 0.5;
             }
             if bottom < 1.0 {
-                let last = source_origin[1] + bottom * source_height;
-                sample_rows[1] = (snap_texel_edge(last).ceil() - 0.5).max(sample_rows[0]);
+                let last = source_origin[1] + bottom * source_size[1];
+                sample_bounds[1][1] = (snap_texel_edge(last).ceil() - 0.5).max(sample_bounds[0][1]);
             }
             source_origin[1] = first;
         }
@@ -138,14 +145,20 @@ impl GraphicsPlacement {
             size,
             source_origin,
             source_per_pixel: scale.recip(),
-            sample_rows,
+            sample_bounds,
         }
     }
 
     fn uncropped_geometry(&self, cell: PixelSize) -> ([f64; 2], [f64; 2], f64) {
+        let cells = self.placement.cells;
+        let cells = if self.is_virtual() && cells.contains(&0) {
+            self.virtual_cells(cell)
+        } else {
+            cells
+        };
         let cell = [f64::from(cell.width.get()), f64::from(cell.height.get())];
         let [width, height] = self.placement.source_size.map(f64::from);
-        let [columns, rows] = self.placement.cells.map(f64::from);
+        let [columns, rows] = cells.map(f64::from);
         let [x, y] = self.placement.cell_offset.map(f64::from);
         let [x, y] = [x.min(cell[0] - 1.0), y.min(cell[1] - 1.0)];
         let available_width = columns * cell[0] - x;
@@ -166,7 +179,23 @@ impl GraphicsPlacement {
         ([x + left, y + top], [width * scale, height * scale], scale)
     }
 
+    fn virtual_cells(&self, cell: PixelSize) -> [u32; 2] {
+        let cell_pixels = [cell.width.get(), cell.height.get()];
+        std::array::from_fn(|axis| {
+            let specified = self.placement.cells[axis];
+            if specified == 0 {
+                self.placement.source_size[axis].div_ceil(cell_pixels[axis])
+            } else {
+                specified
+            }
+        })
+    }
+
     fn set_cell_size(&mut self, cell: PixelSize) {
+        if self.is_virtual() {
+            self.span = self.virtual_cells(cell).map(|count| count as usize);
+            return;
+        }
         let (offset, size, _) = self.uncropped_geometry(cell);
         let cell_size = [cell.width.get(), cell.height.get()].map(f64::from);
         self.span = std::array::from_fn(|axis| {
@@ -428,18 +457,8 @@ impl GraphicsPlacements {
         });
     }
 
-    pub(crate) fn clear_buffer(&mut self) {
-        if !self.anchors.is_empty() {
-            self.orphaned.extend(
-                self.images
-                    .iter()
-                    .filter(|image| image.parent.is_some())
-                    .map(|image| image.placement.image.id())
-                    .filter(|&id| id != 0)
-                    .map(OrphanedImage::new),
-            );
-        }
-        self.clear_placements();
+    pub(crate) fn clear_nonvirtual(&mut self) {
+        self.remove_matching(|image| !image.is_virtual());
     }
 
     fn clear_placements(&mut self) {
@@ -670,8 +689,35 @@ impl GraphicsPlacements {
             existing.placement.image == spec.image
                 && (replaces_image || (spec.id != 0 && existing.placement.id == spec.id))
         };
-        let removes_existing =
-            (replaces_image || image.placement.id != 0) && self.images.iter().any(remove);
+        let replacement = if replaces_image || spec.id != 0 {
+            self.images.iter().position(remove)
+        } else {
+            None
+        };
+        if !replaces_image
+            && evicted.is_empty()
+            && let Some(index) = replacement
+        {
+            let previous = &self.images[index];
+            if previous.placement.z == spec.z && previous.placement.position == spec.position {
+                // Keeping the link and draw order preserves all cached graph indices.
+                image.serial = previous.serial;
+                image.parent = previous.parent;
+                image.root = previous.root;
+                if previous.parent.is_some() {
+                    image.row = previous.row;
+                    image.column = previous.column;
+                }
+                let moved = image.row != previous.row || image.column != previous.column;
+                self.images[index] = image;
+                if moved {
+                    self.sync_graph(false);
+                }
+                self.changed();
+                return Ok(());
+            }
+        }
+        let removes_existing = replacement.is_some();
         let evicts =
             |existing: &GraphicsPlacement| evicted.binary_search(&existing.placement.image).is_ok();
         if !removes_existing && (evicted.is_empty() || !self.images.iter().any(evicts)) {
@@ -682,14 +728,9 @@ impl GraphicsPlacements {
                 .try_reserve(1)
                 .map_err(|_| PlacementError::Quota)?;
         }
-        let retained_serial = (!replaces_image && removes_existing)
-            .then(|| {
-                self.images
-                    .iter()
-                    .find(|entry| remove(entry))
-                    .map(|entry| entry.serial)
-            })
-            .flatten();
+        let retained_serial = replacement
+            .filter(|_| !replaces_image)
+            .map(|index| self.images[index].serial);
         image.serial = retained_serial.unwrap_or(self.next_serial + 1);
         if let PlacementPosition::Relative(parent) = spec.position {
             let referenced = self.parent(parent).ok_or(PlacementError::MissingParent)?;
@@ -918,39 +959,34 @@ impl GraphicsPlacements {
         }
     }
 
-    pub(crate) fn has_orphans(&self) -> bool {
-        !self.orphaned.is_empty()
-    }
-
-    pub(crate) fn retain_unreferenced_orphans(&mut self, other: &Self) {
+    pub(crate) fn reap_orphans(&mut self, images: &mut ImageStore) {
         if self.orphaned.is_empty() {
             return;
         }
         self.orphaned.sort_unstable_by_key(|orphan| orphan.id);
         self.orphaned.dedup_by_key(|orphan| orphan.id);
-        for placement in self.images.iter().chain(&other.images) {
+        for placement in &self.images {
             let id = placement.placement.image.id();
             if let Ok(index) = self.orphaned.binary_search_by_key(&id, |orphan| orphan.id) {
                 self.orphaned[index].referenced = true;
             }
         }
         self.orphaned.retain(|orphan| !orphan.referenced);
-    }
-
-    pub(crate) fn is_orphaned(&self, id: u32) -> bool {
-        self.orphaned
-            .binary_search_by_key(&id, |orphan| orphan.id)
-            .is_ok()
-    }
-
-    pub(crate) fn clear_orphaned(&mut self) {
+        if !self.orphaned.is_empty() {
+            images.retain_ids(|id| {
+                self.orphaned
+                    .binary_search_by_key(&id, |orphan| orphan.id)
+                    .is_err()
+            });
+        }
         self.orphaned.clear();
     }
 }
 
 pub(crate) struct Graphics {
     decoder: Decoder,
-    images: ImageStore,
+    images: [ImageStore; 2],
+    retained_ids: Vec<u32>,
     reply: Option<Reply>,
     active: bool,
     has_relative: bool,
@@ -960,7 +996,8 @@ impl Default for Graphics {
     fn default() -> Self {
         Self {
             decoder: Decoder::default(),
-            images: ImageStore::new(64 * 1024 * 1024, 1024),
+            images: std::array::from_fn(|_| ImageStore::new(64 * 1024 * 1024, 1024)),
+            retained_ids: Vec::new(),
             reply: None,
             active: false,
             has_relative: false,
@@ -969,33 +1006,46 @@ impl Default for Graphics {
 }
 
 impl Graphics {
-    pub(crate) fn get(&self, id: u32) -> Option<&Image> {
-        self.images.get(id)
+    pub(crate) fn images(&self, buffer: ScreenBuffer) -> &ImageStore {
+        &self.images[buffer as usize]
     }
 
-    pub(crate) fn image_source_revision(&self, key: ImageKey) -> Option<u64> {
-        self.images.source_revision(key)
+    pub(crate) fn clear_unplaced(&mut self, screen: &Screen) {
+        let images = &mut self.images[screen.active_buffer() as usize];
+        if images.is_empty() {
+            images.abort_transfer();
+            return;
+        }
+        let placements = screen.graphics_placements();
+        if placements.is_empty() {
+            images.clear();
+            return;
+        }
+
+        images.abort_transfer();
+        self.retained_ids.clear();
+        let ids = placements.iter().map(|image| image.placement.image.id());
+        if self.retained_ids.try_reserve(placements.len()).is_err() {
+            images.retain_ids(|id| ids.clone().any(|placed| placed == id));
+            return;
+        }
+        self.retained_ids.extend(ids.filter(|&id| id != 0));
+        self.retained_ids.sort_unstable();
+        self.retained_ids.dedup();
+        images.retain_ids(|id| self.retained_ids.binary_search(&id).is_ok());
     }
 
-    pub(crate) fn visual_revision(&self) -> u64 {
-        self.images.visual_revision()
-    }
-
-    pub(crate) fn storage_revision(&self) -> u64 {
-        self.images.storage_revision()
-    }
-
-    pub(crate) fn animation_deadline(&self) -> Option<std::time::Instant> {
-        self.images.animation_deadline()
-    }
-
-    pub(crate) fn poll_animations(&mut self, clock: impl FnOnce() -> std::time::Instant) {
-        self.images.poll_animations(clock);
+    pub(crate) fn poll_animations(
+        &mut self,
+        buffer: ScreenBuffer,
+        clock: impl FnOnce() -> std::time::Instant,
+    ) {
+        self.images[buffer as usize].poll_animations(clock);
     }
 
     pub(crate) fn reset(&mut self) {
         self.decoder.cancel();
-        self.images.clear();
+        self.images.iter_mut().for_each(ImageStore::clear);
         self.reply = None;
         self.active = false;
         self.has_relative = false;
@@ -1003,7 +1053,7 @@ impl Graphics {
 
     pub(crate) fn finish(&mut self) {
         self.decoder.cancel();
-        self.images.abort_transfer();
+        self.images.iter_mut().for_each(ImageStore::abort_transfer);
         self.active = false;
     }
 
@@ -1035,17 +1085,18 @@ impl Graphics {
             ApcEvent::End => {
                 self.active = false;
                 self.reap_orphans(screen);
+                let images = &mut self.images[screen.active_buffer() as usize];
                 match self.decoder.finish() {
                     Some(Ok(command)) => {
                         if let Some(delete) = command.decode_delete() {
-                            self.images.abort_transfer();
+                            images.abort_transfer();
                             if let Ok(delete) = delete {
-                                delete_images(delete, screen, &mut self.images, styles);
+                                delete_images(delete, screen, images, styles);
                                 return false;
                             }
                         }
                         debug_assert!(self.reply.is_none());
-                        self.reply = self.images.receive(command, |change| {
+                        self.reply = images.receive(command, |change| {
                             let relative = matches!(&change, lune_kitty_graphics::ImageChange::Place { placement, .. }
                                 if matches!(placement.position, PlacementPosition::Relative(_)));
                             screen.apply_image(change)?;
@@ -1055,7 +1106,7 @@ impl Graphics {
                         return self.reply.is_some();
                     }
                     Some(Err(DecodeError::PayloadTooLong | DecodeError::PayloadAllocation)) => {
-                        self.images.abort_transfer();
+                        images.abort_transfer();
                     }
                     Some(Err(_)) | None => {}
                 }
@@ -1063,7 +1114,7 @@ impl Graphics {
             ApcEvent::Cancel => {
                 self.active = false;
                 if self.decoder.cancel() {
-                    self.images.abort_transfer();
+                    self.images[screen.active_buffer() as usize].abort_transfer();
                 }
             }
         }
@@ -1072,16 +1123,9 @@ impl Graphics {
 
     #[inline]
     pub(crate) fn reap_orphans(&mut self, screen: &mut Screen) {
-        if self.has_relative && screen.has_graphics_orphans() {
-            self.reap_orphans_inner(screen);
+        if self.has_relative {
+            screen.reap_graphics_orphans(&mut self.images);
         }
-    }
-
-    #[cold]
-    fn reap_orphans_inner(&mut self, screen: &mut Screen) {
-        screen.retain_unreferenced_graphics_orphans();
-        self.images.retain_ids(|id| !screen.graphics_orphaned(id));
-        screen.clear_graphics_orphans();
     }
 }
 
@@ -1111,20 +1155,16 @@ fn delete_images(
     }
     let mut removed = Vec::new();
     let mut referenced = Vec::new();
+    let count = screen.graphics_placements().len();
     // Reserve both lists before changing placements or image storage.
-    if removed
-        .try_reserve_exact(screen.graphics_placements().len())
-        .is_err()
-        || referenced
-            .try_reserve_exact(screen.all_graphics_placements().count())
-            .is_err()
-    {
+    if removed.try_reserve_exact(count).is_err() || referenced.try_reserve_exact(count).is_err() {
         return;
     }
     screen.delete_placements(delete.target, styles, |id| removed.push(id));
     referenced.extend(
         screen
-            .all_graphics_placements()
+            .graphics_placements()
+            .iter()
             .map(|image| image.placement.image.id()),
     );
     removed.sort_unstable();
@@ -1141,9 +1181,9 @@ mod quota_tests {
     use crate::ScreenBuffer;
 
     #[test]
-    fn quota_eviction_ranks_both_buffers_and_protects_relative_ancestry() {
+    fn quota_eviction_is_buffer_local_and_protects_relative_ancestry() {
         let mut graphics = Graphics {
-            images: ImageStore::new(12, 3),
+            images: std::array::from_fn(|_| ImageStore::new(12, 3)),
             ..Graphics::default()
         };
         let mut screen = Screen::new(8, 4).unwrap();
@@ -1176,20 +1216,29 @@ mod quota_tests {
             receive(&mut graphics, &mut screen, b"Ga=T,i=4,x=1,s=1,v=1;AAAA/w=="),
             b"EINVAL:Invalid placement region",
         );
-        assert!((1..=3).all(|id| graphics.get(id).is_some()));
+        assert!(graphics.images(ScreenBuffer::Alternate).get(1).is_none());
+        assert!((2..=3).all(|id| graphics.images(ScreenBuffer::Alternate).get(id).is_some()));
         assert_eq!(
             receive(&mut graphics, &mut screen, b"Gi=4,s=1,v=1;AAAA/w=="),
             b"OK"
         );
-        assert!(graphics.get(3).is_none());
         assert_eq!(
             receive(&mut graphics, &mut screen, b"Gi=5,s=1,v=1;AAAA/w=="),
             b"OK"
         );
-        assert!(graphics.get(2).is_none());
+        assert!(graphics.images(ScreenBuffer::Alternate).get(3).is_none());
+        assert!(graphics.images(ScreenBuffer::Alternate).get(2).is_some());
 
         screen.select_buffer(ScreenBuffer::Primary);
         assert_eq!(screen.graphics_placements()[0].placement.image.id(), 1);
+        for id in [4, 5] {
+            assert!(graphics.images(ScreenBuffer::Primary).get(id).is_none());
+            let command = format!("Gi={id},s=1,v=1;/wAA/w==");
+            assert_eq!(
+                receive(&mut graphics, &mut screen, command.as_bytes()),
+                b"OK"
+            );
+        }
         assert_eq!(
             receive(&mut graphics, &mut screen, b"Ga=p,i=4,p=1,P=1,Q=1"),
             b"OK"
@@ -1206,7 +1255,7 @@ mod quota_tests {
             ),
             b"OK",
         );
-        assert!(graphics.get(5).is_none());
+        assert!(graphics.images(ScreenBuffer::Primary).get(5).is_none());
         assert_eq!(
             screen
                 .graphics_placements()
@@ -1219,15 +1268,31 @@ mod quota_tests {
             receive(&mut graphics, &mut screen, b"Ga=T,i=7,P=6,s=1,v=1;AAAA/w=="),
             b"ENOSPC:Image quota exceeded",
         );
-        assert!([1, 4, 6].into_iter().all(|id| graphics.get(id).is_some()));
+        assert!(
+            [1, 4, 6]
+                .into_iter()
+                .all(|id| graphics.images(ScreenBuffer::Primary).get(id).is_some())
+        );
+        assert_eq!(
+            receive(&mut graphics, &mut screen, b"Ga=p,i=6,p=1,C=1"),
+            b"OK"
+        );
         assert_eq!(
             receive(&mut graphics, &mut screen, b"Gi=7,s=1,v=1;AAAA/w=="),
             b"OK"
         );
-        assert!(screen.graphics_placements().is_empty());
+        let [independent] = screen.graphics_placements() else {
+            panic!("The independent placement survives eviction");
+        };
+        assert_eq!(independent.placement.image.id(), 6);
         graphics.reap_orphans(&mut screen);
-        assert!([1, 4, 6].into_iter().all(|id| graphics.get(id).is_none()));
-        assert!(graphics.get(7).is_some());
+        assert!(
+            [1, 4]
+                .into_iter()
+                .all(|id| graphics.images(ScreenBuffer::Primary).get(id).is_none())
+        );
+        assert!(graphics.images(ScreenBuffer::Primary).get(6).is_some());
+        assert!(graphics.images(ScreenBuffer::Primary).get(7).is_some());
 
         for command in [
             b"Gi=8,s=1,v=1;AAAA/w==".as_slice(),
@@ -1236,8 +1301,20 @@ mod quota_tests {
         ] {
             assert_eq!(receive(&mut graphics, &mut screen, command), b"OK");
         }
-        assert_eq!(graphics.get(7).unwrap().dimensions(), (3, 1));
-        assert!(graphics.get(8).is_none());
-        assert!(graphics.get(9).is_none());
+        assert_eq!(
+            graphics
+                .images(ScreenBuffer::Primary)
+                .get(7)
+                .unwrap()
+                .dimensions(),
+            (3, 1)
+        );
+        assert!(graphics.images(ScreenBuffer::Primary).get(8).is_none());
+        assert!(graphics.images(ScreenBuffer::Primary).get(9).is_none());
+        assert!(
+            [2, 4, 5]
+                .into_iter()
+                .all(|id| graphics.images(ScreenBuffer::Alternate).get(id).is_some())
+        );
     }
 }
