@@ -259,6 +259,16 @@ impl Report {
 }
 
 impl Reply {
+    #[cold]
+    pub(crate) fn graphics(&mut self, reply: lune_kitty_graphics::Reply) {
+        self.clear();
+        self.append(b"\x1b_Gi=");
+        self.decimal::<10>(reply.id);
+        self.append(b";");
+        self.append(reply.message);
+        self.append(b"\x1b\\");
+    }
+
     pub(crate) fn bytes(&self) -> &[u8] {
         &self.bytes[usize::from(self.start)..usize::from(self.end)]
     }

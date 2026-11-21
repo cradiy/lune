@@ -66,6 +66,26 @@ fn pixels(width: u32, height: u32) -> PixelSize {
 }
 
 #[test]
+fn kitty_images_commit_after_the_last_chunk_and_keep_reply_order() {
+    let mut session = session(b"\x1b_Gi=7,f=24,s=2,v=1,m=1;/wAA\x1b\\");
+    session.pump().unwrap();
+    assert!(session.processor().graphics_image(7).is_none());
+    assert!(session.transport.written.is_empty());
+
+    session.transport.source = Cursor::new(b"\x1b_Gm=0;AAD/\x1b\\\x1b[c");
+    session.pump().unwrap();
+    let image = session.processor().graphics_image(7).unwrap();
+    assert_eq!(image.dimensions(), (2, 1));
+    assert_eq!(image.rgba(), &[255, 0, 0, 255, 0, 0, 255, 255]);
+    assert_eq!(session.transport.written, b"\x1b");
+    assert!(!session.wants_read());
+
+    session.transport.write_budget = usize::MAX;
+    session.pump().unwrap();
+    assert_eq!(session.transport.written, b"\x1b_Gi=7;OK\x1b\\\x1b[?6c");
+}
+
+#[test]
 fn short_writes_preserve_frames_and_resume_a_reply_at_end_of_input() {
     let mut session = session(b"abc\x1b[6n\x1b[2;3H\x1b[6n");
     session.queue_input(b"key").unwrap();

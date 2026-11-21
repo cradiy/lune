@@ -81,6 +81,15 @@ pub enum DcsEvent<'a> {
     Cancel,
 }
 
+/// Streaming APC framing with raw payload spans and seven-bit ST.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApcEvent<'a> {
+    Start,
+    Data(&'a [u8]),
+    End,
+    Cancel,
+}
+
 /// A lexical event. Sequence bytes retain their syntax for interpretation by a consumer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Event<'a> {
@@ -91,6 +100,7 @@ pub enum Event<'a> {
     Csi(ControlSequence<'a>),
     Osc(OscEvent<'a>),
     Dcs(DcsEvent<'a>),
+    Apc(ApcEvent<'a>),
     Error(ParseError),
 }
 
@@ -122,7 +132,20 @@ enum StringKind {
     Discard,
     Osc,
     Dcs,
+    Apc,
     Rejected,
+}
+
+impl StringKind {
+    #[inline]
+    fn emit_data(self, bytes: &[u8], emit: &mut impl FnMut(Event<'_>)) {
+        match self {
+            Self::Osc => emit(Event::Osc(OscEvent::Data(bytes))),
+            Self::Dcs => emit(Event::Dcs(DcsEvent::Data(bytes))),
+            Self::Apc => emit(Event::Apc(ApcEvent::Data(bytes))),
+            _ => {}
+        }
+    }
 }
 
 /// A fixed-capacity parser whose state persists across calls to [`Self::advance`].
@@ -175,15 +198,21 @@ impl Parser {
     #[inline]
     pub fn advance(&mut self, bytes: &[u8], mut emit: impl FnMut(Event<'_>)) {
         if let [byte] = bytes {
-            if matches!(self.state, State::Ground | State::Utf8Pending)
-                && *byte >= 0x20
-                && *byte != 0x7f
-            {
-                if self.decode(*byte, &mut emit) {
-                    // An invalid pending prefix leaves this byte to be decoded again.
-                    self.decode(*byte, &mut emit);
+            if *byte >= 0x20 && *byte != 0x7f {
+                match self.state {
+                    State::Ground | State::Utf8Pending => {
+                        if self.decode(*byte, &mut emit) {
+                            // An invalid pending prefix leaves this byte to be decoded again.
+                            self.decode(*byte, &mut emit);
+                        }
+                        return;
+                    }
+                    State::String { kind } => {
+                        kind.emit_data(bytes, &mut emit);
+                        return;
+                    }
+                    _ => {}
                 }
-                return;
             }
             self.advance_byte(*byte, &mut emit);
             return;
@@ -212,15 +241,7 @@ impl Parser {
                 }
                 if let State::String { kind } = self.state {
                     let length = text_end(&bytes[offset..]);
-                    match kind {
-                        StringKind::Osc => {
-                            emit(Event::Osc(OscEvent::Data(&bytes[offset..offset + length])))
-                        }
-                        StringKind::Dcs => {
-                            emit(Event::Dcs(DcsEvent::Data(&bytes[offset..offset + length])))
-                        }
-                        _ => {}
-                    }
+                    kind.emit_data(&bytes[offset..offset + length], &mut emit);
                     offset += length;
                     continue;
                 }
@@ -268,6 +289,16 @@ impl Parser {
             }
         ) {
             emit(Event::Dcs(DcsEvent::Cancel));
+        }
+        if matches!(
+            self.state,
+            State::String {
+                kind: StringKind::Apc
+            } | State::StringEscape {
+                kind: StringKind::Apc
+            }
+        ) {
+            emit(Event::Apc(ApcEvent::Cancel));
         }
         if !matches!(
             self.state,
@@ -364,17 +395,6 @@ impl Parser {
             self.state,
             State::String { .. } | State::StringEscape { .. }
         ) {
-            if let State::String { kind } = self.state
-                && byte >= 0x20
-                && byte != 0x7f
-            {
-                match kind {
-                    StringKind::Osc => emit(Event::Osc(OscEvent::Data(&[byte]))),
-                    StringKind::Dcs => emit(Event::Dcs(DcsEvent::Data(&[byte]))),
-                    _ => {}
-                }
-                return;
-            }
             self.advance_string(byte, emit);
             return;
         }
@@ -436,12 +456,14 @@ impl Parser {
                 match kind {
                     StringKind::Osc => emit(Event::Osc(OscEvent::End(OscTerminator::St))),
                     StringKind::Dcs => emit(Event::Dcs(DcsEvent::End)),
+                    StringKind::Apc => emit(Event::Apc(ApcEvent::End)),
                     _ => {}
                 }
             } else {
                 match kind {
                     StringKind::Osc => emit(Event::Osc(OscEvent::Cancel)),
                     StringKind::Dcs => emit(Event::Dcs(DcsEvent::Cancel)),
+                    StringKind::Apc => emit(Event::Apc(ApcEvent::Cancel)),
                     _ => {}
                 }
                 self.start_escape();
@@ -458,6 +480,7 @@ impl Parser {
                 match kind {
                     StringKind::Osc => emit(Event::Osc(OscEvent::Cancel)),
                     StringKind::Dcs => emit(Event::Dcs(DcsEvent::Cancel)),
+                    StringKind::Apc => emit(Event::Apc(ApcEvent::Cancel)),
                     _ => {}
                 }
                 self.state = State::Ground;
@@ -468,6 +491,8 @@ impl Parser {
                 emit(Event::Osc(OscEvent::End(OscTerminator::Bell)));
             }
             0x00..=0x1f if kind == StringKind::Dcs => emit(Event::Dcs(DcsEvent::Data(&[byte]))),
+            0x00..=0x1f if kind == StringKind::Apc => emit(Event::Apc(ApcEvent::Data(&[byte]))),
+            0x20..=0x7e | 0x80..=0xff => kind.emit_data(&[byte], emit),
             _ => {}
         }
     }
@@ -550,16 +575,18 @@ impl Parser {
                     return;
                 }
                 b']' | b'X' | b'^' | b'_' => {
-                    self.state = State::String {
-                        kind: if byte == b']' {
+                    let kind = match byte {
+                        b']' => {
+                            emit(Event::Osc(OscEvent::Start));
                             StringKind::Osc
-                        } else {
-                            StringKind::Discard
-                        },
+                        }
+                        b'_' => {
+                            emit(Event::Apc(ApcEvent::Start));
+                            StringKind::Apc
+                        }
+                        _ => StringKind::Discard,
                     };
-                    if byte == b']' {
-                        emit(Event::Osc(OscEvent::Start));
-                    }
+                    self.state = State::String { kind };
                     return;
                 }
                 _ => {}

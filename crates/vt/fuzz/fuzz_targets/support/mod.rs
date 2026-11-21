@@ -1,4 +1,4 @@
-use lune_vt::{DcsEvent, Event, OscEvent, OscTerminator, Parameter, ParseError, Parser};
+use lune_vt::{ApcEvent, DcsEvent, Event, OscEvent, OscTerminator, Parameter, ParseError, Parser};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Token {
@@ -14,6 +14,10 @@ pub enum Token {
     DcsByte(u8),
     DcsEnd,
     DcsCancel,
+    ApcStart,
+    ApcByte(u8),
+    ApcEnd,
+    ApcCancel,
     Error(ParseError),
 }
 
@@ -48,6 +52,12 @@ pub fn capture(tokens: &mut Vec<Token>, budget: usize, event: Event<'_>) {
         }
         Event::Dcs(DcsEvent::End) => tokens.push(Token::DcsEnd),
         Event::Dcs(DcsEvent::Cancel) => tokens.push(Token::DcsCancel),
+        Event::Apc(ApcEvent::Start) => tokens.push(Token::ApcStart),
+        Event::Apc(ApcEvent::Data(bytes)) => {
+            tokens.extend(bytes.iter().copied().map(Token::ApcByte));
+        }
+        Event::Apc(ApcEvent::End) => tokens.push(Token::ApcEnd),
+        Event::Apc(ApcEvent::Cancel) => tokens.push(Token::ApcCancel),
         Event::Error(error) => tokens.push(Token::Error(error)),
     }
     assert!(tokens.len() <= budget, "Parser exceeded the output budget");

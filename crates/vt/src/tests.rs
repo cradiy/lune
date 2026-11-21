@@ -1,6 +1,6 @@
 use crate::{
-    DcsEvent, Event, MAX_PARAMETERS, MAX_SEQUENCE_BYTES, OscEvent, OscTerminator, Parameter,
-    ParseError, Parser,
+    ApcEvent, DcsEvent, Event, MAX_PARAMETERS, MAX_SEQUENCE_BYTES, OscEvent, OscTerminator,
+    Parameter, ParseError, Parser,
 };
 
 #[derive(Debug, PartialEq, Eq)]
@@ -17,6 +17,10 @@ enum OwnedEvent {
     DcsData(Vec<u8>),
     DcsEnd,
     DcsCancel,
+    ApcStart,
+    ApcData(Vec<u8>),
+    ApcEnd,
+    ApcCancel,
     Error(ParseError),
 }
 
@@ -61,6 +65,16 @@ fn capture(events: &mut Vec<OwnedEvent>, event: Event<'_>) {
         }
         Event::Dcs(DcsEvent::End) => OwnedEvent::DcsEnd,
         Event::Dcs(DcsEvent::Cancel) => OwnedEvent::DcsCancel,
+        Event::Apc(ApcEvent::Start) => OwnedEvent::ApcStart,
+        Event::Apc(ApcEvent::Data(bytes)) => {
+            if let Some(OwnedEvent::ApcData(data)) = events.last_mut() {
+                data.extend_from_slice(bytes);
+                return;
+            }
+            OwnedEvent::ApcData(bytes.to_vec())
+        }
+        Event::Apc(ApcEvent::End) => OwnedEvent::ApcEnd,
+        Event::Apc(ApcEvent::Cancel) => OwnedEvent::ApcCancel,
         Event::Error(error) => OwnedEvent::Error(error),
     };
     events.push(owned);
@@ -377,8 +391,14 @@ fn cancellation_and_escape_restart_preserve_control_order() {
         OwnedEvent::OscCancel,
         OwnedEvent::Execute(0x1a),
         OwnedEvent::Print('C'),
+        OwnedEvent::ApcStart,
+        OwnedEvent::ApcData(b"Pignored".to_vec()),
+        OwnedEvent::ApcCancel,
         csi(1, b'm'),
         OwnedEvent::Print('D'),
+        OwnedEvent::ApcStart,
+        OwnedEvent::ApcData(b"X\x07Y".to_vec()),
+        OwnedEvent::ApcEnd,
         OwnedEvent::Print('E'),
     ];
     assert_eq!(parse(input.chunks(1)), expected);
@@ -477,6 +497,9 @@ fn stream_boundaries_finalize_or_discard_pending_input_explicitly() {
         }
         if prefix.starts_with(b"\x1bP") {
             expected.push(OwnedEvent::DcsCancel);
+        }
+        if prefix.starts_with(b"\x1b_") {
+            expected.push(OwnedEvent::ApcCancel);
         }
         expected.push(OwnedEvent::Error(ParseError::IncompleteSequence));
         assert_eq!(events, expected, "{prefix:?}");

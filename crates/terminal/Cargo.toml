@@ -55,6 +55,7 @@ harness = false
 [dependencies]
 lune-vt = { path = "../vt" }
 lune-text = { path = "../text" }
+lune-kitty-graphics = { path = "../kitty-graphics" }
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

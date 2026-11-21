@@ -7,6 +7,7 @@ mod cell;
 mod charsets;
 mod dcs;
 mod error;
+mod graphics;
 mod grid;
 mod history;
 mod input;
@@ -37,6 +38,7 @@ pub use grid::{Grid, MAX_CELLS, MAX_DIMENSION};
 pub use history::{HistoryLimits, MAX_HISTORY_BYTES, MAX_HISTORY_ROWS, RowHistory};
 pub use input::{InputModes, Key, KeySequence, Modifiers};
 pub use lines::{LogicalLine, LogicalLines};
+pub use lune_kitty_graphics::Image as GraphicsImage;
 pub use lune_text::WidthPolicy;
 pub use mouse::{
     MouseButton, MouseEvent, MouseFormat, MouseSequence, MouseTracking, PixelPosition,

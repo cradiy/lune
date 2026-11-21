@@ -1,9 +1,10 @@
 use std::{collections::TryReserveError, error::Error, fmt};
 
-use lune_vt::{ControlSequence, EscapeSequence, Event, OscEvent, Parameter, Parser};
+use lune_vt::{ApcEvent, ControlSequence, EscapeSequence, Event, OscEvent, Parameter, Parser};
 
 use crate::charsets::Charsets;
 use crate::dcs::Dcs;
+use crate::graphics::Graphics;
 use crate::osc::{Osc, Outcome};
 use crate::rendition_stack::RenditionStack;
 use crate::reply::{
@@ -110,6 +111,7 @@ enum Pending {
     ModeReply(ModeReport),
     StatusReply(StatusReport),
     ColorReply(ColorReport),
+    GraphicsReply(lune_kitty_graphics::Reply),
     OscReplies,
     SizeReply(SizeReport),
     PushTitle,
@@ -146,6 +148,7 @@ struct State {
     color_scheme_notifications: bool,
     osc: Osc,
     dcs: Dcs,
+    graphics: Graphics,
     text_area_pixels: Option<PixelSize>,
     cell_pixels: Option<PixelSize>,
     resize_reporting: Option<ResizeReport>,
@@ -167,6 +170,7 @@ impl State {
             color_scheme_notifications: false,
             osc: Osc::new(palette),
             dcs: Dcs::default(),
+            graphics: Graphics::default(),
             text_area_pixels: None,
             cell_pixels: None,
             resize_reporting: None,
@@ -187,6 +191,7 @@ impl State {
         self.resize_reporting = None;
         self.osc.reset();
         self.dcs = Dcs::default();
+        self.graphics.reset();
     }
 
     #[cold]
@@ -234,6 +239,10 @@ pub struct Processor {
 }
 
 impl Processor {
+    pub fn graphics_image(&self, id: u32) -> Option<&crate::GraphicsImage> {
+        self.state.graphics.get(id)
+    }
+
     /// Starts with default rendition and a bounded style table. Construction
     /// makes no allocation requests; the limit includes permanent default.
     pub fn new(style_limit: usize, palette: Palette) -> Result<Self, StyleError> {
@@ -625,6 +634,10 @@ impl Processor {
                     self.state.osc.data(&input[consumed..consumed + discarded]);
                 } else if self.state.dcs.needs_data() {
                     self.state.dcs.data(&input[consumed..consumed + discarded]);
+                } else if self.state.graphics.needs_data() {
+                    self.state
+                        .graphics
+                        .data(&input[consumed..consumed + discarded]);
                 }
                 consumed += discarded;
                 continue;
@@ -772,6 +785,13 @@ impl Processor {
                     state.last_graphic = '\0';
                     dcs_event(event, screen, styles, state, pending, end);
                 }
+                Event::Apc(event) => {
+                    state.last_graphic = '\0';
+                    if let Some(reply) = state.graphics.event(event) {
+                        pending[*end] = Some(Pending::GraphicsReply(reply));
+                        *end += 1;
+                    }
+                }
                 Event::Error(_) => {
                     state.last_graphic = '\0';
                     *parse_errors = parse_errors.saturating_add(1);
@@ -824,8 +844,10 @@ impl Processor {
             Event::Dcs(event) => {
                 state.dcs.event(event);
             }
+            Event::Apc(ApcEvent::Cancel) => {}
             _ => unreachable!("Finishing emits text, string cancellation, or a lexical error"),
         });
+        state.graphics.finish();
         state.last_graphic = '\0';
         self.drain(screen, text)?;
         text.boundary();
@@ -946,6 +968,12 @@ impl Processor {
                         return Err(ProcessFailure::ReplyPending);
                     }
                     reply.encode(&mut self.reply);
+                }
+                Pending::GraphicsReply(reply) => {
+                    if !self.reply.is_empty() {
+                        return Err(ProcessFailure::ReplyPending);
+                    }
+                    self.reply.graphics(reply);
                 }
                 Pending::SizeReply(reply) => {
                     if !self.reply.is_empty() {

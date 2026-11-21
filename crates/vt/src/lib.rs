@@ -8,7 +8,8 @@
 //! four-byte buffer joins UTF-8 scalars split across input chunks.
 //!
 //! OSC and DCS emit framing events and borrowed raw payload spans. DCS headers
-//! share CSI's bounded parameter structure. SOS, PM, and APC payloads are discarded.
+//! share CSI's bounded parameter structure. APC streams raw payload spans. SOS
+//! and PM payloads are discarded.
 //!
 //! The parsing rules follow the control-sequence structure described in
 //! [XTerm Control Sequences](https://invisible-island.net/xterm/ctlseqs/ctlseqs.html).
@@ -20,7 +21,7 @@ mod utf8;
 mod tests;
 
 pub use parser::{
-    ControlSequence, DcsEvent, EscapeSequence, Event, MAX_INTERMEDIATES, MAX_PARAMETERS,
+    ApcEvent, ControlSequence, DcsEvent, EscapeSequence, Event, MAX_INTERMEDIATES, MAX_PARAMETERS,
     MAX_PRIVATE_MARKERS, MAX_SEQUENCE_BYTES, OscEvent, OscTerminator, Parameter, ParseError,
     Parser,
 };
