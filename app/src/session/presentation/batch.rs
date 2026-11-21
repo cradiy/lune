@@ -86,6 +86,13 @@ impl PaintBatch {
         })
     }
 
+    pub(crate) fn backgrounds(&self) -> impl Iterator<Item = BackgroundRect> + '_ {
+        self.commands.iter().filter_map(|command| match command {
+            StoredCommand::Background(rect) => Some(*rect),
+            _ => None,
+        })
+    }
+
     fn clear(&mut self) {
         self.commands.clear();
         self.units.clear();

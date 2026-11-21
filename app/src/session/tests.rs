@@ -753,6 +753,110 @@ fn paint_commands_replay_damage_and_keep_the_cursor_on_its_own_layer() {
 }
 
 #[test]
+fn raster_surface_restores_the_cursor_and_clips_text_and_backgrounds() {
+    use crate::{PixelRegion, RasterSurface, RasterText};
+
+    fn draw_text(mut region: PixelRegion<'_>, text: RasterText<'_>) {
+        let rect = region.rect();
+        assert!(region.row_mut(rect.size.height.get()).is_none());
+        let pixels = region.row_mut(0).unwrap();
+        match text {
+            RasterText::Run(run) => {
+                for unit in run.units() {
+                    if !unit.cell.is_erased() {
+                        let x = unit.column * 2;
+                        if let Some(position) = x.checked_sub(rect.origin.x as usize)
+                            && let Some(pixel) = pixels.get_mut(position)
+                        {
+                            *pixel = run.style.foreground;
+                        }
+                    }
+                }
+            }
+            RasterText::Cursor(glyph) => pixels[0] = glyph.color,
+        }
+    }
+
+    fn present(
+        session: &Session<Transport>,
+        tracker: &mut PresentationTracker,
+        batch: &mut PaintBatch,
+        surface: &mut RasterSurface<'_>,
+    ) {
+        let frame = session.presentation_frame().unwrap();
+        let prepared = tracker.prepare(&frame, Instant::now()).unwrap();
+        batch
+            .capture(&frame, prepared.damage(), NonZeroU32::new(1).unwrap())
+            .unwrap();
+        surface.apply(batch, draw_text);
+        prepared.commit();
+    }
+
+    let mut session = session(b"Q\x1b[1;1H");
+    session.geometry = GridGeometry::fit(pixels(16, 6), pixels(2, 2)).unwrap();
+    let background = Rgb {
+        red: 5,
+        green: 6,
+        blue: 7,
+    };
+    let foreground = Rgb {
+        red: 200,
+        green: 201,
+        blue: 202,
+    };
+    let cursor = Rgb {
+        red: 10,
+        green: 20,
+        blue: 30,
+    };
+    let mut indexed = [background; 256];
+    indexed[1] = cursor;
+    session.set_theme(&Palette::new(indexed, foreground, background, cursor), None);
+    session.pump().unwrap();
+    let mut tracker = PresentationTracker::default();
+    let mut batch = PaintBatch::default();
+    let padding = Rgb::default();
+    let mut content = [padding; 90];
+    let mut output = [padding; 90];
+    {
+        let size = pixels(15, 5);
+        assert!(RasterSurface::new(size, 14, &mut content, &mut output).is_none());
+        let mut surface = RasterSurface::new(size, 18, &mut content, &mut output).unwrap();
+        present(&session, &mut tracker, &mut batch, &mut surface);
+        assert_eq!(&surface.pixels()[..3], &[background, cursor, background]);
+
+        session.transport.source = Cursor::new(b"\x1b[2;1H");
+        session.pump().unwrap();
+        present(&session, &mut tracker, &mut batch, &mut surface);
+        assert_eq!(
+            &surface.pixels()[..3],
+            &[foreground, background, background]
+        );
+        assert_eq!(&surface.pixels()[36..39], &[cursor, cursor, background]);
+
+        session.transport.source = Cursor::new(b"\x1b[3;8H\x1b[41mZ\x1b[2;1H");
+        session.pump().unwrap();
+        present(&session, &mut tracker, &mut batch, &mut surface);
+        assert_eq!(&surface.pixels()[36..39], &[cursor, cursor, background]);
+        assert_eq!(&surface.pixels()[85..], &[background, foreground]);
+
+        session.transport.source = Cursor::new(b"\x1b[?25l");
+        session.pump().unwrap();
+        present(&session, &mut tracker, &mut batch, &mut surface);
+        assert_eq!(&surface.pixels()[36..39], &[background; 3]);
+        assert_eq!(surface.pixels()[86], foreground);
+    }
+    for row in output
+        .as_chunks::<18>()
+        .0
+        .iter()
+        .chain(content.as_chunks::<18>().0)
+    {
+        assert_eq!(&row[15..], &[padding; 3]);
+    }
+}
+
+#[test]
 fn paint_batch_retains_text_rendition_and_cursor_after_the_source_changes() {
     let mut session = session("A\x1b[2;1H\x1b[1;31;44m水\u{301}\x1b[2;2H".as_bytes());
     session.geometry = GridGeometry::fit(pixels(64, 48), pixels(8, 16)).unwrap();
