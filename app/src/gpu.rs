@@ -65,19 +65,30 @@ impl CachedImage {
         rebuild_layout: bool,
     ) -> bool {
         if self.revision.id() != image.revision() {
-            let Some(updates) = image.pixel_updates(Some(&self.revision), scratch) else {
+            let updates = if let ImageTextures::Tiled(tiles) = &mut self.textures {
+                let plan = image.pixel_update_plan(Some(&self.revision));
+                let updated = if rebuild_layout {
+                    tiles.mark_damage(plan.damage());
+                    Some(true)
+                } else {
+                    tiles.layout = visible_layout;
+                    plan.raster_regions().and_then(|bounds| {
+                        tiles.update_clipped_regions(queue, image, scratch, bounds)
+                    })
+                };
+                if let Some(updated) = updated {
+                    if updated {
+                        self.revision = image.pixel_revision();
+                    }
+                    return updated;
+                }
+                plan.render(scratch)
+            } else {
+                image.pixel_updates(Some(&self.revision), scratch)
+            };
+            let Some(updates) = updates else {
                 return false;
             };
-            if let ImageTextures::Tiled(tiles) = &mut self.textures {
-                if rebuild_layout && matches!(updates, GraphicsPixelUpdates::Rasterize) {
-                    for tile in &mut tiles.tiles {
-                        tile.damage = TileDamage::Full;
-                    }
-                    self.revision = image.pixel_revision();
-                    return true;
-                }
-                tiles.layout = visible_layout;
-            }
             let mut write = |update: &GraphicsPixelUpdate<'_>| {
                 if !update.size.contains(&0) {
                     self.textures.write(
@@ -89,7 +100,6 @@ impl CachedImage {
                         update.bytes,
                         update.bytes_per_row,
                         self.format.bytes_per_pixel(),
-                        rebuild_layout,
                     );
                 }
             };
@@ -119,6 +129,7 @@ struct PreparedImages {
     geometry: GridGeometry,
     stamp: Option<GraphicsStamp>,
     texture_stamp: TextureStamp,
+    animation_membership: Option<u64>,
     rejected: usize,
 }
 
@@ -268,7 +279,7 @@ impl ImageTextureResources {
         let (width, height) = image.dimensions();
         let bytes_per_pixel = format.bytes_per_pixel();
         tiles.write(
-            Some(queue),
+            queue,
             PixelRegion {
                 origin: [0, 0],
                 size: [width, height],
@@ -467,6 +478,7 @@ impl ImageRenderer {
             let prepared = self.prepared.as_mut().expect("A layout was prepared");
             prepared.texture_stamp = texture_stamp;
             prepared.stamp = stamp;
+            prepared.animation_membership = store.animation_membership();
             let rejected = prepared.rejected;
             self.update_palette(queue, frame);
             return rejected;
@@ -480,6 +492,7 @@ impl ImageRenderer {
             geometry: frame.geometry,
             stamp,
             texture_stamp,
+            animation_membership: store.animation_membership(),
             rejected,
         });
         rejected
@@ -491,14 +504,17 @@ impl ImageRenderer {
         store: &GraphicsImageStore,
         same_sources: bool,
     ) -> bool {
-        let visible = if same_sources {
-            let membership = store.animation_membership();
+        let membership = store.animation_membership();
+        let might_have_retired = self.prepared.as_ref().is_some_and(|prepared| {
+            prepared.animation_membership.is_some() && prepared.animation_membership != membership
+        });
+        let visible = if same_sources && !might_have_retired {
             if self.animation_membership != membership {
                 self.rebuild_visible_animations(store, membership);
             }
             &self.visible_animations
         } else {
-            // A source change can invalidate a static image's draw bindings.
+            // Source changes can invalidate bindings, and retired animations can restore pixels.
             &self.visible_images
         };
         for &key in visible {

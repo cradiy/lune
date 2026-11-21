@@ -294,6 +294,41 @@ fn kitty_partial_uploads_resume_in_their_own_screen_buffer() {
 }
 
 #[test]
+fn kitty_scaled_placements_hit_only_the_cells_they_cover() {
+    let data = "/wAA".repeat(30 * 30);
+    for (cell_width, cell_height, placement, axis, span) in [
+        (5, 3, "c=3,h=29", 'y', 5),
+        (3, 5, "r=3,h=29", 'x', 5),
+        (5, 3, "c=3,h=30", 'y', 6),
+    ] {
+        let mut session = session_with_size(
+            b"",
+            PtySize {
+                pixel_width: 16 * cell_width,
+                pixel_height: 12 * cell_height,
+                ..PtySize::new(12, 16)
+            },
+        );
+        let wire = format!(
+            "\x1b_Ga=T,i=1,f=24,s=30,v=30,x=1,w=29,C=1,q=2,{placement};{data}\x1b\\\x1b_Ga=d,d={axis},{axis}={}\x1b\\",
+            span + 1
+        );
+        session
+            .processor
+            .advance(wire.as_bytes(), &mut session.screen, &mut session.writer)
+            .unwrap();
+        assert_eq!(session.screen().graphics_placements().len(), 1);
+
+        let wire = format!("\x1b_Ga=d,d={axis},{axis}={span}\x1b\\");
+        session
+            .processor
+            .advance(wire.as_bytes(), &mut session.screen, &mut session.writer)
+            .unwrap();
+        assert!(session.screen().graphics_placements().is_empty());
+    }
+}
+
+#[test]
 fn kitty_placements_use_the_final_cursor_and_replace_atomically() {
     let size = PtySize {
         pixel_width: 16,
@@ -353,13 +388,26 @@ fn kitty_placements_use_the_final_cursor_and_replace_atomically() {
     let retry = tracker.prepare(&frame, now).unwrap();
     assert!(retry.damage().graphics_changed);
     retry.commit();
+    let unchanged = tracker.prepare(&frame, now).unwrap();
+    assert!(!unchanged.damage().graphics_changed);
+    unchanged.commit();
+
+    let stamp = frame.graphics_stamp();
+    session.transport.source = Cursor::new(b"\x1b_Ga=p,i=7,p=5\x1b\\");
+    session.pump().unwrap();
+    let frame = session.presentation_frame().unwrap();
+    assert_eq!(frame.graphics_stamp(), stamp);
+    let prepared = tracker.prepare(&frame, now).unwrap();
+    assert!(!prepared.damage().graphics_changed);
+    assert_eq!(session.screen().cursor().row, 2);
+    assert_eq!(session.screen().cursor().column, 2);
     assert!(
-        !tracker
-            .prepare(&frame, now)
-            .unwrap()
-            .damage()
-            .graphics_changed
+        session
+            .transport
+            .written
+            .ends_with(b"\x1b_Gi=7,p=5;OK\x1b\\")
     );
+    prepared.commit();
 
     session.transport.source = Cursor::new(b"\x1b[?1049h\x1b_Ga=p,i=7,C=1,q=1\x1b\\\x1b[?1049l");
     session.pump().unwrap();
@@ -446,7 +494,7 @@ fn kitty_history_preserves_visible_fragments_until_their_rows_are_evicted() {
 }
 
 #[test]
-fn kitty_images_follow_top_region_scrollback_past_a_fixed_status_row() {
+fn kitty_placeholders_follow_top_region_scrollback_past_a_fixed_status_row() {
     let size = PtySize {
         pixel_width: 16,
         pixel_height: 10,
@@ -458,7 +506,7 @@ fn kitty_images_follow_top_region_scrollback_past_a_fixed_status_row() {
             "\x1b_Ga=T,i=42,U=1,c=1,r=1,s=1,v=1,q=2;AP8A/w==\x1b\\",
             "\x1b[1;4H\x1b[38;5;42m\u{10eeee}\x1b[0m",
             "\x1b[4;6H\x1b_Ga=T,i=3,s=1,v=1,r=2,C=1,q=2;AAD//w==\x1b\\",
-            "\x1b[5;1HSTATUS\x1b[4;1H\x1bD",
+            "\x1b[5;1HSTATUS",
         )
         .as_bytes(),
         size,
@@ -470,15 +518,19 @@ fn kitty_images_follow_top_region_scrollback_past_a_fixed_status_row() {
         })
         .unwrap();
     session.pump().unwrap();
-    assert!(session.scroll_history(1));
-    let frame = session.presentation_frame().unwrap();
-    let anonymous = frame
+    let key = session
+        .screen()
         .graphics_placements()
         .iter()
         .find(|image| image.placement.image.id() == 0)
-        .unwrap();
-    let key = anonymous.placement.image;
-    assert_eq!(anonymous.row, -1);
+        .unwrap()
+        .placement
+        .image;
+    session.transport.source = Cursor::new(b"\x1b[4;1H\x1bD");
+    session.pump().unwrap();
+    assert!(session.scroll_history(1));
+    let frame = session.presentation_frame().unwrap();
+    assert!(frame.image_store().source_revision(key).is_none());
 
     session.transport.source = Cursor::new(b"\x1b[S");
     session.pump().unwrap();
@@ -487,12 +539,6 @@ fn kitty_images_follow_top_region_scrollback_past_a_fixed_status_row() {
     let top = frame.viewport.row(0).unwrap();
     assert_eq!(top.text(0), Some(CellText::Scalar('A')));
     assert_eq!(top.text(3), Some(CellText::Scalar('\u{10eeee}')));
-    assert!(
-        frame
-            .graphics_placements()
-            .iter()
-            .any(|placement| { placement.placement.image == key && placement.row == -2 })
-    );
     assert!(
         frame
             .graphics_placements()
@@ -523,7 +569,7 @@ fn kitty_unscroll_restores_images_with_their_anchored_rows() {
     };
     let mut session = session_with_size(
         concat!(
-            "\x1b[1;4rA\x1b_Ga=T,i=1,p=1,s=1,v=1,C=1,q=2;/wAA/w==\x1b\\",
+            "\x1b[1;5rA\x1b_Ga=T,i=1,p=1,s=1,v=1,C=1,q=2;/wAA/w==\x1b\\",
             "\x1b_Ga=T,i=3,P=1,Q=1,H=1,s=1,v=1,q=2;AAD//w==\x1b\\",
             "\x1b_Ga=T,i=42,U=1,c=1,r=1,s=1,v=1,q=2;AP8A/w==\x1b\\",
             "\x1b[1;4H\x1b[38;5;42m\u{10eeee}\x1b[0m",
@@ -564,7 +610,7 @@ fn kitty_unscroll_restores_images_with_their_anchored_rows() {
             Some(CellText::Scalar(live))
         );
         assert_eq!(
-            session.screen().grid().row(4).unwrap().text(0),
+            session.screen().grid().row(4 - offset).unwrap().text(0),
             Some(CellText::Scalar('S'))
         );
     }
@@ -737,6 +783,57 @@ fn kitty_cropped_span_can_scroll_at_the_restored_cell_size() {
 }
 
 #[test]
+fn kitty_top_aligned_partial_scroll_clips_images_while_retaining_text_history() {
+    let mut session = session_with_size(
+        concat!(
+            "\x1b[1;8H\x1b_Ga=T,i=1,f=24,s=1,v=1,C=1,q=2;////\x1b\\\x1b[S",
+            "\x1b[1;3r\x1b[HT\x1b[H",
+            "\x1b_Ga=T,i=2,f=24,s=1,v=4,C=1,q=2;/wAAAP8AAAD///8A\x1b\\",
+            "\x1b[3;4H\x1b_Ga=T,i=3,f=24,s=1,v=4,C=1,q=2;////////////////\x1b\\",
+            "\x1b[3;1H\x1bD",
+        )
+        .as_bytes(),
+        PtySize {
+            pixel_width: 16,
+            pixel_height: 10,
+            ..PtySize::new(5, 8)
+        },
+    );
+    session
+        .set_history_limits(HistoryLimits {
+            max_rows: 4,
+            max_bytes: 4096,
+        })
+        .unwrap();
+    session.pump().unwrap();
+    let [history, cropped, crossing] = session.screen().graphics_placements() else {
+        panic!("Expected history, cropped, and crossing placements");
+    };
+    assert_eq!(session.screen().history().len(), 2);
+    assert_eq!(
+        session.screen().view().iter_rows().nth(1).unwrap().text(0),
+        Some(CellText::Scalar('T'))
+    );
+    assert_eq!(history.row, -2);
+    let layout = cropped.layout(pixels(2, 2));
+    assert_eq!(
+        (cropped.row, layout.source_origin[1], layout.size[1]),
+        (0, 2.0, 2.0)
+    );
+    assert_eq!(
+        (crossing.row, crossing.layout(pixels(2, 2)).size[1]),
+        (2, 4.0)
+    );
+
+    session.transport.source = Cursor::new(b"\x1b[S");
+    session.pump().unwrap();
+    let [history, crossing] = session.screen().graphics_placements() else {
+        panic!("Expected the history and crossing placements");
+    };
+    assert_eq!((history.row, crossing.row), (-3, 2));
+}
+
+#[test]
 fn kitty_delete_preserves_surviving_references_and_cancels_pending_uploads() {
     let mut session = session(
         concat!(
@@ -862,6 +959,8 @@ fn kitty_numbered_images_use_the_newest_live_id() {
 
     session.transport.source = Cursor::new(
         concat!(
+            "\x1b_Ga=p,I=13,p=9,P=900,Q=1,q=1\x1b\\",
+            "\x1b_Ga=p,I=13,p=9,P=900,Q=1,q=2\x1b\\",
             "\x1b_Ga=d,d=N,I=13,q=3\x1b\\",
             "\x1b_Ga=d,d=F,i=1,I=13,q=2\x1b\\",
             "\x1b_Ga=q,i=3,I=0,s=1,v=1;/////w==\x1b\\",
@@ -875,6 +974,7 @@ fn kitty_numbered_images_use_the_newest_live_id() {
     assert_eq!(
         session.transport.written,
         concat!(
+            "\x1b_GI=13,p=9;ENOPARENT:Parent placement missing\x1b\\",
             "\x1b_GI=13;EINVAL:Invalid image data\x1b\\",
             "\x1b_Gi=3;OK\x1b\\",
         )
@@ -883,6 +983,7 @@ fn kitty_numbered_images_use_the_newest_live_id() {
     let [placement] = session.screen().graphics_placements() else {
         panic!("Expected the original placement")
     };
+    assert_eq!(placement.placement.image.id(), 3);
     assert_eq!(placement.placement.id, 9);
     assert_eq!(
         session
@@ -945,19 +1046,28 @@ fn kitty_numbered_images_use_the_newest_live_id() {
 }
 
 #[test]
-fn kitty_frame_transfer_replies_identify_the_upload_on_success_and_failure() {
+fn kitty_animation_replies_identify_requests_and_transferred_frames() {
     let mut session = session(
         concat!(
             "\x1b_GI=17,f=24,s=1,v=1;/wAA\x1b\\",
             "\x1b_GI=17,f=24,s=1,v=1;AAD/\x1b\\",
             "\x1b_Ga=f,I=17,p=21,f=24,s=1,v=1,m=1;AP8A\x1b\\",
+            "\x1b_Ga=q,i=41,e=c,r=1,c=2,w=3,X=1,C=1,U=1,m=1;%ignored\x1b\\",
+            "\x1b_Ga=q,i=42,e=T,U=1,q=1;%ignored\x1b\\",
             "\x1b_Ga=f,m=0;\x1b\\",
             "\x1b_Ga=f,I=17,r=999,f=32,s=1,v=1,m=1;AAAA\x1b\\",
             "\x1b_Ga=f,m=0;\x1b\\",
             "\x1b_Ga=f,I=17,r=999,f=24,s=10001,v=1;AA==\x1b\\",
             "\x1b_Ga=f,I=17,r=3,c=99,f=24,s=1,v=1;AAAA\x1b\\",
             "\x1b_Ga=f,i=99,r=123,f=24,s=1,v=1;AAAA\x1b\\",
+            "\x1b_Ga=f,i=99,I=17,r=4\x1b\\",
             "\x1b_Ga=c,I=17,r=2,c=1\x1b\\",
+            "\x1b_Ga=c,i=99,r=4,c=1\x1b\\",
+            "\x1b_Ga=a,i=99,r=4,q=1\x1b\\",
+            "\x1b_Ga=a,I=99,r=4,q=1\x1b\\",
+            "\x1b_Ga=a,I=99,r=4,q=2\x1b\\",
+            "\x1b_Ga=a,i=99,I=17,r=4\x1b\\",
+            "\x1b_Ga=a,I=17,r=1\x1b\\",
             "\x1b_Ga=f,i=2,p=22,r=3,f=24,s=1,v=1;////\x1b\\",
         )
         .as_bytes(),
@@ -969,15 +1079,29 @@ fn kitty_frame_transfer_replies_identify_the_upload_on_success_and_failure() {
         concat!(
             "\x1b_Gi=1,I=17;OK\x1b\\",
             "\x1b_Gi=2,I=17;OK\x1b\\",
+            "\x1b_Gi=41,e=c,r=1,c=2,w=3,X=1,C=1;OK\x1b\\",
             "\x1b_GI=17,r=2;OK\x1b\\",
             "\x1b_GI=17,r=3;ENODATA:Insufficient image data\x1b\\",
             "\x1b_GI=17,r=3;EINVAL:Invalid image data\x1b\\",
             "\x1b_GI=17,r=3;EINVAL:Animation base frame not found\x1b\\",
             "\x1b_Gi=99,r=123;ENOENT:Image not found\x1b\\",
+            "\x1b_Gi=99,I=17,r=4;EINVAL:Invalid image data\x1b\\",
             "\x1b_GI=17;OK\x1b\\",
+            "\x1b_Gi=99;ENOENT:Image not found\x1b\\",
+            "\x1b_Gi=99,r=4;ENOENT:Image not found\x1b\\",
+            "\x1b_GI=99,r=4;ENOENT:Image not found\x1b\\",
+            "\x1b_Gi=99,I=17,r=4;EINVAL:Invalid image data\x1b\\",
             "\x1b_Gi=2,p=22,r=3;OK\x1b\\",
         )
         .as_bytes()
+    );
+    assert_eq!(
+        session
+            .graphics_image(2)
+            .unwrap()
+            .pixels(&mut Vec::new())
+            .unwrap(),
+        &[0, 255, 0, 255]
     );
 }
 
@@ -1015,18 +1139,26 @@ fn kitty_relative_placements_follow_parent_replacement_and_release_descendants()
 
     session.transport.source = Cursor::new(
         concat!(
+            "\x1b_Ga=T,i=25,p=5,P=20,Q=1,H=1,s=1,v=1,q=1;AAAA/w==\x1b\\",
             "\x1b_Ga=p,i=21,p=2,P=20,Q=1,V=1,q=1\x1b\\",
-            "\x1b[2;5H\x1b_Ga=p,i=20,p=1,z=2,C=1,q=1\x1b\\",
         )
         .as_bytes(),
     );
     session.pump().unwrap();
-    assert_eq!(points(&session), [(4, 2), (6, 1), (4, 1)]);
+    assert_eq!(points(&session), [(4, 1), (4, 2), (6, 1), (5, 1)]);
+
+    session.transport.source = Cursor::new(b"\x1b[2;6H\x1b_Ga=p,i=20,p=1,C=1,q=1\x1b\\");
+    session.pump().unwrap();
+    assert_eq!(points(&session), [(5, 1), (5, 2), (7, 1), (6, 1)]);
+
+    session.transport.source = Cursor::new(b"\x1b_Ga=p,i=20,p=1,z=2,C=1,q=1\x1b\\");
+    session.pump().unwrap();
+    assert_eq!(points(&session), [(5, 2), (7, 1), (6, 1), (5, 1)]);
     assert_eq!(
-        session.screen().graphics_placements()[2].serial(),
+        session.screen().graphics_placements()[3].serial(),
         root_serial
     );
-    assert_eq!(session.screen().graphics_placements()[2].placement.z, 2);
+    assert_eq!(session.screen().graphics_placements()[3].placement.z, 2);
 
     session.transport.source = Cursor::new(
         concat!(
@@ -1041,6 +1173,7 @@ fn kitty_relative_placements_follow_parent_replacement_and_release_descendants()
     assert!(session.graphics_image(20).is_some());
     assert!(session.graphics_image(21).is_none());
     assert!(session.graphics_image(22).is_none());
+    assert!(session.graphics_image(25).is_none());
 
     session.transport.source =
         Cursor::new(b"\x1b[3;2H\x1b_Ga=T,i=19,s=1,v=1,C=1,q=1;AAAA/w==\x1b\\\x1b[S");
@@ -2034,6 +2167,112 @@ fn kitty_images_compose_in_an_offscreen_wgpu_pass() {
         )
         .as_bytes(),
     );
+    {
+        let mut renderer = crate::ImageRenderer::new(&device, format);
+        let mut render = |tiled: &Session<Transport>| {
+            let frame = tiled.presentation_frame().unwrap();
+            assert_eq!(renderer.prepare(&device, &queue, &frame), 0);
+            read_frame(&renderer)
+        };
+        for wire in [near.as_slice(), far] {
+            send(&mut tiled, wire);
+            assert_eq!(pixel(&render(&tiled), 0, 0), [0, 0, 0, 255]);
+        }
+        for wire in [
+            concat!(
+                "\x1b_Ga=f,i=47,c=1,f=24,x=4,y=4,s=1,v=1,X=1,q=2;/wAA\x1b\\",
+                "\x1b_Ga=a,i=47,c=2,q=2\x1b\\",
+            )
+            .as_bytes(),
+            b"\x1b_Ga=f,i=47,r=2,f=24,x=120,y=120,s=1,v=1,X=1,q=2;AP8A\x1b\\",
+            b"\x1b_Ga=f,i=47,r=2,f=24,x=5,y=4,s=1,v=1,X=1,q=2;AAD/\x1b\\",
+        ] {
+            send(&mut tiled, wire);
+            assert_eq!(pixel(&render(&tiled), 0, 0), [0, 0, 0, 255]);
+        }
+        send(
+            &mut tiled,
+            concat!(
+                "\x1b_Ga=p,i=47,p=7,x=4,y=4,w=2,h=1,C=1,q=2\x1b\\",
+                "\x1b[1;2H\x1b_Ga=p,i=47,p=8,x=120,y=120,w=1,h=1,C=1,q=2\x1b\\",
+            )
+            .as_bytes(),
+        );
+        let revealed = render(&tiled);
+        assert_eq!(pixel(&revealed, 0, 0), [255, 0, 0, 255]);
+        assert_eq!(pixel(&revealed, 1, 0), [0, 0, 255, 255]);
+        assert_eq!(pixel(&revealed, 2, 0), [0, 255, 0, 255]);
+        assert!(renderer.pixel_scratch_capacity() <= 8);
+        send(
+            &mut tiled,
+            b"\x1b_Ga=d,d=f,i=47,r=2\x1b\\\x1b_Ga=d,d=i,i=47\x1b\\\x1b[1;1H",
+        );
+    }
+    for move_crop in [false, true] {
+        let mut renderer = crate::ImageRenderer::new(&device, format);
+        let mut render = |wire: &[u8]| {
+            send(&mut tiled, wire);
+            let frame = tiled.presentation_frame().unwrap();
+            assert_eq!(renderer.prepare(&device, &queue, &frame), 0);
+            (
+                pixel(&read_frame(&renderer), 0, 0),
+                renderer.pixel_scratch_capacity(),
+            )
+        };
+        for wire in [near.as_slice(), far] {
+            assert_eq!(render(wire), ([0, 0, 0, 255], 0));
+        }
+        if move_crop {
+            assert_eq!(render(near), ([0, 0, 0, 255], 0));
+        }
+        let wire = format!(
+            "\x1b_Ga=f,i=47,c=1,x=4,y=4,s=27,v=27,q=2;{}\x1b\\\x1b_Ga=a,i=47,c=2,q=2\x1b\\{}",
+            "/wAAgP8AAID/AACA".repeat(243),
+            if move_crop {
+                str::from_utf8(far).unwrap()
+            } else {
+                ""
+            },
+        );
+        assert_eq!(render(wire.as_bytes()), ([0, 0, 0, 255], 0));
+        assert_eq!(
+            render(b"\x1b_Ga=p,i=47,p=7,x=4,y=4,w=1,h=1,C=1,q=2\x1b\\").0,
+            [128, 0, 0, 255],
+        );
+        send(
+            &mut tiled,
+            b"\x1b_Ga=d,d=f,i=47,r=2\x1b\\\x1b_Ga=d,d=i,i=47\x1b\\",
+        );
+    }
+    {
+        let mut renderer = crate::ImageRenderer::new(&device, format);
+        let mut render = |wire: &[u8]| {
+            send(&mut tiled, wire);
+            let frame = tiled.presentation_frame().unwrap();
+            assert_eq!(renderer.prepare(&device, &queue, &frame), 0);
+            (
+                pixel(&read_frame(&renderer), 0, 0),
+                renderer.pixel_scratch_capacity(),
+            )
+        };
+        let left = b"\x1b_Ga=p,i=47,p=7,x=125,y=4,w=1,h=1,C=1,q=2\x1b\\";
+        let right = b"\x1b_Ga=p,i=47,p=7,x=128,y=4,w=1,h=1,C=1,q=2\x1b\\";
+        for wire in [left, right, left] {
+            assert_eq!(render(wire), ([0, 0, 0, 255], 0));
+        }
+        let wire = format!(
+            "\x1b_Ga=f,i=47,c=1,x=125,y=4,s=4,v=27,q=2;{}\x1b\\\x1b_Ga=a,i=47,c=2,q=2\x1b\\",
+            "/wAAgP8AAID/AACA".repeat(36),
+        );
+        let (pixel, scratch) = render(wire.as_bytes());
+        assert_eq!(pixel, [128, 0, 0, 255]);
+        assert!(scratch <= 2 * 27 * 4, "Scratch capacity was {scratch}");
+        assert_eq!(render(right).0, [128, 0, 0, 255]);
+        send(
+            &mut tiled,
+            b"\x1b_Ga=d,d=f,i=47,r=2\x1b\\\x1b_Ga=d,d=i,i=47\x1b\\",
+        );
+    }
     let reference = rows.concat();
     let wire = format!(
         concat!(
@@ -2186,6 +2425,35 @@ fn kitty_images_compose_in_an_offscreen_wgpu_pass() {
         );
         read_frame(renderer)
     };
+    let mut overlap = session_with_size(
+        concat!(
+            "\x1b]4;11;#0000ff\x07",
+            "\x1b_Ga=T,i=4294967295,p=1,f=16,s=1,v=1,C=1,q=2;C4A=\x1b\\",
+            "\x1b_Ga=T,i=2,f=24,s=1,v=1,C=1,q=2;/wAA\x1b\\",
+        )
+        .as_bytes(),
+        size,
+    );
+    overlap.pump().unwrap();
+    let blended = pixel(&draw(&mut renderer, &overlap), 0, 0);
+    assert!(
+        blended
+            .into_iter()
+            .zip([187, 0, 188, 255])
+            .all(|(actual, expected)| actual.abs_diff(expected) <= 1)
+    );
+    for (wire, expected) in [
+        (
+            b"\x1b_Ga=p,i=4294967295,p=1,z=-1,C=1,q=2\x1b\\".as_slice(),
+            [255, 0, 0, 255],
+        ),
+        (b"\x1b_Ga=p,i=4294967295,p=1,z=0,C=1,q=2\x1b\\", blended),
+    ] {
+        overlap.transport.source = Cursor::new(wire);
+        overlap.pump().unwrap();
+        assert_eq!(pixel(&draw(&mut renderer, &overlap), 0, 0), expected);
+    }
+
     let mut below_screen = session_with_size(
         concat!(
             "\x1b[4;1H\x1b_Ga=T,i=51,p=1,s=1,v=1,C=1,q=2;/wAA/w==\x1b\\",
@@ -2331,6 +2599,29 @@ fn kitty_images_compose_in_an_offscreen_wgpu_pass() {
             assert_eq!(renderer.cached_texture(key), Some(&primary_texture));
         }
     }
+
+    let mut temporary_animation = session_with_size(
+        concat!(
+            "\x1b_Ga=T,i=59,f=24,s=1,v=1,C=1,q=2;/wAA\x1b\\",
+            "\x1b_Ga=f,i=59,f=24,s=1,v=1,q=2;AAD/\x1b\\",
+            "\x1b_Ga=a,i=59,c=2\x1b\\",
+        )
+        .as_bytes(),
+        size,
+    );
+    temporary_animation.pump().unwrap();
+    let key = temporary_animation.screen().graphics_placements()[0]
+        .placement
+        .image;
+    assert_eq!(
+        pixel(&draw(&mut renderer, &temporary_animation), 0, 0),
+        blue
+    );
+    let texture = renderer.cached_texture(key).unwrap().clone();
+    temporary_animation.transport.source = Cursor::new(b"\x1b_Ga=d,d=f,i=59,r=2\x1b\\");
+    temporary_animation.pump().unwrap();
+    assert_eq!(pixel(&draw(&mut renderer, &temporary_animation), 0, 0), red);
+    assert_eq!(renderer.cached_texture(key), Some(&texture));
 
     for inactive in [false, true] {
         let mut anonymous = session_with_size(

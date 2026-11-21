@@ -100,6 +100,75 @@ fn quota_and_query_preserve_stored_pixels() {
 }
 
 #[test]
+fn quota_evicts_the_shortest_priority_prefix_after_placement_succeeds() {
+    let mut images = ImageStore::new(28, 6);
+    let wire = concat!(
+        "\x1b_Ga=T,i=1,s=1,v=1;AAAA/w==\x1b\\",
+        "\x1b_Ga=T,i=2,N=1,s=1,v=1;AAAA/w==\x1b\\",
+        "\x1b_Ga=T,i=3,s=2,v=1;AAAA/wAAAP8=\x1b\\",
+        "\x1b_Ga=T,i=4,N=1,s=1,v=1;AAAA/w==\x1b\\",
+        "\x1b_Ga=T,i=5,s=1,v=1;AAAA/w==\x1b\\",
+        "\x1b_Ga=T,i=6,s=1,v=1;AAAA/w==\x1b\\",
+    );
+    let mut keys = Vec::new();
+    feed(wire.as_bytes(), 7, |command| {
+        let reply = images.receive(command.unwrap(), |change| {
+            let ImageChange::Place { placement, .. } = change else {
+                panic!("Expected an initial placement");
+            };
+            keys.push(placement.image);
+            Ok(())
+        });
+        assert_eq!(reply.unwrap().message, b"OK");
+    });
+
+    let receive = |images: &mut ImageStore, accept: bool| {
+        let mut reply = None;
+        feed(
+            b"\x1b_Ga=T,i=7,P=6,f=24,s=3,v=1;/wAA/wAA/wAA\x1b\\",
+            7,
+            |command| {
+                reply = images.receive(command.unwrap(), |change| match change {
+                    ImageChange::RankEvictions { ranking, .. } => {
+                        ranking.mark_placed(keys[0])?;
+                        ranking.mark_placed(keys[1])?;
+                        ranking.protect(keys[5])?;
+                        if !accept {
+                            ranking.mark_placed(keys[3])?;
+                            ranking.protect(keys[2])?;
+                        }
+                        Ok(())
+                    }
+                    ImageChange::Place { evicted, .. } => {
+                        if accept {
+                            assert_eq!(evicted, &[keys[2], keys[3]]);
+                            Ok(())
+                        } else {
+                            assert_eq!(evicted, &[keys[1], keys[3], keys[4]]);
+                            Err(PlacementError::InvalidRegion)
+                        }
+                    }
+                    ImageChange::Remove { .. } => panic!("Expected a placement"),
+                });
+            },
+        );
+        reply.unwrap().message
+    };
+    let before = images.storage_revision();
+    assert_eq!(
+        receive(&mut images, false),
+        b"EINVAL:Invalid placement region"
+    );
+    assert_eq!(images.storage_revision(), before);
+    assert!((1..=6).all(|id| images.get(id).is_some()));
+    assert!(images.get(7).is_none());
+
+    assert_eq!(receive(&mut images, true), b"OK");
+    let retained: Vec<_> = (1..=7).filter(|&id| images.get(id).is_some()).collect();
+    assert_eq!(retained, [1, 2, 5, 6, 7]);
+}
+
+#[test]
 fn numbered_images_follow_committed_replacement_and_eviction() {
     let mut images = ImageStore::new(8, 2);
     let mut protected = None;
@@ -428,6 +497,41 @@ fn animation_base_edits_follow_live_links_and_deletion_freezes_dependents() {
         receive(b"\x1b_Ga=d,d=F,i=1,r=1\x1b\\\x1b_Ga=f,i=1,r=1,f=24,s=1,v=1,X=1;/wD/\x1b\\"),
         [255, 0, 0, 255, 255, 255, 255, 255, 255, 255, 255, 255],
     );
+}
+
+#[test]
+fn temporary_animation_releases_its_state_when_the_original_frame_remains() {
+    let mut images = ImageStore::new(4096, 1);
+    let apply = |images: &mut ImageStore, wire: &[u8]| {
+        feed(wire, 5, |command| {
+            let command = command.unwrap();
+            if let Some(delete) = command.decode_delete() {
+                images.delete_frame(delete.unwrap(), |_| Ok(()));
+            } else if let Some(reply) = images.receive(command, |_| Ok(())) {
+                assert_eq!(reply.message, b"OK");
+            }
+        });
+    };
+    apply(
+        &mut images,
+        b"\x1b_Gi=1,f=24,s=1,v=1;/wAA\x1b\\\x1b_Ga=a,i=1,c=1\x1b\\",
+    );
+    assert_eq!(images.animation_membership(), None);
+    let upload = b"\x1b_Ga=f,i=1,f=24,s=1,v=1;AAD/\x1b\\\x1b_Ga=a,i=1,c=2\x1b\\";
+    let delete = b"\x1b_Ga=d,d=f,i=1,r=2\x1b\\";
+    apply(&mut images, upload);
+    assert!(images.animation_membership().is_some());
+    apply(&mut images, delete);
+    assert_eq!(images.animation_membership(), None);
+    assert_eq!(
+        images.get(1).unwrap().pixels(&mut Vec::new()).unwrap(),
+        [255, 0, 0, 255]
+    );
+
+    apply(&mut images, b"\x1b_Ga=a,i=1,v=2\x1b\\");
+    apply(&mut images, upload);
+    apply(&mut images, delete);
+    assert!(images.animation_membership().is_some());
 }
 
 #[test]
@@ -932,6 +1036,8 @@ fn zlib_checks_stream_boundaries_and_png_expands_paletted_alpha() {
 
 #[test]
 fn rejected_png_uploads_preserve_the_existing_image() {
+    use std::io::Write as _;
+
     let mut images = ImageStore::new(4, 1);
     let mut receive = |wire: &str| {
         let mut reply = None;
@@ -962,11 +1068,26 @@ fn rejected_png_uploads_preserve_the_existing_image() {
     assert_eq!(message, b"ENOMEM:PNG image is too large");
     assert_eq!(retained, original);
 
-    let (message, replaced) = receive(concat!(
-        "\x1b_Gi=1,f=100;",
-        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACklEQVR4nGM44NBwAAAFqPLXkQAAAANJREFUhQJBLdmETQAAAABJRU5ErkJggg==",
-        "\x1b\\",
-    ));
+    let png = PAYLOAD_ENGINE
+        .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACklEQVR4nGM44NBwAAAFqPLXkQAAAANJREFUhQJBLdmETQAAAABJRU5ErkJggg==")
+        .unwrap();
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+    encoder.write_all(&png).unwrap();
+    let compressed = encoder.finish().unwrap();
+    let size = png.len();
+    let payload = PAYLOAD_ENGINE.encode(&compressed);
+    let truncated = PAYLOAD_ENGINE.encode(&compressed[..compressed.len() - 1]);
+    for (size, payload) in [
+        (0, &payload),
+        (size - 1, &payload),
+        (size + 1, &payload),
+        (size, &truncated),
+    ] {
+        let (message, retained) = receive(&format!("\x1b_Gi=1,f=100,o=z,S={size};{payload}\x1b\\"));
+        assert_eq!(message, b"EINVAL:Invalid image data");
+        assert_eq!(retained, original);
+    }
+    let (message, replaced) = receive(&format!("\x1b_Gi=1,f=100,o=z,S={size};{payload}\x1b\\"));
     assert_eq!(message, b"OK");
     assert_ne!(replaced, original);
     assert_eq!(
@@ -1458,6 +1579,28 @@ fn local_transfers_use_checked_ranges_and_unlink_only_tagged_temp_files() {
         &[255, 0, 0, 255]
     );
     assert!(!temporary.exists());
+
+    let pixel_count = 64 * 32;
+    let mut ranged = vec![0; 7];
+    ranged.extend((0..pixel_count).flat_map(|_| [9, 32, 81]));
+    ranged.push(0);
+    fs::write(&file, ranged).unwrap();
+    let mut images = ImageStore::new(pixel_count * 4, 1);
+    let controls = format!("i=1,t=f,f=24,s=64,v=32,O=7,S={}", pixel_count * 3);
+    assert_eq!(
+        local_reply(&mut images, &controls, &b(&file)).message,
+        b"OK"
+    );
+    let mut scratch = Vec::new();
+    let pixels = images.get(1).unwrap().pixels(&mut scratch).unwrap();
+    assert_eq!(pixels.len(), pixel_count * 4);
+    assert!(
+        pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|&pixel| pixel == [9, 32, 81, 255])
+    );
 }
 
 #[cfg(target_os = "linux")]
@@ -1527,9 +1670,10 @@ fn payload_bounds_and_nonfinal_block_alignment_are_enforced() {
     );
     assert!(output.iter().all(|&byte| byte == 0));
 
+    let oversized = vec![b'A'; MAX_DIRECT_PAYLOAD_BYTES + 1];
     decoder.start();
     decoder.push(b"G;");
-    decoder.push(&[b'A'; MAX_DIRECT_PAYLOAD_BYTES + 1]);
+    decoder.push(&oversized);
     assert_eq!(
         decoder
             .finish()
@@ -1539,19 +1683,14 @@ fn payload_bounds_and_nonfinal_block_alignment_are_enforced() {
         Err(PayloadError::TooLong)
     );
 
-    decoder.start();
-    decoder.push(b"Ga=q,e=T,i=19;");
-    decoder.push(&[b'%'; INLINE_ENCODED_BYTES + 1]);
-    decoder.push(b"ignored");
-    assert!(
-        decoder
-            .finish()
-            .unwrap()
-            .unwrap()
-            .encoded_payload()
-            .unwrap()
-            .is_empty()
-    );
+    for payload in [b"%ignored", &first[..INLINE_ENCODED_BYTES + 1], &oversized] {
+        decoder.start();
+        decoder.push(b"Ga=q,e=T,i=19,m=2;");
+        decoder.push(payload);
+        let command = decoder.finish().unwrap().unwrap();
+        assert_eq!(command.encoded_payload(), Ok(&[][..]));
+        assert_eq!(command.decode_payload(&mut []), Ok(0));
+    }
 
     decoder.start();
     decoder.push(b"Gt=f;");

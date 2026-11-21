@@ -83,6 +83,7 @@ mod linux {
     use std::{
         ffi::{OsStr, OsString},
         fs::File,
+        io::{Read, Seek, SeekFrom},
         os::{
             fd::AsRawFd,
             unix::{
@@ -103,6 +104,7 @@ mod linux {
 
     const SHARED_DIRECTORY: &str = "/dev/shm";
     const TEMP_MARKER: &[u8] = b"tty-graphics-protocol";
+    const SMALL_READ_BYTES: usize = 4096;
 
     pub(super) fn read(
         source: LocalSource,
@@ -126,7 +128,7 @@ mod linux {
                 )
                 .ok()?;
                 let (file, stat, resolved) = readable(&fd)?;
-                let data = read_range(&file, &stat, &source, limit, fixed_capacity);
+                let data = read_range(file, &stat, &source, limit, fixed_capacity);
                 if matches!(source.medium, Medium::Temporary) {
                     unlink_temporary(&resolved, &stat);
                 }
@@ -161,7 +163,7 @@ mod linux {
                 )
                 .ok()?;
                 let (file, stat, _) = readable(&fd)?;
-                let data = read_range(&file, &stat, &source, limit, fixed_capacity);
+                let data = read_range(file, &stat, &source, limit, fixed_capacity);
                 if same_entry(&dir, entry, &stat) {
                     let _ = shm::unlink(name);
                 }
@@ -198,7 +200,7 @@ mod linux {
     }
 
     fn read_range(
-        file: &File,
+        mut file: File,
         stat: &Stat,
         source: &LocalSource,
         limit: usize,
@@ -223,9 +225,16 @@ mod linux {
         bytes
             .try_reserve_exact(fixed_capacity.unwrap_or(len))
             .ok()?;
-        bytes.resize(len, 0);
-        file.read_exact_at(&mut bytes, source.offset).ok()?;
-        Some(bytes)
+        if len <= SMALL_READ_BYTES {
+            bytes.resize(len, 0);
+            file.read_exact_at(&mut bytes, source.offset).ok()?;
+            return Some(bytes);
+        }
+        if source.offset != 0 {
+            file.seek(SeekFrom::Start(source.offset)).ok()?;
+        }
+        let read = file.take(len as u64).read_to_end(&mut bytes).ok()?;
+        (read == len).then_some(bytes)
     }
 
     fn same_entry(dir: &OwnedFd, entry: &OsStr, expected: &Stat) -> bool {

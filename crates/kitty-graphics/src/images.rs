@@ -10,8 +10,8 @@ use super::{
     INLINE_DECODED_BYTES, ImageChange, Placement, PlacementError, Value, control_keys,
 };
 use crate::animation::{
-    Animation, Canvas, FrameBudget, FrameComposition, FrameControl, FrameUpload, INDEXED,
-    LOAD_FIELDS, PixelRevision, Region,
+    Animation, Canvas, FrameBudget, FrameComposition, FrameControl, FrameDamage, FrameUpload,
+    INDEXED, LOAD_FIELDS, PixelRevision, Region,
 };
 use crate::pixels::{
     INVALID, ImageFormat, Inflater, PixelTransfer, Pixels, PngProfiles, QUOTA, UNSUPPORTED,
@@ -20,6 +20,7 @@ use crate::source::{BAD_SOURCE, LocalSource};
 
 mod quota;
 mod wakes;
+use quota::EvictionScratch;
 use wakes::AnimationWakes;
 
 static NEXT_IMAGE_REVISION: AtomicU64 = AtomicU64::new(1);
@@ -55,6 +56,71 @@ pub struct PixelUpdate<'a> {
     pub size: [u32; 2],
     pub bytes_per_row: u32,
     pub bytes: &'a [u8],
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PixelBounds {
+    pub origin: [u32; 2],
+    pub size: [u32; 2],
+}
+
+pub struct PixelUpdatePlan<'a> {
+    image: &'a Image,
+    damage: Option<FrameDamage<'a>>,
+}
+
+impl<'a> PixelUpdatePlan<'a> {
+    /// Returns up to two changed rectangles. None means a whole-frame update.
+    #[inline]
+    pub fn damage(&self) -> Option<[PixelBounds; 2]> {
+        Some(match self.damage.as_ref()? {
+            FrameDamage::Overwrite(update) => [
+                PixelBounds {
+                    origin: update.origin,
+                    size: update.size,
+                },
+                PixelBounds::default(),
+            ],
+            FrameDamage::Regions(regions) => regions.map(Region::bounds),
+        })
+    }
+
+    /// Returns changed rectangles that require rasterizing the current frame.
+    #[inline]
+    pub fn raster_regions(&self) -> Option<[PixelBounds; 2]> {
+        match self.damage.as_ref()? {
+            FrameDamage::Regions(regions)
+                if self.image.animation.as_ref()?.needs_rasterization() =>
+            {
+                Some(regions.map(Region::bounds))
+            }
+            FrameDamage::Overwrite(_) => None,
+            FrameDamage::Regions(_) => None,
+        }
+    }
+
+    #[inline]
+    pub fn render<'scratch>(self, scratch: &'scratch mut Vec<u8>) -> Option<PixelUpdates<'scratch>>
+    where
+        'a: 'scratch,
+    {
+        let regions = match self.damage {
+            Some(FrameDamage::Overwrite(update)) => return Some(PixelUpdates::One(update)),
+            Some(FrameDamage::Regions(regions)) => Some(regions),
+            None => None,
+        };
+        let image = self.image;
+        if let Some(animation) = &image.animation {
+            return animation
+                .render_updates(&image.bytes, image.dimensions(), regions, scratch)
+                .ok();
+        }
+        Some(PixelUpdates::One(PixelUpdate::full(
+            &image.bytes,
+            image.dimensions(),
+            image.format,
+        )))
+    }
 }
 
 pub enum PixelUpdates<'a> {
@@ -134,32 +200,31 @@ impl Image {
         )
     }
 
+    #[inline]
+    pub fn pixel_update_plan(&self, previous: Option<&PixelRevision>) -> PixelUpdatePlan<'_> {
+        let damage = previous.and_then(|previous| {
+            self.animation
+                .as_ref()?
+                .frame_damage(previous, self.revision)
+        });
+        PixelUpdatePlan {
+            image: self,
+            damage,
+        }
+    }
+
     /// Returns replacement pixels or a request to rasterize the current frame.
     pub fn pixel_updates<'a>(
         &'a self,
         previous: Option<&PixelRevision>,
         scratch: &'a mut Vec<u8>,
     ) -> Option<PixelUpdates<'a>> {
-        if let Some(animation) = &self.animation {
-            return animation
-                .pixel_updates(
-                    &self.bytes,
-                    self.dimensions(),
-                    self.revision,
-                    previous,
-                    scratch,
-                )
-                .ok();
-        }
-        Some(PixelUpdates::One(PixelUpdate::full(
-            &self.bytes,
-            self.dimensions(),
-            self.format,
-        )))
+        self.pixel_update_plan(previous).render(scratch)
     }
 
     fn update_animation(
         &mut self,
+        spare: &mut Option<Box<Animation>>,
         operation: impl FnOnce(&mut Animation, &[u8]) -> Result<(), &'static [u8]>,
     ) -> Result<(), &'static [u8]> {
         if self.format != ImageFormat::Rgba {
@@ -168,9 +233,21 @@ impl Image {
         if let Some(animation) = self.animation.as_mut() {
             return operation(animation, &self.bytes);
         }
+        if let Some(animation) = spare.as_mut() {
+            if let Err(error) = operation(animation, &self.bytes) {
+                *spare = None;
+                return Err(error);
+            }
+            if !animation.is_redundant() {
+                self.animation = spare.take();
+            }
+            return Ok(());
+        }
         let mut animation = Animation::default();
         operation(&mut animation, &self.bytes)?;
-        self.animation = Some(Box::new(animation));
+        if !animation.is_redundant() {
+            self.animation = Some(Box::new(animation));
+        }
         Ok(())
     }
 
@@ -273,6 +350,7 @@ pub struct ImageStore {
     storage_revision: u64,
     source_invalidation: Option<SourceInvalidation>,
     animation_wakes: AnimationWakes,
+    eviction_scratch: EvictionScratch,
 }
 
 impl ImageStore {
@@ -294,6 +372,7 @@ impl ImageStore {
             storage_revision: next_image_revision(),
             source_invalidation: None,
             animation_wakes: AnimationWakes::default(),
+            eviction_scratch: EvictionScratch::default(),
         }
     }
 
@@ -480,6 +559,7 @@ impl ImageStore {
         self.stored_bytes = 0;
         self.anonymous_images = 0;
         self.animation_wakes.clear();
+        self.eviction_scratch = EvictionScratch::default();
     }
 
     pub fn receive(
@@ -546,27 +626,45 @@ impl ImageStore {
                 || number_field.is_none()
                 || placement_field.is_none()
             {
-                return reply(id, image_number, placement_id, 0, quiet_value, Err(INVALID));
+                let frame_number = if matches!(action, Some(Value::Letter(b'a' | b'f'))) {
+                    number(controls, b'r').unwrap_or_default()
+                } else {
+                    0
+                };
+                return reply(
+                    id,
+                    image_number,
+                    placement_id,
+                    frame_number,
+                    quiet_value,
+                    Err(INVALID),
+                );
             }
             if delete {
                 // Placement deletion is dispatched through Command::decode_delete.
                 return None;
             }
-            if controls.get(b'a') == Some(Value::Letter(b'p')) {
-                let id = if image_number == 0 {
+            if action == Some(Value::Letter(b'p')) {
+                let image_id = if image_number == 0 {
                     id
                 } else {
                     self.newest_id(image_number).unwrap_or_default()
                 };
-                let result = self.place(&command, id, apply);
-                return reply(id, image_number, placement_id, 0, quiet_value, result);
+                let result = self.place(&command, image_id, apply);
+                let reply_id = if result.is_ok() { image_id } else { id };
+                return reply(reply_id, image_number, placement_id, 0, quiet_value, result);
             }
             if let Some(Value::Letter(action @ (b'a' | b'c'))) = action {
                 let result = self.animation_action(&command, id, image_number, action);
                 if action == b'a' && result.is_ok() {
                     return None;
                 }
-                return reply(id, image_number, 0, 0, quiet_value, result);
+                let frame_number = if action == b'a' {
+                    number(controls, b'r').unwrap_or_default()
+                } else {
+                    0
+                };
+                return reply(id, image_number, 0, frame_number, quiet_value, result);
             }
             let mut frame_number = 0;
             match self.begin(
@@ -601,7 +699,7 @@ impl ImageStore {
             if let Some(source) = transfer.local.take() {
                 let mut decoded = [0; INLINE_DECODED_BYTES];
                 let written = command
-                    .decode_payload(&mut decoded)
+                    .decode_transfer(&mut decoded)
                     .map_err(|_| BAD_SOURCE)?;
                 if written > crate::MAX_PATH_BYTES {
                     return Err(BAD_SOURCE);
@@ -703,7 +801,7 @@ impl ImageStore {
         let dimensions = image.dimensions();
         let revision = next_image_revision();
         let original_revision = image.source_revision();
-        image.update_animation(|animation, original| {
+        image.update_animation(&mut self.animation_wakes.spare, |animation, original| {
             apply(
                 animation,
                 Canvas {
@@ -871,13 +969,14 @@ impl ImageStore {
         mut apply: impl FnMut(ImageChange<'_>) -> Result<(), PlacementError>,
     ) -> Result<(), &'static [u8]> {
         let previous_bytes = self.images.get(&key).map(StoredImage::storage_bytes);
-        let evicted = self.eviction_plan(
+        let evictions = self.eviction_plan(
             key,
             placement,
             pixels.bytes.capacity(),
             previous_bytes,
             &mut apply,
         )?;
+        let evicted = evictions.as_slice();
         let replaces_image = previous_bytes.is_some();
         if !replaces_image {
             self.images.try_reserve(1).map_err(|_| QUOTA)?;
@@ -912,7 +1011,7 @@ impl ImageStore {
                 dimensions,
                 replaces_image: false,
                 anonymous: Some(image),
-                evicted: &evicted,
+                evicted,
             })
             .map_err(placement_error)?;
             entry
@@ -923,19 +1022,19 @@ impl ImageStore {
                     dimensions,
                     replaces_image,
                     anonymous: None,
-                    evicted: &evicted,
+                    evicted,
                 })
                 .map_err(placement_error)?;
             } else if replaces_image || !evicted.is_empty() {
                 apply(ImageChange::Remove {
                     replaced: replaces_image.then_some(key),
-                    evicted: &evicted,
+                    evicted,
                 })
                 .map_err(placement_error)?;
             }
             StoredImage::Named(image)
         };
-        for victim in evicted {
+        for &victim in evicted {
             self.remove_stored(victim, revision);
         }
         let bytes = entry.storage_bytes();

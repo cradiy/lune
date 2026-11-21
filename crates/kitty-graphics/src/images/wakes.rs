@@ -5,6 +5,7 @@ use super::{Animation, Image, ImageKey, StoredImage};
 
 #[derive(Default)]
 pub(super) struct AnimationWakes {
+    pub(super) spare: Option<Box<Animation>>,
     animated: HashSet<ImageKey>,
     membership: u64,
     pending: HashSet<ImageKey>,
@@ -22,6 +23,7 @@ impl AnimationWakes {
     }
 
     pub(super) fn clear(&mut self) {
+        self.spare = None;
         self.animated.clear();
         self.membership = self.membership.wrapping_add(1);
         self.pending.clear();
@@ -91,6 +93,16 @@ impl AnimationWakes {
         let Some(animation) = image.animation.as_mut() else {
             return;
         };
+        if animation.is_redundant() {
+            self.remove(key, animation);
+            if self.spare.is_none() {
+                animation.reset_for_reuse();
+                self.spare = image.animation.take();
+            } else {
+                image.animation = None;
+            }
+            return;
+        }
         self.membership = self
             .membership
             .wrapping_add(u64::from(self.animated.insert(key)));

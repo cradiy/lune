@@ -78,6 +78,14 @@ impl GraphicsPlacement {
             .map(|root| root.serial)
     }
 
+    fn shift_relative(&mut self, delta: [i64; 2]) {
+        self.column += delta[0];
+        self.row += delta[1];
+        let root = self.root.as_mut().expect("A relative placement has a root");
+        root.offset[0] += delta[0];
+        root.offset[1] += delta[1];
+    }
+
     pub fn origin_in_view(
         &self,
         history_offset: usize,
@@ -166,11 +174,11 @@ impl GraphicsPlacement {
         } else {
             cells
         };
-        let cell = [f64::from(cell.width.get()), f64::from(cell.height.get())];
+        let cell = [cell.width.get(), cell.height.get()];
+        let [x, y] = self.cell_offset(cell).map(f64::from);
+        let cell = cell.map(f64::from);
         let [width, height] = self.placement.source_size.map(f64::from);
         let [columns, rows] = cells.map(f64::from);
-        let [x, y] = self.placement.cell_offset.map(f64::from);
-        let [x, y] = [x.min(cell[0] - 1.0), y.min(cell[1] - 1.0)];
         let available_width = columns * cell[0] - x;
         let available_height = rows * cell[1] - y;
         let (scale, left, top) = match (columns > 0.0, rows > 0.0) {
@@ -189,6 +197,36 @@ impl GraphicsPlacement {
         ([x + left, y + top], [width * scale, height * scale], scale)
     }
 
+    fn cell_offset(&self, cell: [u32; 2]) -> [u32; 2] {
+        let [x, y] = self.placement.cell_offset;
+        [x.min(cell[0] - 1), y.min(cell[1] - 1)]
+    }
+
+    fn uncropped_span(&self, cell: [u32; 2]) -> [usize; 2] {
+        let requested = self.placement.cells;
+        let source = self.placement.source_size;
+        let offset = self.cell_offset(cell);
+        std::array::from_fn(|axis| {
+            if requested[axis] != 0 {
+                return requested[axis] as usize;
+            }
+            let scaled_axis = 1 - axis;
+            if requested[scaled_axis] == 0 {
+                let extent = u64::from(source[axis]) + u64::from(offset[axis]);
+                return extent.div_ceil(u64::from(cell[axis])) as usize;
+            }
+
+            // Round the exact ratio up once, at the cell boundary.
+            let available = u64::from(requested[scaled_axis]) * u64::from(cell[scaled_axis])
+                - u64::from(offset[scaled_axis]);
+            let scale_divisor = u64::from(source[scaled_axis]);
+            let extent = u128::from(available) * u128::from(source[axis])
+                + u128::from(u64::from(offset[axis]) * scale_divisor);
+            let cell_extent = u64::from(cell[axis]) * scale_divisor;
+            usize::try_from(extent.div_ceil(u128::from(cell_extent))).unwrap_or(usize::MAX)
+        })
+    }
+
     fn virtual_cells(&self, cell: PixelSize) -> [u32; 2] {
         let cell_pixels = [cell.width.get(), cell.height.get()];
         std::array::from_fn(|axis| {
@@ -202,9 +240,10 @@ impl GraphicsPlacement {
     }
 
     fn set_cell_size(&mut self, cell: PixelSize) {
-        let (offset, size, _) = self.uncropped_geometry(cell);
-        let cell_size = [cell.width.get(), cell.height.get()].map(f64::from);
+        let cell_size = [cell.width.get(), cell.height.get()];
         if self.is_virtual() {
+            let (offset, size, _) = self.uncropped_geometry(cell);
+            let cell_size = cell_size.map(f64::from);
             self.virtual_start = std::array::from_fn(|axis| {
                 snap_integer_edge(offset[axis] / cell_size[axis]).floor() as u32
             });
@@ -215,29 +254,24 @@ impl GraphicsPlacement {
             });
             return;
         }
-        self.span = std::array::from_fn(|axis| {
-            let count = self.placement.cells[axis];
-            if count == 0 {
-                ((offset[axis] + size[axis]) / cell_size[axis]).ceil() as usize
-            } else {
-                count as usize
-            }
-        });
+        self.span = self.uncropped_span(cell_size);
         if self.vertical_crop != UNCROPPED {
+            let (offset, size, _) = self.uncropped_geometry(cell);
+            let row_height = f64::from(cell_size[1]);
             let [top, bottom] = self.vertical_crop;
             let mut height = if bottom.is_finite() {
                 bottom * size[1] + offset[1]
             } else if self.placement.cells[1] != 0 {
-                f64::from(self.placement.cells[1]) * cell_size[1]
+                f64::from(self.placement.cells[1]) * row_height
             } else {
                 offset[1] + size[1]
             };
             if top.is_finite() {
                 height -= top * size[1] + offset[1];
             }
-            let rows = height / cell_size[1];
+            let rows = height / row_height;
             // Allow round-off when projecting a crop edge onto a cell boundary.
-            let tolerance = (size[1] / cell_size[1]).max(rows) * (8.0 * f64::EPSILON);
+            let tolerance = (size[1] / row_height).max(rows) * (8.0 * f64::EPSILON);
             self.span[1] = (rows - tolerance.min(1e-7)).ceil().max(1.0) as usize;
         }
     }
@@ -560,26 +594,52 @@ impl GraphicsPlacements {
         delta: i64,
         cell: PixelSize,
     ) {
-        self.scroll_matching(destination, delta, cell, |rows| {
-            rows.start >= source.start && rows.end <= source.end
+        self.scroll_matching(delta, cell, |rows| {
+            (rows.start >= source.start && rows.end <= source.end).then(|| destination.clone())
         });
+    }
+
+    pub(crate) fn scroll_with_history(
+        &mut self,
+        available: Range<i64>,
+        delta: i64,
+        cell: PixelSize,
+    ) {
+        let first = available.start;
+        let end = available.end;
+        if delta < 0 && end != i64::MAX {
+            // Captured text shifts existing history while live images clip at the margin.
+            self.scroll_matching(delta, cell, |rows| {
+                if rows.end <= 0 {
+                    Some(first..0)
+                } else if rows.start >= 0 && rows.end <= end {
+                    Some(0..end)
+                } else {
+                    None
+                }
+            });
+        } else {
+            self.scroll(i64::MIN..end, available, delta, cell);
+        }
+        if end != i64::MAX {
+            self.discard_history_before(first, cell);
+        }
     }
 
     pub(crate) fn reverse_page(&mut self, first_retained_row: i64, delta: i64, cell: PixelSize) {
         // The live portion carries the whole placement. Placements entirely in
         // scrollback keep their position.
-        self.scroll_matching(first_retained_row..i64::MAX, delta, cell, |rows| {
-            rows.end > 0
+        self.scroll_matching(delta, cell, |rows| {
+            (rows.end > 0).then_some(first_retained_row..i64::MAX)
         });
     }
 
     #[cold]
     fn scroll_matching(
         &mut self,
-        destination: Range<i64>,
         delta: i64,
         cell: PixelSize,
-        mut moves: impl FnMut(&Range<i64>) -> bool,
+        mut destination: impl FnMut(&Range<i64>) -> Option<Range<i64>>,
     ) {
         // Virtual roots move with the text that contains their placeholders.
         if !self.has_cursor_placements() {
@@ -592,9 +652,9 @@ impl GraphicsPlacements {
                 return true;
             }
             let rows = image.rows();
-            if !moves(&rows) {
+            let Some(destination) = destination(&rows) else {
                 return true;
-            }
+            };
             changed = true;
             let moved = rows.start.saturating_add(delta)..rows.end.saturating_add(delta);
             image.row = moved.start;
@@ -775,19 +835,36 @@ impl GraphicsPlacements {
             && evicted.is_empty()
             && let Some(index) = replacement
         {
-            let previous = &self.images[index];
-            if previous.placement.z == spec.z && previous.placement.position == spec.position {
-                // Keeping the link and draw order preserves all cached graph indices.
-                image.serial = previous.serial;
-                image.parent = previous.parent;
-                image.root = previous.root;
+            let previous = &mut self.images[index];
+            if previous.placement.z == spec.z
+                && let Some(relative_delta) =
+                    placement_offset_delta(previous.placement.position, spec.position)
+            {
                 if previous.parent.is_some() {
                     image.row = previous.row;
                     image.column = previous.column;
                 }
                 let moved = image.row != previous.row || image.column != previous.column;
+                let layout = Placement {
+                    keep_cursor: spec.keep_cursor,
+                    ..previous.placement
+                };
+                if !moved && image.vertical_crop == previous.vertical_crop && spec == layout {
+                    previous.placement.keep_cursor = spec.keep_cursor;
+                    return Ok(());
+                }
+                // Keeping the link and draw order preserves all cached graph indices.
+                image.serial = previous.serial;
+                image.parent = previous.parent;
+                image.root = previous.root;
+                let shifted = relative_delta != [0; 2];
+                if shifted {
+                    image.shift_relative(relative_delta);
+                }
                 self.images[index] = image;
-                if moved {
+                if shifted {
+                    self.shift_relative_descendants(index, relative_delta);
+                } else if moved {
                     self.sync_graph(false);
                 }
                 self.changed();
@@ -870,6 +947,34 @@ impl GraphicsPlacements {
         }
         self.changed();
         Ok(())
+    }
+
+    fn shift_relative_descendants(&mut self, index: usize, delta: [i64; 2]) {
+        let image = &self.images[index];
+        let serial = image.serial;
+        let root = image.root.expect("A relative placement has a root").serial;
+        for &entry_index in &self.relative_indices {
+            let entry_index = usize::from(entry_index);
+            let entry = &self.images[entry_index];
+            if entry_index == index
+                || entry
+                    .root
+                    .is_none_or(|entry_root| entry_root.serial != root)
+            {
+                continue;
+            }
+            let mut parent = entry.parent;
+            while let Some(ancestor) = parent {
+                if ancestor == serial {
+                    self.images[entry_index].shift_relative(delta);
+                    break;
+                }
+                if ancestor == root {
+                    break;
+                }
+                parent = self.images[self.anchors[&ancestor]].parent;
+            }
+        }
     }
 
     fn reindex(&mut self) {
@@ -1095,6 +1200,22 @@ impl GraphicsPlacements {
         }
         self.orphaned.clear();
     }
+}
+
+fn placement_offset_delta(before: PlacementPosition, after: PlacementPosition) -> Option<[i64; 2]> {
+    if before == after {
+        return Some([0; 2]);
+    }
+    let (PlacementPosition::Relative(before), PlacementPosition::Relative(after)) = (before, after)
+    else {
+        return None;
+    };
+    if before.image_id != after.image_id || before.placement_id != after.placement_id {
+        return None;
+    }
+    Some(std::array::from_fn(|axis| {
+        i64::from(after.offset[axis]) - i64::from(before.offset[axis])
+    }))
 }
 
 pub(crate) struct Graphics {

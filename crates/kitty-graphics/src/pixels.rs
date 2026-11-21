@@ -140,18 +140,18 @@ impl PixelTransfer {
         command: &Command<'_>,
         inflater: &mut Inflater,
     ) -> Result<(), &'static [u8]> {
-        let encoded = command.encoded_payload().map_err(|_| INVALID)?.len();
-        if matches!(self.compression, Compression::Zlib)
-            && command.controls.get(b'm') == Some(Value::Unsigned(1))
-        {
-            inflater.restart();
-            self.compression = Compression::Streaming;
-        }
-        if matches!(self.compression, Compression::Streaming) {
+        let encoded = command.encoded_transfer().map_err(|_| INVALID)?.len();
+        if !matches!(self.compression, Compression::None) {
+            let state = if matches!(self.compression, Compression::Zlib) {
+                self.compression = Compression::Streaming;
+                inflater.restart()
+            } else {
+                inflater.active()
+            };
             let size = self
                 .expected
                 .expect("Direct zlib transfers have a decoded size");
-            return inflater.active().append(
+            return state.append(
                 command,
                 encoded,
                 self.wire_limit,
@@ -160,7 +160,6 @@ impl PixelTransfer {
                 &mut self.bytes,
             );
         }
-        let compressed = matches!(self.compression, Compression::Zlib);
         let start = self.bytes.len();
         let decoded = base64::decoded_len_estimate(encoded).min(self.wire_limit - start);
         let needed = start + decoded;
@@ -172,7 +171,7 @@ impl PixelTransfer {
                 .max(needed)
                 .min(self.wire_limit);
             // Leave room for in-place RGBA expansion when the RGB buffer reaches its limit.
-            let capacity = if capacity == self.wire_limit && !compressed {
+            let capacity = if capacity == self.wire_limit {
                 self.format.output_capacity(capacity)
             } else {
                 capacity
@@ -182,7 +181,7 @@ impl PixelTransfer {
                 .map_err(|_| QUOTA)?;
         }
         self.bytes.resize(needed, 0);
-        match command.decode_payload(&mut self.bytes[start..]) {
+        match command.decode_transfer(&mut self.bytes[start..]) {
             Ok(written) => {
                 self.bytes.truncate(start + written);
                 Ok(())
@@ -192,7 +191,7 @@ impl PixelTransfer {
                 if matches!(
                     error,
                     PayloadError::Base64(base64::DecodeSliceError::OutputSliceTooSmall)
-                ) && (compressed || self.expected.is_none())
+                ) && self.expected.is_none()
                 {
                     return Err(QUOTA);
                 }
@@ -344,7 +343,7 @@ impl InflateState {
             .map_err(|_| QUOTA)?;
         self.input.resize(estimated, 0);
         let length = command
-            .decode_payload(&mut self.input)
+            .decode_transfer(&mut self.input)
             .map_err(|error| match error {
                 PayloadError::Base64(base64::DecodeSliceError::OutputSliceTooSmall) => QUOTA,
                 _ => INVALID,
@@ -358,6 +357,9 @@ impl InflateState {
             };
         }
         let more = command.controls.get(b'm') == Some(Value::Unsigned(1));
+        if !more && remaining == wire_limit && size <= MAX_EAGER_INFLATE_BYTES {
+            output.try_reserve_exact(capacity).map_err(|_| QUOTA)?;
+        }
         self.ended = inflate_chunk(&mut self.decoder, input, size, capacity, output, more)?;
         Ok(())
     }

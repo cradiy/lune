@@ -1,4 +1,4 @@
-use lune_terminal::{GraphicsImage, GraphicsImageFormat};
+use lune_terminal::{GraphicsImage, GraphicsImageFormat, GraphicsPixelBounds};
 use wgpu::{
     BindGroup, BindGroupLayout, Device, Extent3d, Queue, Sampler, TexelCopyBufferLayout, Texture,
     TextureDescriptor, TextureDimension, TextureFormat, TextureUsages, TextureView,
@@ -157,7 +157,22 @@ impl TileDamage {
                 Self::Two([first, second.bounding_rect(region)])
             }
             Self::Two([first, second]) => {
-                Self::One(first.bounding_rect(second).bounding_rect(region))
+                let pair = first.bounding_rect(second);
+                let union = pair.bounding_rect(region);
+                let (pixels, regions) = [
+                    [pair, region],
+                    [first.bounding_rect(region), second],
+                    [first, second.bounding_rect(region)],
+                ]
+                .into_iter()
+                .map(|[left, right]| (left.pixel_count() + right.pixel_count(), [left, right]))
+                .min_by_key(|&(pixels, _)| pixels)
+                .expect("Three possible merges");
+                if pixels < union.pixel_count() {
+                    Self::Two(regions)
+                } else {
+                    Self::One(union)
+                }
             }
             Self::Full => Self::Full,
         };
@@ -165,6 +180,11 @@ impl TileDamage {
 }
 
 impl TextureTile {
+    fn resident_clip(&self, region: PixelRegion) -> Option<PixelRegion> {
+        self.resident.as_ref()?;
+        self.region.storage.intersection(region)
+    }
+
     pub fn needs_upload(&self) -> bool {
         self.resident.is_none() || !matches!(self.damage, TileDamage::Clean)
     }
@@ -298,39 +318,156 @@ impl TextureTiles {
         }
     }
 
+    pub fn mark_damage(&mut self, bounds: Option<[GraphicsPixelBounds; 2]>) {
+        if let Some(bounds) = bounds {
+            for region in damage_regions(bounds) {
+                self.visit_resident_intersections(region, |tile, clip| tile.damage.add(clip));
+            }
+        } else {
+            for tile in &mut self.tiles {
+                tile.damage = TileDamage::Full;
+            }
+        }
+    }
+
+    pub fn update_clipped_regions(
+        &mut self,
+        queue: &Queue,
+        image: &GraphicsImage,
+        scratch: &mut Vec<u8>,
+        bounds: [GraphicsPixelBounds; 2],
+    ) -> Option<bool> {
+        let mut visible_limit = None;
+        let mut visible_pixels = 0;
+        let mut largest = 0;
+        for region in damage_regions(bounds) {
+            for (_, tile) in self.candidates(region, FILTER_BORDER) {
+                if tile.visible_layout != self.layout {
+                    continue;
+                }
+                let Some(clip) = tile.resident_clip(region) else {
+                    continue;
+                };
+                let limit = *visible_limit.get_or_insert_with(|| {
+                    damage_regions(bounds)
+                        .map(PixelRegion::pixel_count)
+                        .sum::<u32>()
+                        * 3
+                        / 4
+                });
+                let pixels = clip.pixel_count();
+                visible_pixels += pixels;
+                // Keep the shared rasterization path when the visible clips cover most of the damage.
+                if visible_pixels > limit || tile.needs_upload() {
+                    return None;
+                }
+                largest = largest.max(pixels);
+            }
+        }
+        if visible_pixels == 0 {
+            self.mark_damage(Some(bounds));
+            return Some(true);
+        }
+        Some(self.rasterize_clipped_regions(queue, image, scratch, bounds, largest))
+    }
+
+    #[cold]
+    fn rasterize_clipped_regions(
+        &mut self,
+        queue: &Queue,
+        image: &GraphicsImage,
+        scratch: &mut Vec<u8>,
+        bounds: [GraphicsPixelBounds; 2],
+        largest: u32,
+    ) -> bool {
+        let capacity = largest as usize * image.format().bytes_per_pixel() as usize;
+        if scratch
+            .try_reserve_exact(capacity.saturating_sub(scratch.len()))
+            .is_err()
+        {
+            return false;
+        }
+        for region in damage_regions(bounds) {
+            for index in self.candidate_indices(region, FILTER_BORDER) {
+                let tile = &mut self.tiles[index];
+                let Some(clip) = tile.resident_clip(region) else {
+                    continue;
+                };
+                if tile.visible_layout != self.layout {
+                    tile.damage.add(clip);
+                    continue;
+                }
+                let Some(update) = image.pixel_region(clip.origin, clip.size, scratch) else {
+                    return false;
+                };
+                let binding = tile
+                    .resident
+                    .as_ref()
+                    .expect("A resident tile has a binding");
+                write_region(
+                    queue,
+                    &binding.texture,
+                    clip.relative_to(tile.region.storage.origin),
+                    update.bytes,
+                    update.bytes_per_row,
+                );
+            }
+        }
+        true
+    }
+
+    fn visit_resident_intersections(
+        &mut self,
+        region: PixelRegion,
+        mut visit: impl FnMut(&mut TextureTile, PixelRegion),
+    ) {
+        // Filter borders share texels with neighboring tiles.
+        for index in self.candidate_indices(region, FILTER_BORDER) {
+            let tile = &mut self.tiles[index];
+            if let Some(clip) = tile.resident_clip(region) {
+                visit(tile, clip);
+            }
+        }
+    }
+
     pub fn write(
         &mut self,
-        queue: Option<&Queue>,
+        queue: &Queue,
         region: PixelRegion,
         bytes: &[u8],
         bytes_per_row: u32,
         bytes_per_pixel: u32,
     ) {
-        // Filter borders share texels with neighboring tiles.
-        for index in self.candidate_indices(region, FILTER_BORDER) {
-            let tile = &mut self.tiles[index];
-            let storage = tile.region.storage;
-            let (Some(binding), Some(clip)) = (&tile.resident, storage.intersection(region)) else {
-                continue;
-            };
-            let Some(queue) = queue.filter(|_| {
-                tile.visible_layout == self.layout && matches!(tile.damage, TileDamage::Clean)
-            }) else {
+        let layout = self.layout;
+        self.visit_resident_intersections(region, |tile, clip| {
+            if tile.visible_layout != layout || !matches!(tile.damage, TileDamage::Clean) {
                 tile.damage.add(clip);
-                continue;
-            };
+                return;
+            }
+            let binding = tile
+                .resident
+                .as_ref()
+                .expect("A resident tile has a binding");
             let [x, y] = clip.origin;
             let offset = (y - region.origin[1]) as usize * bytes_per_row as usize
                 + (x - region.origin[0]) as usize * bytes_per_pixel as usize;
             write_region(
                 queue,
                 &binding.texture,
-                clip.relative_to(storage.origin),
+                clip.relative_to(tile.region.storage.origin),
                 &bytes[offset..],
                 bytes_per_row,
             );
-        }
+        });
     }
+}
+
+fn damage_regions(bounds: [GraphicsPixelBounds; 2]) -> impl Iterator<Item = PixelRegion> {
+    bounds
+        .into_iter()
+        .filter_map(|GraphicsPixelBounds { origin, size }| {
+            (!size.contains(&0)).then_some(PixelRegion { origin, size })
+        })
 }
 
 impl ImageTextures {
@@ -348,17 +485,10 @@ impl ImageTextures {
         bytes: &[u8],
         bytes_per_row: u32,
         bytes_per_pixel: u32,
-        defer_tiles: bool,
     ) {
         match self {
             Self::Single(tile) => write_region(queue, &tile.texture, region, bytes, bytes_per_row),
-            Self::Tiled(tiles) => tiles.write(
-                (!defer_tiles).then_some(queue),
-                region,
-                bytes,
-                bytes_per_row,
-                bytes_per_pixel,
-            ),
+            Self::Tiled(tiles) => tiles.write(queue, region, bytes, bytes_per_row, bytes_per_pixel),
         }
     }
 
@@ -421,7 +551,6 @@ impl ImageTextures {
                 bytes,
                 width * bytes_per_pixel,
                 bytes_per_pixel,
-                false,
             );
         }
         true

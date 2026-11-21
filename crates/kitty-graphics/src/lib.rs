@@ -18,7 +18,9 @@ mod source;
 pub use animation::PixelRevision;
 pub use delete::{Delete, DeleteTarget};
 pub use features::{FeatureReply, MAX_FEATURE_REPLY_BYTES};
-pub use images::{Image, ImageKey, ImageStore, PixelUpdate, PixelUpdates, Reply};
+pub use images::{
+    Image, ImageKey, ImageStore, PixelBounds, PixelUpdate, PixelUpdatePlan, PixelUpdates, Reply,
+};
 pub use pixels::ImageFormat;
 pub use placeholder::{PLACEHOLDER, Placeholder};
 pub use placement::{
@@ -162,7 +164,15 @@ pub struct Command<'a> {
 }
 
 impl Command<'_> {
+    /// Returns the encoded transfer block, which is empty for feature queries.
     pub fn encoded_payload(&self) -> Result<&[u8], PayloadError> {
+        if self.controls.is_feature_query() {
+            return Ok(&[]);
+        }
+        self.encoded_transfer()
+    }
+
+    fn encoded_transfer(&self) -> Result<&[u8], PayloadError> {
         self.encoded_payload.ok_or(PayloadError::TooLong)
     }
 
@@ -172,7 +182,14 @@ impl Command<'_> {
 
     /// Decodes this command's payload block into caller-provided storage.
     pub fn decode_payload(&self, output: &mut [u8]) -> Result<usize, PayloadError> {
-        let payload = self.encoded_payload()?;
+        if self.controls.is_feature_query() {
+            return Ok(0);
+        }
+        self.decode_transfer(output)
+    }
+
+    fn decode_transfer(&self, output: &mut [u8]) -> Result<usize, PayloadError> {
+        let payload = self.encoded_transfer()?;
         match self.controls.get(b'm') {
             None | Some(Value::Unsigned(0)) => {}
             Some(Value::Unsigned(1))

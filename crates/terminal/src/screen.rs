@@ -188,17 +188,13 @@ impl Screen {
         if !self.graphics.is_empty() {
             let first_row = -(self.history.len() as i64);
             let cell = self.graphics_cell_extent();
-            let whole_screen = self.scroll_region.end == self.grid.rows();
-            let last_row = if whole_screen {
+            let last_row = if self.scroll_region.end == self.grid.rows() {
                 i64::MAX
             } else {
                 self.scroll_region.end as i64
             };
             self.graphics
-                .scroll(i64::MIN..last_row, first_row..last_row, delta, cell);
-            if !whole_screen {
-                self.graphics.discard_history_before(first_row, cell);
-            }
+                .scroll_with_history(first_row..last_row, delta, cell);
         }
     }
 

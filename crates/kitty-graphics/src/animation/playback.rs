@@ -88,6 +88,10 @@ pub(super) struct Playback {
 }
 
 impl Playback {
+    pub(super) fn retains_settings(&self) -> bool {
+        self.mode != PlaybackMode::Stopped || self.loop_limit.is_some()
+    }
+
     pub(super) fn restart_frame(&mut self) {
         self.timing = Timing::Start;
     }
