@@ -2,7 +2,9 @@ use std::collections::TryReserveError;
 use std::num::NonZeroU32;
 use std::ops::Range;
 
-use lune_terminal::{Cell, CellText, DisplayUnit, MAX_CELL_TEXT_BYTES, MAX_DIMENSION, Rgb, Style};
+use lune_terminal::{
+    Cell, CellText, DisplayUnit, MAX_CELL_TEXT_BYTES, MAX_DIMENSION, PixelSize, Rgb, Style,
+};
 
 use super::{
     BackgroundRect, CursorGlyph, CursorPaint, PaintCommand, PaintError, PresentationDamage,
@@ -15,6 +17,7 @@ pub struct PaintBatch {
     commands: Vec<StoredCommand>,
     units: Vec<StoredUnit>,
     text: String,
+    cell_size: Option<PixelSize>,
 }
 
 pub struct BatchRun<'a> {
@@ -48,10 +51,16 @@ impl PaintBatch {
         self.clear();
         let result =
             frame.visit_paint_commands(damage, cursor_thickness, |command| self.store(command));
-        if result.is_err() {
+        if result.is_ok() {
+            self.cell_size = frame.geometry.cell_pixels();
+        } else {
             self.clear();
         }
         result
+    }
+
+    pub fn cell_pixels(&self) -> Option<PixelSize> {
+        self.cell_size
     }
 
     #[inline]
@@ -97,6 +106,7 @@ impl PaintBatch {
         self.commands.clear();
         self.units.clear();
         self.text.clear();
+        self.cell_size = None;
     }
 
     fn store(

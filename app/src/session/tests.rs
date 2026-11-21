@@ -754,26 +754,34 @@ fn paint_commands_replay_damage_and_keep_the_cursor_on_its_own_layer() {
 
 #[test]
 fn raster_surface_restores_the_cursor_and_clips_text_and_backgrounds() {
-    use crate::{CoverageMask, PixelRegion, RasterSurface, RasterText};
+    use crate::{CoverageMask, GlyphMask, GlyphSource, RasterSurface};
+    use lune_terminal::DisplayUnit;
 
-    fn draw_text(mut region: PixelRegion<'_>, text: RasterText<'_>) {
-        let rect = region.rect();
-        assert!(region.row_mut(rect.size.height.get()).is_none());
-        let mask = CoverageMask::new(pixels(1, 1), 1, &[255]).unwrap();
-        match text {
-            RasterText::Run(run) => {
-                for unit in run.units() {
-                    if !unit.cell.is_erased() {
-                        let x = (unit.column * 2) as i32;
-                        region.blend_mask((x, rect.origin.y as i32), mask, run.style.foreground);
-                    }
+    struct Glyphs;
+
+    impl GlyphSource for Glyphs {
+        fn glyph(
+            &mut self,
+            unit: DisplayUnit<'_>,
+            style: &Style,
+            cell: PixelSize,
+        ) -> Option<GlyphMask<'_>> {
+            assert_eq!(cell, pixels(2, 2));
+            match unit.text {
+                CellText::Extended("水\u{301}") => {
+                    assert!(style.bold);
+                    assert_eq!((unit.column, unit.cell.width()), (1, 2));
+                    Some(GlyphMask {
+                        coverage: CoverageMask::new(pixels(2, 1), 2, &[255, 255]).unwrap(),
+                        offset: (-1, 0),
+                    })
                 }
+                CellText::Scalar('Z') => Some(GlyphMask {
+                    coverage: CoverageMask::new(pixels(1, 1), 1, &[255]).unwrap(),
+                    offset: (0, 0),
+                }),
+                _ => panic!("Unexpected display unit"),
             }
-            RasterText::Cursor(glyph) => region.blend_mask(
-                (rect.origin.x as i32, rect.origin.y as i32),
-                mask,
-                glyph.color,
-            ),
         }
     }
 
@@ -788,11 +796,11 @@ fn raster_surface_restores_the_cursor_and_clips_text_and_backgrounds() {
         batch
             .capture(&frame, prepared.damage(), NonZeroU32::new(1).unwrap())
             .unwrap();
-        surface.apply(batch, draw_text);
+        surface.apply_glyphs(batch, &mut Glyphs);
         prepared.commit();
     }
 
-    let mut session = session(b"Q\x1b[1;1H");
+    let mut session = session("\x1b[1;2H\x1b[1m水\u{301}\x1b[0m\x1b[1;3H".as_bytes());
     session.geometry = GridGeometry::fit(pixels(16, 6), pixels(2, 2)).unwrap();
     let background = Rgb {
         red: 5,
@@ -823,14 +831,21 @@ fn raster_surface_restores_the_cursor_and_clips_text_and_backgrounds() {
         assert!(RasterSurface::new(size, 14, &mut content, &mut output).is_none());
         let mut surface = RasterSurface::new(size, 18, &mut content, &mut output).unwrap();
         present(&session, &mut tracker, &mut batch, &mut surface);
-        assert_eq!(&surface.pixels()[..3], &[background, cursor, background]);
+        assert_eq!(
+            &surface.pixels()[..7],
+            &[
+                background, background, background, cursor, cursor, cursor, background
+            ]
+        );
 
         session.transport.source = Cursor::new(b"\x1b[2;1H");
         session.pump().unwrap();
         present(&session, &mut tracker, &mut batch, &mut surface);
         assert_eq!(
-            &surface.pixels()[..3],
-            &[foreground, background, background]
+            &surface.pixels()[..7],
+            &[
+                background, background, foreground, background, background, background, background
+            ]
         );
         assert_eq!(&surface.pixels()[36..39], &[cursor, cursor, background]);
 

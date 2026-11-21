@@ -1,6 +1,6 @@
 use std::num::NonZeroU32;
 
-use lune_terminal::{PixelSize, Rgb};
+use lune_terminal::{DisplayUnit, PixelSize, Rgb, Style};
 
 use crate::{BatchRun, CursorGlyph, PaintBatch, PaintCommand, PixelRect};
 
@@ -96,6 +96,22 @@ pub enum RasterText<'a> {
     Cursor(CursorGlyph<'a>),
 }
 
+pub struct GlyphMask<'a> {
+    pub coverage: CoverageMask<'a>,
+    /// Pixel offset from the leading cell's top-left corner.
+    pub offset: (i32, i32),
+}
+
+/// Supplies rasterized coverage for a complete display unit.
+pub trait GlyphSource {
+    fn glyph(
+        &mut self,
+        unit: DisplayUnit<'_>,
+        style: &Style,
+        cell: PixelSize,
+    ) -> Option<GlyphMask<'_>>;
+}
+
 /// Composites terminal batches into caller-owned RGB storage.
 pub struct RasterSurface<'a> {
     content: &'a mut [Rgb],
@@ -126,6 +142,39 @@ impl<'a> RasterSurface<'a> {
 
     pub fn pixels(&self) -> &[Rgb] {
         self.output
+    }
+
+    /// Paints each visible display unit with a mask from the glyph source.
+    pub fn apply_glyphs(&mut self, batch: &PaintBatch, glyphs: &mut impl GlyphSource) {
+        let Some(cell) = batch.cell_pixels() else {
+            return;
+        };
+        self.apply(batch, |mut region, text| match text {
+            RasterText::Run(run) => {
+                for unit in run.units() {
+                    if !unit.cell.is_erased() {
+                        paint_glyph(
+                            &mut region,
+                            glyphs,
+                            unit,
+                            run.style.style,
+                            run.style.foreground,
+                            cell,
+                        );
+                    }
+                }
+            }
+            RasterText::Cursor(glyph) => {
+                paint_glyph(
+                    &mut region,
+                    glyphs,
+                    glyph.unit,
+                    glyph.style,
+                    glyph.color,
+                    cell,
+                );
+            }
+        });
     }
 
     /// Applies a batch in order. Text callbacks can modify pixels inside the
@@ -211,6 +260,30 @@ impl<'a> RasterSurface<'a> {
             self.output[row.clone()].copy_from_slice(&self.content[row]);
         }
     }
+}
+
+#[inline]
+fn paint_glyph(
+    region: &mut PixelRegion<'_>,
+    glyphs: &mut impl GlyphSource,
+    unit: DisplayUnit<'_>,
+    style: &Style,
+    color: Rgb,
+    cell: PixelSize,
+) {
+    let Some(mask) = glyphs.glyph(unit, style, cell) else {
+        return;
+    };
+    let x = (unit.column * cell.width.get() as usize) as i32;
+    let y = region.rect.origin.y as i32;
+    region.blend_mask(
+        (
+            x.saturating_add(mask.offset.0),
+            y.saturating_add(mask.offset.1),
+        ),
+        mask.coverage,
+        color,
+    );
 }
 
 fn buffer_len(size: PixelSize, stride: usize) -> Option<usize> {
