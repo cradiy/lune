@@ -5,8 +5,8 @@ use std::sync::{
 use std::{collections::HashMap, ops::Range};
 
 use lune_kitty_graphics::{
-    Decoder, Delete, DeleteTarget, Image, ImageKey, ImageStore, Placement, PlacementError,
-    PlacementPosition, RelativePlacement, Reply,
+    DecodeError, Decoder, Delete, DeleteTarget, Image, ImageKey, ImageStore, Placement,
+    PlacementError, PlacementPosition, RelativePlacement, Reply,
 };
 use lune_vt::ApcEvent;
 
@@ -18,7 +18,9 @@ pub use placeholders::{
 };
 
 const MAX_PLACEMENTS: usize = 4096;
+const _: () = assert!(MAX_PLACEMENTS - 1 <= u16::MAX as usize);
 const MAX_PARENT_DEPTH: usize = 16;
+const UNCROPPED: [f64; 2] = [f64::NEG_INFINITY, f64::INFINITY];
 static NEXT_PLACEMENT_REVISION: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug)]
@@ -26,7 +28,8 @@ pub struct GraphicsPlacement {
     pub placement: Placement,
     pub row: i64,
     pub column: i64,
-    clip: [i64; 2],
+    // Retained vertical edges in units of the requested source rectangle height.
+    vertical_crop: [f64; 2],
     span: [usize; 2],
     anonymous: Option<Arc<Image>>,
     serial: u64,
@@ -38,6 +41,7 @@ pub struct GraphicsPlacement {
 struct PlacementRoot {
     serial: u64,
     offset: [i64; 2],
+    index: u16,
     is_virtual: bool,
 }
 
@@ -45,6 +49,9 @@ struct PlacementRoot {
 pub struct GraphicsLayout {
     pub offset: [f64; 2],
     pub size: [f64; 2],
+    pub source_origin: [f64; 2],
+    pub source_per_pixel: f64,
+    pub sample_rows: [f64; 2],
 }
 
 impl GraphicsPlacement {
@@ -82,17 +89,13 @@ impl GraphicsPlacement {
         self.anonymous.as_deref()
     }
 
-    pub fn row_clip(&self) -> Range<i64> {
-        self.row.saturating_add(self.clip[0])..self.row.saturating_add(self.clip[1])
-    }
-
     fn rows(&self) -> Range<i64> {
         self.rows_at(self.row)
     }
 
     fn rows_at(&self, row: i64) -> Range<i64> {
         let height = i64::try_from(self.span[1]).unwrap_or(i64::MAX);
-        row.saturating_add(self.clip[0])..row.saturating_add(self.clip[1].min(height))
+        row..row.saturating_add(height)
     }
 
     fn columns_at(&self, column: i64) -> Range<i64> {
@@ -108,6 +111,38 @@ impl GraphicsPlacement {
     }
 
     pub fn layout(&self, cell: PixelSize) -> GraphicsLayout {
+        let (mut offset, mut size, scale) = self.uncropped_geometry(cell);
+        let mut source_origin = self.placement.source_origin.map(f64::from);
+        let mut sample_rows = UNCROPPED;
+        if self.vertical_crop != UNCROPPED {
+            let [top, bottom] = self.vertical_crop;
+            let start = top.max(0.0);
+            let fraction = bottom.min(1.0) - start;
+            if top.is_finite() {
+                offset[1] = (start - top) * size[1];
+            }
+            size[1] *= fraction;
+            let source_height = f64::from(self.placement.source_size[1]);
+            let first = source_origin[1] + start * source_height;
+            if top > 0.0 {
+                sample_rows[0] = snap_texel_edge(first).floor() + 0.5;
+            }
+            if bottom < 1.0 {
+                let last = source_origin[1] + bottom * source_height;
+                sample_rows[1] = (snap_texel_edge(last).ceil() - 0.5).max(sample_rows[0]);
+            }
+            source_origin[1] = first;
+        }
+        GraphicsLayout {
+            offset,
+            size,
+            source_origin,
+            source_per_pixel: scale.recip(),
+            sample_rows,
+        }
+    }
+
+    fn uncropped_geometry(&self, cell: PixelSize) -> ([f64; 2], [f64; 2], f64) {
         let cell = [f64::from(cell.width.get()), f64::from(cell.height.get())];
         let [width, height] = self.placement.source_size.map(f64::from);
         let [columns, rows] = self.placement.cells.map(f64::from);
@@ -128,23 +163,60 @@ impl GraphicsPlacement {
             (false, true) => (available_height / height, 0.0, 0.0),
             (false, false) => (1.0, 0.0, 0.0),
         };
-        GraphicsLayout {
-            offset: [x + left, y + top],
-            size: [width * scale, height * scale],
-        }
+        ([x + left, y + top], [width * scale, height * scale], scale)
     }
 
     fn set_cell_size(&mut self, cell: PixelSize) {
-        let layout = self.layout(cell);
-        let size = [cell.width.get(), cell.height.get()];
+        let (offset, size, _) = self.uncropped_geometry(cell);
+        let cell_size = [cell.width.get(), cell.height.get()].map(f64::from);
         self.span = std::array::from_fn(|axis| {
             let count = self.placement.cells[axis];
             if count == 0 {
-                ((layout.offset[axis] + layout.size[axis]) / f64::from(size[axis])).ceil() as usize
+                ((offset[axis] + size[axis]) / cell_size[axis]).ceil() as usize
             } else {
                 count as usize
             }
         });
+        if self.vertical_crop != UNCROPPED {
+            let [top, bottom] = self.vertical_crop;
+            let mut height = if bottom.is_finite() {
+                bottom * size[1] + offset[1]
+            } else if self.placement.cells[1] != 0 {
+                f64::from(self.placement.cells[1]) * cell_size[1]
+            } else {
+                offset[1] + size[1]
+            };
+            if top.is_finite() {
+                height -= top * size[1] + offset[1];
+            }
+            let rows = height / cell_size[1];
+            // Allow round-off when projecting a crop edge onto a cell boundary.
+            let tolerance = (size[1] / cell_size[1]).max(rows) * (8.0 * f64::EPSILON);
+            self.span[1] = (rows - tolerance.min(1e-7)).ceil().max(1.0) as usize;
+        }
+    }
+
+    fn crop_rows(&mut self, retained: Range<i64>, cell: PixelSize) -> bool {
+        if retained.is_empty() {
+            return false;
+        }
+        let (offset, size, _) = self.uncropped_geometry(cell);
+        let anchor = if self.vertical_crop[0].is_finite() {
+            self.vertical_crop[0]
+        } else {
+            -offset[1] / size[1]
+        };
+        let rows_to_source = f64::from(cell.height.get()) / size[1];
+        let edge = |row: i64| anchor + row.saturating_sub(self.row) as f64 * rows_to_source;
+        if retained.end < self.rows().end {
+            self.vertical_crop[1] = self.vertical_crop[1].min(edge(retained.end));
+        }
+        if retained.start > self.row {
+            self.vertical_crop[0] = edge(retained.start);
+        }
+        self.row = retained.start;
+        self.span[1] = retained.end.saturating_sub(retained.start) as usize;
+        self.vertical_crop[0].max(0.0) < self.vertical_crop[1].min(1.0)
     }
 
     pub(crate) fn cursor_travel(&self, measured_cell: bool) -> [usize; 2] {
@@ -174,7 +246,15 @@ impl GraphicsPlacement {
                 requested.min(remaining)
             };
         }
-        let cursor_anchored = placement.position == PlacementPosition::Cursor;
+        let cursor_anchored = match placement.position {
+            PlacementPosition::Cursor => true,
+            PlacementPosition::Virtual => {
+                // Placeholder pixels are drawn below the cursor.
+                placement.z = -1;
+                false
+            }
+            PlacementPosition::Relative(_) => false,
+        };
         let mut image = Self {
             placement,
             row: if cursor_anchored {
@@ -187,7 +267,7 @@ impl GraphicsPlacement {
             } else {
                 0
             },
-            clip: [0, i64::MAX],
+            vertical_crop: UNCROPPED,
             span: [0; 2],
             anonymous,
             serial: 0,
@@ -196,6 +276,15 @@ impl GraphicsPlacement {
         };
         image.set_cell_size(cell);
         Ok(image)
+    }
+}
+
+fn snap_texel_edge(pixel: f64) -> f64 {
+    let rounded = pixel.round();
+    if (pixel - rounded).abs() < 1e-9 {
+        rounded
+    } else {
+        pixel
     }
 }
 
@@ -214,7 +303,6 @@ pub(crate) struct GraphicsAnchor {
     pub(crate) source: CellPosition,
     pub(crate) destination: Option<CellPosition>,
     index: usize,
-    row_offset: i64,
 }
 
 impl GraphicsPlacements {
@@ -265,7 +353,7 @@ impl GraphicsPlacements {
             if image.placement.position != PlacementPosition::Cursor {
                 continue;
             }
-            let row = image.row_clip().start.max(-history);
+            let row = image.row.max(-history);
             let source = crate::reflow::normalize_position(
                 view,
                 CellPosition {
@@ -278,7 +366,6 @@ impl GraphicsPlacements {
                 source,
                 destination: None,
                 index,
-                row_offset: row - image.row,
             });
         }
         anchors.sort_unstable_by_key(|anchor| anchor.source);
@@ -291,6 +378,7 @@ impl GraphicsPlacements {
         window: Range<usize>,
         history: usize,
         columns: usize,
+        cell: PixelSize,
     ) {
         if anchors.is_empty() {
             return;
@@ -307,10 +395,10 @@ impl GraphicsPlacements {
             else {
                 return false;
             };
-            image.row = destination.row as i64 - window.start as i64 - anchor.row_offset;
+            image.row = destination.row as i64 - window.start as i64;
             image.column = destination.column.min(columns - 1) as i64;
-            image.clip[0] = image.clip[0].max(-(history as i64) - image.row);
-            !image.rows().is_empty()
+            let first = -(history as i64);
+            image.row >= first || image.crop_rows(first..image.rows().end, cell)
         });
         self.sync_graph(self.images.len() != count);
         if !self.images.is_empty() {
@@ -321,7 +409,7 @@ impl GraphicsPlacements {
     pub(crate) fn crop_alternate(&mut self, columns: usize, rows: usize) {
         self.remove_matching(|image| {
             image.placement.position == PlacementPosition::Cursor
-                && (image.column >= columns as i64 || image.row_clip().start >= rows as i64)
+                && (image.column >= columns as i64 || image.row >= rows as i64)
         });
     }
 
@@ -351,16 +439,15 @@ impl GraphicsPlacements {
         });
     }
 
-    pub(crate) fn discard_history_before(&mut self, first_row: i64) {
+    pub(crate) fn discard_history_before(&mut self, first_row: i64, cell: PixelSize) {
         let count = self.images.len();
         let mut changed = false;
         self.images.retain_mut(|image| {
-            if image.is_virtual() || image.parent.is_some() || image.row_clip().start >= first_row {
+            if image.is_virtual() || image.parent.is_some() || image.row >= first_row {
                 return true;
             }
             changed = true;
-            image.clip[0] = first_row.saturating_sub(image.row);
-            !image.rows().is_empty()
+            image.crop_rows(first_row..image.rows().end, cell)
         });
         if changed {
             self.sync_graph(self.images.len() != count);
@@ -370,16 +457,24 @@ impl GraphicsPlacements {
         }
     }
 
-    pub(crate) fn scroll(&mut self, source: Range<i64>, destination: Range<i64>, delta: i64) {
-        self.scroll_matching(destination, delta, |rows| {
+    pub(crate) fn scroll(
+        &mut self,
+        source: Range<i64>,
+        destination: Range<i64>,
+        delta: i64,
+        cell: PixelSize,
+    ) {
+        self.scroll_matching(destination, delta, cell, |rows| {
             rows.start >= source.start && rows.end <= source.end
         });
     }
 
-    pub(crate) fn reverse_page(&mut self, first_retained_row: i64, delta: i64) {
+    pub(crate) fn reverse_page(&mut self, first_retained_row: i64, delta: i64, cell: PixelSize) {
         // The live portion carries the whole placement. Placements entirely in
         // scrollback keep their position.
-        self.scroll_matching(first_retained_row..i64::MAX, delta, |rows| rows.end > 0);
+        self.scroll_matching(first_retained_row..i64::MAX, delta, cell, |rows| {
+            rows.end > 0
+        });
     }
 
     #[cold]
@@ -387,6 +482,7 @@ impl GraphicsPlacements {
         &mut self,
         destination: Range<i64>,
         delta: i64,
+        cell: PixelSize,
         mut moves: impl FnMut(&Range<i64>) -> bool,
     ) {
         let count = self.images.len();
@@ -400,15 +496,13 @@ impl GraphicsPlacements {
                 return true;
             }
             changed = true;
-            let retained_start = rows.start.saturating_add(delta).max(destination.start);
-            let retained_end = rows.end.saturating_add(delta).min(destination.end);
-            if retained_start >= retained_end {
-                return false;
+            let moved = rows.start.saturating_add(delta)..rows.end.saturating_add(delta);
+            image.row = moved.start;
+            if moved.start >= destination.start && moved.end <= destination.end {
+                return true;
             }
-            image.row = image.row.saturating_add(delta);
-            image.clip[0] = image.clip[0].max(destination.start.saturating_sub(image.row));
-            image.clip[1] = image.clip[1].min(destination.end.saturating_sub(image.row));
-            true
+            let retained = moved.start.max(destination.start)..moved.end.min(destination.end);
+            image.crop_rows(retained, cell)
         });
         if changed {
             self.sync_graph(self.images.len() != count);
@@ -607,7 +701,11 @@ impl GraphicsPlacements {
         self.virtual_count += usize::from(image.is_virtual());
         self.images.insert(position, image);
         if graph {
-            self.sync_graph(true);
+            if removes_existing || !evicted.is_empty() {
+                self.sync_graph(true);
+            } else {
+                self.index_inserted(position);
+            }
         }
         self.changed();
         Ok(())
@@ -621,6 +719,33 @@ impl GraphicsPlacements {
                 .enumerate()
                 .map(|(index, image)| (image.serial, index)),
         );
+    }
+
+    fn refresh_root_indices(&mut self) {
+        for image in &mut self.images {
+            if let Some(root) = &mut image.root {
+                root.index = self.anchors[&root.serial] as u16;
+            }
+        }
+    }
+
+    fn index_inserted(&mut self, index: usize) {
+        if index + 1 == self.images.len() {
+            self.anchors.insert(self.images[index].serial, index);
+        } else {
+            self.reindex();
+            for image in &mut self.images {
+                if let Some(root) = &mut image.root
+                    && usize::from(root.index) >= index
+                {
+                    root.index += 1;
+                }
+            }
+        }
+        if self.images[index].parent.is_some() {
+            self.resolve_root(index)
+                .expect("A newly added relative placement was validated");
+        }
     }
 
     fn validate(
@@ -645,10 +770,11 @@ impl GraphicsPlacements {
         mut image: &'a GraphicsPlacement,
         replacement: Option<&'a GraphicsPlacement>,
         replaces_image: bool,
-    ) -> Result<([i64; 2], PlacementRoot), PlacementError> {
+    ) -> Result<(&'a GraphicsPlacement, [i64; 2], Option<u16>), PlacementError> {
         let mut offset = [0i64; 2];
         let mut visited = [0; MAX_PARENT_DEPTH + 2];
         let mut depth = 0;
+        let mut anchor_index = None;
         while let Some(parent) = image.parent {
             visited[depth] = image.serial;
             depth += 1;
@@ -664,7 +790,10 @@ impl GraphicsPlacements {
             offset[0] += i64::from(link.offset[0]);
             offset[1] += i64::from(link.offset[1]);
             image = match replacement.filter(|image| image.serial == parent) {
-                Some(proposed) => proposed,
+                Some(proposed) => {
+                    anchor_index = None;
+                    proposed
+                }
                 None => {
                     let index = *self
                         .anchors
@@ -678,18 +807,30 @@ impl GraphicsPlacements {
                     {
                         return Err(PlacementError::MissingParent);
                     }
+                    anchor_index = Some(index as u16);
                     referenced
                 }
             };
         }
-        Ok((
-            [image.column + offset[0], image.row + offset[1]],
-            PlacementRoot {
-                serial: image.serial,
-                offset,
-                is_virtual: image.is_virtual(),
-            },
-        ))
+        Ok((image, offset, anchor_index))
+    }
+
+    fn resolve_root(&mut self, index: usize) -> Result<(), PlacementError> {
+        let (anchor, offset, anchor_index) = self.resolve(&self.images[index], None, false)?;
+        let column = anchor.column + offset[0];
+        let row = anchor.row + offset[1];
+        let root = PlacementRoot {
+            serial: anchor.serial,
+            offset,
+            index: anchor_index.expect("Relative placement has an existing anchor"),
+            is_virtual: anchor.is_virtual(),
+        };
+        self.virtual_parents |= root.is_virtual;
+        let image = &mut self.images[index];
+        image.column = column;
+        image.row = row;
+        image.root = Some(root);
+        Ok(())
     }
 
     #[cold]
@@ -702,8 +843,9 @@ impl GraphicsPlacements {
                 let Some(root) = self.images[index].root else {
                     continue;
                 };
-                let anchor = &self.images[self.anchors[&root.serial]];
-                let [column, row] = [anchor.column + root.offset[0], anchor.row + root.offset[1]];
+                let anchor = &self.images[usize::from(root.index)];
+                let column = anchor.column + root.offset[0];
+                let row = anchor.row + root.offset[1];
                 let image = &mut self.images[index];
                 image.column = column;
                 image.row = row;
@@ -718,19 +860,11 @@ impl GraphicsPlacements {
             if self.images[index].parent.is_none() {
                 continue;
             }
-            match self.resolve(&self.images[index], None, false) {
-                Ok(([column, row], root)) => {
-                    relative = true;
-                    self.virtual_parents |= root.is_virtual;
-                    let image = &mut self.images[index];
-                    image.column = column;
-                    image.row = row;
-                    image.root = Some(root);
-                }
-                Err(_) => {
-                    invalid = true;
-                    self.images[index].parent = Some(0);
-                }
+            if self.resolve_root(index).is_ok() {
+                relative = true;
+            } else {
+                invalid = true;
+                self.images[index].parent = Some(0);
             }
         }
         if invalid {
@@ -747,6 +881,7 @@ impl GraphicsPlacements {
             });
             if relative {
                 self.reindex();
+                self.refresh_root_indices();
             }
         }
         if !relative {
@@ -869,11 +1004,18 @@ impl Graphics {
                         });
                         return self.reply.is_some();
                     }
-                    Some(Err(_)) => self.images.abort_transfer(),
-                    None => {}
+                    Some(Err(DecodeError::PayloadTooLong | DecodeError::PayloadAllocation)) => {
+                        self.images.abort_transfer();
+                    }
+                    Some(Err(_)) | None => {}
                 }
             }
-            ApcEvent::Cancel => self.finish(),
+            ApcEvent::Cancel => {
+                self.active = false;
+                if self.decoder.cancel() {
+                    self.images.abort_transfer();
+                }
+            }
         }
         false
     }

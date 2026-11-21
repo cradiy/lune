@@ -92,6 +92,14 @@ impl Controls {
                 values[index] = Some(parse_value(value).ok_or(DecodeError::InvalidControl)?);
                 present |= bit;
             }
+            // The zero selectors are unset, but they still count for duplicate detection.
+            for key in *b"iI" {
+                let index = key_index(key).expect("Image selector has a control index");
+                if values[index] == Some(Value::Unsigned(0)) {
+                    values[index] = None;
+                    present &= !(1 << index);
+                }
+            }
         }
         Ok(Self { values, present })
     }
@@ -210,8 +218,12 @@ impl Decoder {
         self.large_payload.clear();
     }
 
-    pub fn cancel(&mut self) {
-        self.state = State::Idle;
+    /// Cancels the APC and reports whether it may have carried an image chunk.
+    pub fn cancel(&mut self) -> bool {
+        let state = core::mem::replace(&mut self.state, State::Idle);
+        !matches!(state, State::Idle | State::Selector | State::Ignore)
+            && !Controls::parse(&self.control[..self.control_len])
+                .is_ok_and(|controls| controls.is_feature_query())
     }
 
     pub fn push(&mut self, mut bytes: &[u8]) {

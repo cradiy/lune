@@ -5,19 +5,20 @@ use lune_terminal::{
     GraphicsImage, GraphicsImageFormat, GraphicsImageKey, GraphicsPlacement, PixelSize, Row,
     RowRevision, graphics_parent_origins,
 };
-use wgpu::{
-    BindGroup, Buffer, Device, Extent3d, Queue, RenderPipeline, Sampler, TexelCopyBufferLayout,
-    Texture, TextureDescriptor, TextureDimension, TextureFormat, TextureUsages, TextureView,
-};
+use wgpu::{Buffer, Device, Queue, RenderPipeline, Sampler, Texture, TextureFormat, TextureView};
 
 use crate::{GridGeometry, PresentationFrame};
 
 mod backgrounds;
 mod placeholders;
+mod textures;
 
 pub use backgrounds::{BackgroundPrepareError, CellBackgroundRenderer};
+use textures::{
+    ImageTextures, PixelRegion, TextureBinding, TileRegion, make_texture, write_texture,
+};
 
-type Instance = [f32; 8];
+type ImageInstance = [f32; 10];
 
 struct ImageLocation {
     origin: [i64; 2],
@@ -47,13 +48,13 @@ struct CachedImage {
     source_revision: u64,
     revision: u64,
     format: GraphicsImageFormat,
-    texture: Texture,
-    binding: BindGroup,
+    textures: ImageTextures,
 }
 
 struct Draw {
     image_id: GraphicsImageKey,
     layer: GraphicsLayer,
+    tile: u32,
     instances: Range<u32>,
 }
 
@@ -75,7 +76,7 @@ pub struct ImageRenderer {
     has_indexed: bool,
     images: HashMap<GraphicsImageKey, CachedImage>,
     buffer: Option<Buffer>,
-    instances: Vec<Instance>,
+    instances: Vec<ImageInstance>,
     draws: Vec<Draw>,
     prepared: Option<PreparedImages>,
     placeholder_rows: Vec<RowRevision>,
@@ -90,21 +91,36 @@ impl ImageRenderer {
         });
         let palette = make_texture(device, 256, 1, TextureFormat::Rgba8UnormSrgb);
         let palette_view = palette.create_view(&wgpu::TextureViewDescriptor::default());
-        let pipeline = |fragment| {
+        let pipeline = |fragment, blend| {
             create_quad_pipeline(
                 device,
                 &module,
                 format,
                 "vertex_main",
                 fragment,
-                Some(wgpu::BlendState::ALPHA_BLENDING),
+                Some(blend),
+                wgpu::VertexBufferLayout {
+                    array_stride: size_of::<ImageInstance>() as u64,
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4, 2 => Float32x2],
+                },
             )
         };
         Self {
-            pipeline: pipeline("fragment_main"),
-            indexed: pipeline("indexed_main"),
-            indexed_alpha: pipeline("indexed_alpha_main"),
-            sampler: device.create_sampler(&wgpu::SamplerDescriptor::default()),
+            pipeline: pipeline("fragment_main", wgpu::BlendState::ALPHA_BLENDING),
+            indexed: pipeline(
+                "indexed_main",
+                wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING,
+            ),
+            indexed_alpha: pipeline(
+                "indexed_alpha_main",
+                wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING,
+            ),
+            sampler: device.create_sampler(&wgpu::SamplerDescriptor {
+                mag_filter: wgpu::FilterMode::Linear,
+                min_filter: wgpu::FilterMode::Linear,
+                ..Default::default()
+            }),
             palette,
             palette_view,
             palette_revision: None,
@@ -134,7 +150,9 @@ impl ImageRenderer {
 
     #[cfg(test)]
     pub(crate) fn cached_texture(&self, key: GraphicsImageKey) -> Option<&Texture> {
-        self.images.get(&key).map(|entry| &entry.texture)
+        self.images
+            .get(&key)
+            .map(|entry| &entry.textures.get(0).texture)
     }
 
     /// Builds the image pass for a viewport. Returns the number of placements
@@ -221,8 +239,11 @@ impl ImageRenderer {
         } else {
             HashMap::new()
         };
-        let buffer_limit = device.limits().max_buffer_size;
-        let max_instances = (buffer_limit / size_of::<Instance>() as u64) as usize;
+        let limits = device.limits();
+        let buffer_limit = limits.max_buffer_size;
+        let max_instances =
+            (buffer_limit / size_of::<ImageInstance>() as u64).min(u64::from(u32::MAX)) as usize;
+        let mut tile_instances = Vec::new();
         for placement in frame.graphics_placements() {
             let image_id = placement.placement.image;
             let Some(image) = frame.graphics_image(placement) else {
@@ -230,7 +251,7 @@ impl ImageRenderer {
             };
             let mut uploaded = None;
             let mut push = |location: &ImageLocation| {
-                let Some(vertices) = instance(placement, image, cell, area, location) else {
+                let Some(quad) = ImageQuad::new(placement, cell, area, location) else {
                     return;
                 };
                 if self.instances.len() >= max_instances
@@ -239,7 +260,31 @@ impl ImageRenderer {
                     rejected += 1;
                     return;
                 }
-                self.push_instance(placement, image.format(), vertices);
+                let (width, height) = image.dimensions();
+                if width.max(height) <= limits.max_texture_dimension_2d {
+                    self.push_instance(
+                        placement,
+                        image.format(),
+                        0,
+                        quad.instance([width, height]),
+                    );
+                    return;
+                }
+                let ImageTextures::Tiled(tiles) = &self.images[&image_id].textures else {
+                    unreachable!("Oversized images are tiled");
+                };
+                tile_instances.clear();
+                tile_instances.extend(tiles.iter().enumerate().filter_map(|(index, tile)| {
+                    quad.tile_instance(tile.region)
+                        .map(|vertices| (index as u32, vertices))
+                }));
+                if tile_instances.len() > max_instances - self.instances.len() {
+                    rejected += 1;
+                    return;
+                }
+                for &(tile, vertices) in &tile_instances {
+                    self.push_instance(placement, image.format(), tile, vertices);
+                }
             };
             if placement.is_virtual() {
                 if let Some(runs) = placeholders.get(&placement.serial()) {
@@ -256,16 +301,9 @@ impl ImageRenderer {
                 continue;
             };
             let unbounded = i64::MIN..i64::MAX;
-            let rows = if placement.virtual_parent().is_some() {
-                unbounded.clone()
-            } else {
-                let offset = offset as i64;
-                let rows = placement.row_clip();
-                rows.start.saturating_add(offset)..rows.end.saturating_add(offset)
-            };
             push(&ImageLocation {
                 origin,
-                clip: [unbounded, rows],
+                clip: [unbounded.clone(), unbounded],
             });
         }
         write_instances(device, queue, &mut self.buffer, &self.instances);
@@ -276,7 +314,8 @@ impl ImageRenderer {
         &mut self,
         placement: &GraphicsPlacement,
         format: GraphicsImageFormat,
-        instance: Instance,
+        tile: u32,
+        instance: ImageInstance,
     ) {
         self.has_indexed |= format != GraphicsImageFormat::Rgba;
         let image_id = placement.placement.image;
@@ -286,12 +325,14 @@ impl ImageRenderer {
         if let Some(last) = self.draws.last_mut()
             && last.layer == layer
             && last.image_id == image_id
+            && last.tile == tile
         {
             last.instances.end += 1;
         } else {
             self.draws.push(Draw {
                 layer,
                 image_id,
+                tile,
                 instances: first..first + 1,
             });
         }
@@ -327,63 +368,63 @@ impl ImageRenderer {
                     return false;
                 };
                 if !update.size.contains(&0) {
-                    let [x, y] = update.origin;
-                    let [width, height] = update.size;
-                    queue.write_texture(
-                        wgpu::TexelCopyTextureInfo {
-                            origin: wgpu::Origin3d { x, y, z: 0 },
-                            ..cached.texture.as_image_copy()
+                    cached.textures.write(
+                        queue,
+                        PixelRegion {
+                            origin: update.origin,
+                            size: update.size,
                         },
                         update.bytes,
-                        TexelCopyBufferLayout {
-                            offset: 0,
-                            bytes_per_row: Some(update.bytes_per_row),
-                            rows_per_image: None,
-                        },
-                        Extent3d {
-                            width,
-                            height,
-                            depth_or_array_layers: 1,
-                        },
+                        update.bytes_per_row,
+                        cached.format.bytes_per_pixel(),
                     );
                 }
                 cached.revision = revision;
             }
             return true;
         }
-        let Some(texture) = upload_graphics_image(device, queue, image, &mut self.pixel_scratch)
-        else {
+        let Some(pixels) = image.pixels(&mut self.pixel_scratch) else {
             return false;
         };
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let (image_binding, source_binding, source) = if image.format() == GraphicsImageFormat::Rgba
-        {
-            (0, 1, wgpu::BindingResource::Sampler(&self.sampler))
-        } else {
-            (2, 3, wgpu::BindingResource::TextureView(&self.palette_view))
+        let (width, height) = image.dimensions();
+        let format = image.format();
+        let pipeline = match format {
+            GraphicsImageFormat::Rgba => &self.pipeline,
+            GraphicsImageFormat::Indexed => &self.indexed,
+            GraphicsImageFormat::IndexedAlpha => &self.indexed_alpha,
         };
-        let binding = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &self.pipeline(image.format()).get_bind_group_layout(0),
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: image_binding,
-                    resource: wgpu::BindingResource::TextureView(&view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: source_binding,
-                    resource: source,
-                },
-            ],
-        });
+        let layout = pipeline.get_bind_group_layout(0);
+        let textures = ImageTextures::new(
+            [width, height],
+            device.limits().max_texture_dimension_2d,
+            |region| {
+                TextureBinding::new(
+                    device,
+                    &layout,
+                    format,
+                    &self.sampler,
+                    &self.palette_view,
+                    region,
+                )
+            },
+        );
+        textures.write(
+            queue,
+            PixelRegion {
+                origin: [0, 0],
+                size: [width, height],
+            },
+            pixels,
+            width * format.bytes_per_pixel(),
+            format.bytes_per_pixel(),
+        );
         self.images.insert(
             id,
             CachedImage {
                 source_revision: image.source_revision(),
                 revision,
-                format: image.format(),
-                texture,
-                binding,
+                format,
+                textures,
             },
         );
         true
@@ -404,7 +445,7 @@ impl ImageRenderer {
                 pass.set_pipeline(self.pipeline(image.format));
                 format = Some(image.format);
             }
-            pass.set_bind_group(0, &image.binding, &[]);
+            pass.set_bind_group(0, &image.textures.get(draw.tile as usize).binding, &[]);
             pass.draw(0..4, draw.instances.clone());
         }
     }
@@ -417,6 +458,7 @@ fn create_quad_pipeline(
     vertex: &str,
     fragment: &str,
     blend: Option<wgpu::BlendState>,
+    buffer_layout: wgpu::VertexBufferLayout<'_>,
 ) -> RenderPipeline {
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: None,
@@ -425,11 +467,7 @@ fn create_quad_pipeline(
             module,
             entry_point: Some(vertex),
             compilation_options: wgpu::PipelineCompilationOptions::default(),
-            buffers: &[Some(wgpu::VertexBufferLayout {
-                array_stride: size_of::<Instance>() as u64,
-                step_mode: wgpu::VertexStepMode::Instance,
-                attributes: &wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4],
-            })],
+            buffers: &[Some(buffer_layout)],
         },
         primitive: wgpu::PrimitiveState {
             topology: wgpu::PrimitiveTopology::TriangleStrip,
@@ -452,11 +490,11 @@ fn create_quad_pipeline(
     })
 }
 
-fn write_instances(
+fn write_instances<T: bytemuck::Pod>(
     device: &Device,
     queue: &Queue,
     buffer: &mut Option<Buffer>,
-    instances: &[Instance],
+    instances: &[T],
 ) {
     let bytes = bytemuck::cast_slice(instances);
     if bytes.is_empty() {
@@ -478,87 +516,87 @@ fn write_instances(
     queue.write_buffer(buffer.as_ref().expect("Instances have a buffer"), 0, bytes);
 }
 
-fn instance(
-    placement: &GraphicsPlacement,
-    image: &GraphicsImage,
-    cell: PixelSize,
-    area: PixelSize,
-    location: &ImageLocation,
-) -> Option<Instance> {
-    let layout = placement.layout(cell);
-    let cell = [f64::from(cell.width.get()), f64::from(cell.height.get())];
-    let screen = [f64::from(area.width.get()), f64::from(area.height.get())];
-    let dimensions = image.dimensions();
-    let mut data = [0.0; 8];
-    for (axis, dimension) in [dimensions.0, dimensions.1].into_iter().enumerate() {
-        let origin = location.origin[axis] as f64 * cell[axis] + layout.offset[axis];
-        let start = origin.max((location.clip[axis].start as f64 * cell[axis]).max(0.0));
-        let end = (origin + layout.size[axis])
-            .min((location.clip[axis].end as f64 * cell[axis]).min(screen[axis]));
-        if start >= end {
-            return None;
+struct ImageQuad {
+    bounds: [[f64; 2]; 2],
+    source: [[f64; 2]; 2],
+    sample_rows: [f64; 2],
+}
+
+impl ImageQuad {
+    fn new(
+        placement: &GraphicsPlacement,
+        cell: PixelSize,
+        area: PixelSize,
+        location: &ImageLocation,
+    ) -> Option<Self> {
+        let layout = placement.layout(cell);
+        let cell = [f64::from(cell.width.get()), f64::from(cell.height.get())];
+        let screen = [f64::from(area.width.get()), f64::from(area.height.get())];
+        let mut quad = Self {
+            bounds: [[0.0; 2]; 2],
+            source: [[0.0; 2]; 2],
+            sample_rows: layout.sample_rows,
+        };
+        for axis in 0..2 {
+            let origin = location.origin[axis] as f64 * cell[axis] + layout.offset[axis];
+            let start = origin.max((location.clip[axis].start as f64 * cell[axis]).max(0.0));
+            let end = (origin + layout.size[axis])
+                .min((location.clip[axis].end as f64 * cell[axis]).min(screen[axis]));
+            if start >= end {
+                return None;
+            }
+            let direction = if axis == 0 { 1.0 } else { -1.0 };
+            let source_origin = layout.source_origin[axis];
+            quad.bounds[axis] =
+                [start, end].map(|pixel| direction * (pixel / screen[axis] * 2.0 - 1.0));
+            quad.source[axis] = [start, end]
+                .map(|pixel| source_origin + (pixel - origin) * layout.source_per_pixel);
         }
-        let direction = if axis == 0 { 1.0 } else { -1.0 };
-        let source_origin = f64::from(placement.placement.source_origin[axis]);
-        let source_scale = f64::from(placement.placement.source_size[axis]) / layout.size[axis];
-        for (edge, pixel) in [start, end].into_iter().enumerate() {
-            data[edge * 2 + axis] = (direction * (pixel / screen[axis] * 2.0 - 1.0)) as f32;
-            data[4 + edge * 2 + axis] =
-                ((source_origin + (pixel - origin) * source_scale) / f64::from(dimension)) as f32;
+        Some(quad)
+    }
+
+    fn instance(&self, dimensions: [u32; 2]) -> ImageInstance {
+        let [[left, right], [top, bottom]] = self.bounds;
+        let [[x0, x1], [y0, y1]] = self.source;
+        let [width, height] = dimensions.map(f64::from);
+        let [first_row, last_row] = self.sample_rows.map(|row| row.clamp(0.0, height) / height);
+        [
+            left,
+            top,
+            right,
+            bottom,
+            x0 / width,
+            y0 / height,
+            x1 / width,
+            y1 / height,
+            first_row,
+            last_row,
+        ]
+        .map(|v| v as f32)
+    }
+
+    fn tile_instance(&self, tile: TileRegion) -> Option<ImageInstance> {
+        let mut quad = Self {
+            bounds: [[0.0; 2]; 2],
+            source: [[0.0; 2]; 2],
+            sample_rows: self
+                .sample_rows
+                .map(|row| row - f64::from(tile.storage.origin[1])),
+        };
+        for axis in 0..2 {
+            let tile_origin = f64::from(tile.visible.origin[axis]);
+            let [start, end] = self.source[axis];
+            let first = start.max(tile_origin);
+            let last = end.min(tile_origin + f64::from(tile.visible.size[axis]));
+            if first >= last {
+                return None;
+            }
+            let [lower, upper] = self.bounds[axis];
+            let scale = (upper - lower) / (end - start);
+            quad.bounds[axis] = [first, last].map(|pixel| lower + (pixel - start) * scale);
+            let storage_origin = f64::from(tile.storage.origin[axis]);
+            quad.source[axis] = [first - storage_origin, last - storage_origin];
         }
+        Some(quad.instance(tile.storage.size))
     }
-    Some(data)
-}
-
-fn upload_graphics_image(
-    device: &Device,
-    queue: &Queue,
-    image: &GraphicsImage,
-    scratch: &mut Vec<u8>,
-) -> Option<Texture> {
-    let (width, height) = image.dimensions();
-    if width.max(height) > device.limits().max_texture_dimension_2d {
-        return None;
-    }
-    let bytes_per_row = width.checked_mul(image.format().bytes_per_pixel())?;
-    let format = match image.format() {
-        GraphicsImageFormat::Rgba => TextureFormat::Rgba8UnormSrgb,
-        GraphicsImageFormat::Indexed => TextureFormat::R8Uint,
-        GraphicsImageFormat::IndexedAlpha => TextureFormat::Rg8Uint,
-    };
-    let pixels = image.pixels(scratch)?;
-    let texture = make_texture(device, width, height, format);
-    write_texture(queue, &texture, pixels, bytes_per_row);
-    Some(texture)
-}
-
-fn make_texture(device: &Device, width: u32, height: u32, format: TextureFormat) -> Texture {
-    let size = Extent3d {
-        width,
-        height,
-        depth_or_array_layers: 1,
-    };
-    device.create_texture(&TextureDescriptor {
-        label: None,
-        size,
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: TextureDimension::D2,
-        format,
-        usage: TextureUsages::COPY_DST | TextureUsages::TEXTURE_BINDING,
-        view_formats: &[],
-    })
-}
-
-fn write_texture(queue: &Queue, texture: &Texture, bytes: &[u8], bytes_per_row: u32) {
-    queue.write_texture(
-        texture.as_image_copy(),
-        bytes,
-        TexelCopyBufferLayout {
-            offset: 0,
-            bytes_per_row: Some(bytes_per_row),
-            rows_per_image: None,
-        },
-        texture.size(),
-    );
 }

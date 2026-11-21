@@ -8,7 +8,9 @@ fn feed(input: &[u8], chunk: usize, mut command: impl FnMut(Result<Command<'_>, 
     let mut receive = |event: Event<'_>| match event {
         Event::Apc(ApcEvent::Start) => decoder.start(),
         Event::Apc(ApcEvent::Data(bytes)) => decoder.push(bytes),
-        Event::Apc(ApcEvent::Cancel) => decoder.cancel(),
+        Event::Apc(ApcEvent::Cancel) => {
+            decoder.cancel();
+        }
         Event::Apc(ApcEvent::End) => {
             if let Some(decoded) = decoder.finish() {
                 command(decoded);
@@ -48,7 +50,7 @@ fn graphics_commands_survive_fragmentation_and_cancelled_apcs() {
 
 #[test]
 fn invalid_controls_recover_at_the_next_apc() {
-    let input = b"\x1b_Gi=1,i=2\x1b\\\x1b_Gi=4294967296\x1b\\\x1b_Gz=-2147483649\x1b\\\x1b_Gq=1\x07\x1b\\\x1b_Ga=d,d=a\x1b\\";
+    let input = b"\x1b_Gi=0,i=2\x1b\\\x1b_Gi=4294967296\x1b\\\x1b_Gz=-2147483649\x1b\\\x1b_Gq=1\x07\x1b\\\x1b_Ga=d,d=a\x1b\\";
     let mut errors = Vec::new();
     let mut accepted = 0;
     feed(input, 1, |result| match result {
@@ -72,7 +74,7 @@ fn invalid_controls_recover_at_the_next_apc() {
 
 #[test]
 fn quota_and_query_preserve_stored_pixels() {
-    let input = b"\x1b_Gi=1,s=1,v=1,q=1;AQIDBA==\x1b\\\x1b_Gi=2,s=2,v=1;AAAAAA==\x1b\\\x1b_Gi=1,s=1,v=1;AAAA\x1b\\\x1b_Ga=q,i=1,s=1,v=1;AAAAAA==\x1b\\";
+    let input = b"\x1b_Gi=1,s=1,v=1,q=1;AQIDBA==\x1b\\\x1b_Gi=2,s=2,v=1;AAAAAA==\x1b\\\x1b_Gi=1,s=1,v=10001;AAAA\x1b\\\x1b_Gi=1,s=1,v=1;AAAA\x1b\\\x1b_Ga=q,i=1,s=1,v=1;AAAAAA==\x1b\\";
     let mut images = ImageStore::new(4, 1);
     let mut replies = Vec::new();
     feed(input, 3, |command| {
@@ -85,6 +87,7 @@ fn quota_and_query_preserve_stored_pixels() {
             .collect::<Vec<_>>(),
         [
             (2, b"ENOSPC:Image quota exceeded".as_slice()),
+            (1, b"EINVAL:Invalid image data".as_slice()),
             (1, b"ENODATA:Insufficient image data".as_slice()),
             (1, b"OK".as_slice()),
         ]
@@ -242,6 +245,59 @@ fn removing_an_animation_releases_shared_frame_storage() {
     for _ in 0..stored {
         assert_eq!(receive(&mut images, patch).message, b"OK");
     }
+}
+
+#[test]
+fn deleting_the_last_dependent_frame_releases_original_pixels() {
+    let receive = |images: &mut ImageStore, wire: &[u8]| {
+        let mut reply = None;
+        feed(wire, wire.len(), |command| {
+            let command = command.unwrap();
+            if let Some(delete) = command.decode_delete() {
+                images.delete_frame(delete.unwrap(), |_| Ok(()));
+            } else {
+                reply = images.receive(command, |_| Ok(()));
+            }
+        });
+        reply
+    };
+    let mut images = ImageStore::new(1024, 4);
+    let base = format!("\x1b_Gi=1,f=24,s=16,v=16;{}\x1b\\", "/wAA".repeat(256));
+    let next = format!("\x1b_Ga=f,i=1,f=24,s=16,v=16;{}\x1b\\", "AP8A".repeat(256));
+    for wire in [
+        base.as_bytes(),
+        next.as_bytes(),
+        b"\x1b_Ga=f,i=1,c=1,f=24,s=1,v=1;AAD/\x1b\\",
+    ] {
+        assert_eq!(receive(&mut images, wire).unwrap().message, b"OK");
+    }
+    receive(&mut images, b"\x1b_Ga=d,d=f,i=1,r=1\x1b\\");
+    receive(&mut images, b"\x1b_Ga=a,i=1,c=2\x1b\\");
+    let mut scratch = Vec::new();
+    let dependent = images.get(1).unwrap().pixels(&mut scratch).unwrap();
+    assert_eq!(&dependent[..8], &[0, 0, 255, 255, 255, 0, 0, 255]);
+
+    receive(&mut images, b"\x1b_Ga=d,d=F,i=1,r=999\x1b\\");
+    let second = format!("\x1b_Gi=2,f=24,s=16,v=16;{}\x1b\\", "AAAA".repeat(256));
+    assert_eq!(
+        receive(&mut images, second.as_bytes()).unwrap().message,
+        b"OK"
+    );
+    let root = images.get(1).unwrap();
+    assert_eq!(&root.pixels(&mut scratch).unwrap()[..4], &[0, 255, 0, 255]);
+    let root_revision = root.revision();
+
+    let patch = b"\x1b_Ga=f,i=1,c=1,f=24,s=1,v=1;AAD/\x1b\\";
+    assert_eq!(receive(&mut images, patch).unwrap().message, b"OK");
+    receive(&mut images, b"\x1b_Ga=a,i=1,c=2\x1b\\");
+    let image = images.get(1).unwrap();
+    let patch = image.pixel_update(root_revision, &mut scratch).unwrap();
+    assert_eq!((patch.origin, patch.size), ([0, 0], [1, 1]));
+    assert_eq!(patch.bytes, &[0, 0, 255, 255]);
+    let surface = image.pixel_update(0, &mut scratch).unwrap();
+    assert_eq!(surface.size, [16, 16]);
+    assert_eq!(surface.bytes.len(), 1024);
+    assert_eq!(&surface.bytes[..8], &[0, 0, 255, 255, 0, 255, 0, 255]);
 }
 
 #[test]

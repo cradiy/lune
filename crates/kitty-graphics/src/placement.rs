@@ -30,7 +30,7 @@ pub struct RelativePlacement {
 }
 
 impl Placement {
-    pub(crate) const CONTROL_NAMES: &[u8] = b"pXYxywhcrCzUPQHV";
+    pub(crate) const CONTROL_NAMES: &[u8] = b"pxywhXYcrCUzPQHV";
     pub(crate) const KEYS: u64 = control_keys(Self::CONTROL_NAMES);
 
     pub(crate) fn parse(image: ImageKey, controls: &Controls) -> Option<Self> {

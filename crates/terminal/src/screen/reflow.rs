@@ -429,6 +429,7 @@ impl Screen {
             wrap_pending: false,
         };
         before_commit()?;
+        let graphics_cell = self.graphics_cell_extent();
         let (primary_graphics, alternate_graphics) = if primary_active {
             (&mut self.graphics, &mut self.inactive.graphics)
         } else {
@@ -439,6 +440,7 @@ impl Screen {
             plan.window.clone(),
             history.len(),
             columns,
+            graphics_cell,
         );
         alternate_graphics.crop_alternate(columns, rows);
         // Every allocation is complete. Move source payloads before publishing state.

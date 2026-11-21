@@ -74,7 +74,9 @@ impl Image {
 
     pub fn pixels<'a>(&'a self, scratch: &'a mut Vec<u8>) -> Option<&'a [u8]> {
         if let Some(animation) = &self.animation {
-            return animation.pixels(&self.bytes, self.width, scratch).ok();
+            return animation
+                .pixels(&self.bytes, self.dimensions(), scratch)
+                .ok();
         }
         Some(&self.bytes)
     }
@@ -128,6 +130,18 @@ impl Image {
         let result = operation(&mut animation, &self.bytes)?;
         self.animation = Some(Box::new(animation));
         Ok(result)
+    }
+
+    fn release_unused_original(&mut self) -> usize {
+        if !self.bytes.is_empty()
+            && self
+                .animation
+                .as_ref()
+                .is_some_and(|animation| !animation.uses_original())
+        {
+            return std::mem::take(&mut self.bytes).capacity();
+        }
+        0
     }
 }
 
@@ -306,6 +320,7 @@ impl ImageStore {
             .as_mut()
             .is_some_and(|animation| animation.delete_frame(number));
         if removed {
+            self.stored_bytes -= image.release_unused_original();
             if image.revision() != previous {
                 self.visual_revision = self.visual_revision.wrapping_add(1);
             }
@@ -345,13 +360,14 @@ impl ImageStore {
         let quiet = controls.quiet().map_err(|_| INVALID);
         if controls.is_feature_query() {
             let id = number(controls, b'i').unwrap_or_default();
+            let image_number = number(controls, b'I');
             let valid = id != 0
-                && matches!(controls.get(b'e'), Some(Value::Letter(_)))
-                && controls.get(b'I').is_none();
+                && image_number == Some(0)
+                && matches!(controls.get(b'e'), Some(Value::Letter(_)));
             let result = if valid { Ok(()) } else { Err(INVALID) };
             let mut response = reply(
                 id,
-                number(controls, b'I').unwrap_or_default(),
+                image_number.unwrap_or_default(),
                 0,
                 quiet.unwrap_or_default().unwrap_or_default(),
                 quiet.and(result),
@@ -366,7 +382,7 @@ impl ImageStore {
             let continuation = controls.only(const { control_keys(b"amq") })
                 && action.is_none_or(|action| action == Value::Letter(pending.action));
             if continuation {
-                if let Ok(Some(quiet)) = quiet {
+                if let Ok(Some(quiet @ 1..=2)) = quiet {
                     pending.quiet = quiet;
                 }
                 pending
@@ -542,6 +558,7 @@ impl ImageStore {
                 },
             )
         })?;
+        self.stored_bytes -= image.release_unused_original();
         if image.revision() != previous {
             self.visual_revision = self.visual_revision.wrapping_add(1);
         }

@@ -3,8 +3,10 @@ use std::sync::OnceLock;
 use lune_terminal::{Palette, PaletteEntry, Row, RowRevision, StyleError};
 use wgpu::{Buffer, Device, Queue, RenderPipeline, TextureFormat};
 
-use super::{Instance, create_quad_pipeline, write_instances};
+use super::{create_quad_pipeline, write_instances};
 use crate::{GridGeometry, PresentationFrame};
+
+type Instance = [f32; 8];
 
 #[derive(Debug)]
 pub enum BackgroundPrepareError {
@@ -37,6 +39,11 @@ impl CellBackgroundRenderer {
                 "solid_vertex",
                 "solid_fragment",
                 None,
+                wgpu::VertexBufferLayout {
+                    array_stride: size_of::<Instance>() as u64,
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4],
+                },
             ),
             buffer: None,
             instances: Vec::new(),

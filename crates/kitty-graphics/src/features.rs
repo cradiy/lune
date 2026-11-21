@@ -1,7 +1,8 @@
 use crate::animation::{COMPOSE_FIELDS, CONTROL_FIELDS, LOAD_FIELDS};
-use crate::{Controls, Placement, Value};
+use crate::pixels::MAX_IMAGE_DIMENSION;
+use crate::{Controls, Placement, Value, control_keys};
 
-const TRANSMISSION: &[u8] = b"ftsvSOoN";
+const TRANSMISSION: &[u8] = b"tofsvSON";
 const DELETE: &[u8] = b"dpxyzr";
 type Fields = (&'static [u8], fn(u8, Value) -> bool);
 
@@ -44,7 +45,8 @@ impl FeatureReply {
             b'c' => &[(COMPOSE_FIELDS, frame_composition)],
             _ => return None,
         };
-        let mut supported = Vec::new();
+        let requested = controls.present & !const { control_keys(b"aeiImq") };
+        let mut supported = Vec::with_capacity(requested.count_ones() as usize);
         for &(keys, accepts) in fields {
             supported.extend(keys.iter().copied().filter_map(|key| {
                 let value = controls.get(key)?;
@@ -59,17 +61,20 @@ impl FeatureReply {
 }
 
 fn transmission(key: u8, value: Value) -> bool {
-    match (key, value) {
-        (b'f', Value::Unsigned(8 | 16 | 24 | 100)) | (b'o', Value::Letter(b'z')) => true,
-        (b'N', Value::Unsigned(1)) => true,
-        (b't', Value::Letter(b'f' | b't' | b's')) => cfg!(target_os = "linux"),
-        (b's' | b'v' | b'S' | b'O', Value::Unsigned(value)) => value != 0,
-        _ => false,
-    }
+    matches!(
+        (key, value),
+        (b'f', Value::Unsigned(8 | 16 | 24 | 32 | 100))
+            | (b't', Value::Letter(b'd'))
+            | (b'o', Value::Letter(b'z'))
+            | (b'N', Value::Unsigned(1))
+            | (b's' | b'v', Value::Unsigned(1..=MAX_IMAGE_DIMENSION))
+            | (b'S' | b'O', Value::Unsigned(1..))
+    ) || (cfg!(target_os = "linux")
+        && matches!((key, value), (b't', Value::Letter(b'f' | b't' | b's'))))
 }
 
 fn frame_transmission(key: u8, value: Value) -> bool {
-    !matches!((key, value), (b'N', _) | (b'f', Value::Unsigned(8 | 16))) && transmission(key, value)
+    !matches!((key, value), (b'f', Value::Unsigned(8 | 16))) && transmission(key, value)
 }
 
 fn frame_load(key: u8, value: Value) -> bool {
@@ -107,7 +112,8 @@ fn deletion(key: u8, value: Value) -> bool {
         b'd' => matches!(
             value,
             Value::Letter(
-                b'A' | b'i'
+                b'a' | b'A'
+                    | b'i'
                     | b'I'
                     | b'n'
                     | b'N'

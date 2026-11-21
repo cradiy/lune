@@ -16,8 +16,8 @@ use playback::{Playback, PlaybackMode};
 const MAX_PATCH_DEPTH: u8 = 24;
 const DEFAULT_GAP_MS: u32 = 40;
 pub(crate) const LOAD_FIELDS: &[u8] = b"xycrzXY";
-pub(crate) const CONTROL_FIELDS: &[u8] = b"crzsv";
-pub(crate) const COMPOSE_FIELDS: &[u8] = b"crxywhXYC";
+pub(crate) const CONTROL_FIELDS: &[u8] = b"svrcz";
+pub(crate) const COMPOSE_FIELDS: &[u8] = b"rcxywhXYC";
 pub(crate) const NO_FRAME: &[u8] = b"ENOENT:Animation frame not found";
 pub(crate) const INVALID_REGION: &[u8] = b"EINVAL:Invalid animation frame region";
 pub(crate) const INDEXED: &[u8] = b"EINVAL:Animation requires RGB or RGBA image data";
@@ -172,17 +172,30 @@ struct Frame {
     gap_ms: u32,
 }
 
+impl Frame {
+    fn uses_original_surface(&self) -> bool {
+        self.surface
+            .as_ref()
+            .is_some_and(|surface| surface.data.uses_original())
+    }
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct Animation {
     root: Frame,
     extra: Vec<Frame>,
     current: usize,
+    original_users: usize,
     total_gap_ms: u64,
     playback: Playback,
     pub(crate) scheduled_at: Option<Instant>,
 }
 
 impl Animation {
+    pub(crate) fn uses_original(&self) -> bool {
+        self.root.surface.is_none() || self.original_users != 0
+    }
+
     pub(crate) fn revision(&self) -> Option<u64> {
         Some(self.frame(self.current)?.surface.as_ref()?.revision)
     }
@@ -190,14 +203,14 @@ impl Animation {
     pub(crate) fn pixels<'a>(
         &'a self,
         original: &'a [u8],
-        width: u32,
+        dimensions: (u32, u32),
         scratch: &'a mut Vec<u8>,
     ) -> Result<&'a [u8], &'static [u8]> {
         match self
             .frame(self.current)
             .and_then(|frame| frame.surface.as_deref())
         {
-            Some(surface) => surface.data.pixels(original, width as usize, scratch),
+            Some(surface) => surface.data.pixels(original, dimensions, scratch),
             None => Ok(original),
         }
     }
@@ -234,7 +247,7 @@ impl Animation {
             return Ok(update);
         }
         let bytes = match data {
-            Some(data) => data.pixels(original, dimensions.0 as usize, scratch)?,
+            Some(data) => data.pixels(original, dimensions, scratch)?,
             None => original,
         };
         Ok(PixelUpdate::full(bytes, dimensions, ImageFormat::Rgba))
@@ -299,6 +312,7 @@ impl Animation {
                 base
             };
             let depth = base.depth() + 1;
+            let uses_original = base.uses_original();
             let patch = SurfaceData::Patch(Patch {
                 base,
                 region,
@@ -306,18 +320,22 @@ impl Animation {
                 pixels: pixels.bytes,
                 blend: !upload.overwrite,
                 depth,
+                uses_original,
             });
             if depth > MAX_PATCH_DEPTH {
                 let mut scratch = Vec::new();
-                patch.pixels(original, width as usize, &mut scratch)?;
+                patch.pixels(original, dimensions, &mut scratch)?;
                 SurfaceData::Full(scratch)
             } else {
                 patch
             }
         };
         let surface = budget.store(data, revision)?;
+        let original_user = usize::from(surface.data.uses_original());
         if let Some(frame) = self.frame_mut(index) {
+            let previous_user = usize::from(frame.uses_original_surface());
             frame.surface = Some(surface);
+            self.original_users -= previous_user;
             if let Some(gap_ms) = upload.gap_ms {
                 self.set_gap(index, gap_ms);
             }
@@ -330,6 +348,7 @@ impl Animation {
             });
             self.total_gap_ms += u64::from(gap_ms);
         }
+        self.original_users += original_user;
         Ok(number)
     }
 
@@ -424,6 +443,7 @@ impl Animation {
         } else {
             self.extra.remove(index - 1)
         };
+        self.original_users -= usize::from(removed.uses_original_surface());
         self.total_gap_ms -= u64::from(removed.gap_ms);
         if self.extra.capacity() > self.extra.len().saturating_mul(4).max(8) {
             self.extra.shrink_to_fit();
@@ -487,6 +507,10 @@ enum SurfaceData {
 }
 
 impl SurfaceData {
+    fn uses_original(&self) -> bool {
+        matches!(self, Self::Patch(patch) if patch.uses_original)
+    }
+
     fn capacity(&self) -> usize {
         match self {
             Self::Full(pixels) => pixels.capacity(),
@@ -497,18 +521,19 @@ impl SurfaceData {
     fn pixels<'a>(
         &'a self,
         original: &[u8],
-        width: usize,
+        dimensions: (u32, u32),
         scratch: &'a mut Vec<u8>,
     ) -> Result<&'a [u8], &'static [u8]> {
         match self {
             Self::Full(pixels) => Ok(pixels),
             Self::Patch(_) => {
-                resize_scratch(scratch, original.len())?;
+                let (width, height) = (dimensions.0 as usize, dimensions.1 as usize);
+                resize_scratch(scratch, width * height * 4)?;
                 let region = Region {
                     x: 0,
                     y: 0,
                     width,
-                    height: original.len() / (width * 4),
+                    height,
                 };
                 self.render(original, width, region, scratch);
                 Ok(scratch)
@@ -552,6 +577,14 @@ enum Base {
 }
 
 impl Base {
+    fn uses_original(&self) -> bool {
+        match self {
+            Self::Color(_) => false,
+            Self::Original => true,
+            Self::Frame(surface) => surface.data.uses_original(),
+        }
+    }
+
     fn revision(&self, original: u64) -> Option<u64> {
         match self {
             Self::Color(_) => None,
@@ -595,6 +628,7 @@ struct Patch {
     pixels: Vec<u8>,
     blend: bool,
     depth: u8,
+    uses_original: bool,
 }
 
 impl Patch {

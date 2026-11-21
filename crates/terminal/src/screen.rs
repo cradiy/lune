@@ -173,8 +173,9 @@ impl Screen {
         if !self.graphics.is_empty() {
             if captured {
                 let first_row = -(self.history.len() as i64);
+                let cell = self.graphics_cell_extent();
                 self.graphics
-                    .scroll(i64::MIN..i64::MAX, first_row..i64::MAX, -1);
+                    .scroll(i64::MIN..i64::MAX, first_row..i64::MAX, -1, cell);
             } else {
                 self.scroll_graphics(self.scroll_region.start, 1, false);
             }
@@ -227,12 +228,13 @@ impl Screen {
 
     fn discard_evicted_graphics(&mut self) {
         let first_row = -(self.history.len() as i64);
+        let cell = self.graphics_cell_extent();
         let primary = if self.active_buffer == ScreenBuffer::Primary {
             &mut self.graphics
         } else {
             &mut self.inactive.graphics
         };
-        primary.discard_history_before(first_row);
+        primary.discard_history_before(first_row, cell);
     }
 
     #[inline]
@@ -247,14 +249,15 @@ impl Screen {
         let end = self.scroll_region.end;
         let whole_screen = start == 0 && end == self.grid.rows();
         let moves = count.min(end - start) as i64;
+        let cell = self.graphics_cell_extent();
         if whole_screen && down {
             let first_retained_row = -(self.view().history_rows() as i64);
-            self.graphics.reverse_page(first_retained_row, moves);
+            self.graphics.reverse_page(first_retained_row, moves, cell);
         } else {
             let end = if whole_screen { i64::MAX } else { end as i64 };
             let region = start as i64..end;
             let delta = if down { moves } else { -moves };
-            self.graphics.scroll(region.clone(), region, delta);
+            self.graphics.scroll(region.clone(), region, delta, cell);
         }
     }
 

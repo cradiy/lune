@@ -9,6 +9,7 @@ use crate::{Controls, Value};
 pub(crate) const INVALID: &[u8] = b"EINVAL:Invalid image data";
 pub(crate) const QUOTA: &[u8] = b"ENOSPC:Image quota exceeded";
 pub(crate) const UNSUPPORTED: &[u8] = b"ENOTSUP:Unsupported graphics command";
+pub(crate) const MAX_IMAGE_DIMENSION: u32 = 10_000;
 const SHORT: &[u8] = b"ENODATA:Insufficient image data";
 
 const ENCODED_OVERHEAD: usize = 64 * 1024;
@@ -199,6 +200,9 @@ fn pixel_size(
     channels: usize,
     max_bytes: usize,
 ) -> Result<usize, &'static [u8]> {
+    if width.max(height) > MAX_IMAGE_DIMENSION {
+        return Err(INVALID);
+    }
     (width as usize)
         .checked_mul(height as usize)
         .and_then(|pixels| pixels.checked_mul(channels))
