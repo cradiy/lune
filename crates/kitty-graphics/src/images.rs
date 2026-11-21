@@ -247,6 +247,11 @@ struct NumberedImage {
     id: u32,
 }
 
+struct SourceInvalidation {
+    previous: u64,
+    image: ImageKey,
+}
+
 /// Stores image data and resolves Kitty image IDs and numbers.
 pub struct ImageStore {
     max_bytes: usize,
@@ -263,6 +268,7 @@ pub struct ImageStore {
     frame_budget: OnceLock<Arc<FrameBudget>>,
     visual_revision: u64,
     storage_revision: u64,
+    source_invalidation: Option<SourceInvalidation>,
     animation_wakes: AnimationWakes,
 }
 
@@ -282,6 +288,7 @@ impl ImageStore {
             frame_budget: OnceLock::new(),
             visual_revision: 0,
             storage_revision: next_image_revision(),
+            source_invalidation: None,
             animation_wakes: AnimationWakes::default(),
         }
     }
@@ -313,6 +320,14 @@ impl ImageStore {
     /// The unique revision assigned at creation and when stored sources are invalidated.
     pub fn storage_revision(&self) -> u64 {
         self.storage_revision
+    }
+
+    /// Returns the source key for an adjacent one-source invalidation.
+    pub fn invalidated_source(&self, previous: u64) -> Option<ImageKey> {
+        self.source_invalidation
+            .as_ref()
+            .filter(|entry| entry.previous == previous)
+            .map(|entry| entry.image)
     }
 
     pub fn has_anonymous_images(&self) -> bool {
@@ -366,12 +381,14 @@ impl ImageStore {
     pub fn retain_ids(&mut self, mut keep: impl FnMut(u32) -> bool) {
         let before = self.images.len();
         let mut removed_numbered = false;
+        let mut last_removed = None;
         self.images.retain(|&key, image| {
             let retain = match image {
                 StoredImage::Named(_) => keep(key.id()),
                 StoredImage::Anonymous { owner, .. } => owner.strong_count() != 0,
             };
             if !retain {
+                last_removed = Some(key);
                 self.stored_bytes -= image.storage_bytes();
                 self.anonymous_images -= usize::from(key.id() == 0);
                 if let StoredImage::Named(image) = image {
@@ -387,8 +404,9 @@ impl ImageStore {
             self.numbered
                 .retain(|entry| self.images.contains_key(&ImageKey(u64::from(entry.id))));
         }
-        if before != self.images.len() {
-            self.storage_revision = next_image_revision();
+        let removed = before - self.images.len();
+        if removed != 0 {
+            self.invalidate_sources(next_image_revision(), last_removed.filter(|_| removed == 1));
         }
     }
 
@@ -449,7 +467,7 @@ impl ImageStore {
     pub fn clear(&mut self) {
         self.abort_transfer();
         if !self.images.is_empty() {
-            self.storage_revision = next_image_revision();
+            self.invalidate_sources(next_image_revision(), None);
         }
         self.images.clear();
         self.numbered.clear();
@@ -946,7 +964,7 @@ impl ImageStore {
     }
 
     fn release_stored(&mut self, key: ImageKey, mut entry: StoredImage, revision: u64) {
-        self.storage_revision = revision;
+        self.invalidate_sources(revision, Some(key));
         self.stored_bytes -= entry.storage_bytes();
         self.anonymous_images -= usize::from(key.id() == 0);
         if let StoredImage::Named(image) = &mut entry {
@@ -964,6 +982,14 @@ impl ImageStore {
                 self.animation_wakes.remove(key, animation);
             }
         }
+    }
+
+    fn invalidate_sources(&mut self, revision: u64, image: Option<ImageKey>) {
+        let previous = std::mem::replace(&mut self.storage_revision, revision);
+        // Evictions and replacements in a single upload share a revision.
+        self.source_invalidation = image
+            .filter(|_| previous != revision)
+            .map(|image| SourceInvalidation { previous, image });
     }
 }
 

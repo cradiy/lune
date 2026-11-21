@@ -134,19 +134,27 @@ fn numbered_images_follow_committed_replacement_and_eviction() {
     );
     assert_eq!(images.newest_id(17), Some(2));
 
+    let previous = images.storage_revision();
     assert_eq!(
         receive(&mut images, b"\x1b_Gi=99,s=1,v=1;AAAA/w==\x1b\\").message,
         b"OK"
     );
     assert!(images.get(2).is_none());
     assert_eq!(images.newest_id(17), Some(1));
-
     assert_eq!(
-        receive(&mut images, b"\x1b_Gi=1,s=1,v=1;AAAA/w==\x1b\\").message,
+        images.invalidated_source(previous).map(ImageKey::id),
+        Some(2)
+    );
+
+    let previous = images.storage_revision();
+    assert_eq!(
+        receive(&mut images, b"\x1b_Gi=1,s=2,v=1;/wAA/wAA//8=\x1b\\").message,
         b"OK"
     );
     assert!(images.get(1).is_some());
+    assert!(images.get(99).is_none());
     assert_eq!(images.newest_id(17), None);
+    assert_eq!(images.invalidated_source(previous), None);
 }
 
 #[test]
@@ -1111,10 +1119,45 @@ fn png_cicp_uses_the_highest_supported_color_metadata() {
         ),
         (
             [1, 1, 0, 0],
+            png::BitDepth::Eight,
+            &[18, 248, 168, 94],
+            moxcms::ColorProfile::new_srgb(),
+            [7, 255, 185, 94],
+        ),
+        (
+            [1, 1, 0, 0],
             png::BitDepth::Sixteen,
             &[0x10, 0, 0xeb, 0, 0x7d, 0x80, 127, 128],
             moxcms::ColorProfile::new_srgb(),
             [0, 255, 139, 127],
+        ),
+        (
+            [9, 16, 0, 0],
+            png::BitDepth::Eight,
+            &[120, 110, 96, 63],
+            moxcms::ColorProfile::new_srgb(),
+            [179, 125, 86, 63],
+        ),
+        (
+            [9, 16, 0, 1],
+            png::BitDepth::Sixteen,
+            &[0x75, 0x30, 0x82, 0xdc, 0x90, 0x88, 0x7f, 0xb2],
+            moxcms::ColorProfile::new_srgb(),
+            [101, 193, 244, 127],
+        ),
+        (
+            [9, 18, 0, 1],
+            png::BitDepth::Eight,
+            &[191, 191, 191, 65],
+            moxcms::ColorProfile::new_srgb(),
+            [240, 240, 240, 65],
+        ),
+        (
+            [9, 18, 0, 0],
+            png::BitDepth::Sixteen,
+            &[0x80, 0xe8, 0x7d, 0x00, 0x7b, 0x0c, 0x80, 0xbf],
+            moxcms::ColorProfile::new_srgb(),
+            [144, 136, 134, 128],
         ),
     ] {
         let mut png = Vec::new();

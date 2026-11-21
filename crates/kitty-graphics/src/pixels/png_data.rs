@@ -13,6 +13,9 @@ use png::{
 
 use super::{ENCODED_OVERHEAD, INVALID, ImageFormat, Pixels, QUOTA, pixel_size, zeroed};
 
+mod hdr;
+use hdr::HdrTransform;
+
 const BAD_PNG: &[u8] = b"EBADPNG:Invalid PNG image data";
 const DISPLAY_GAMMA: f64 = 2.2;
 const GAMMA_THRESHOLD: f64 = 0.05;
@@ -28,7 +31,9 @@ enum ProfileTransform {
     NarrowSrgb,
     EightBit(Layout, Arc<Transform8BitExecutor>),
     SixteenBit(Arc<Transform16BitExecutor>),
+    NarrowCurve(Arc<Vec<u8>>),
     Narrow(Arc<NarrowTransform>),
+    Hdr(Arc<HdrTransform>),
 }
 
 #[derive(Default)]
@@ -118,8 +123,23 @@ pub(super) fn decode_png(
             Some(ProfileTransform::SixteenBit(transform)) => {
                 decode_png_profile_16(&mut reader, &mut rgba, &**transform)?;
             }
+            Some(ProfileTransform::NarrowCurve(table)) => {
+                let table: &[u8; 65536] = table.as_slice().try_into().expect("16-bit curve table");
+                decode_png_16(&mut reader, &mut rgba, |sample| {
+                    table[usize::from(u16::from_be_bytes(sample))]
+                })?;
+            }
             Some(ProfileTransform::Narrow(transform)) => {
-                decode_png_narrow_16(&mut reader, &mut rgba, transform)?;
+                let encode = &SRGB_BYTES;
+                decode_with_rgb_transform_16(&mut reader, &mut rgba, |samples| {
+                    transform.convert(samples, encode)
+                })?;
+            }
+            Some(ProfileTransform::Hdr(transform)) => {
+                let encode = &SRGB_BYTES;
+                decode_with_rgb_transform_16(&mut reader, &mut rgba, |samples| {
+                    transform.convert(samples, encode)
+                })?;
             }
             _ => {
                 if let Some(gamma) = gamma {
@@ -134,7 +154,13 @@ pub(super) fn decode_png(
             }
         }
     } else {
-        decode_png_8(&mut reader, &mut rgba)?;
+        let curve = match &profile {
+            Some(ProfileTransform::NarrowCurve(table)) => {
+                Some(table.as_slice().try_into().expect("8-bit curve table"))
+            }
+            _ => None,
+        };
+        decode_png_8(&mut reader, &mut rgba, curve)?;
         let table: Option<[u8; 256]> = if matches!(profile, Some(ProfileTransform::NarrowSrgb)) {
             Some(std::array::from_fn(|color| {
                 srgb_byte(normalize_narrow(color as f32, 1.0))
@@ -150,11 +176,7 @@ pub(super) fn decode_png(
                 })
         };
         if let Some(table) = table {
-            for [red, green, blue, _] in rgba.as_chunks_mut::<4>().0 {
-                *red = table[usize::from(*red)];
-                *green = table[usize::from(*green)];
-                *blue = table[usize::from(*blue)];
-            }
+            map_rgb_bytes(&mut rgba, &table);
         }
     }
     reader.finish().map_err(png_error)?;
@@ -164,7 +186,12 @@ pub(super) fn decode_png(
                 convert_profile_8(&mut rgba, layout, &*transform)?;
             }
             Some(ProfileTransform::Narrow(transform)) => {
-                convert_narrow_8(&mut rgba, &transform);
+                let encode = &SRGB_BYTES;
+                convert_rgb_8(&mut rgba, |samples| transform.convert(samples, encode));
+            }
+            Some(ProfileTransform::Hdr(transform)) => {
+                let encode = &SRGB_BYTES;
+                convert_rgb_8(&mut rgba, |samples| transform.convert(samples, encode));
             }
             _ => {}
         }
@@ -242,32 +269,40 @@ impl PngProfiles {
         {
             return Some(cached.transform.clone());
         }
-        let profile = match &source {
-            ProfileSource::Cicp(codes) => cicp_profile(*codes, gray)?,
-            ProfileSource::Embedded(bytes) => ColorProfile::new_from_slice(bytes).ok()?,
-            ProfileSource::Colorimetry(chromaticities, gamma) => {
-                colorimetry_profile(*chromaticities, *gamma, gray)?
-            }
-        };
-        if profile.color_space != space {
-            return None;
-        }
-        let transform = if narrow {
-            ProfileTransform::Narrow(Arc::new(NarrowTransform::new(profile, &SRGB, wide)?))
-        } else if wide {
-            ProfileTransform::SixteenBit(
-                profile
-                    .create_transform_16bit(layout, &SRGB, Layout::Rgb, Default::default())
-                    .ok()?,
-            )
+        let transform = if let ProfileSource::Cicp(codes) = &source
+            && matches!(
+                TransferCharacteristics::try_from(codes.transfer_function),
+                Ok(TransferCharacteristics::Smpte2084 | TransferCharacteristics::Hlg)
+            ) {
+            ProfileTransform::Hdr(Arc::new(HdrTransform::new(*codes, &SRGB, gray, wide)?))
         } else {
-            let dest = if gray { Layout::Rgb } else { Layout::Rgba };
-            ProfileTransform::EightBit(
-                layout,
-                profile
-                    .create_transform_8bit(layout, &SRGB, dest, Default::default())
-                    .ok()?,
-            )
+            let profile = match &source {
+                ProfileSource::Cicp(codes) => cicp_profile(*codes, gray)?,
+                ProfileSource::Embedded(bytes) => ColorProfile::new_from_slice(bytes).ok()?,
+                ProfileSource::Colorimetry(chromaticities, gamma) => {
+                    colorimetry_profile(*chromaticities, *gamma, gray)?
+                }
+            };
+            if profile.color_space != space {
+                return None;
+            }
+            if narrow {
+                narrow_transform(profile, &SRGB, wide)?
+            } else if wide {
+                ProfileTransform::SixteenBit(
+                    profile
+                        .create_transform_16bit(layout, &SRGB, Layout::Rgb, Default::default())
+                        .ok()?,
+                )
+            } else {
+                let dest = if gray { Layout::Rgb } else { Layout::Rgba };
+                ProfileTransform::EightBit(
+                    layout,
+                    profile
+                        .create_transform_8bit(layout, &SRGB, dest, Default::default())
+                        .ok()?,
+                )
+            }
         };
         if let Some(source) = source.cache_key() {
             self.0 = Some(CachedProfile {
@@ -285,12 +320,7 @@ fn cicp_profile(codes: CodingIndependentCodePoints, gray: bool) -> Option<ColorP
     let color_primaries = CicpColorPrimaries::try_from(codes.color_primaries).ok()?;
     let transfer_characteristics =
         TransferCharacteristics::try_from(codes.transfer_function).ok()?;
-    if color_primaries == CicpColorPrimaries::Xyz
-        || matches!(
-            transfer_characteristics,
-            TransferCharacteristics::Smpte2084 | TransferCharacteristics::Hlg
-        )
-    {
+    if color_primaries == CicpColorPrimaries::Xyz {
         return None;
     }
     let mut profile = ColorProfile::new_from_cicp(CicpProfile {
@@ -403,62 +433,88 @@ fn srgb_byte(value: f32) -> u8 {
 
 struct NarrowTransform {
     linear_samples: Vec<f32>,
-    matrix: Option<[[f32; 3]; 3]>,
+    matrix: [[f32; 3]; 3],
+}
+
+fn narrow_transform(
+    mut profile: ColorProfile,
+    srgb: &ColorProfile,
+    wide: bool,
+) -> Option<ProfileTransform> {
+    static LINEAR_GRAY: LazyLock<ColorProfile> =
+        LazyLock::new(|| ColorProfile::new_gray_with_gamma(1.0));
+    let cicp = profile.cicp.as_ref()?;
+    let matrix = (profile.color_space == DataColorSpace::Rgb
+        && cicp.color_primaries != CicpColorPrimaries::Bt709)
+        .then(|| profile.transform_matrix(srgb).to_f32().v);
+    if profile.color_space == DataColorSpace::Rgb {
+        profile.color_space = DataColorSpace::Gray;
+        profile.gray_trc = profile.red_trc.take();
+    }
+    let transform = profile
+        .create_transform_f32(
+            Layout::Gray,
+            &LINEAR_GRAY,
+            Layout::Gray,
+            TransformOptions {
+                allow_extended_range_rgb_xyz: true,
+                ..Default::default()
+            },
+        )
+        .ok()?;
+    if let Some(matrix) = matrix {
+        Some(ProfileTransform::Narrow(Arc::new(NarrowTransform {
+            linear_samples: narrow_table(&*transform, wide, |value| value)?,
+            matrix,
+        })))
+    } else {
+        let encode = &SRGB_BYTES;
+        let table = narrow_table(&*transform, wide, |value| encode_linear(value, encode))?;
+        Some(ProfileTransform::NarrowCurve(Arc::new(table)))
+    }
+}
+
+fn narrow_table<T>(
+    transform: &moxcms::TransformF32Executor,
+    wide: bool,
+    map: impl Fn(f32) -> T,
+) -> Option<Vec<T>> {
+    let size = if wide { 65536 } else { 256 };
+    let scale = if wide { 256.0 } else { 1.0 };
+    let mut table = Vec::new();
+    table.try_reserve_exact(size).ok()?;
+    let mut encoded = [0.0; 256];
+    let mut linear = [0.0; 256];
+    for start in (0..size).step_by(encoded.len()) {
+        for (index, value) in encoded.iter_mut().enumerate() {
+            *value = normalize_narrow((start + index) as f32, scale);
+        }
+        transform.transform(&encoded, &mut linear).ok()?;
+        table.extend(linear.into_iter().map(&map));
+    }
+    Some(table)
 }
 
 impl NarrowTransform {
-    fn new(mut profile: ColorProfile, srgb: &ColorProfile, wide: bool) -> Option<Self> {
-        static LINEAR_GRAY: LazyLock<ColorProfile> =
-            LazyLock::new(|| ColorProfile::new_gray_with_gamma(1.0));
-        let cicp = profile.cicp.as_ref()?;
-        let matrix = (profile.color_space == DataColorSpace::Rgb
-            && cicp.color_primaries != CicpColorPrimaries::Bt709)
-            .then(|| profile.transform_matrix(srgb).to_f32().v);
-        if profile.color_space == DataColorSpace::Rgb {
-            profile.color_space = DataColorSpace::Gray;
-            profile.gray_trc = profile.red_trc.take();
-        }
-        let transform = profile
-            .create_transform_f32(
-                Layout::Gray,
-                &LINEAR_GRAY,
-                Layout::Gray,
-                TransformOptions {
-                    allow_extended_range_rgb_xyz: true,
-                    ..Default::default()
-                },
-            )
-            .ok()?;
-        let size = if wide { 65536 } else { 256 };
-        let scale = if wide { 256.0 } else { 1.0 };
-        let mut linear_samples = Vec::new();
-        linear_samples.try_reserve_exact(size).ok()?;
-        linear_samples.resize(size, 0.0);
-        let mut input = [0.0; 256];
-        for (block, output) in linear_samples.chunks_mut(256).enumerate() {
-            for (index, value) in input.iter_mut().enumerate() {
-                *value = normalize_narrow((block * 256 + index) as f32, scale);
-            }
-            transform.transform(&input, output).ok()?;
-        }
-        Some(Self {
-            linear_samples,
-            matrix,
-        })
-    }
-
     #[inline]
     fn convert(&self, samples: [usize; 3], encode: &[u8; SRGB_STEPS + 1]) -> [u8; 3] {
         let [r, g, b] = samples.map(|sample| self.linear_samples[sample]);
-        let linear = if let Some(matrix) = self.matrix {
-            matrix.map(|[a, b_coeff, c]| a * r + b_coeff * g + c * b)
-        } else {
-            [r, g, b]
-        };
-        linear.map(|value| {
-            let level = (value * SRGB_STEPS as f32 + 0.5) as usize;
-            encode[level.min(SRGB_STEPS)]
-        })
+        self.matrix
+            .map(|[a, b_coeff, c]| encode_linear(a * r + b_coeff * g + c * b, encode))
+    }
+}
+
+#[inline]
+fn encode_linear(value: f32, encode: &[u8; SRGB_STEPS + 1]) -> u8 {
+    let level = (value * SRGB_STEPS as f32 + 0.5) as usize;
+    encode[level.min(SRGB_STEPS)]
+}
+
+fn map_rgb_bytes(rgba: &mut [u8], table: &[u8; 256]) {
+    for [r, g, b, _] in rgba.as_chunks_mut::<4>().0 {
+        *r = table[usize::from(*r)];
+        *g = table[usize::from(*g)];
+        *b = table[usize::from(*b)];
     }
 }
 
@@ -474,23 +530,21 @@ static SRGB_BYTES: LazyLock<[u8; SRGB_STEPS + 1]> = LazyLock::new(|| {
 });
 
 #[cold]
-fn convert_narrow_8(rgba: &mut [u8], transform: &NarrowTransform) {
-    let encode = &SRGB_BYTES;
+fn convert_rgb_8(rgba: &mut [u8], convert: impl Fn([usize; 3]) -> [u8; 3]) {
     for pixel in rgba.as_chunks_mut::<4>().0 {
         let [r, g, b, _] = pixel.map(usize::from);
-        pixel[..3].copy_from_slice(&transform.convert([r, g, b], encode));
+        pixel[..3].copy_from_slice(&convert([r, g, b]));
     }
 }
 
 #[cold]
-fn decode_png_narrow_16(
+fn decode_with_rgb_transform_16(
     reader: &mut Reader<Cursor<&[u8]>>,
     rgba: &mut [u8],
-    transform: &NarrowTransform,
+    convert: impl Fn([usize; 3]) -> [u8; 3],
 ) -> Result<(), &'static [u8]> {
-    let encode = &SRGB_BYTES;
     let samples = |rgb: [u16; 3], alpha| {
-        let [r, g, b] = transform.convert(rgb.map(usize::from), encode);
+        let [r, g, b] = convert(rgb.map(usize::from));
         [r, g, b, alpha]
     };
     match reader.output_color_type().0 {
@@ -563,7 +617,11 @@ fn convert_profile_rows_16<const N: usize, const CHANNELS: usize>(
     })
 }
 
-fn decode_png_8(reader: &mut Reader<Cursor<&[u8]>>, rgba: &mut [u8]) -> Result<(), &'static [u8]> {
+fn decode_png_8(
+    reader: &mut Reader<Cursor<&[u8]>>,
+    rgba: &mut [u8],
+    curve: Option<&[u8; 256]>,
+) -> Result<(), &'static [u8]> {
     let size = reader
         .output_buffer_size()
         .filter(|&size| size <= rgba.len())
@@ -575,10 +633,32 @@ fn decode_png_8(reader: &mut Reader<Cursor<&[u8]>>, rgba: &mut [u8]) -> Result<(
     if output.bit_depth != BitDepth::Eight {
         return Err(BAD_PNG);
     }
-    match output.color_type {
-        ColorType::Grayscale => expand_png_pixels(rgba, |[v]| [v, v, v, 255]),
-        ColorType::GrayscaleAlpha => expand_png_pixels(rgba, |[v, a]| [v, v, v, a]),
-        ColorType::Rgb => expand_png_pixels(rgba, |[r, g, b]| [r, g, b, 255]),
+    if let Some(curve) = curve {
+        expand_png_8(rgba, output.color_type, |sample| curve[usize::from(sample)])?;
+        if output.color_type == ColorType::Rgba {
+            map_rgb_bytes(rgba, curve);
+        }
+    } else {
+        expand_png_8(rgba, output.color_type, |sample| sample)?;
+    }
+    Ok(())
+}
+
+fn expand_png_8(
+    rgba: &mut [u8],
+    color: ColorType,
+    map: impl Fn(u8) -> u8,
+) -> Result<(), &'static [u8]> {
+    match color {
+        ColorType::Grayscale => expand_png_pixels(rgba, |[gray]| {
+            let gray = map(gray);
+            [gray, gray, gray, 255]
+        }),
+        ColorType::GrayscaleAlpha => expand_png_pixels(rgba, |[gray, alpha]| {
+            let gray = map(gray);
+            [gray, gray, gray, alpha]
+        }),
+        ColorType::Rgb => expand_png_pixels(rgba, |[r, g, b]| [map(r), map(g), map(b), 255]),
         ColorType::Rgba => {}
         ColorType::Indexed => return Err(BAD_PNG),
     }

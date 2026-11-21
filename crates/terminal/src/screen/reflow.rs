@@ -194,12 +194,15 @@ fn layout<'a>(
             if next_image < image_anchors.len() {
                 let mut previous = row.source_range().start;
                 let mut column = 0;
+                let wrap_end = row.wrap_end();
                 while let Some(anchor) = image_anchors.get_mut(next_image) {
-                    let Some(distance) = row.map_position_from(previous, anchor.source) else {
-                        break;
-                    };
-                    column += distance;
-                    if row.wrap_end().is_some() && column == row.used_columns() {
+                    if previous != anchor.source {
+                        let Some(distance) = row.map_position_from(previous, anchor.source) else {
+                            break;
+                        };
+                        column += distance;
+                    }
+                    if wrap_end == Some(column) {
                         break;
                     }
                     anchor.destination = Some(CellPosition { row: count, column });
@@ -226,11 +229,28 @@ fn layout<'a>(
     );
     let saved = placed(mapped[1].expect("The retained saved cursor maps"), columns);
     let start = count.saturating_sub(height).min(cursor.row);
+    let end = start + height;
+    // Destinations are ordered by source, so only the tail can extend past the window.
+    for anchor in image_anchors.iter_mut().rev() {
+        let Some(destination) = &mut anchor.destination else {
+            continue;
+        };
+        if anchor.source.row == view.rows() {
+            destination.row = count
+                .min(end)
+                .saturating_add(destination.row)
+                .min(i64::MAX as usize);
+        } else if destination.row >= end {
+            anchor.destination = None;
+        } else {
+            break;
+        }
+    }
     Ok((
         Layout {
-            window: start..start + height,
-            cursor: clipped(cursor, start..start + height),
-            saved: clipped(saved, start..start + height),
+            window: start..end,
+            cursor: clipped(cursor, start..end),
+            saved: clipped(saved, start..end),
             anchor: mapped[2].map(|point| point.row),
         },
         replay.expect("The primary cursor selects a replay checkpoint"),

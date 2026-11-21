@@ -136,6 +136,26 @@ impl TextureStamp {
             anonymous_placements: placements.filter(|_| store.has_anonymous_images()),
         }
     }
+
+    fn prune(
+        self,
+        previous: Option<Self>,
+        store: &GraphicsImageStore,
+        images: &mut HashMap<GraphicsImageKey, CachedImage>,
+    ) {
+        if images.is_empty() {
+            return;
+        }
+        if let Some(key) = previous
+            .filter(|stamp| stamp.anonymous_placements == self.anonymous_placements)
+            .and_then(|stamp| store.invalidated_source(stamp.sources))
+        {
+            images.remove(&key);
+        } else {
+            images
+                .retain(|&key, cached| store.source_revision(key) == Some(cached.source_revision));
+        }
+    }
 }
 
 struct ImagePipeline {
@@ -396,29 +416,31 @@ impl ImageRenderer {
         queue: &Queue,
         frame: &PresentationFrame<'_>,
     ) -> usize {
-        if self.graphics_buffer != frame.graphics_buffer() {
+        let previous_texture = if self.graphics_buffer != frame.graphics_buffer() {
             self.graphics_buffer = frame.graphics_buffer();
             std::mem::swap(&mut self.images, &mut self.inactive_images);
-            self.inactive_texture_stamp = self.prepared.take().map(|p| p.texture_stamp);
-        }
+            std::mem::replace(
+                &mut self.inactive_texture_stamp,
+                self.prepared.take().map(|p| p.texture_stamp),
+            )
+        } else {
+            self.prepared.as_ref().map(|p| p.texture_stamp)
+        };
         let inactive_store = frame.inactive_image_store();
         let inactive_stamp = TextureStamp::new(inactive_store, frame.inactive_graphics_revision);
         if self.inactive_texture_stamp != Some(inactive_stamp) {
-            self.inactive_images.retain(|&id, cached| {
-                inactive_store.source_revision(id) == Some(cached.source_revision)
-            });
+            inactive_stamp.prune(
+                self.inactive_texture_stamp,
+                inactive_store,
+                &mut self.inactive_images,
+            );
             self.inactive_texture_stamp = Some(inactive_stamp);
         }
         let stamp = frame.graphics_stamp();
         let store = frame.image_store();
         let texture_stamp = TextureStamp::new(store, stamp.map(GraphicsStamp::placement_revision));
-        if self
-            .prepared
-            .as_ref()
-            .is_none_or(|state| state.texture_stamp != texture_stamp)
-        {
-            self.images
-                .retain(|&id, cached| store.source_revision(id) == Some(cached.source_revision));
+        if previous_texture != Some(texture_stamp) {
+            texture_stamp.prune(previous_texture, store, &mut self.images);
         }
         if let Some(prepared) = &self.prepared
             && prepared.geometry == frame.geometry

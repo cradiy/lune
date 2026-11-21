@@ -680,6 +680,24 @@ fn kitty_full_page_reverse_scroll_preserves_history_and_offscreen_pixels() {
     assert_eq!(rows(&session), [(1, -1), (2, 0), (3, 3)]);
     assert_eq!(session.screen().history().len(), 1);
 
+    session.transport.source = Cursor::new(b"\x1b[?1049h");
+    session.pump().unwrap();
+    assert_eq!(session.screen().active_buffer(), ScreenBuffer::Alternate);
+    session.screen.reflow(9, 3, StyleId::default()).unwrap();
+    session.geometry = GridGeometry::from_pty_size(PtySize {
+        columns: 9,
+        pixel_width: 18,
+        ..size
+    });
+    session.processor.update_geometry(
+        &mut session.screen,
+        session.geometry.text_area_pixels(),
+        session.geometry.cell_pixels(),
+    );
+    session.transport.source = Cursor::new(b"\x1b[?1049l");
+    session.pump().unwrap();
+    assert_eq!(rows(&session), [(1, -1), (2, 0), (3, 3)]);
+
     session.transport.source = Cursor::new(b"\x1b[3;1H\x1bD");
     session.pump().unwrap();
     assert_eq!(rows(&session), [(1, -2), (2, -1), (3, 2)]);
@@ -2159,6 +2177,39 @@ fn kitty_images_compose_in_an_offscreen_wgpu_pass() {
         );
         read_frame(renderer)
     };
+    let mut below_screen = session_with_size(
+        concat!(
+            "\x1b[4;1H\x1b_Ga=T,i=51,p=1,s=1,v=1,C=1,q=2;/wAA/w==\x1b\\",
+            "\x1b_Ga=T,i=52,P=51,Q=1,H=1,s=1,v=1,q=2;AAD//w==\x1b\\",
+            "\x1b[H\x1bM",
+        )
+        .as_bytes(),
+        PtySize {
+            rows: 4,
+            pixel_height: 8,
+            ..size
+        },
+    );
+    below_screen.pump().unwrap();
+    assert_eq!(
+        renderer.prepare(&device, &queue, &below_screen.presentation_frame().unwrap()),
+        0
+    );
+    assert_eq!(renderer.image_instance_count(), 0);
+    below_screen
+        .screen
+        .reflow(8, 5, StyleId::default())
+        .unwrap();
+    below_screen.geometry = GridGeometry::from_pty_size(size);
+    below_screen.processor.update_geometry(
+        &mut below_screen.screen,
+        below_screen.geometry.text_area_pixels(),
+        below_screen.geometry.cell_pixels(),
+    );
+    let revealed = draw(&mut renderer, &below_screen);
+    assert_eq!(pixel(&revealed, 0, 8), [255, 0, 0, 255]);
+    assert_eq!(pixel(&revealed, 2, 8), [0, 0, 255, 255]);
+
     resize_cell_height(&mut clipped, 5);
     let shrunk = draw(&mut renderer, &clipped);
     assert_eq!(pixel(&shrunk, 0, 4), [0, 255, 0, 255]);
@@ -2548,6 +2599,76 @@ fn kitty_images_compose_in_an_offscreen_wgpu_pass() {
         [green, [0, 0, 255, 255]]
     );
     assert_eq!([pixel(&clipped, 4, 0), pixel(&clipped, 4, 1)], [red; 2]);
+
+    let mut replacement = session_with_size(
+        concat!(
+            "\x1b_Ga=T,i=81,p=1,f=24,s=1,v=1,C=1,q=2;/wAA\x1b\\",
+            "\x1b[1;2H\x1b_Ga=p,i=81,p=2,C=1,q=2\x1b\\",
+            "\x1b_Ga=T,i=82,P=81,Q=1,H=2,f=24,s=1,v=1,q=2;AP8A\x1b\\",
+            "\x1b[1;4H\x1b_Ga=T,i=83,f=24,s=1,v=1,C=1,q=2;AAD/\x1b\\",
+        )
+        .as_bytes(),
+        size,
+    );
+    replacement.pump().unwrap();
+    let placed = replacement.screen().graphics_placements();
+    let [parent, child, other] = [0, 2, 3].map(|index| placed[index].placement.image);
+    let original = draw(&mut renderer, &replacement);
+    let other_texture = renderer.cached_texture(other).unwrap().clone();
+    for wire in [
+        b"\x1b[2;1H\x1b_Ga=T,i=81,p=3,f=24,s=2,v=1,m=1,C=1,q=2;AP8A\x1b\\".as_slice(),
+        b"\x1b_Gm=0\x1b\\",
+    ] {
+        replacement.transport.source = Cursor::new(wire);
+        replacement.pump().unwrap();
+        assert_eq!(draw(&mut renderer, &replacement), original);
+    }
+    replacement.transport.source =
+        Cursor::new(b"\x1b_Ga=T,i=81,p=3,f=24,s=2,v=1,C=1,q=2;AP8A/wAA\x1b\\");
+    replacement.pump().unwrap();
+    let replaced = draw(&mut renderer, &replacement);
+    assert_eq!(
+        [
+            pixel(&replaced, 0, 0),
+            pixel(&replaced, 2, 0),
+            pixel(&replaced, 4, 0)
+        ],
+        [[0; 4]; 3]
+    );
+    assert_eq!(
+        [pixel(&replaced, 0, 2), pixel(&replaced, 1, 2)],
+        [green, red]
+    );
+    assert!(!renderer.has_cached_image(child));
+    let parent_texture = renderer.cached_texture(parent).unwrap().clone();
+    assert_eq!(renderer.cached_texture(other), Some(&other_texture));
+
+    replacement.transport.source = Cursor::new(b"\x1b_Gi=83,f=24,s=1,v=1,q=2;/wAA\x1b\\");
+    replacement.pump().unwrap();
+    let uploaded = draw(&mut renderer, &replacement);
+    assert_eq!(pixel(&uploaded, 6, 0), [0; 4]);
+    assert!(!renderer.has_cached_image(other));
+    assert_eq!(renderer.cached_texture(parent), Some(&parent_texture));
+
+    let mut hdr = session_with_size(
+        concat!(
+            "\x1b_Ga=T,f=100,C=1,q=2;iVBORw0KGgoAAAANSUhEUgAAAAEAAAABEAYAAABPhRjKAAAABGNJQ1AJEAABTSMj/gAAABFJREFUeJxjKDVoujOh4/9/ABMuBRov1pKzAAAAAElFTkSuQmCC\x1b\\",
+            "\x1b[1;2H\x1b_Ga=T,f=100,C=1,q=2;iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAABGNJQ1AJEgABTqf3kAAAAA1JREFUeJxj2L9//38AB7sDPeNTXsQAAAAASUVORK5CYII=\x1b\\",
+        )
+        .as_bytes(),
+        size,
+    );
+    hdr.pump().unwrap();
+    let mapped = draw(&mut renderer, &hdr);
+    for (x, expected) in [(0, [101, 193, 244, 255]), (2, [240, 240, 240, 255])] {
+        let actual = pixel(&mapped, x, 0);
+        assert!(
+            actual
+                .into_iter()
+                .zip(expected)
+                .all(|(a, b)| a.abs_diff(b) <= 1)
+        );
+    }
 }
 
 #[cfg(feature = "wgpu-renderer")]

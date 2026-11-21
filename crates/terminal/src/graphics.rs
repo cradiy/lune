@@ -411,23 +411,42 @@ impl GraphicsPlacements {
         columns: usize,
     ) -> Result<Vec<GraphicsAnchor>, StorageError> {
         let history = view.history_rows() as i64;
+        let live_rows = view.live_grid().rows() as i64;
+        let end = CellPosition {
+            row: history as usize + live_rows as usize,
+            column: 0,
+        };
         let mut anchors = Vec::new();
         for (index, image) in self.images.iter().enumerate() {
             if image.placement.position != PlacementPosition::Cursor {
                 continue;
             }
-            let row = image.row.max(-history);
-            let source = crate::reflow::normalize_position(
-                view,
-                CellPosition {
-                    row: (row + history) as usize,
-                    column: image.column.clamp(0, columns as i64 - 1) as usize,
-                },
-            )?;
+            let (source, destination) = if image.row >= live_rows {
+                // Resolve the gap below the live rows once the new layout is known.
+                let offset = usize::try_from(image.row - live_rows).unwrap_or(usize::MAX);
+                (
+                    end,
+                    Some(CellPosition {
+                        row: offset,
+                        column: image.column as usize,
+                    }),
+                )
+            } else {
+                (
+                    crate::reflow::normalize_position(
+                        view,
+                        CellPosition {
+                            row: (image.row.max(-history) + history) as usize,
+                            column: image.column.clamp(0, columns as i64 - 1) as usize,
+                        },
+                    )?,
+                    None,
+                )
+            };
             anchors.try_reserve(1).map_err(StorageError::from)?;
             anchors.push(GraphicsAnchor {
                 source,
-                destination: None,
+                destination,
                 index,
             });
         }
@@ -454,8 +473,7 @@ impl GraphicsPlacements {
                 return true;
             }
             let anchor = anchors.next().expect("A physical root has a reflow anchor");
-            let Some(destination) = anchor.destination.filter(|point| point.row < window.end)
-            else {
+            let Some(destination) = anchor.destination else {
                 return false;
             };
             image.row = destination.row as i64 - window.start as i64;
