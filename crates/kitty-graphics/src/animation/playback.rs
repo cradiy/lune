@@ -112,6 +112,12 @@ impl Playback {
 }
 
 impl Animation {
+    pub(crate) fn suspend(&mut self) {
+        if let Timing::Showing(shown) = self.playback.timing {
+            self.playback.timing = Timing::Waiting(shown);
+        }
+    }
+
     pub(crate) fn playing(&self) -> bool {
         self.playback.mode != PlaybackMode::Stopped
     }

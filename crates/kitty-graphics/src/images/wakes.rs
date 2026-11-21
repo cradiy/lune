@@ -5,11 +5,84 @@ use super::{Animation, Image, ImageKey, StoredImage};
 
 #[derive(Default)]
 pub(super) struct AnimationWakes {
+    animated: HashSet<ImageKey>,
+    membership: u64,
     pending: HashSet<ImageKey>,
     scheduled: BTreeMap<Instant, Vec<ImageKey>>,
+    visibility: Option<(HashSet<ImageKey>, HashSet<ImageKey>)>,
 }
 
 impl AnimationWakes {
+    pub(super) fn membership(&self) -> Option<u64> {
+        (!self.animated.is_empty()).then_some(self.membership)
+    }
+
+    pub(super) fn contains(&self, key: ImageKey) -> bool {
+        self.animated.contains(&key)
+    }
+
+    pub(super) fn clear(&mut self) {
+        self.animated.clear();
+        self.membership = self.membership.wrapping_add(1);
+        self.pending.clear();
+        self.scheduled.clear();
+        if let Some((visible, scratch)) = &mut self.visibility {
+            visible.clear();
+            scratch.clear();
+        }
+    }
+
+    pub(super) fn is_visible(&self, key: ImageKey) -> bool {
+        self.visibility
+            .as_ref()
+            .is_none_or(|(visible, _)| visible.contains(&key))
+    }
+
+    pub(super) fn set_visibility(
+        &mut self,
+        images: &mut HashMap<ImageKey, StoredImage>,
+        keys: impl IntoIterator<Item = ImageKey>,
+    ) -> bool {
+        let unrestricted = self.visibility.is_none();
+        let (mut previous, mut visible) = self.visibility.take().unwrap_or_default();
+        visible.extend(keys);
+        let mut revealed = false;
+        let mut prune = false;
+        for &key in &self.animated {
+            let was_visible = unrestricted || previous.contains(&key);
+            let now_visible = visible.contains(&key);
+            if was_visible == now_visible {
+                continue;
+            }
+            let Some(StoredImage::Named(image)) = images.get_mut(&key) else {
+                continue;
+            };
+            let animation = image
+                .animation
+                .as_mut()
+                .expect("An animated image has frames");
+            if now_visible {
+                revealed = true;
+                if animation.playing() {
+                    self.pending.insert(key);
+                }
+            } else {
+                self.pending.remove(&key);
+                prune |= animation.scheduled_at.take().is_some();
+                animation.suspend();
+            }
+        }
+        if prune {
+            self.scheduled.retain(|_, keys| {
+                keys.retain(|key| visible.contains(key));
+                !keys.is_empty()
+            });
+        }
+        previous.clear();
+        self.visibility = Some((visible, previous));
+        revealed
+    }
+
     pub(super) fn deadline(&self) -> Option<Instant> {
         self.scheduled.first_key_value().map(|(&at, _)| at)
     }
@@ -18,8 +91,11 @@ impl AnimationWakes {
         let Some(animation) = image.animation.as_mut() else {
             return;
         };
+        self.membership = self
+            .membership
+            .wrapping_add(u64::from(self.animated.insert(key)));
         self.unschedule(key, animation);
-        if animation.playing() {
+        if animation.playing() && self.is_visible(key) {
             self.pending.insert(key);
         } else {
             self.pending.remove(&key);
@@ -27,6 +103,9 @@ impl AnimationWakes {
     }
 
     pub(super) fn remove(&mut self, key: ImageKey, animation: &mut Animation) {
+        self.membership = self
+            .membership
+            .wrapping_add(u64::from(self.animated.remove(&key)));
         self.unschedule(key, animation);
         self.pending.remove(&key);
     }

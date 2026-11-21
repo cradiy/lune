@@ -59,6 +59,20 @@ impl<'a> Viewport<'a> {
         self.view.iter_rows().skip(self.start).take(self.height)
     }
 
+    /// Visits viewport rows and, for virtual parents, the remaining live rows.
+    pub fn rows_for_graphics(
+        &self,
+        virtual_parents: bool,
+    ) -> impl Iterator<Item = &'a Row> + use<'a> {
+        let hidden = if virtual_parents {
+            self.offset().min(self.height)
+        } else {
+            0
+        };
+        self.iter_rows()
+            .chain(self.view.iter_live_rows().skip(self.height - hidden))
+    }
+
     /// Cursor coordinates when its physical row lies in this window. Appearance,
     /// including visibility mode, remains available from [`crate::Screen::cursor_appearance`].
     pub fn cursor(&self) -> Option<Cursor> {

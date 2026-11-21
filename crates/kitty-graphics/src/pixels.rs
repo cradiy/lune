@@ -197,18 +197,18 @@ impl PixelTransfer {
     }
 
     pub(crate) fn load(&mut self, source: LocalSource, name: &[u8]) -> Result<(), &'static [u8]> {
-        self.bytes = source.read(
-            name,
-            self.wire_limit,
-            matches!(self.compression, Compression::None) && self.expected.is_some(),
-        )?;
+        let output_capacity = match self.compression {
+            Compression::None => self.expected.map(|size| self.format.output_capacity(size)),
+            _ => None,
+        };
+        self.bytes = source.read(name, self.wire_limit, output_capacity)?;
         Ok(())
     }
 
     pub(crate) fn finish(self, max_bytes: usize) -> Result<Pixels, &'static [u8]> {
         let bytes = match self.compression {
             Compression::Zlib => match self.expected {
-                Some(size) => inflate(&self.bytes, size)?,
+                Some(size) => inflate(&self.bytes, size, self.format.output_capacity(size))?,
                 None => inflate_limited(&self.bytes, self.wire_limit)?,
             },
             Compression::Streaming(stream) if stream.ended => self.bytes,
@@ -270,9 +270,9 @@ fn pixel_size(
         .ok_or(QUOTA)
 }
 
-fn zeroed(size: usize) -> Result<Vec<u8>, &'static [u8]> {
+fn zeroed(size: usize, capacity: usize) -> Result<Vec<u8>, &'static [u8]> {
     let mut bytes = Vec::new();
-    bytes.try_reserve_exact(size).map_err(|_| QUOTA)?;
+    bytes.try_reserve_exact(capacity).map_err(|_| QUOTA)?;
     bytes.resize(size, 0);
     Ok(bytes)
 }
@@ -362,8 +362,8 @@ impl ZlibTransfer {
     }
 }
 
-fn inflate(bytes: &[u8], size: usize) -> Result<Vec<u8>, &'static [u8]> {
-    let mut inflated = zeroed(size)?;
+fn inflate(bytes: &[u8], size: usize, capacity: usize) -> Result<Vec<u8>, &'static [u8]> {
+    let mut inflated = zeroed(size, capacity)?;
     let mut decoder = Decompress::new(true);
     let mut status = decoder
         .decompress(bytes, &mut inflated, FlushDecompress::Finish)
@@ -429,7 +429,7 @@ fn decode_png(bytes: &[u8], max_bytes: usize) -> Result<Pixels, &'static [u8]> {
         .output_buffer_size()
         .filter(|&size| size <= rgba_size)
         .ok_or(QUOTA)?;
-    let mut rgba = zeroed(rgba_size)?;
+    let mut rgba = zeroed(rgba_size, rgba_size)?;
     let input_start = rgba_size - size;
     let output = reader
         .next_frame(&mut rgba[input_start..])
@@ -470,18 +470,6 @@ fn png_error(error: DecodingError) -> &'static [u8] {
     }
 }
 
-fn expand_rgb(mut rgb: Vec<u8>) -> Result<Vec<u8>, &'static [u8]> {
-    let size = (rgb.len() / 3).checked_mul(4).ok_or(QUOTA)?;
-    if rgb.capacity() >= size {
-        rgb.resize(size, 0);
-        expand_rgb_in_place(&mut rgb);
-        return Ok(rgb);
-    }
-    let mut rgba = zeroed(size)?;
-    expand_rgb_pixels(&rgb, &mut rgba);
-    Ok(rgba)
-}
-
 fn expand_rgb_pixels(rgb: &[u8], rgba: &mut [u8]) {
     let pixels = rgba.as_chunks_mut::<4>().0;
     for (out, &[r, g, b]) in pixels.iter_mut().zip(rgb.as_chunks::<3>().0) {
@@ -489,8 +477,12 @@ fn expand_rgb_pixels(rgb: &[u8], rgba: &mut [u8]) {
     }
 }
 
-fn expand_rgb_in_place(rgba: &mut [u8]) {
-    let mut end = rgba.len() / 4;
+fn expand_rgb(mut rgba: Vec<u8>) -> Result<Vec<u8>, &'static [u8]> {
+    let mut end = rgba.len() / 3;
+    let size = end.checked_mul(4).ok_or(QUOTA)?;
+    rgba.try_reserve_exact(size - rgba.len())
+        .map_err(|_| QUOTA)?;
+    rgba.resize(size, 0);
     // Work from the end, using disjoint source and destination slices where possible.
     while end > 3 {
         let start = (3 * end).div_ceil(4);
@@ -502,4 +494,5 @@ fn expand_rgb_in_place(rgba: &mut [u8]) {
         let [r, g, b] = rgba.as_chunks::<3>().0[index];
         rgba.as_chunks_mut::<4>().0[index] = [r, g, b, 255];
     }
+    Ok(rgba)
 }

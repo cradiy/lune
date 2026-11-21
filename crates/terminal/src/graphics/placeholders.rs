@@ -91,6 +91,9 @@ fn visit_placeholder_rows<'a>(
     let mut last_key = None;
     let mut last_placement = None;
     for (row_index, row) in rows {
+        if !row.has_graphics_placeholder() {
+            continue;
+        }
         let mut previous: Option<(usize, [Color; 2], GraphicsPlaceholder)> = None;
         let mut pending: Option<GraphicsPlaceholderRun> = None;
         let mut next_extended = 0;

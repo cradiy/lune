@@ -7,6 +7,9 @@ use lune_terminal::{
 
 use super::*;
 
+#[cfg(feature = "wgpu-renderer")]
+static OFFSCREEN_GPU_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 struct Transport {
     source: Cursor<&'static [u8]>,
     written: Vec<u8>,
@@ -476,6 +479,29 @@ fn kitty_delete_preserves_surviving_references_and_cancels_pending_uploads() {
     assert_eq!(remaining.placement.id, 6);
     assert!(session.graphics_image(41).is_some());
 
+    session.transport.source = Cursor::new(
+        concat!(
+            "\x1b_Gi=40,m=1,f=24,s=2,v=1;/wAA\x1b\\",
+            "\x1b_Ga=d,d=I,i=41,I=9,p=6,q=1\x1b\\",
+            "\x1b_Gm=0;AAD/\x1b\\",
+            "\x1b_Ga=d,d=F,i=41,I=9,q=2\x1b\\",
+            "\x1b_Ga=d,d=G,i=41\x1b\\\x1b[c",
+        )
+        .as_bytes(),
+    );
+    session.pump().unwrap();
+    assert_eq!(session.transport.written, b"\x1b");
+    session.transport.write_budget = usize::MAX;
+    session.pump().unwrap();
+    assert_eq!(
+        session.transport.written,
+        b"\x1b_Gi=41,I=9,p=6;EINVAL:Invalid image data\x1b\\\x1b[?62;22c"
+    );
+    session.transport.written.clear();
+    assert!(session.graphics_image(40).is_none());
+    assert!(session.graphics_image(41).is_some());
+    assert_eq!(session.screen().graphics_placements().len(), 1);
+
     session.transport.source = Cursor::new(b"\x1b_Ga=d,d=i,i=41,p=6\x1b\\");
     session.pump().unwrap();
     assert!(session.screen().graphics_placements().is_empty());
@@ -784,6 +810,9 @@ fn kitty_images_compose_in_an_offscreen_wgpu_pass() {
     use std::sync::mpsc;
     use std::time::Duration;
 
+    let _gpu_guard = OFFSCREEN_GPU_TESTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let size = PtySize {
         pixel_width: 16,
         pixel_height: 10,
@@ -1940,6 +1969,16 @@ fn kitty_images_compose_in_an_offscreen_wgpu_pass() {
     assert_eq!([pixel(&moved, 0, 0), pixel(&moved, 2, 0)], [empty; 2]);
     assert_eq!(renderer.cached_texture(key), Some(&child_texture));
 
+    relative.transport.source = Cursor::new(b"\x1b_Ga=d,d=G,i=65\x1b\\");
+    relative.pump().unwrap();
+    assert!(relative.transport.written.is_empty());
+    assert_eq!(draw(&mut renderer, &relative), moved);
+    assert_eq!(renderer.cached_texture(key), Some(&child_texture));
+    relative.transport.source = Cursor::new(b"\x1b_Ga=d,d=I,i=65\x1b\\");
+    relative.pump().unwrap();
+    let deleted = draw(&mut renderer, &relative);
+    assert_eq!([pixel(&deleted, 4, 2), pixel(&deleted, 6, 2)], [red, empty]);
+
     let mut letterboxed = session_with_size(
         concat!(
             "\x1b_Ga=T,i=66,p=1,U=1,c=3,r=1,s=1,v=1,q=2;AP8A/w==\x1b\\",
@@ -2000,6 +2039,201 @@ fn kitty_images_compose_in_an_offscreen_wgpu_pass() {
     assert_eq!(pixel(&erased, 3, 2), pixel(&complete, 3, 2));
     assert_eq!(pixel(&erased, 3, 5), pixel(&complete, 3, 5));
     assert_eq!(pixel(&erased, 8, 2), pixel(&complete, 8, 2));
+
+    let mut hidden = session_with_size(
+        concat!(
+            "\x1b_Ga=T,i=69,U=1,c=1,r=1,s=1,v=1,q=2;/wAA/w==\x1b\\",
+            "\x1b_Ga=T,i=70,P=69,H=1,s=1,v=1,q=2;/wAA/w==\x1b\\",
+            "\x1b_Ga=f,i=70,s=1,v=1,z=20,q=2;AP8A/w==\x1b\\",
+            "\x1b_Ga=a,i=70,s=3,r=1,z=10\x1b\\",
+        )
+        .as_bytes(),
+        size,
+    );
+    let at = |ms| now + Duration::from_millis(ms);
+    hidden.pump_with_clock(|| at(0)).unwrap();
+    assert_eq!(hidden.presentation_deadline(), None);
+    assert_eq!(pixel(&draw(&mut renderer, &hidden), 2, 0), empty);
+
+    hidden.transport.source = Cursor::new("\x1b[?2026h\x1b[38;5;69m\u{10eeee}\x1b[0m".as_bytes());
+    hidden.pump_with_clock(|| at(100)).unwrap();
+    assert!(hidden.presentation_frame().is_none());
+    assert_eq!(pixel(&read_frame(&renderer), 2, 0), empty);
+
+    hidden.transport.source = Cursor::new(b"\x1b[?2026l");
+    hidden.pump_with_clock(|| at(140)).unwrap();
+    assert_eq!(hidden.presentation_deadline(), Some(at(150)));
+    assert_eq!(pixel(&draw(&mut renderer, &hidden), 2, 0), red);
+    hidden.pump_with_clock(|| at(150)).unwrap();
+    assert_eq!(pixel(&draw(&mut renderer, &hidden), 2, 0), green);
+
+    hidden.transport.source = Cursor::new(b"\x1b[1;1H\x1b[X");
+    hidden.pump_with_clock(|| at(155)).unwrap();
+    assert_eq!(hidden.presentation_deadline(), None);
+    assert_eq!(pixel(&draw(&mut renderer, &hidden), 2, 0), empty);
+
+    let mut composition = session_with_size(
+        concat!(
+            "\x1b_Ga=T,i=71,s=2,v=1,C=1,q=2;/wAA//8AAP8=\x1b\\",
+            "\x1b_Ga=f,i=71,s=2,v=1,X=1,q=2;AAD//wAA//8=\x1b\\",
+            "\x1b_Ga=f,i=71,c=2,x=1,s=1,v=1,X=1,q=2;AP8A/w==\x1b\\",
+            "\x1b_Ga=a,i=71,c=3\x1b\\",
+        )
+        .as_bytes(),
+        size,
+    );
+    composition.pump().unwrap();
+    let before = draw(&mut renderer, &composition);
+    assert_eq!(
+        [pixel(&before, 0, 0), pixel(&before, 1, 0)],
+        [[0, 0, 255, 255], green]
+    );
+
+    composition.transport.source = Cursor::new(b"\x1b_Ga=c,i=71,r=1,c=2,C=1,q=2\x1b\\");
+    composition.pump().unwrap();
+    let composed = draw(&mut renderer, &composition);
+    assert_eq!(
+        [pixel(&composed, 0, 0), pixel(&composed, 1, 0)],
+        [red, green]
+    );
+
+    composition.transport.source =
+        Cursor::new(b"\x1b_Ga=f,i=71,r=1,s=1,v=1,X=1,q=2;AAD//w==\x1b\\");
+    composition.pump().unwrap();
+    assert_eq!(draw(&mut renderer, &composition), composed);
+
+    composition.transport.source =
+        Cursor::new(b"\x1b[1;3H\x1b_Ga=T,i=72,s=2,v=2,C=1,q=2;/wAA//8AAP//AAD//wAA/w==\x1b\\");
+    composition.pump().unwrap();
+    let base = draw(&mut renderer, &composition);
+    assert_eq!([pixel(&base, 5, 0), pixel(&base, 5, 1)], [red; 2]);
+    composition.transport.source = Cursor::new(
+        b"\x1b_Ga=f,i=72,c=1,x=1,s=2,v=2,X=1,q=2;AP8A//////8AAP///////w==\x1b\\\x1b_Ga=a,i=72,c=2\x1b\\",
+    );
+    composition.pump().unwrap();
+    let clipped = draw(&mut renderer, &composition);
+    assert_eq!(
+        [pixel(&clipped, 5, 0), pixel(&clipped, 5, 1)],
+        [green, [0, 0, 255, 255]]
+    );
+    assert_eq!([pixel(&clipped, 4, 0), pixel(&clipped, 4, 1)], [red; 2]);
+}
+
+#[cfg(feature = "wgpu-renderer")]
+#[test]
+#[ignore = "Requires a Vulkan adapter"]
+fn kitty_large_crop_uploads_only_the_needed_tiles() {
+    let _gpu_guard = OFFSCREEN_GPU_TESTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+    let adapter =
+        pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
+            .unwrap();
+    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        required_limits: wgpu::Limits {
+            max_texture_dimension_2d: 1024,
+            ..Default::default()
+        },
+        ..Default::default()
+    }))
+    .unwrap();
+    let mut session = session_with_size(
+        b"",
+        PtySize {
+            pixel_width: 16,
+            pixel_height: 10,
+            ..PtySize::new(5, 8)
+        },
+    );
+    let send = |session: &mut Session<Transport>, wire: &[u8]| {
+        assert_eq!(
+            session
+                .processor
+                .advance(wire, &mut session.screen, &mut session.writer)
+                .unwrap(),
+            wire.len()
+        );
+    };
+    let row = "AP8A".repeat(1024);
+    let first = format!("\x1b_Gi=73,f=24,s=1024,v=1024,m=1,q=2;{row}\x1b\\");
+    let middle = format!("\x1b_Gm=1;{row}\x1b\\");
+    let last = format!("\x1b_Gm=0;{row}\x1b\\");
+    send(&mut session, first.as_bytes());
+    for _ in 1..1023 {
+        send(&mut session, middle.as_bytes());
+    }
+    send(&mut session, last.as_bytes());
+
+    let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+    let mut cropped = crate::ImageRenderer::new(&device, format);
+    send(
+        &mut session,
+        b"\x1b_Ga=p,i=73,p=1,x=32,y=32,w=2,h=2,C=1,q=2\x1b\\",
+    );
+    let frame = session.presentation_frame().unwrap();
+    let key = frame.graphics_placements()[0].placement.image;
+    assert_eq!(cropped.prepare(&device, &queue, &frame), 0);
+    assert_eq!(cropped.cached_texture(key).unwrap().width(), 511);
+    assert_eq!(cropped.resident_image_tiles(key), 1);
+    queue.submit([]);
+
+    send(
+        &mut session,
+        b"\x1b_Ga=p,i=73,p=1,x=509,y=32,w=2,h=2,C=1,q=2\x1b\\",
+    );
+    assert_eq!(
+        cropped.prepare(&device, &queue, &session.presentation_frame().unwrap()),
+        0
+    );
+    assert_eq!(cropped.resident_image_tiles(key), 2);
+    queue.submit([]);
+
+    send(&mut session, b"\x1b_Ga=p,i=73,p=1,c=8,r=5,C=1,q=2\x1b\\");
+    let mut whole = crate::ImageRenderer::new(&device, format);
+    assert_eq!(
+        whole.prepare(&device, &queue, &session.presentation_frame().unwrap()),
+        0
+    );
+    assert_eq!(whole.cached_texture(key).unwrap().width(), 1024);
+    queue.submit([]);
+}
+
+#[test]
+fn kitty_placeholder_damage_follows_placeholder_rows() {
+    let mut session = session(
+        concat!(
+            "\x1b_Ga=T,i=42,U=1,c=1,r=1,s=1,v=1,q=2;/wAA/w==\x1b\\",
+            "\x1b[38;5;42m\u{10eeee}\x1b[0m",
+        )
+        .as_bytes(),
+    );
+    let now = Instant::now();
+    let mut tracker = PresentationTracker::default();
+    session.pump_with_clock(|| now).unwrap();
+    tracker
+        .prepare(&session.presentation_frame().unwrap(), now)
+        .unwrap()
+        .commit();
+
+    session.transport.source = Cursor::new(b"\x1b[2;1Hx");
+    session.pump_with_clock(|| now).unwrap();
+    let frame = session.presentation_frame().unwrap();
+    let update = tracker.prepare(&frame, now).unwrap();
+    assert_eq!(update.damage().rows, RowDamage::Rows(&[1]));
+    assert!(!update.damage().graphics_changed);
+    update.commit();
+
+    session.transport.source = Cursor::new(b"\x1b[1;1H\x1b[X");
+    session.pump_with_clock(|| now).unwrap();
+    let frame = session.presentation_frame().unwrap();
+    assert!(
+        tracker
+            .prepare(&frame, now)
+            .unwrap()
+            .damage()
+            .graphics_changed
+    );
 }
 
 #[test]
@@ -2168,7 +2402,7 @@ fn kitty_animation_deadlines_follow_loading_and_finite_loops() {
 
     session.transport.source = Cursor::new(
         concat!(
-            "\x1b_Gi=2,s=1,v=1,q=1;AAAA/w==\x1b\\",
+            "\x1b_Ga=T,i=2,s=1,v=1,C=1,q=1;AAAA/w==\x1b\\",
             "\x1b_Ga=f,i=2,s=1,v=1,z=15,q=1;//8A/w==\x1b\\",
             "\x1b_Ga=a,i=2,s=2,r=1,z=15\x1b\\"
         )
@@ -2184,6 +2418,73 @@ fn kitty_animation_deadlines_follow_loading_and_finite_loops() {
     session.transport.source = Cursor::new(b"\x1b_Gi=2,s=1,v=1,q=1;AAAA/w==\x1b\\");
     session.pump_with_clock(|| at(70_630)).unwrap();
     assert_eq!(session.presentation_deadline(), Some(at(70_670)));
+}
+
+#[test]
+fn kitty_animation_waits_for_placement_and_only_damages_visible_images() {
+    let mut session = session(
+        concat!(
+            "\x1b_Ga=T,i=2,s=1,v=1,C=1,q=2;/////w==\x1b\\",
+            "\x1b_Gi=1,s=1,v=1,q=2;/wAA/w==\x1b\\",
+            "\x1b_Ga=f,i=1,s=1,v=1,z=20,q=2;AP8A/w==\x1b\\",
+            "\x1b_Ga=a,i=1,s=3,r=1,z=10\x1b\\",
+        )
+        .as_bytes(),
+    );
+    session
+        .set_history_limits(HistoryLimits {
+            max_rows: 4,
+            max_bytes: 4096,
+        })
+        .unwrap();
+    let start = Instant::now();
+    let at = |ms| start + Duration::from_millis(ms);
+    let current = |session: &Session<Transport>| -> [u8; 4] {
+        session
+            .graphics_image(1)
+            .unwrap()
+            .pixels(&mut Vec::new())
+            .unwrap()
+            .try_into()
+            .unwrap()
+    };
+    session
+        .pump_with_clock(|| panic!("An unplaced animation must not start a timer"))
+        .unwrap();
+    assert_eq!(session.presentation_deadline(), None);
+    let static_stamp = session.presentation_frame().unwrap().graphics_stamp();
+
+    session.transport.source = Cursor::new(b"\x1b_Ga=a,i=1,c=2\x1b\\");
+    session.pump_with_clock(|| at(25)).unwrap();
+    assert_eq!(current(&session), [0, 255, 0, 255]);
+    assert_eq!(
+        session.presentation_frame().unwrap().graphics_stamp(),
+        static_stamp
+    );
+
+    session.transport.source = Cursor::new(b"\x1b_Ga=p,i=1,C=1,q=2\x1b\\");
+    session.pump_with_clock(|| at(100)).unwrap();
+    assert_eq!(current(&session), [0, 255, 0, 255]);
+    assert_eq!(session.presentation_deadline(), Some(at(120)));
+
+    session.transport.source = Cursor::new(b"\x1b_Ga=d,d=i,i=1\x1b\\");
+    session.pump_with_clock(|| at(115)).unwrap();
+    assert_eq!(session.presentation_deadline(), None);
+    session.pump_with_clock(|| at(800)).unwrap();
+    assert_eq!(current(&session), [0, 255, 0, 255]);
+
+    session.transport.source = Cursor::new(b"\x1b_Ga=p,i=1,C=1,q=2\x1b\\");
+    session.pump_with_clock(|| at(1000)).unwrap();
+    assert_eq!(current(&session), [255, 0, 0, 255]);
+    assert_eq!(session.presentation_deadline(), Some(at(1010)));
+
+    session.transport.source = Cursor::new(b"\x1b[3;1H\x1bD");
+    session.pump_with_clock(|| at(1005)).unwrap();
+    assert_eq!(session.presentation_deadline(), None);
+    assert!(session.scroll_history(1));
+    assert!(session.presentation_deadline().is_some());
+    session.follow_output();
+    assert_eq!(session.presentation_deadline(), None);
 }
 
 #[test]
@@ -2529,6 +2830,71 @@ fn synchronized_output_replies_while_held_and_releases_at_the_original_deadline(
     assert_eq!(session.transport.source.position(), 0);
     session.pump_with_clock(|| deadline).unwrap();
     assert_eq!(session.transport.written, b"\x1b[?2026;1$y\x1b[?2026;2$y");
+}
+
+#[test]
+fn kitty_synchronized_output_defers_animation_until_presentation() {
+    for release_by_timeout in [false, true] {
+        let start = Instant::now();
+        let at = |ms| start + Duration::from_millis(ms);
+        let mut session = session(
+            concat!(
+                "\x1b_Ga=T,i=1,s=1,v=1,C=1,q=2;/wAA/w==\x1b\\",
+                "\x1b_Ga=f,i=1,s=1,v=1,z=20,q=2;AP8A/w==\x1b\\",
+                "\x1b_Ga=a,i=1,s=3,r=1,z=20\x1b\\",
+            )
+            .as_bytes(),
+        );
+        let pixel = |session: &Session<Transport>, id| -> [u8; 4] {
+            session
+                .graphics_image(id)
+                .unwrap()
+                .pixels(&mut Vec::new())
+                .unwrap()
+                .try_into()
+                .unwrap()
+        };
+        session.pump_with_clock(|| at(0)).unwrap();
+        assert_eq!(session.presentation_deadline(), Some(at(20)));
+
+        session.transport.source = Cursor::new(
+            concat!(
+                "\x1b[?2026h\x1b[1;2H\x1b_Ga=T,i=2,s=1,v=1,C=1;AAD//w==\x1b\\",
+                "\x1b_Ga=f,i=2,s=1,v=1,z=8,q=2;/////w==\x1b\\",
+                "\x1b_Ga=a,i=2,s=3,r=1,z=8\x1b\\",
+            )
+            .as_bytes(),
+        );
+        session.transport.write_budget = usize::MAX;
+        session.pump_with_clock(|| at(5)).unwrap();
+        assert_eq!(session.transport.written, b"\x1b_Gi=2;OK\x1b\\");
+        assert_eq!(
+            session.presentation_deadline(),
+            Some(at(5) + SYNCHRONIZED_OUTPUT_TIMEOUT)
+        );
+        session.pump_with_clock(|| at(60)).unwrap();
+        assert!(session.presentation_frame().is_none());
+        assert_eq!(pixel(&session, 1), [255, 0, 0, 255]);
+        assert_eq!(pixel(&session, 2), [0, 0, 255, 255]);
+
+        let released = if release_by_timeout {
+            at(5) + SYNCHRONIZED_OUTPUT_TIMEOUT
+        } else {
+            session.transport.source = Cursor::new(b"\x1b[?2026l");
+            at(70)
+        };
+        session.pump_with_clock(|| released).unwrap();
+        assert!(session.presentation_frame().is_some());
+        assert_eq!(pixel(&session, 1), [0, 255, 0, 255]);
+        session
+            .pump_with_clock(|| released + Duration::from_millis(7))
+            .unwrap();
+        assert_eq!(pixel(&session, 2), [0, 0, 255, 255]);
+        session
+            .pump_with_clock(|| released + Duration::from_millis(8))
+            .unwrap();
+        assert_eq!(pixel(&session, 2), [255, 255, 255, 255]);
+    }
 }
 
 #[test]

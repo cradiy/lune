@@ -401,7 +401,7 @@ impl Screen {
         }
     }
 
-    fn graphics_cell_extent(&self) -> PixelSize {
+    pub(crate) fn graphics_cell_extent(&self) -> PixelSize {
         self.graphics_cell.unwrap_or(PixelSize {
             width: NonZeroU32::MIN,
             height: NonZeroU32::MIN,

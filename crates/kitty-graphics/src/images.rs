@@ -317,6 +317,24 @@ impl ImageStore {
         self.animation_wakes.deadline()
     }
 
+    pub fn animation_membership(&self) -> Option<u64> {
+        self.animation_wakes.membership()
+    }
+
+    pub fn is_animated(&self, key: ImageKey) -> bool {
+        self.animation_wakes.contains(key)
+    }
+
+    /// Restricts automatic playback to the visible image keys.
+    pub fn set_animation_visibility(&mut self, visible: impl IntoIterator<Item = ImageKey>) {
+        if self
+            .animation_wakes
+            .set_visibility(&mut self.images, visible)
+        {
+            self.visual_revision = self.visual_revision.wrapping_add(1);
+        }
+    }
+
     /// Advances due animations using a monotonic clock and updates their next deadline.
     pub fn poll_animations(&mut self, clock: impl FnOnce() -> Instant) {
         if self.animation_wakes.poll(clock, &mut self.images) {
@@ -387,7 +405,7 @@ impl ImageStore {
             .is_some_and(|animation| animation.delete_frame(number));
         if removed {
             self.stored_bytes -= image.release_unused_original();
-            if image.revision() != previous {
+            if image.revision() != previous && self.animation_wakes.is_visible(key) {
                 self.visual_revision = self.visual_revision.wrapping_add(1);
             }
             self.animation_wakes.update(key, image);
@@ -424,7 +442,7 @@ impl ImageStore {
         self.numbered.clear();
         self.stored_bytes = 0;
         self.anonymous_images = 0;
-        self.animation_wakes = AnimationWakes::default();
+        self.animation_wakes.clear();
     }
 
     pub fn receive(
@@ -455,6 +473,10 @@ impl ImageStore {
             return Some(response);
         }
         let action = controls.get(b'a');
+        let delete = action == Some(Value::Letter(b'd'));
+        if delete {
+            self.abort_transfer();
+        }
         let mut transfer = if let Some(mut pending) = self.pending.take() {
             let continuation = controls.only(const { control_keys(b"amq") })
                 && action.is_none_or(|action| action == Value::Letter(pending.action));
@@ -488,6 +510,10 @@ impl ImageStore {
                 || placement_field.is_none()
             {
                 return reply(id, image_number, placement_id, 0, quiet_value, Err(INVALID));
+            }
+            if delete {
+                // Placement deletion is dispatched through Command::decode_delete.
+                return None;
             }
             if controls.get(b'a') == Some(Value::Letter(b'p')) {
                 let id = if image_number == 0 {
@@ -655,7 +681,7 @@ impl ImageStore {
             )
         })?;
         self.stored_bytes -= image.release_unused_original();
-        if image.revision() != previous {
+        if image.revision() != previous && self.animation_wakes.is_visible(key) {
             self.visual_revision = self.visual_revision.wrapping_add(1);
         }
         self.animation_wakes.update(key, image);

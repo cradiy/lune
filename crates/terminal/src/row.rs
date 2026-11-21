@@ -1,18 +1,25 @@
 use std::{
     fmt,
     iter::FusedIterator,
+    num::NonZeroU64,
     ops::Range,
     slice,
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use crate::{Cell, CellPosition, CellText, CellWidth, MAX_CELL_TEXT_BYTES, StorageError, StyleId};
+use crate::{
+    Cell, CellPosition, CellText, CellWidth, GRAPHICS_PLACEHOLDER, MAX_CELL_TEXT_BYTES,
+    StorageError, StyleId,
+};
 
 static NEXT_ROW_REVISION: AtomicU64 = AtomicU64::new(1);
+const PLACEHOLDER_ABSENT: u64 = 1 << 62;
+const PLACEHOLDER_PRESENT: u64 = 1 << 63;
+const REVISION_MASK: u64 = !(PLACEHOLDER_ABSENT | PLACEHOLDER_PRESENT);
 
 /// An opaque cache key for a physical row's cells, width, and extended text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct RowRevision(u64);
+pub struct RowRevision(NonZeroU64);
 
 #[derive(Debug)]
 struct ExtendedText {
@@ -331,11 +338,14 @@ impl Row {
     /// Successful edits can publish a new key even when the visible values match.
     #[inline]
     pub fn revision(&self) -> RowRevision {
-        let revision = self.revision.load(Ordering::Relaxed);
-        if revision == 0 {
-            self.publish_revision()
-        } else {
-            RowRevision(revision)
+        self.revision_from_packed(self.revision.load(Ordering::Relaxed))
+    }
+
+    #[inline]
+    fn revision_from_packed(&self, packed: u64) -> RowRevision {
+        match NonZeroU64::new(packed & REVISION_MASK) {
+            Some(revision) => RowRevision(revision),
+            None => self.publish_revision(),
         }
     }
 
@@ -343,16 +353,58 @@ impl Row {
     fn publish_revision(&self) -> RowRevision {
         let fresh = NEXT_ROW_REVISION
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-                value.checked_add(1)
+                (value <= REVISION_MASK).then_some(value + 1)
             })
             .expect("Row revision space exhausted");
-        match self
-            .revision
-            .compare_exchange(0, fresh, Ordering::Relaxed, Ordering::Relaxed)
-        {
-            Ok(_) => RowRevision(fresh),
-            Err(published) => RowRevision(published),
+        let revision =
+            match self
+                .revision
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |packed| {
+                    (packed & REVISION_MASK == 0).then_some(packed | fresh)
+                }) {
+                Ok(_) => fresh,
+                Err(published) => published & REVISION_MASK,
+            };
+        RowRevision(NonZeroU64::new(revision).expect("A revision was published"))
+    }
+
+    /// A revision for rows that contain a Kitty graphics placeholder.
+    #[inline]
+    pub fn graphics_placeholder_revision(&self) -> Option<RowRevision> {
+        let packed = self.revision.load(Ordering::Relaxed);
+        match packed & !REVISION_MASK {
+            PLACEHOLDER_PRESENT => Some(self.revision_from_packed(packed)),
+            PLACEHOLDER_ABSENT => None,
+            _ => self
+                .scan_graphics_placeholders()
+                .then(|| self.revision_from_packed(packed)),
         }
+    }
+
+    #[inline]
+    pub(crate) fn has_graphics_placeholder(&self) -> bool {
+        let packed = self.revision.load(Ordering::Relaxed);
+        if packed > REVISION_MASK {
+            packed & PLACEHOLDER_PRESENT != 0
+        } else {
+            self.scan_graphics_placeholders()
+        }
+    }
+
+    #[cold]
+    fn scan_graphics_placeholders(&self) -> bool {
+        let present = self
+            .cells
+            .iter()
+            .any(|cell| cell.has_character(GRAPHICS_PLACEHOLDER));
+        let flag = if present {
+            PLACEHOLDER_PRESENT
+        } else {
+            PLACEHOLDER_ABSENT
+        };
+        // Concurrent readers observe the same cells and publish the same flag.
+        self.revision.fetch_or(flag, Ordering::Relaxed);
+        present
     }
 
     #[inline]

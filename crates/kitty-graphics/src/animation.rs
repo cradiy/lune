@@ -395,7 +395,7 @@ impl Animation {
         let bytes = match data {
             Some(SurfaceData::Full(bytes)) => bytes,
             Some(SurfaceData::Patch(_)) => return Ok(PixelUpdates::Rasterize),
-            None => original,
+            Some(SurfaceData::Original) | None => original,
         };
         Ok(PixelUpdates::One(PixelUpdate::full(
             bytes,
@@ -464,19 +464,14 @@ impl Animation {
         {
             SurfaceData::Full(pixels.bytes)
         } else {
+            let (bytes, stride) =
+                region.retain_patch_pixels(pixels.bytes, patch_width as usize * 4)?;
             let pixels = if parent.is_some() {
-                PatchPixels::shared(pixels.bytes, budget)?
+                PatchPixels::shared(bytes, budget)?
             } else {
-                PatchPixels::Owned(pixels.bytes)
+                PatchPixels::Owned(bytes)
             };
-            Patch::new(
-                base,
-                region,
-                patch_width as usize * 4,
-                pixels,
-                !upload.overwrite,
-            )
-            .into_data(&canvas)?
+            Patch::new(base, region, stride, pixels, !upload.overwrite).into_data(&canvas)?
         };
         if matches!(data, SurfaceData::Full(_)) {
             parent = None;
@@ -488,17 +483,7 @@ impl Animation {
                 parent,
                 surface,
             };
-            if self.linked_frames == 0 {
-                self.replace_surface(replacement);
-            } else {
-                self.replace_with_dependents(replacement, region, &canvas)?;
-            }
-            if let Some(gap_ms) = upload.gap_ms {
-                self.set_gap(index, gap_ms);
-            }
-            if index == self.current {
-                self.playback.restart_frame();
-            }
+            self.edit_frame(replacement, region, upload.gap_ms, &canvas)?;
         } else {
             self.extra.try_reserve(1).map_err(|_| QUOTA)?;
             let gap_ms = upload.gap_ms.unwrap_or(DEFAULT_GAP_MS);
@@ -511,6 +496,28 @@ impl Animation {
                 parent,
             });
             self.total_gap_ms += u64::from(gap_ms);
+        }
+        Ok(())
+    }
+
+    fn edit_frame(
+        &mut self,
+        replacement: FrameReplacement,
+        region: Region,
+        gap_ms: Option<u32>,
+        canvas: &Canvas<'_>,
+    ) -> Result<(), &'static [u8]> {
+        let index = replacement.index;
+        if self.linked_frames == 0 {
+            self.replace_surface(replacement);
+        } else {
+            self.replace_with_dependents(replacement, region, canvas)?;
+        }
+        if let Some(gap_ms) = gap_ms {
+            self.set_gap(index, gap_ms);
+        }
+        if index == self.current {
+            self.playback.restart_frame();
         }
         Ok(())
     }
@@ -621,6 +628,22 @@ impl Animation {
         let target_region = Region::checked(composition.target_origin, size, dimensions)?;
         if source == target && source_region.intersection(target_region).is_some() {
             return Err(INVALID_REGION);
+        }
+        if composition.overwrite && size == dimensions {
+            let surface = match &frame.surface {
+                Some(surface) => Arc::clone(surface),
+                None => canvas.budget.store(
+                    SurfaceData::Original,
+                    canvas.original_revision,
+                    canvas.original_revision,
+                )?,
+            };
+            let replacement = FrameReplacement {
+                index: target,
+                parent: None,
+                surface,
+            };
+            return self.edit_frame(replacement, target_region, None, &canvas);
         }
         let mut bytes = Vec::new();
         let len = source_region.width * source_region.height * 4;
@@ -752,7 +775,7 @@ impl Surface {
                 .base
                 .revision(original_revision)
                 .map(|base| (base, patch.region)),
-            SurfaceData::Full(_) => None,
+            SurfaceData::Full(_) | SurfaceData::Original => None,
         }
     }
 }
@@ -777,6 +800,7 @@ impl Drop for FrameCharge {
 }
 
 enum SurfaceData {
+    Original,
     Full(Vec<u8>),
     Patch(Patch),
 }
@@ -801,11 +825,12 @@ impl SurfaceData {
     }
 
     fn uses_original(&self) -> bool {
-        matches!(self, Self::Patch(patch) if patch.uses_original)
+        matches!(self, Self::Original) || matches!(self, Self::Patch(patch) if patch.uses_original)
     }
 
     fn capacity(&self) -> usize {
         match self {
+            Self::Original => 0,
             Self::Full(pixels) => pixels.capacity(),
             Self::Patch(patch) => patch.pixels.capacity(),
         }
@@ -813,11 +838,12 @@ impl SurfaceData {
 
     fn pixels<'a>(
         &'a self,
-        original: &[u8],
+        original: &'a [u8],
         dimensions: (u32, u32),
         scratch: &'a mut Vec<u8>,
     ) -> Result<&'a [u8], &'static [u8]> {
         match self {
+            Self::Original => Ok(original),
             Self::Full(pixels) => Ok(pixels),
             Self::Patch(_) => {
                 let (width, height) = (dimensions.0 as usize, dimensions.1 as usize);
@@ -836,6 +862,7 @@ impl SurfaceData {
 
     fn render(&self, original: &[u8], width: usize, region: Region, output: &mut [u8]) {
         match self {
+            Self::Original => region.copy_pixels(original, width, output),
             Self::Full(pixels) => region.copy_pixels(pixels, width, output),
             Self::Patch(patch) => {
                 match &patch.base {
@@ -865,7 +892,7 @@ fn render_region<'a>(
         return Ok(region.update(&[], 0));
     }
     match data {
-        None => Ok(region.update_from(original, width, 4)),
+        Some(SurfaceData::Original) | None => Ok(region.update_from(original, width, 4)),
         Some(SurfaceData::Full(bytes)) => Ok(region.update_from(bytes, width, 4)),
         Some(data) => {
             let stride = region.width * 4;
@@ -884,7 +911,7 @@ fn render_two_regions<'a>(
     scratch: &'a mut Vec<u8>,
 ) -> Result<PixelUpdates<'a>, &'static [u8]> {
     match data {
-        None => Ok(PixelUpdates::Two(
+        Some(SurfaceData::Original) | None => Ok(PixelUpdates::Two(
             regions.map(|region| region.update_from(original, width, 4)),
         )),
         Some(SurfaceData::Full(pixels)) => Ok(PixelUpdates::Two(
@@ -937,7 +964,7 @@ impl Base {
         match self {
             Self::Frame(surface) => match &surface.data {
                 SurfaceData::Patch(patch) => patch.depth,
-                SurfaceData::Full(_) => 0,
+                SurfaceData::Full(_) | SurfaceData::Original => 0,
             },
             _ => 0,
         }
@@ -1074,6 +1101,32 @@ pub(crate) struct Region {
 impl Region {
     fn area(self) -> usize {
         self.width * self.height
+    }
+
+    fn retain_patch_pixels(
+        self,
+        pixels: Vec<u8>,
+        source_stride: usize,
+    ) -> Result<(Vec<u8>, usize), &'static [u8]> {
+        if self.is_empty() {
+            return Ok((Vec::new(), 0));
+        }
+        let stride = self.width * 4;
+        let len = stride * self.height;
+        // Keep the upload's stride when packing would save less than a quarter of its bytes.
+        if pixels.len() - len < pixels.len().div_ceil(4) {
+            return Ok((pixels, source_stride));
+        }
+        let mut retained = Vec::new();
+        retained.try_reserve_exact(len).map_err(|_| QUOTA)?;
+        if stride == source_stride {
+            retained.extend_from_slice(&pixels[..len]);
+        } else {
+            for row in pixels.chunks_exact(source_stride).take(self.height) {
+                retained.extend_from_slice(&row[..stride]);
+            }
+        }
+        Ok((retained, stride))
     }
 
     pub(crate) fn is_empty(self) -> bool {

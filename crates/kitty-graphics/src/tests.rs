@@ -280,6 +280,95 @@ fn animation_frames_commit_complete_patches_and_keep_the_current_surface_on_fail
 }
 
 #[test]
+fn clipped_animation_uploads_keep_only_pixels_inside_the_canvas() {
+    let mut images = ImageStore::new(2048, 1);
+    let send = |images: &mut ImageStore, wire: &[u8]| {
+        let mut reply = None;
+        feed(wire, 23, |command| {
+            reply = images.receive(command.unwrap(), |_| Ok(()));
+        });
+        reply
+    };
+    let wire = format!(
+        "\x1b_Gi=1,s=32,v=16;{}\x1b\\",
+        PAYLOAD_ENGINE.encode([[255, 0, 0, 255]; 512].as_flattened()),
+    );
+    assert_eq!(send(&mut images, wire.as_bytes()).unwrap().message, b"OK");
+
+    let mut patch = [[255, 255, 255, 255]; 512];
+    patch[0] = [0, 255, 0, 255];
+    patch[32] = [0, 0, 255, 255];
+    let payload = PAYLOAD_ENGINE.encode(patch.as_flattened());
+    for frame in 2..=13 {
+        let column = 31 + frame % 2;
+        let wire = format!("\x1b_Ga=f,i=1,c=1,s=32,v=16,x={column},y=14,X=1;{payload}\x1b\\");
+        let reply = send(&mut images, wire.as_bytes()).unwrap();
+        assert_eq!(
+            (reply.frame_number, reply.message),
+            (frame, b"OK".as_slice())
+        );
+    }
+
+    let mut scratch = Vec::new();
+    let mut expected = [[255, 0, 0, 255]; 512];
+    for frame in [13, 12] {
+        let wire = format!("\x1b_Ga=a,i=1,c={frame}\x1b\\");
+        assert!(send(&mut images, wire.as_bytes()).is_none());
+        if frame == 12 {
+            expected[479] = patch[0];
+            expected[511] = patch[32];
+        }
+        assert_eq!(
+            images.get(1).unwrap().pixels(&mut scratch).unwrap(),
+            expected.as_flattened(),
+        );
+    }
+}
+
+#[test]
+fn full_frame_overwrite_shares_pixels_at_quota_and_detaches_source_edits() {
+    let mut images = ImageStore::new(2048, 1);
+    let send = |images: &mut ImageStore, wire: &[u8]| {
+        let mut reply = None;
+        feed(wire, 17, |command| {
+            reply = images.receive(command.unwrap(), |_| Ok(()));
+        });
+        reply.map(|reply| reply.message)
+    };
+    let black = [0, 0, 0, 255];
+    let red = [255, 0, 0, 255];
+    let green = [0, 255, 0, 255];
+    let blue = [0, 0, 255, 255];
+    for (index, pixel) in [black, red, green, blue, black].into_iter().enumerate() {
+        let controls = if index == 0 { "a=t" } else { "a=f,X=1" };
+        let payload = PAYLOAD_ENGINE.encode([pixel; 512].as_flattened());
+        let wire = format!("\x1b_G{controls},i=1,s=32,v=16;{payload}\x1b\\");
+        assert_eq!(send(&mut images, wire.as_bytes()), Some(b"OK".as_slice()));
+    }
+    assert_eq!(send(&mut images, b"\x1b_Ga=a,i=1,c=3\x1b\\"), None);
+
+    let mut scratch = Vec::new();
+    for (source, color) in [(2, red), (1, black)] {
+        let previous = images.get(1).unwrap().revision();
+        let wire = format!("\x1b_Ga=c,i=1,r={source},c=3,x=1,C=1\x1b\\");
+        assert_eq!(
+            send(&mut images, wire.as_bytes()),
+            Some(b"EINVAL:Invalid animation frame region".as_slice())
+        );
+        assert_eq!(images.get(1).unwrap().revision(), previous);
+
+        let wire = format!("\x1b_Ga=c,i=1,r={source},c=3,C=1\x1b\\");
+        assert_eq!(send(&mut images, wire.as_bytes()), Some(b"OK".as_slice()));
+        let wire = format!("\x1b_Ga=f,i=1,r={source},s=1,v=1,X=1;AP8A/w==\x1b\\");
+        assert_eq!(send(&mut images, wire.as_bytes()), Some(b"OK".as_slice()));
+        assert_eq!(
+            images.get(1).unwrap().pixels(&mut scratch).unwrap(),
+            [color; 512].as_flattened(),
+        );
+    }
+}
+
+#[test]
 fn animation_base_edits_follow_live_links_and_deletion_freezes_dependents() {
     let mut images = ImageStore::new(4096, 1);
     let mut receive = |wire: &[u8]| {
@@ -713,7 +802,7 @@ fn direct_rgb_chunks_preserve_pixel_order_at_the_storage_limit() {
 
 #[test]
 fn zlib_checks_stream_boundaries_and_png_expands_paletted_alpha() {
-    let mut images = ImageStore::new(8, 2);
+    let mut images = ImageStore::new(24, 3);
     let wire = concat!(
         "\x1b_Gi=1,s=1,v=1,o=z,m=1;eJxj\x1b\\\x1b_Gm=0;ZGJmAQAAGAAL\x1b\\",
         "\x1b_Gi=1,s=1,v=1,o=z;eJxjZGJmAQAAGAALWg==\x1b\\",
@@ -724,6 +813,8 @@ fn zlib_checks_stream_boundaries_and_png_expands_paletted_alpha() {
         "\x1b_Gi=1,s=1,v=1,o=z,m=1;eJxjZGJmAQAAGAAL\x1b\\\x1b_Gm=0;Wg==\x1b\\",
         "\x1b_Gi=2,f=100,o=z,S=99,m=1;eJzrDPBz5+WS4mJg\x1b\\",
         "\x1b_Gm=0;YOD19HAJYmBgYARhRmYGBgbV22GnGBgY2AJ8QlwZGBgElYwXPAzfx8DAwFQS5Bf8v4GDf3MWAwMDl6eLY0jFnOQMBgaGJobG8rNF2xgYGBg8Xf1c1jklNAEAsUoWww==\x1b\\",
+        "\x1b_Gi=3,f=24,s=2,v=2,o=z;eJxjZGJmYWVj5+Dk4uYBAAF4AE8=\x1b\\",
+        "\x1b_Gi=3,f=24,s=1,v=3,o=z;eJxjZGJmYWVj5+Dk4uYBAAF4AE8=\x1b\\",
     );
     let mut replies = Vec::new();
     feed(wire.as_bytes(), 7, |command| {
@@ -735,7 +826,7 @@ fn zlib_checks_stream_boundaries_and_png_expands_paletted_alpha() {
     });
     let bad = b"EINVAL:Invalid image data".as_slice();
     let ok = b"OK".as_slice();
-    assert_eq!(replies, [ok, bad, bad, bad, bad, ok, bad, ok]);
+    assert_eq!(replies, [ok, bad, bad, bad, bad, ok, bad, ok, ok, bad]);
     assert_eq!(
         images.get(1).unwrap().pixels(&mut Vec::new()).unwrap(),
         &[1, 2, 3, 4]
@@ -743,6 +834,10 @@ fn zlib_checks_stream_boundaries_and_png_expands_paletted_alpha() {
     assert_eq!(
         images.get(2).unwrap().pixels(&mut Vec::new()).unwrap(),
         &[17, 34, 51, 128]
+    );
+    assert_eq!(
+        images.get(3).unwrap().pixels(&mut Vec::new()).unwrap(),
+        &[1, 2, 3, 255, 4, 5, 6, 255, 7, 8, 9, 255, 10, 11, 12, 255]
     );
 }
 

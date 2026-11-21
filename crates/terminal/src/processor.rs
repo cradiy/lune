@@ -245,10 +245,12 @@ impl Processor {
 
     pub fn poll_graphics_animations(
         &mut self,
-        buffer: ScreenBuffer,
+        screen: &Screen,
         clock: impl FnOnce() -> std::time::Instant,
     ) {
-        self.state.graphics.poll_animations(buffer, clock);
+        self.state
+            .graphics
+            .poll_animations(screen, &self.styles, clock);
     }
 
     /// Starts with default rendition and a bounded style table. Construction

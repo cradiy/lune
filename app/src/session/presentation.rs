@@ -256,7 +256,7 @@ pub struct PresentationTracker {
     indexed_graphics: bool,
     graphics_palette: u64,
     revisions: Vec<RowRevision>,
-    offscreen_graphics_rows: Vec<RowRevision>,
+    placeholder_rows: Vec<Option<RowRevision>>,
     changed_rows: Vec<usize>,
     palette: Option<Palette>,
     reverse_video: bool,
@@ -364,10 +364,10 @@ impl PresentationTracker {
             self.changed_rows
                 .try_reserve_exact(rows - self.changed_rows.len())?;
         }
-        let offscreen_rows = frame.offscreen_graphics_rows().len();
-        if offscreen_rows > self.offscreen_graphics_rows.len() {
-            self.offscreen_graphics_rows
-                .try_reserve_exact(offscreen_rows - self.offscreen_graphics_rows.len())?;
+        let placeholder_rows = frame.graphics_placeholder_revisions().size_hint().0;
+        if placeholder_rows > self.placeholder_rows.len() {
+            self.placeholder_rows
+                .try_reserve_exact(placeholder_rows - self.placeholder_rows.len())?;
         }
 
         let colors_changed = self
@@ -421,17 +421,7 @@ impl PresentationTracker {
         if colors_changed {
             self.palette = Some(frame.palette.clone());
         }
-        graphics_changed |=
-            frame.has_virtual_graphics() && (all_rows || !self.changed_rows.is_empty());
-        if !frame
-            .offscreen_graphics_rows()
-            .eq(self.offscreen_graphics_rows.iter().copied())
-        {
-            self.offscreen_graphics_rows.clear();
-            self.offscreen_graphics_rows
-                .extend(frame.offscreen_graphics_rows());
-            graphics_changed = true;
-        }
+        graphics_changed |= self.graphics_rows_changed(frame, placeholder_rows, all_rows);
 
         let source = frame
             .viewport
@@ -472,6 +462,41 @@ impl PresentationTracker {
             cursor_change,
             cursor,
         })
+    }
+
+    fn graphics_rows_changed(
+        &mut self,
+        frame: &PresentationFrame<'_>,
+        count: usize,
+        all_rows: bool,
+    ) -> bool {
+        if count == 0 {
+            self.placeholder_rows.clear();
+            return false;
+        }
+        let revisions = || frame.graphics_placeholder_revisions();
+        if all_rows || self.placeholder_rows.len() != count {
+            let changed = !revisions().eq(self.placeholder_rows.iter().copied());
+            self.placeholder_rows.clear();
+            self.placeholder_rows.extend(revisions());
+            return changed;
+        }
+        let mut changed = false;
+        for &index in &self.changed_rows {
+            let row = frame.viewport.row(index).expect("Damaged rows are visible");
+            let revision = row.graphics_placeholder_revision();
+            changed |= std::mem::replace(&mut self.placeholder_rows[index], revision) != revision;
+        }
+        let visible = frame.viewport.rows();
+        if count > visible {
+            for (previous, revision) in self.placeholder_rows[visible..]
+                .iter_mut()
+                .zip(revisions().skip(visible))
+            {
+                changed |= std::mem::replace(previous, revision) != revision;
+            }
+        }
+        changed
     }
 }
 

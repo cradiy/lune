@@ -124,6 +124,7 @@ impl<'a> PresentationFrame<'a> {
             })
     }
 
+    #[cfg(feature = "wgpu-renderer")]
     pub(crate) fn has_virtual_graphics(&self) -> bool {
         self.virtual_graphics
     }
@@ -133,20 +134,13 @@ impl<'a> PresentationFrame<'a> {
         self.virtual_parents
     }
 
-    pub(crate) fn offscreen_graphics_rows(
+    pub(crate) fn graphics_placeholder_revisions(
         &self,
-    ) -> impl ExactSizeIterator<Item = RowRevision> + '_ {
-        let height = self.viewport.rows();
-        let hidden = if self.virtual_parents {
-            self.viewport.offset().min(height)
-        } else {
-            0
-        };
+    ) -> impl Iterator<Item = Option<RowRevision>> + '_ {
         self.viewport
-            .source()
-            .iter_live_rows()
-            .skip(height - hidden)
-            .map(Row::revision)
+            .rows_for_graphics(self.virtual_parents)
+            .take(if self.virtual_graphics { usize::MAX } else { 0 })
+            .map(Row::graphics_placeholder_revision)
     }
 }
 
@@ -377,6 +371,7 @@ impl Session<Pty> {
             self.geometry.text_area_pixels(),
             self.geometry.cell_pixels(),
         );
+        self.poll_graphics_animations(Instant::now);
         Ok(())
     }
 
@@ -456,15 +451,11 @@ impl<T: Read + Write> Session<T> {
         if self.finished {
             return None;
         }
-        match (
-            self.presentation_deadline,
+        self.presentation_deadline.or_else(|| {
             self.processor
                 .graphics_images(self.screen.active_buffer())
-                .animation_deadline(),
-        ) {
-            (Some(sync), Some(animation)) => Some(sync.min(animation)),
-            (sync, animation) => sync.or(animation),
-        }
+                .animation_deadline()
+        })
     }
 
     pub fn processor(&self) -> &Processor {
@@ -487,7 +478,9 @@ impl<T: Read + Write> Session<T> {
 
     /// Updates primary scrollback limits and clamps the visible history.
     pub fn set_history_limits(&mut self, limits: HistoryLimits) -> Result<(), StorageError> {
-        self.screen.set_history_limits(limits)
+        self.screen.set_history_limits(limits)?;
+        self.poll_graphics_animations(Instant::now);
+        Ok(())
     }
 
     /// Moves the local viewport. Positive steps go toward older rows.
@@ -498,12 +491,19 @@ impl<T: Read + Write> Session<T> {
         } else {
             self.screen.scroll_viewport_down(steps.unsigned_abs());
         }
-        self.screen.viewport_offset() != offset
+        let moved = self.screen.viewport_offset() != offset;
+        if moved {
+            self.poll_graphics_animations(Instant::now);
+        }
+        moved
     }
 
     /// Returns the primary viewport to the live buffer.
     pub fn follow_output(&mut self) {
-        self.screen.scroll_viewport_to_bottom();
+        if self.screen.viewport_offset() != 0 {
+            self.screen.scroll_viewport_to_bottom();
+            self.poll_graphics_animations(Instant::now);
+        }
     }
 
     /// Reclaims unreachable styles while preserving IDs held by the caller.
@@ -723,8 +723,7 @@ impl<T: Read + Write> Session<T> {
         {
             self.processor.end_synchronized_output();
             self.presentation_deadline = None;
-            self.processor
-                .poll_graphics_animations(self.screen.active_buffer(), &now);
+            self.poll_graphics_animations(&now);
             return Ok(());
         }
 
@@ -735,11 +734,14 @@ impl<T: Read + Write> Session<T> {
         } else {
             self.presentation_deadline = None;
         }
-        if !self.finished {
-            self.processor
-                .poll_graphics_animations(self.screen.active_buffer(), now);
-        }
+        self.poll_graphics_animations(now);
         result
+    }
+
+    fn poll_graphics_animations(&mut self, clock: impl FnOnce() -> Instant) {
+        if !self.finished && self.presentation_deadline.is_none() {
+            self.processor.poll_graphics_animations(&self.screen, clock);
+        }
     }
 
     fn pump_pty(&mut self) -> io::Result<()> {

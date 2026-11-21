@@ -3,7 +3,7 @@ use std::ops::Range;
 
 use lune_terminal::{
     GraphicsImage, GraphicsImageFormat, GraphicsImageKey, GraphicsPixelRevision,
-    GraphicsPixelUpdate, GraphicsPixelUpdates, GraphicsPlacement, PixelSize, Row, RowRevision,
+    GraphicsPixelUpdate, GraphicsPixelUpdates, GraphicsPlacement, PixelSize, RowRevision,
     ScreenBuffer,
 };
 use wgpu::{Buffer, Device, Queue, RenderPipeline, Sampler, Texture, TextureFormat, TextureView};
@@ -21,6 +21,7 @@ use textures::{
 };
 
 type ImageInstance = [f32; 12];
+const CROP_TILE_EDGE: u32 = 512;
 
 struct ImageLocation {
     origin: [i64; 2],
@@ -228,7 +229,7 @@ pub struct ImageRenderer {
     draws: Vec<Draw>,
     visible_images: Vec<GraphicsImageKey>,
     prepared: Option<PreparedImages>,
-    placeholder_rows: Vec<RowRevision>,
+    placeholder_rows: Vec<Option<RowRevision>>,
     pixel_scratch: Vec<u8>,
 }
 
@@ -363,13 +364,9 @@ impl ImageRenderer {
                         .stamp
                         .zip(stamp)
                         .is_some_and(|(previous, current)| previous.same_layout(current))))
-            && (!frame.has_virtual_graphics()
-                || frame
-                    .viewport
-                    .iter_rows()
-                    .map(Row::revision)
-                    .chain(frame.offscreen_graphics_rows())
-                    .eq(self.placeholder_rows.iter().copied()))
+            && frame
+                .graphics_placeholder_revisions()
+                .eq(self.placeholder_rows.iter().copied())
             && (prepared.stamp == stamp || self.refresh_visible_pixels(queue, frame))
         {
             let prepared = self.prepared.as_mut().expect("A layout was prepared");
@@ -386,15 +383,8 @@ impl ImageRenderer {
         }
         let rejected = self.prepare_changed(device, queue, frame);
         self.placeholder_rows.clear();
-        if frame.has_virtual_graphics() {
-            self.placeholder_rows.extend(
-                frame
-                    .viewport
-                    .iter_rows()
-                    .map(Row::revision)
-                    .chain(frame.offscreen_graphics_rows()),
-            );
-        }
+        self.placeholder_rows
+            .extend(frame.graphics_placeholder_revisions());
         self.update_palette(queue, frame);
         self.prepared = Some(PreparedImages {
             geometry: frame.geometry,
@@ -461,14 +451,19 @@ impl ImageRenderer {
                 let Some(quad) = ImageQuad::new(placement, cell, area, location) else {
                     return;
                 };
-                if self.instances.len() >= max_instances
-                    || !*uploaded.get_or_insert_with(|| self.cache(device, queue, image_id, image))
-                {
+                if self.instances.len() >= max_instances {
                     rejected += 1;
                     return;
                 }
+                let Some(tiled) = *uploaded.get_or_insert_with(|| {
+                    let crop = (!placement.is_virtual()).then_some(&quad);
+                    self.cache(device, queue, image_id, image, crop)
+                }) else {
+                    rejected += 1;
+                    return;
+                };
                 let (width, height) = image.dimensions();
-                if width.max(height) <= limits.max_texture_dimension_2d {
+                if !tiled {
                     self.push_instance(
                         placement,
                         image.format(),
@@ -480,7 +475,7 @@ impl ImageRenderer {
                 let ImageTextures::Tiled(tiles) =
                     &mut self.images.get_mut(&image_id).unwrap().textures
                 else {
-                    unreachable!("Oversized images are tiled");
+                    unreachable!("A tiled image has tile storage");
                 };
                 tile_instances.clear();
                 tile_instances.extend(tiles.candidates(quad.source_region(), 0).filter_map(
@@ -580,20 +575,39 @@ impl ImageRenderer {
         queue: &Queue,
         id: GraphicsImageKey,
         image: &GraphicsImage,
-    ) -> bool {
+        crop: Option<&ImageQuad>,
+    ) -> Option<bool> {
         if let Some(cached) = self.images.get_mut(&id)
             && cached.source_revision == image.source_revision()
         {
-            return cached.update_pixels(queue, image, &mut self.pixel_scratch);
+            return cached
+                .update_pixels(queue, image, &mut self.pixel_scratch)
+                .then_some(matches!(cached.textures, ImageTextures::Tiled(_)));
         }
         let (width, height) = image.dimensions();
         let limit = device.limits().max_texture_dimension_2d;
-        let textures = if width.max(height) > limit {
+        let pixels = width * height;
+        let crop_tiles = crop.and_then(|quad| {
+            if pixels < 4 * CROP_TILE_EDGE * CROP_TILE_EDGE || limit <= CROP_TILE_EDGE {
+                return None;
+            }
+            let region = quad.source_region();
+            if region.size[0] * region.size[1] > pixels / 4 {
+                return None;
+            }
+            let tiles = TextureTiles::new([width, height], CROP_TILE_EDGE);
+            let covered: u32 = tiles
+                .candidates(region, 0)
+                .map(|(_, tile)| tile.region.storage.size[0] * tile.region.storage.size[1])
+                .sum();
+            (covered <= pixels / 2).then_some(tiles)
+        });
+        let textures = if let Some(tiles) = crop_tiles {
+            ImageTextures::Tiled(tiles)
+        } else if width.max(height) > limit {
             ImageTextures::Tiled(TextureTiles::new([width, height], limit))
         } else {
-            let Some(pixels) = image.pixels(&mut self.pixel_scratch) else {
-                return false;
-            };
+            let pixels = image.pixels(&mut self.pixel_scratch)?;
             let format = image.format();
             let texture = self.texture_resources.bindings(device, format, pixels)([width, height]);
             write_texture(
@@ -604,6 +618,7 @@ impl ImageRenderer {
             );
             ImageTextures::Single(texture)
         };
+        let tiled = matches!(textures, ImageTextures::Tiled(_));
         self.images.insert(
             id,
             CachedImage {
@@ -613,7 +628,7 @@ impl ImageRenderer {
                 textures,
             },
         );
-        true
+        Some(tiled)
     }
 
     /// Draws the prepared layers over the pass's base background.

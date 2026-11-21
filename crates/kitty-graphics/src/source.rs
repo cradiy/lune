@@ -47,9 +47,9 @@ impl LocalSource {
         self,
         name: &[u8],
         limit: usize,
-        fixed: bool,
+        fixed_capacity: Option<usize>,
     ) -> Result<Vec<u8>, &'static [u8]> {
-        read(self, name, limit, fixed)
+        read(self, name, limit, fixed_capacity)
     }
 }
 
@@ -58,13 +58,18 @@ fn read(
     source: LocalSource,
     name: &[u8],
     limit: usize,
-    fixed: bool,
+    fixed_capacity: Option<usize>,
 ) -> Result<Vec<u8>, &'static [u8]> {
-    linux::read(source, name, limit, fixed).ok_or(BAD_SOURCE)
+    linux::read(source, name, limit, fixed_capacity).ok_or(BAD_SOURCE)
 }
 
 #[cfg(not(target_os = "linux"))]
-fn read(source: LocalSource, _: &[u8], _: usize, _: bool) -> Result<Vec<u8>, &'static [u8]> {
+fn read(
+    source: LocalSource,
+    _: &[u8],
+    _: usize,
+    _: Option<usize>,
+) -> Result<Vec<u8>, &'static [u8]> {
     let LocalSource {
         medium: _,
         offset: _,
@@ -103,7 +108,7 @@ mod linux {
         source: LocalSource,
         name: &[u8],
         limit: usize,
-        fixed: bool,
+        fixed_capacity: Option<usize>,
     ) -> Option<Vec<u8>> {
         let name = OsStr::from_bytes(name);
         if name.is_empty() || name.as_bytes().contains(&0) {
@@ -121,7 +126,7 @@ mod linux {
                 )
                 .ok()?;
                 let (file, stat, resolved) = readable(&fd)?;
-                let data = read_range(&file, &stat, &source, limit, fixed);
+                let data = read_range(&file, &stat, &source, limit, fixed_capacity);
                 if matches!(source.medium, Medium::Temporary) {
                     unlink_temporary(&resolved, &stat);
                 }
@@ -156,7 +161,7 @@ mod linux {
                 )
                 .ok()?;
                 let (file, stat, _) = readable(&fd)?;
-                let data = read_range(&file, &stat, &source, limit, fixed);
+                let data = read_range(&file, &stat, &source, limit, fixed_capacity);
                 if same_entry(&dir, entry, &stat) {
                     let _ = shm::unlink(name);
                 }
@@ -197,12 +202,12 @@ mod linux {
         stat: &Stat,
         source: &LocalSource,
         limit: usize,
-        fixed: bool,
+        fixed_capacity: Option<usize>,
     ) -> Option<Vec<u8>> {
         let available = u64::try_from(stat.st_size)
             .ok()?
             .checked_sub(source.offset)?;
-        let len = if fixed {
+        let len = if fixed_capacity.is_some() {
             if source.size.is_some_and(|size| size < limit) {
                 return None;
             }
@@ -216,7 +221,9 @@ mod linux {
             return None;
         }
         let mut bytes = Vec::new();
-        bytes.try_reserve_exact(len).ok()?;
+        bytes
+            .try_reserve_exact(fixed_capacity.unwrap_or(len))
+            .ok()?;
         bytes.resize(len, 0);
         file.read_exact_at(&mut bytes, source.offset).ok()?;
         Some(bytes)

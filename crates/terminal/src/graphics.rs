@@ -16,9 +16,11 @@ use crate::{
 };
 
 mod placeholders;
+mod visibility;
 pub use placeholders::{
     GraphicsPlaceholderRun, visit_graphics_placeholders, visit_graphics_placeholders_with_parents,
 };
+use visibility::AnimationVisibility;
 
 const MAX_PLACEMENTS: usize = 4096;
 const _: () = assert!(MAX_PLACEMENTS - 1 <= u16::MAX as usize);
@@ -1004,6 +1006,8 @@ pub(crate) struct Graphics {
     reply: Option<Reply>,
     active: bool,
     has_relative: bool,
+    animation_buffer: Option<ScreenBuffer>,
+    animation_visibility: AnimationVisibility,
 }
 
 impl Default for Graphics {
@@ -1015,6 +1019,8 @@ impl Default for Graphics {
             reply: None,
             active: false,
             has_relative: false,
+            animation_buffer: None,
+            animation_visibility: AnimationVisibility::default(),
         }
     }
 }
@@ -1051,10 +1057,24 @@ impl Graphics {
 
     pub(crate) fn poll_animations(
         &mut self,
-        buffer: ScreenBuffer,
+        screen: &Screen,
+        styles: &StyleTable,
         clock: impl FnOnce() -> std::time::Instant,
     ) {
-        self.images[buffer as usize].poll_animations(clock);
+        let buffer = screen.active_buffer();
+        if self.animation_buffer != Some(buffer) {
+            if let Some(previous) = self.animation_buffer.replace(buffer)
+                && self.images[previous as usize]
+                    .animation_membership()
+                    .is_some()
+            {
+                self.images[previous as usize].set_animation_visibility([]);
+            }
+            self.animation_visibility.invalidate();
+        }
+        let store = &mut self.images[buffer as usize];
+        self.animation_visibility.update(screen, styles, store);
+        store.poll_animations(clock);
     }
 
     pub(crate) fn reset(&mut self) {
@@ -1063,6 +1083,7 @@ impl Graphics {
         self.reply = None;
         self.active = false;
         self.has_relative = false;
+        self.animation_visibility.invalidate();
     }
 
     pub(crate) fn finish(&mut self) {
@@ -1102,12 +1123,10 @@ impl Graphics {
                 let images = &mut self.images[screen.active_buffer() as usize];
                 match self.decoder.finish() {
                     Some(Ok(command)) => {
-                        if let Some(delete) = command.decode_delete() {
+                        if let Some(Ok(delete)) = command.decode_delete() {
                             images.abort_transfer();
-                            if let Ok(delete) = delete {
-                                delete_images(delete, screen, images, styles);
-                                return false;
-                            }
+                            delete_images(delete, screen, images, styles);
+                            return false;
                         }
                         debug_assert!(self.reply.is_none());
                         self.reply = images.receive(command, |change| {
