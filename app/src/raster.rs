@@ -4,6 +4,24 @@ use lune_terminal::{PixelSize, Rgb};
 
 use crate::{BatchRun, CursorGlyph, PaintBatch, PaintCommand, PixelRect};
 
+/// An 8-bit coverage mask with a byte stride.
+#[derive(Clone, Copy)]
+pub struct CoverageMask<'a> {
+    bytes: &'a [u8],
+    size: PixelSize,
+    stride: usize,
+}
+
+impl<'a> CoverageMask<'a> {
+    pub fn new(size: PixelSize, stride: usize, bytes: &'a [u8]) -> Option<Self> {
+        Some(Self {
+            bytes: bytes.get(..buffer_len(size, stride)?)?,
+            size,
+            stride,
+        })
+    }
+}
+
 /// A clipped view of writable pixels. Row indices are relative to its rectangle.
 pub struct PixelRegion<'a> {
     pixels: &'a mut [Rgb],
@@ -22,6 +40,47 @@ impl PixelRegion<'_> {
         }
         let start = row as usize * self.stride;
         Some(&mut self.pixels[start..start + self.rect.size.width.get() as usize])
+    }
+
+    /// Blends a coverage mask at a signed origin in surface pixels.
+    pub fn blend_mask(&mut self, origin: (i32, i32), mask: CoverageMask<'_>, color: Rgb) {
+        let (mask_x, mask_y) = (i64::from(origin.0), i64::from(origin.1));
+        let (region_x, region_y) = (i64::from(self.rect.origin.x), i64::from(self.rect.origin.y));
+        let left = mask_x.max(region_x);
+        let top = mask_y.max(region_y);
+        let right = (mask_x + i64::from(mask.size.width.get()))
+            .min(region_x + i64::from(self.rect.size.width.get()));
+        let bottom = (mask_y + i64::from(mask.size.height.get()))
+            .min(region_y + i64::from(self.rect.size.height.get()));
+        if left >= right || top >= bottom {
+            return;
+        }
+
+        let width = (right - left) as usize;
+        let dest_x = (left - region_x) as usize;
+        let dest_y = (top - region_y) as usize;
+        let source_x = (left - mask_x) as usize;
+        let source_y = (top - mask_y) as usize;
+        for row in 0..(bottom - top) as usize {
+            let dest = (dest_y + row) * self.stride + dest_x;
+            let source = (source_y + row) * mask.stride + source_x;
+            for (pixel, &coverage) in self.pixels[dest..dest + width]
+                .iter_mut()
+                .zip(&mask.bytes[source..source + width])
+            {
+                match coverage {
+                    0 => {}
+                    255 => *pixel = color,
+                    alpha => {
+                        *pixel = Rgb {
+                            red: blend_channel(pixel.red, color.red, alpha),
+                            green: blend_channel(pixel.green, color.green, alpha),
+                            blue: blend_channel(pixel.blue, color.blue, alpha),
+                        };
+                    }
+                }
+            }
+        }
     }
 
     fn fill(&mut self, color: Rgb) {
@@ -55,13 +114,7 @@ impl<'a> RasterSurface<'a> {
         content: &'a mut [Rgb],
         output: &'a mut [Rgb],
     ) -> Option<Self> {
-        let width = size.width.get() as usize;
-        if stride < width {
-            return None;
-        }
-        let length = (size.height.get() as usize - 1)
-            .checked_mul(stride)?
-            .checked_add(width)?;
+        let length = buffer_len(size, stride)?;
         Some(Self {
             content: content.get_mut(..length)?,
             output: output.get_mut(..length)?,
@@ -160,6 +213,22 @@ impl<'a> RasterSurface<'a> {
     }
 }
 
+fn buffer_len(size: PixelSize, stride: usize) -> Option<usize> {
+    let width = size.width.get() as usize;
+    if stride < width {
+        return None;
+    }
+    (size.height.get() as usize - 1)
+        .checked_mul(stride)?
+        .checked_add(width)
+}
+
+#[inline]
+fn blend_channel(background: u8, foreground: u8, coverage: u8) -> u8 {
+    let alpha = u16::from(coverage);
+    ((u16::from(background) * (255 - alpha) + u16::from(foreground) * alpha + 127) / 255) as u8
+}
+
 fn clip_rect(rect: PixelRect, size: PixelSize) -> Option<PixelRect> {
     let width = size.width.get().checked_sub(rect.origin.x)?;
     let height = size.height.get().checked_sub(rect.origin.y)?;
@@ -179,5 +248,44 @@ fn region(pixels: &mut [Rgb], stride: usize, rect: PixelRect) -> PixelRegion<'_>
         pixels: &mut pixels[start..start + length],
         stride,
         rect,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lune_terminal::PixelPosition;
+
+    #[test]
+    fn coverage_blends_only_the_intersection_of_strided_regions() {
+        let size = |width, height| PixelSize {
+            width: NonZeroU32::new(width).unwrap(),
+            height: NonZeroU32::new(height).unwrap(),
+        };
+        let rgb = |red, green, blue| Rgb { red, green, blue };
+        let foreground = rgb(255, 0, 11);
+        let background = rgb(0, 255, 10);
+        let mut pixels = [background; 28];
+        let mut coverage = [241; 43];
+        coverage[21..24].copy_from_slice(&[0, 128, 255]);
+        coverage[30..33].copy_from_slice(&[255, 1, 254]);
+        assert!(CoverageMask::new(size(7, 5), 6, &coverage).is_none());
+        assert!(CoverageMask::new(size(7, 5), 9, &coverage[..42]).is_none());
+        let mask = CoverageMask::new(size(7, 5), 9, &coverage).unwrap();
+        let mut region = region(
+            &mut pixels,
+            7,
+            PixelRect {
+                origin: PixelPosition { x: 2, y: 1 },
+                size: size(3, 2),
+            },
+        );
+        region.blend_mask((-1, -1), mask, foreground);
+        region.blend_mask((i32::MAX, i32::MIN), mask, foreground);
+
+        let mut expected = [background; 28];
+        expected[9..12].copy_from_slice(&[background, rgb(128, 127, 11), foreground]);
+        expected[16..19].copy_from_slice(&[foreground, rgb(1, 254, 10), rgb(254, 1, 11)]);
+        assert_eq!(pixels, expected);
     }
 }

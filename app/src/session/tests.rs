@@ -754,26 +754,26 @@ fn paint_commands_replay_damage_and_keep_the_cursor_on_its_own_layer() {
 
 #[test]
 fn raster_surface_restores_the_cursor_and_clips_text_and_backgrounds() {
-    use crate::{PixelRegion, RasterSurface, RasterText};
+    use crate::{CoverageMask, PixelRegion, RasterSurface, RasterText};
 
     fn draw_text(mut region: PixelRegion<'_>, text: RasterText<'_>) {
         let rect = region.rect();
         assert!(region.row_mut(rect.size.height.get()).is_none());
-        let pixels = region.row_mut(0).unwrap();
+        let mask = CoverageMask::new(pixels(1, 1), 1, &[255]).unwrap();
         match text {
             RasterText::Run(run) => {
                 for unit in run.units() {
                     if !unit.cell.is_erased() {
-                        let x = unit.column * 2;
-                        if let Some(position) = x.checked_sub(rect.origin.x as usize)
-                            && let Some(pixel) = pixels.get_mut(position)
-                        {
-                            *pixel = run.style.foreground;
-                        }
+                        let x = (unit.column * 2) as i32;
+                        region.blend_mask((x, rect.origin.y as i32), mask, run.style.foreground);
                     }
                 }
             }
-            RasterText::Cursor(glyph) => pixels[0] = glyph.color,
+            RasterText::Cursor(glyph) => region.blend_mask(
+                (rect.origin.x as i32, rect.origin.y as i32),
+                mask,
+                glyph.color,
+            ),
         }
     }
 
