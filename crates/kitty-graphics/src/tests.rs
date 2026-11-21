@@ -755,21 +755,29 @@ fn anonymous_pixels_live_with_their_placement_and_release_quota() {
 fn direct_rgb_chunks_preserve_pixel_order_at_the_storage_limit() {
     use std::io::Write as _;
 
-    let rgb: Vec<_> = (0..257 * 64)
-        .map(|index| [index as u8, (index >> 8) as u8, (index % 17) as u8])
+    let rgb: Vec<_> = (0..257 * 96)
+        .map(|index| {
+            let red = (index % 251) as u8;
+            [red, red >> 3, red % 17]
+        })
         .collect();
     let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
     encoder.write_all(rgb.as_flattened()).unwrap();
     let compressed = encoder.finish().unwrap();
+    assert!(compressed.len().div_ceil(3) * 4 <= 4096);
     let expected: Vec<_> = rgb.iter().map(|&[r, g, b]| [r, g, b, 255]).collect();
-    for (bytes, compression) in [(rgb.as_flattened(), ""), (&compressed, "o=z,")] {
+    for (bytes, compression, block) in [
+        (rgb.as_flattened(), "", 52),
+        (&compressed, "o=z,", 52),
+        (&compressed, "o=z,", 4096),
+    ] {
         let encoded = PAYLOAD_ENGINE.encode(bytes);
         let mut wire = String::new();
-        for (index, chunk) in encoded.as_bytes().chunks(52).enumerate() {
-            let more = u8::from((index + 1) * 52 < encoded.len());
+        for (index, chunk) in encoded.as_bytes().chunks(block).enumerate() {
+            let more = u8::from((index + 1) * block < encoded.len());
             wire.push_str("\x1b_G");
             if index == 0 {
-                wire.push_str("i=1,f=24,s=257,v=64,");
+                wire.push_str("i=1,f=24,s=257,v=96,");
                 wire.push_str(compression);
             }
             wire.push_str(&format!(
@@ -888,6 +896,50 @@ fn png_expansion_preserves_pixels_across_rows() {
         assert_eq!(
             images.get(1).unwrap().pixels(&mut Vec::new()).unwrap(),
             expected.as_flattened()
+        );
+    }
+}
+
+#[test]
+fn png_gamma_corrects_color_at_source_precision_and_keeps_alpha() {
+    let rgba8 = [1, 64, 128, 255, 16, 128, 200, 128];
+    let rgba16 = [129u16, 255, 384, 385, 0x7f80, 0x8080, 0xfeff, 0xff00]
+        .into_iter()
+        .flat_map(u16::to_be_bytes)
+        .collect::<Vec<_>>();
+    let cases = [
+        (
+            png::BitDepth::Eight,
+            rgba8.as_slice(),
+            [21, 136, 186, 255, 72, 186, 228, 128],
+        ),
+        (
+            png::BitDepth::Sixteen,
+            rgba16.as_slice(),
+            [14, 19, 24, 1, 186, 186, 255, 255],
+        ),
+    ];
+    for (depth, pixels, expected) in cases {
+        let mut png = Vec::new();
+        let mut encoder = png::Encoder::new(&mut png, 2, 1);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(depth);
+        encoder.set_source_gamma(png::ScaledFloat::from_scaled(100_000));
+        encoder
+            .write_header()
+            .unwrap()
+            .write_image_data(pixels)
+            .unwrap();
+
+        let wire = format!("\x1b_Gi=1,f=100;{}\x1b\\", PAYLOAD_ENGINE.encode(&png));
+        let mut images = ImageStore::new(8, 1);
+        feed(wire.as_bytes(), 11, |command| {
+            let reply = images.receive(command.unwrap(), |_| Ok(())).unwrap();
+            assert_eq!(reply.message, b"OK");
+        });
+        assert_eq!(
+            images.get(1).unwrap().pixels(&mut Vec::new()).unwrap(),
+            expected
         );
     }
 }
@@ -1051,7 +1103,14 @@ fn payload_bounds_and_nonfinal_block_alignment_are_enforced() {
     decoder.start();
     decoder.push(b"G;");
     decoder.push(&[b'A'; MAX_DIRECT_PAYLOAD_BYTES + 1]);
-    assert_eq!(decoder.finish(), Some(Err(DecodeError::PayloadTooLong)));
+    assert_eq!(
+        decoder
+            .finish()
+            .unwrap()
+            .unwrap()
+            .decode_payload(&mut output),
+        Err(PayloadError::TooLong)
+    );
 
     decoder.start();
     decoder.push(b"Ga=q,e=T,i=19;");
@@ -1062,7 +1121,8 @@ fn payload_bounds_and_nonfinal_block_alignment_are_enforced() {
             .finish()
             .unwrap()
             .unwrap()
-            .encoded_payload
+            .encoded_payload()
+            .unwrap()
             .is_empty()
     );
 
@@ -1076,7 +1136,14 @@ fn payload_bounds_and_nonfinal_block_alignment_are_enforced() {
     decoder.start();
     decoder.push(b"Gt=f;");
     decoder.push(&[b'A'; INLINE_ENCODED_BYTES + 1]);
-    assert_eq!(decoder.finish(), Some(Err(DecodeError::PayloadTooLong)));
+    assert_eq!(
+        decoder
+            .finish()
+            .unwrap()
+            .unwrap()
+            .decode_payload(&mut output),
+        Err(PayloadError::TooLong)
+    );
 
     decoder.start();
     decoder.push(b"Gm=1;AQ==");

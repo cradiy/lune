@@ -164,21 +164,32 @@ impl Screen {
     }
 
     fn history_captured(&mut self, captured: bool) {
+        if captured {
+            self.scroll_captured_history(1);
+        } else {
+            self.scroll_graphics(self.scroll_region.start, 1, false);
+        }
+    }
+
+    fn scroll_captured_history(&mut self, lines: usize) {
+        if lines == 0 {
+            return;
+        }
         if self.display_offset != 0 {
             self.display_offset = self
                 .display_offset
-                .saturating_add(usize::from(captured))
+                .saturating_add(lines)
                 .min(self.history.len());
         }
         if !self.graphics.is_empty() {
-            if captured {
-                let first_row = -(self.history.len() as i64);
-                let cell = self.graphics_cell_extent();
-                self.graphics
-                    .scroll(i64::MIN..i64::MAX, first_row..i64::MAX, -1, cell);
-            } else {
-                self.scroll_graphics(self.scroll_region.start, 1, false);
-            }
+            let first_row = -(self.history.len() as i64);
+            let cell = self.graphics_cell_extent();
+            self.graphics.scroll(
+                i64::MIN..i64::MAX,
+                first_row..i64::MAX,
+                -(lines as i64),
+                cell,
+            );
         }
     }
 
@@ -1231,7 +1242,18 @@ impl Screen {
                 return self.capture_history(style).map(|_| ());
             }
             let prepared = self.history.prepare(self.grid.columns(), count, style)?;
-            let result = (0..count).try_for_each(|_| self.capture_history(style).map(|_| ()));
+            let mut captured = 0;
+            let result = (0..count).try_for_each(|_| {
+                if self.history.capture(&mut self.grid, style)? {
+                    captured += 1;
+                } else {
+                    self.scroll_captured_history(std::mem::take(&mut captured));
+                    self.history_captured(false);
+                }
+                Ok(())
+            });
+            // Each capture adds at most one history row, so the source cutoff is monotonic.
+            self.scroll_captured_history(captured);
             if prepared {
                 self.history.finish();
             }

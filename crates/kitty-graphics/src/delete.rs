@@ -58,7 +58,7 @@ impl Command<'_> {
         if self.controls.get(b'a') != Some(Value::Letter(b'd')) {
             return None;
         }
-        if !self.encoded_payload.is_empty()
+        if self.has_payload()
             || self.controls.has_conflicting_image_selectors()
             || self.controls.quiet().is_err()
         {

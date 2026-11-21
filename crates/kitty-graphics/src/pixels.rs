@@ -1,10 +1,10 @@
-use std::io::Cursor;
-
 use flate2::{Decompress, FlushDecompress, Status};
-use png::{BitDepth, ColorType, DecodingError, Transformations};
 
 use crate::source::LocalSource;
-use crate::{Command, Controls, MAX_DIRECT_PAYLOAD_BYTES, PayloadError, Value};
+use crate::{Command, Controls, PayloadError, Value};
+
+mod png_data;
+use png_data::decode_png;
 
 pub(crate) const INVALID: &[u8] = b"EINVAL:Invalid image data";
 pub(crate) const QUOTA: &[u8] = b"ENOSPC:Image quota exceeded";
@@ -13,6 +13,7 @@ pub(crate) const MAX_IMAGE_DIMENSION: u32 = 10_000;
 const SHORT: &[u8] = b"ENODATA:Insufficient image data";
 
 const ENCODED_OVERHEAD: usize = 64 * 1024;
+const MAX_EAGER_INFLATE_BYTES: usize = 64 * 1024;
 
 enum Format {
     Raw {
@@ -134,10 +135,7 @@ impl PixelTransfer {
     }
 
     pub(crate) fn append_payload(&mut self, command: &Command<'_>) -> Result<(), &'static [u8]> {
-        let encoded = command.encoded_payload.len();
-        if encoded > MAX_DIRECT_PAYLOAD_BYTES {
-            return Err(INVALID);
-        }
+        let encoded = command.encoded_payload().map_err(|_| INVALID)?.len();
         if matches!(self.compression, Compression::Zlib)
             && command.controls.get(b'm') == Some(Value::Unsigned(1))
         {
@@ -301,7 +299,8 @@ impl ZlibTransfer {
         output: &mut Vec<u8>,
     ) -> Result<(), &'static [u8]> {
         let remaining = wire_limit - self.decoder.total_in() as usize;
-        let estimated = base64::decoded_len_estimate(command.encoded_payload.len()).min(remaining);
+        let encoded = command.encoded_payload().map_err(|_| INVALID)?.len();
+        let estimated = base64::decoded_len_estimate(encoded).min(remaining);
         self.input
             .try_reserve_exact(estimated.saturating_sub(self.input.len()))
             .map_err(|_| QUOTA)?;
@@ -312,7 +311,7 @@ impl ZlibTransfer {
                 PayloadError::Base64(base64::DecodeSliceError::OutputSliceTooSmall) => QUOTA,
                 _ => INVALID,
             })?;
-        let mut input = &self.input[..length];
+        let input = &self.input[..length];
         if self.ended {
             return if input.is_empty() {
                 Ok(())
@@ -321,65 +320,71 @@ impl ZlibTransfer {
             };
         }
         let more = command.controls.get(b'm') == Some(Value::Unsigned(1));
-        while !input.is_empty() || !more {
-            let read = self.decoder.total_in();
-            let written = self.decoder.total_out() as usize;
-            let status = if written == size {
-                // Leave room to detect excess output while consuming the checksum.
-                self.decoder
-                    .decompress(input, &mut [0], FlushDecompress::None)
-            } else {
-                if written == output.len() {
-                    let needed = written.saturating_mul(2).max(8192).min(size);
-                    let reserve = if needed == size { capacity } else { needed };
-                    output
-                        .try_reserve_exact(reserve - written)
-                        .map_err(|_| QUOTA)?;
-                    output.resize(needed, 0);
-                }
-                self.decoder
-                    .decompress(input, &mut output[written..], FlushDecompress::None)
-            }
-            .map_err(|_| INVALID)?;
-            let consumed = (self.decoder.total_in() - read) as usize;
-            input = &input[consumed..];
-            let total = self.decoder.total_out() as usize;
-            if total > size {
-                return Err(INVALID);
-            }
-            if status == Status::StreamEnd {
-                if !input.is_empty() || total != size {
-                    return Err(INVALID);
-                }
-                self.ended = true;
-                return Ok(());
-            }
-            if consumed == 0 && total == written {
-                return Err(INVALID);
-            }
-        }
+        self.ended = inflate_chunk(&mut self.decoder, input, size, capacity, output, more)?;
         Ok(())
     }
 }
 
-fn inflate(bytes: &[u8], size: usize, capacity: usize) -> Result<Vec<u8>, &'static [u8]> {
-    let mut inflated = zeroed(size, capacity)?;
-    let mut decoder = Decompress::new(true);
-    let mut status = decoder
-        .decompress(bytes, &mut inflated, FlushDecompress::Finish)
+fn inflate_chunk(
+    decoder: &mut Decompress,
+    mut input: &[u8],
+    size: usize,
+    capacity: usize,
+    output: &mut Vec<u8>,
+    more: bool,
+) -> Result<bool, &'static [u8]> {
+    while !input.is_empty() || !more {
+        let read = decoder.total_in();
+        let written = decoder.total_out() as usize;
+        let status = if written == size {
+            // Leave room to detect excess output while consuming the checksum.
+            decoder.decompress(input, &mut [0], FlushDecompress::None)
+        } else {
+            if written == output.len() {
+                let needed = written.saturating_mul(2).max(8192).min(size);
+                let reserve = if needed == size { capacity } else { needed };
+                output
+                    .try_reserve_exact(reserve - written)
+                    .map_err(|_| QUOTA)?;
+                output.resize(needed, 0);
+            }
+            decoder.decompress(input, &mut output[written..], FlushDecompress::None)
+        }
         .map_err(|_| INVALID)?;
-    if status != Status::StreamEnd && decoder.total_out() == size as u64 {
-        let remaining = &bytes[decoder.total_in() as usize..];
-        status = decoder
-            .decompress(remaining, &mut [0], FlushDecompress::Finish)
-            .map_err(|_| INVALID)?;
+        let consumed = (decoder.total_in() - read) as usize;
+        input = &input[consumed..];
+        let total = decoder.total_out() as usize;
+        if total > size {
+            return Err(INVALID);
+        }
+        if status == Status::StreamEnd {
+            if !input.is_empty() || total != size {
+                return Err(INVALID);
+            }
+            return Ok(true);
+        }
+        if consumed == 0 && total == written {
+            return Err(INVALID);
+        }
     }
-    if status != Status::StreamEnd
-        || decoder.total_out() != size as u64
-        || decoder.total_in() != bytes.len() as u64
-    {
-        return Err(INVALID);
-    }
+    Ok(false)
+}
+
+fn inflate(bytes: &[u8], size: usize, capacity: usize) -> Result<Vec<u8>, &'static [u8]> {
+    // Grow large outputs as the decoder produces bytes.
+    let mut inflated = if size <= MAX_EAGER_INFLATE_BYTES {
+        zeroed(size, capacity)?
+    } else {
+        Vec::new()
+    };
+    inflate_chunk(
+        &mut Decompress::new(true),
+        bytes,
+        size,
+        capacity,
+        &mut inflated,
+        false,
+    )?;
     Ok(inflated)
 }
 
@@ -397,7 +402,13 @@ fn inflate_limited(bytes: &[u8], limit: usize) -> Result<Vec<u8>, &'static [u8]>
         if written > limit - pixels.len() {
             return Err(QUOTA);
         }
-        pixels.try_reserve(written).map_err(|_| QUOTA)?;
+        let needed = pixels.len() + written;
+        if needed > pixels.capacity() {
+            let capacity = pixels.capacity().saturating_mul(2).max(needed).min(limit);
+            pixels
+                .try_reserve_exact(capacity - pixels.len())
+                .map_err(|_| QUOTA)?;
+        }
         pixels.extend_from_slice(&block[..written]);
         if status == Status::StreamEnd {
             return if decoder.total_in() == bytes.len() as u64 {
@@ -409,64 +420,6 @@ fn inflate_limited(bytes: &[u8], limit: usize) -> Result<Vec<u8>, &'static [u8]>
         if written == 0 && input == decoder.total_in() {
             return Err(INVALID);
         }
-    }
-}
-
-fn decode_png(bytes: &[u8], max_bytes: usize) -> Result<Pixels, &'static [u8]> {
-    let mut decoder = png::Decoder::new_with_limits(
-        Cursor::new(bytes),
-        png::Limits {
-            bytes: max_bytes.saturating_add(ENCODED_OVERHEAD),
-        },
-    );
-    decoder.set_transformations(Transformations::normalize_to_color8());
-    decoder.set_ignore_iccp_chunk(true);
-    decoder.set_ignore_text_chunk(true);
-    let dimensions = decoder.read_header_info().map_err(png_error)?.size();
-    let rgba_size = pixel_size(dimensions, 4, max_bytes)?;
-    let mut reader = decoder.read_info().map_err(png_error)?;
-    let size = reader
-        .output_buffer_size()
-        .filter(|&size| size <= rgba_size)
-        .ok_or(QUOTA)?;
-    let mut rgba = zeroed(rgba_size, rgba_size)?;
-    let input_start = rgba_size - size;
-    let output = reader
-        .next_frame(&mut rgba[input_start..])
-        .map_err(png_error)?;
-    reader.finish().map_err(png_error)?;
-    if (output.width, output.height) != dimensions || output.bit_depth != BitDepth::Eight {
-        return Err(INVALID);
-    }
-    match output.color_type {
-        ColorType::Grayscale => expand_png_pixels(&mut rgba, |[v]| [v, v, v, 255]),
-        ColorType::GrayscaleAlpha => expand_png_pixels(&mut rgba, |[v, a]| [v, v, v, a]),
-        ColorType::Rgb => expand_png_pixels(&mut rgba, |[r, g, b]| [r, g, b, 255]),
-        ColorType::Rgba => {}
-        ColorType::Indexed => return Err(INVALID),
-    }
-    Ok(Pixels {
-        dimensions,
-        format: ImageFormat::Rgba,
-        bytes: rgba,
-    })
-}
-
-fn expand_png_pixels<const N: usize>(rgba: &mut [u8], expand: impl Fn([u8; N]) -> [u8; 4]) {
-    // Packed decoded pixels occupy the tail. Each output pixel ends at or before the next input.
-    let count = rgba.len() / 4;
-    let start = count * (4 - N);
-    for index in 0..count {
-        let input = start + index * N;
-        let pixel = rgba[input..][..N].try_into().expect("A full input pixel");
-        rgba[index * 4..][..4].copy_from_slice(&expand(pixel));
-    }
-}
-
-fn png_error(error: DecodingError) -> &'static [u8] {
-    match error {
-        DecodingError::LimitsExceeded => QUOTA,
-        _ => INVALID,
     }
 }
 

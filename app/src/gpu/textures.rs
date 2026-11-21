@@ -13,6 +13,26 @@ pub(super) struct PixelRegion {
 }
 
 impl PixelRegion {
+    pub fn pixel_count(self) -> u32 {
+        self.size[0] * self.size[1]
+    }
+
+    pub fn bounding_rect(self, other: Self) -> Self {
+        let origin = std::array::from_fn(|axis| self.origin[axis].min(other.origin[axis]));
+        let size = std::array::from_fn(|axis| {
+            (self.origin[axis] + self.size[axis]).max(other.origin[axis] + other.size[axis])
+                - origin[axis]
+        });
+        Self { origin, size }
+    }
+
+    pub fn relative_to(self, origin: [u32; 2]) -> Self {
+        Self {
+            origin: std::array::from_fn(|axis| self.origin[axis] - origin[axis]),
+            size: self.size,
+        }
+    }
+
     fn intersection(self, other: Self) -> Option<Self> {
         let origin = std::array::from_fn(|axis| self.origin[axis].max(other.origin[axis]));
         let size = std::array::from_fn(|axis| {
@@ -102,6 +122,7 @@ pub(super) enum ImageTextures {
 
 pub(super) struct TextureTiles {
     pub tiles: Vec<TextureTile>,
+    pub layout: u64,
     step: [u32; 2],
     count: [u32; 2],
 }
@@ -109,6 +130,58 @@ pub(super) struct TextureTiles {
 pub(super) struct TextureTile {
     pub region: TileRegion,
     pub resident: Option<TextureBinding>,
+    pub visible_layout: u64,
+    pub damage: TileDamage,
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum TileDamage {
+    Clean,
+    One(PixelRegion),
+    Two([PixelRegion; 2]),
+    Full,
+}
+
+impl TileDamage {
+    fn add(&mut self, region: PixelRegion) {
+        *self = match *self {
+            Self::Clean => Self::One(region),
+            Self::One(first) if first.intersection(region).is_some() => {
+                Self::One(first.bounding_rect(region))
+            }
+            Self::One(first) => Self::Two([first, region]),
+            Self::Two([first, second]) if first.intersection(region).is_some() => {
+                Self::Two([first.bounding_rect(region), second])
+            }
+            Self::Two([first, second]) if second.intersection(region).is_some() => {
+                Self::Two([first, second.bounding_rect(region)])
+            }
+            Self::Two([first, second]) => {
+                Self::One(first.bounding_rect(second).bounding_rect(region))
+            }
+            Self::Full => Self::Full,
+        };
+    }
+}
+
+impl TextureTile {
+    pub fn needs_upload(&self) -> bool {
+        self.resident.is_none() || !matches!(self.damage, TileDamage::Clean)
+    }
+
+    pub fn needs_full_upload(&self) -> bool {
+        self.resident.is_none() || matches!(self.damage, TileDamage::Full)
+    }
+
+    pub fn upload_regions(&self) -> impl Iterator<Item = PixelRegion> + use<> {
+        let regions = match self.damage {
+            TileDamage::Clean if self.resident.is_some() => [None; 2],
+            TileDamage::Clean | TileDamage::Full => [Some(self.region.storage), None],
+            TileDamage::One(region) => [Some(region), None],
+            TileDamage::Two(regions) => regions.map(Some),
+        };
+        regions.into_iter().flatten()
+    }
 }
 
 impl TextureTiles {
@@ -117,6 +190,15 @@ impl TextureTiles {
         region: PixelRegion,
         border: u32,
     ) -> impl Iterator<Item = (usize, &TextureTile)> {
+        self.candidate_indices(region, border)
+            .map(|index| (index, &self.tiles[index]))
+    }
+
+    fn candidate_indices(
+        &self,
+        region: PixelRegion,
+        border: u32,
+    ) -> impl Iterator<Item = usize> + use<> {
         let columns = self.count[0];
         let [first_col, first_row] = std::array::from_fn(|axis| {
             (region.origin[axis].saturating_sub(border) / self.step[axis]).min(self.count[axis])
@@ -131,10 +213,7 @@ impl TextureTiles {
         (first_row..end_row).flat_map(move |row| {
             let start = (row * columns + first_col) as usize;
             let end = (row * columns + end_col) as usize;
-            self.tiles[start..end]
-                .iter()
-                .enumerate()
-                .map(move |(offset, tile)| (start + offset, tile))
+            start..end
         })
     }
 
@@ -169,39 +248,47 @@ impl TextureTiles {
                 tiles.push(TextureTile {
                     region: TileRegion { visible, storage },
                     resident: None,
+                    visible_layout: 0,
+                    damage: TileDamage::Clean,
                 });
             }
         }
         Self {
             tiles,
+            layout: 0,
             step: [step_x, step_y],
             count,
         }
     }
 
     pub fn write(
-        &self,
-        queue: &Queue,
+        &mut self,
+        queue: Option<&Queue>,
         region: PixelRegion,
         bytes: &[u8],
         bytes_per_row: u32,
         bytes_per_pixel: u32,
     ) {
         // Filter borders share texels with neighboring tiles.
-        for (_, tile) in self.candidates(region, FILTER_BORDER) {
+        for index in self.candidate_indices(region, FILTER_BORDER) {
+            let tile = &mut self.tiles[index];
             let storage = tile.region.storage;
-            let (Some(binding), Some(mut clip)) = (&tile.resident, storage.intersection(region))
-            else {
+            let (Some(binding), Some(clip)) = (&tile.resident, storage.intersection(region)) else {
+                continue;
+            };
+            let Some(queue) = queue.filter(|_| {
+                tile.visible_layout == self.layout && matches!(tile.damage, TileDamage::Clean)
+            }) else {
+                tile.damage.add(clip);
                 continue;
             };
             let [x, y] = clip.origin;
             let offset = (y - region.origin[1]) as usize * bytes_per_row as usize
                 + (x - region.origin[0]) as usize * bytes_per_pixel as usize;
-            clip.origin = [x - storage.origin[0], y - storage.origin[1]];
             write_region(
                 queue,
                 &binding.texture,
-                clip,
+                clip.relative_to(storage.origin),
                 &bytes[offset..],
                 bytes_per_row,
             );
@@ -218,28 +305,43 @@ impl ImageTextures {
     }
 
     pub fn write(
-        &self,
+        &mut self,
         queue: &Queue,
         region: PixelRegion,
         bytes: &[u8],
         bytes_per_row: u32,
         bytes_per_pixel: u32,
+        defer_tiles: bool,
     ) {
         match self {
             Self::Single(tile) => write_region(queue, &tile.texture, region, bytes, bytes_per_row),
-            Self::Tiled(tiles) => tiles.write(queue, region, bytes, bytes_per_row, bytes_per_pixel),
+            Self::Tiled(tiles) => tiles.write(
+                (!defer_tiles).then_some(queue),
+                region,
+                bytes,
+                bytes_per_row,
+                bytes_per_pixel,
+            ),
         }
     }
 
-    pub fn rasterize(&self, queue: &Queue, image: &GraphicsImage, scratch: &mut Vec<u8>) -> bool {
+    pub fn rasterize(
+        &mut self,
+        queue: &Queue,
+        image: &GraphicsImage,
+        scratch: &mut Vec<u8>,
+    ) -> bool {
         let bytes_per_pixel = image.format().bytes_per_pixel();
         if let Self::Tiled(tiles) = self
-            && tiles.tiles.iter().any(|tile| tile.resident.is_none())
+            && tiles
+                .tiles
+                .iter()
+                .any(|tile| tile.needs_upload() || tile.visible_layout != tiles.layout)
         {
             let largest = tiles
                 .tiles
                 .iter()
-                .filter(|tile| tile.resident.is_some())
+                .filter(|tile| tile.visible_layout == tiles.layout && tile.resident.is_some())
                 .map(|tile| {
                     let [width, height] = tile.region.storage.size;
                     width as usize * height as usize * bytes_per_pixel as usize
@@ -253,15 +355,20 @@ impl ImageTextures {
             {
                 return false;
             }
-            for tile in &tiles.tiles {
+            for tile in &mut tiles.tiles {
                 let Some(binding) = &tile.resident else {
                     continue;
                 };
+                if tile.visible_layout != tiles.layout {
+                    tile.damage = TileDamage::Full;
+                    continue;
+                }
                 let region = tile.region.storage;
                 let Some(update) = image.pixel_region(region.origin, region.size, scratch) else {
                     return false;
                 };
                 write_texture(queue, &binding.texture, update.bytes, update.bytes_per_row);
+                tile.damage = TileDamage::Clean;
             }
         } else {
             let Some(bytes) = image.pixels(scratch) else {
@@ -277,6 +384,7 @@ impl ImageTextures {
                 bytes,
                 width * bytes_per_pixel,
                 bytes_per_pixel,
+                false,
             );
         }
         true
@@ -318,7 +426,7 @@ pub(super) fn write_texture(queue: &Queue, texture: &Texture, bytes: &[u8], byte
     );
 }
 
-fn write_region(
+pub(super) fn write_region(
     queue: &Queue,
     texture: &Texture,
     region: PixelRegion,

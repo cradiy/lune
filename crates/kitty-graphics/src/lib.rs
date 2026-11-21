@@ -143,7 +143,6 @@ fn parse_value(raw: &[u8]) -> Option<Value> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DecodeError {
     ControlTooLong,
-    PayloadTooLong,
     InvalidControl,
     DuplicateKey(u8),
     PayloadAllocation,
@@ -151,6 +150,7 @@ pub enum DecodeError {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum PayloadError {
+    TooLong,
     InvalidChunk,
     Base64(DecodeSliceError),
 }
@@ -158,21 +158,29 @@ pub enum PayloadError {
 #[derive(Debug, PartialEq, Eq)]
 pub struct Command<'a> {
     pub controls: Controls,
-    pub encoded_payload: &'a [u8],
+    encoded_payload: Option<&'a [u8]>,
 }
 
 impl Command<'_> {
+    pub fn encoded_payload(&self) -> Result<&[u8], PayloadError> {
+        self.encoded_payload.ok_or(PayloadError::TooLong)
+    }
+
+    fn has_payload(&self) -> bool {
+        self.encoded_payload.is_none_or(|bytes| !bytes.is_empty())
+    }
+
     /// Decodes this command's payload block into caller-provided storage.
     pub fn decode_payload(&self, output: &mut [u8]) -> Result<usize, PayloadError> {
+        let payload = self.encoded_payload()?;
         match self.controls.get(b'm') {
             None | Some(Value::Unsigned(0)) => {}
             Some(Value::Unsigned(1))
-                if self.encoded_payload.len().is_multiple_of(4)
-                    && !self.encoded_payload.ends_with(b"=") => {}
+                if payload.len().is_multiple_of(4) && !payload.ends_with(b"=") => {}
             _ => return Err(PayloadError::InvalidChunk),
         }
         PAYLOAD_ENGINE
-            .decode_slice(self.encoded_payload, output)
+            .decode_slice(payload, output)
             .map_err(PayloadError::Base64)
     }
 }
@@ -308,21 +316,18 @@ impl Decoder {
         let state = core::mem::replace(&mut self.state, State::Idle);
         match state {
             State::Control | State::Payload | State::LargePayload | State::PayloadOverflow => Some(
-                Controls::parse(&self.control[..self.control_len]).and_then(|controls| {
-                    let payload = if matches!(state, State::PayloadOverflow) {
-                        if !controls.is_feature_query() {
-                            return Err(DecodeError::PayloadTooLong);
-                        }
-                        &[][..]
-                    } else if matches!(state, State::LargePayload) {
-                        &self.large_payload
-                    } else {
-                        &self.payload[..self.payload_len]
+                Controls::parse(&self.control[..self.control_len]).map(|controls| {
+                    // Keep the request identity after discarding an oversized payload.
+                    let encoded_payload = match state {
+                        State::PayloadOverflow if controls.is_feature_query() => Some(&[][..]),
+                        State::PayloadOverflow => None,
+                        State::LargePayload => Some(self.large_payload.as_slice()),
+                        _ => Some(&self.payload[..self.payload_len]),
                     };
-                    Ok(Command {
+                    Command {
                         controls,
-                        encoded_payload: payload,
-                    })
+                        encoded_payload,
+                    }
                 }),
             ),
             State::Failed(error) => Some(Err(error)),

@@ -7,8 +7,7 @@ use std::time::Instant;
 
 use super::{
     Command, Controls, DecodeError, Delete, DeleteTarget, EvictionRanking, FeatureReply,
-    INLINE_DECODED_BYTES, INLINE_ENCODED_BYTES, ImageChange, Placement, PlacementError, Value,
-    control_keys,
+    INLINE_DECODED_BYTES, ImageChange, Placement, PlacementError, Value, control_keys,
 };
 use crate::animation::{
     Animation, Canvas, FrameBudget, FrameComposition, FrameControl, FrameUpload, INDEXED,
@@ -564,9 +563,6 @@ impl ImageStore {
             let local = transfer.local.is_some();
             let format_error = |error| if local { BAD_SOURCE } else { error };
             if let Some(source) = transfer.local.take() {
-                if command.encoded_payload.len() > INLINE_ENCODED_BYTES {
-                    return Err(BAD_SOURCE);
-                }
                 let mut decoded = [0; INLINE_DECODED_BYTES];
                 let written = command
                     .decode_payload(&mut decoded)
@@ -635,7 +631,7 @@ impl ImageStore {
         image_number: u32,
         action: u8,
     ) -> Result<(), &'static [u8]> {
-        if !command.encoded_payload.is_empty() {
+        if command.has_payload() {
             return Err(INVALID);
         }
         let key = self.existing_key(id, image_number)?;
@@ -711,7 +707,7 @@ impl ImageStore {
         {
             return Err(UNSUPPORTED);
         }
-        if !command.encoded_payload.is_empty() || number(&command.controls, b'N').is_none() {
+        if command.has_payload() || number(&command.controls, b'N').is_none() {
             return Err(INVALID);
         }
         let key = ImageKey(u64::from(id));

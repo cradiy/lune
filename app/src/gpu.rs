@@ -16,8 +16,8 @@ mod textures;
 
 pub use backgrounds::{BackgroundPrepareError, CellBackgroundRenderer};
 use textures::{
-    ImageTextures, PixelRegion, TextureBinding, TextureTiles, TileRegion, make_texture,
-    write_texture,
+    ImageTextures, PixelRegion, TextureBinding, TextureTiles, TileDamage, TileRegion, make_texture,
+    write_region, write_texture,
 };
 
 type ImageInstance = [f32; 12];
@@ -60,12 +60,24 @@ impl CachedImage {
         queue: &Queue,
         image: &GraphicsImage,
         scratch: &mut Vec<u8>,
+        visible_layout: u64,
+        rebuild_layout: bool,
     ) -> bool {
         if self.revision.id() != image.revision() {
             let Some(updates) = image.pixel_updates(Some(&self.revision), scratch) else {
                 return false;
             };
-            let write = |update: &GraphicsPixelUpdate<'_>| {
+            if let ImageTextures::Tiled(tiles) = &mut self.textures {
+                if rebuild_layout && matches!(updates, GraphicsPixelUpdates::Rasterize) {
+                    for tile in &mut tiles.tiles {
+                        tile.damage = TileDamage::Full;
+                    }
+                    self.revision = image.pixel_revision();
+                    return true;
+                }
+                tiles.layout = visible_layout;
+            }
+            let mut write = |update: &GraphicsPixelUpdate<'_>| {
                 if !update.size.contains(&0) {
                     self.textures.write(
                         queue,
@@ -76,6 +88,7 @@ impl CachedImage {
                         update.bytes,
                         update.bytes_per_row,
                         self.format.bytes_per_pixel(),
+                        rebuild_layout,
                     );
                 }
             };
@@ -161,24 +174,37 @@ impl ImageTextureResources {
         instances: &[(usize, ImageInstance)],
         scratch: &mut Vec<u8>,
     ) -> bool {
+        let previous_layout = tiles.layout.wrapping_sub(1);
+        // Keep tile-sized scratch when expanding a previously cropped resident image.
         if instances.len() == tiles.tiles.len()
-            && tiles.tiles.iter().all(|tile| tile.resident.is_none())
+            && tiles.tiles.iter().all(|tile| {
+                tile.needs_full_upload()
+                    && (tile.resident.is_none() || tile.visible_layout == previous_layout)
+            })
         {
             return self.upload_all_tiles(device, queue, image, tiles, scratch);
         }
         let format = image.format();
         for &(index, _) in instances {
             let tile = &mut tiles.tiles[index];
-            if tile.resident.is_some() {
-                continue;
+            let storage = tile.region.storage;
+            for region in tile.upload_regions() {
+                let Some(update) = image.pixel_region(region.origin, region.size, scratch) else {
+                    return false;
+                };
+                let texture = tile.resident.get_or_insert_with(|| {
+                    self.bindings(device, format, update.bytes)(storage.size)
+                });
+                write_region(
+                    queue,
+                    &texture.texture,
+                    region.relative_to(storage.origin),
+                    update.bytes,
+                    update.bytes_per_row,
+                );
             }
-            let region = tile.region.storage;
-            let Some(update) = image.pixel_region(region.origin, region.size, scratch) else {
-                return false;
-            };
-            let texture = self.bindings(device, format, update.bytes)(region.size);
-            write_texture(queue, &texture.texture, update.bytes, update.bytes_per_row);
-            tile.resident = Some(texture);
+            tile.visible_layout = tiles.layout;
+            tile.damage = TileDamage::Clean;
         }
         true
     }
@@ -197,12 +223,15 @@ impl ImageTextureResources {
         let format = image.format();
         let bind = self.bindings(device, format, pixels);
         for tile in &mut tiles.tiles {
-            tile.resident = Some(bind(tile.region.storage.size));
+            tile.resident
+                .get_or_insert_with(|| bind(tile.region.storage.size));
+            tile.visible_layout = tiles.layout;
+            tile.damage = TileDamage::Clean;
         }
         let (width, height) = image.dimensions();
         let bytes_per_pixel = format.bytes_per_pixel();
         tiles.write(
-            queue,
+            Some(queue),
             PixelRegion {
                 origin: [0, 0],
                 size: [width, height],
@@ -229,6 +258,7 @@ pub struct ImageRenderer {
     draws: Vec<Draw>,
     visible_images: Vec<GraphicsImageKey>,
     prepared: Option<PreparedImages>,
+    layout_generation: u64,
     placeholder_rows: Vec<Option<RowRevision>>,
     pixel_scratch: Vec<u8>,
 }
@@ -291,6 +321,7 @@ impl ImageRenderer {
             draws: Vec::new(),
             visible_images: Vec::new(),
             prepared: None,
+            layout_generation: 0,
             placeholder_rows: Vec::new(),
             pixel_scratch: Vec::new(),
         }
@@ -405,7 +436,13 @@ impl ImageRenderer {
                 return false;
             };
             if cached.source_revision != image.source_revision()
-                || !cached.update_pixels(queue, image, &mut self.pixel_scratch)
+                || !cached.update_pixels(
+                    queue,
+                    image,
+                    &mut self.pixel_scratch,
+                    self.layout_generation,
+                    false,
+                )
             {
                 return false;
             }
@@ -419,6 +456,7 @@ impl ImageRenderer {
         queue: &Queue,
         frame: &PresentationFrame<'_>,
     ) -> usize {
+        self.layout_generation = self.layout_generation.wrapping_add(1);
         self.draws.clear();
         self.instances.clear();
         self.visible_images.clear();
@@ -445,6 +483,14 @@ impl ImageRenderer {
             let Some(image) = frame.graphics_image(placement) else {
                 continue;
             };
+            let virtual_pieces = if placement.is_virtual() {
+                placeholders
+                    .pieces
+                    .get(&placement.serial())
+                    .map_or(&[][..], Vec::as_slice)
+            } else {
+                &[]
+            };
             let previous_instances = self.instances.len();
             let mut uploaded = None;
             let mut push = |location: &ImageLocation| {
@@ -456,8 +502,21 @@ impl ImageRenderer {
                     return;
                 }
                 let Some(tiled) = *uploaded.get_or_insert_with(|| {
-                    let crop = (!placement.is_virtual()).then_some(&quad);
-                    self.cache(device, queue, image_id, image, crop)
+                    self.cache(device, queue, image_id, image, |max_pixels| {
+                        let mut region = quad.source_region();
+                        if region.pixel_count() > max_pixels {
+                            return None;
+                        }
+                        for piece in virtual_pieces.iter().skip(1) {
+                            if let Some(quad) = ImageQuad::new(placement, cell, area, piece) {
+                                region = region.bounding_rect(quad.source_region());
+                                if region.pixel_count() > max_pixels {
+                                    return None;
+                                }
+                            }
+                        }
+                        Some(region)
+                    })
                 }) else {
                     rejected += 1;
                     return;
@@ -477,6 +536,7 @@ impl ImageRenderer {
                 else {
                     unreachable!("A tiled image has tile storage");
                 };
+                tiles.layout = self.layout_generation;
                 tile_instances.clear();
                 tile_instances.extend(tiles.candidates(quad.source_region(), 0).filter_map(
                     |(index, tile)| {
@@ -502,10 +562,8 @@ impl ImageRenderer {
                 }
             };
             if placement.is_virtual() {
-                if let Some(runs) = placeholders.pieces.get(&placement.serial()) {
-                    for location in runs {
-                        push(location);
-                    }
+                for location in virtual_pieces {
+                    push(location);
                 }
             } else if let Some(origin) = placement
                 .origin_in_view(frame.viewport.offset(), |parent| {
@@ -575,33 +633,37 @@ impl ImageRenderer {
         queue: &Queue,
         id: GraphicsImageKey,
         image: &GraphicsImage,
-        crop: Option<&ImageQuad>,
+        crop: impl FnOnce(u32) -> Option<PixelRegion>,
     ) -> Option<bool> {
         if let Some(cached) = self.images.get_mut(&id)
             && cached.source_revision == image.source_revision()
         {
             return cached
-                .update_pixels(queue, image, &mut self.pixel_scratch)
+                .update_pixels(
+                    queue,
+                    image,
+                    &mut self.pixel_scratch,
+                    self.layout_generation,
+                    true,
+                )
                 .then_some(matches!(cached.textures, ImageTextures::Tiled(_)));
         }
         let (width, height) = image.dimensions();
         let limit = device.limits().max_texture_dimension_2d;
         let pixels = width * height;
-        let crop_tiles = crop.and_then(|quad| {
-            if pixels < 4 * CROP_TILE_EDGE * CROP_TILE_EDGE || limit <= CROP_TILE_EDGE {
-                return None;
-            }
-            let region = quad.source_region();
-            if region.size[0] * region.size[1] > pixels / 4 {
-                return None;
-            }
-            let tiles = TextureTiles::new([width, height], CROP_TILE_EDGE);
-            let covered: u32 = tiles
-                .candidates(region, 0)
-                .map(|(_, tile)| tile.region.storage.size[0] * tile.region.storage.size[1])
-                .sum();
-            (covered <= pixels / 2).then_some(tiles)
-        });
+        let crop_tiles = if pixels >= 4 * CROP_TILE_EDGE * CROP_TILE_EDGE && limit > CROP_TILE_EDGE
+        {
+            crop(pixels / 4).and_then(|region| {
+                let tiles = TextureTiles::new([width, height], CROP_TILE_EDGE);
+                let covered: u32 = tiles
+                    .candidates(region, 0)
+                    .map(|(_, tile)| tile.region.storage.pixel_count())
+                    .sum();
+                (covered <= pixels / 2).then_some(tiles)
+            })
+        } else {
+            None
+        };
         let textures = if let Some(tiles) = crop_tiles {
             ImageTextures::Tiled(tiles)
         } else if width.max(height) > limit {
