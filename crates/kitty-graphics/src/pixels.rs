@@ -1,11 +1,12 @@
 use flate2::{Decompress, FlushDecompress, Status};
 
+use crate::animation::INVALID_REGION;
 use crate::source::LocalSource;
 use crate::{Command, Controls, PayloadError, Value};
 
 mod png_data;
 pub(crate) use png_data::PngProfiles;
-use png_data::decode_png;
+use png_data::{PNG_HEADER_BYTES, check_png_frame_bounds, decode_png};
 
 pub(crate) const INVALID: &[u8] = b"EINVAL:Invalid image data";
 pub(crate) const QUOTA: &[u8] = b"ENOSPC:Image quota exceeded";
@@ -21,7 +22,9 @@ enum Format {
         dimensions: (u32, u32),
         channels: usize,
     },
-    Png,
+    Png {
+        frame_canvas: Option<(u32, u32)>,
+    },
 }
 
 impl Format {
@@ -75,6 +78,7 @@ impl PixelTransfer {
         controls: &Controls,
         max_bytes: usize,
         direct: bool,
+        frame_canvas: Option<(u32, u32)>,
     ) -> Result<Self, &'static [u8]> {
         let compressed = match controls.get(b'o') {
             None => false,
@@ -83,7 +87,7 @@ impl PixelTransfer {
         };
         let encoded_limit = max_bytes.saturating_add(ENCODED_OVERHEAD);
         let format = match controls.get(b'f') {
-            Some(Value::Unsigned(100)) => Format::Png,
+            Some(Value::Unsigned(100)) => Format::Png { frame_canvas },
             value @ (None | Some(Value::Unsigned(8 | 16 | 24 | 32))) => {
                 let channels = match value {
                     Some(Value::Unsigned(bits)) => bits as usize / 8,
@@ -103,19 +107,18 @@ impl PixelTransfer {
                 channels,
             } => {
                 let stored_channels = if channels == 3 { 4 } else { channels };
-                Some(
-                    pixel_size(dimensions, stored_channels, max_bytes)? / stored_channels
-                        * channels,
-                )
+                let size = pixel_size(dimensions, stored_channels, max_bytes)?;
+                check_frame_canvas(dimensions, frame_canvas)?;
+                Some(size / stored_channels * channels)
             }
-            Format::Png if compressed && direct => {
+            Format::Png { .. } if compressed && direct => {
                 let size = required(controls, b'S')? as usize;
                 if size > encoded_limit {
                     return Err(QUOTA);
                 }
                 Some(size)
             }
-            Format::Png => None,
+            Format::Png { .. } => None,
         };
         let wire_limit = if compressed {
             encoded_limit
@@ -209,6 +212,17 @@ impl PixelTransfer {
         Ok(())
     }
 
+    pub(crate) fn check_pending_png(&mut self, max_bytes: usize) -> Result<(), &'static [u8]> {
+        if let Format::Png { frame_canvas } = &mut self.format
+            && let Some(canvas) = *frame_canvas
+            && let Some(header) = self.bytes.first_chunk::<PNG_HEADER_BYTES>()
+        {
+            check_png_frame_bounds(header, max_bytes, canvas)?;
+            *frame_canvas = None;
+        }
+        Ok(())
+    }
+
     pub(crate) fn finish(
         self,
         max_bytes: usize,
@@ -260,9 +274,19 @@ impl PixelTransfer {
                     bytes,
                 })
             }
-            Format::Png => decode_png(&bytes, max_bytes, profiles),
+            Format::Png { frame_canvas } => decode_png(&bytes, max_bytes, frame_canvas, profiles),
         }
     }
+}
+
+fn check_frame_canvas(
+    (width, height): (u32, u32),
+    canvas: Option<(u32, u32)>,
+) -> Result<(), &'static [u8]> {
+    if canvas.is_some_and(|(columns, rows)| width > columns || height > rows) {
+        return Err(INVALID_REGION);
+    }
+    Ok(())
 }
 
 fn required(controls: &Controls, key: u8) -> Result<u32, &'static [u8]> {

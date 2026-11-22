@@ -10,8 +10,8 @@ use super::{
     INLINE_DECODED_BYTES, ImageChange, Placement, PlacementError, Value, control_keys,
 };
 use crate::animation::{
-    Animation, Canvas, FrameBudget, FrameComposition, FrameControl, FrameDamage, FrameUpload,
-    INDEXED, LOAD_FIELDS, PixelRevision, Region,
+    Animation, Canvas, FrameAppend, FrameBudget, FrameComposition, FrameControl, FrameDamage,
+    FrameUpload, INDEXED, LOAD_FIELDS, PixelRevision, Region,
 };
 use crate::pixels::{
     INVALID, ImageFormat, Inflater, PixelTransfer, Pixels, PngProfiles, QUOTA, UNSUPPORTED,
@@ -20,7 +20,7 @@ use crate::source::{BAD_SOURCE, LocalSource};
 
 mod quota;
 mod wakes;
-use quota::EvictionScratch;
+use quota::{EvictionScratch, Evictions};
 use wakes::AnimationWakes;
 
 static NEXT_IMAGE_REVISION: AtomicU64 = AtomicU64::new(1);
@@ -520,6 +520,7 @@ impl ImageStore {
         else {
             return;
         };
+        self.abort_transfer();
         let Ok(key) = self.existing_key(id, image_number) else {
             return;
         };
@@ -606,6 +607,12 @@ impl ImageStore {
         let action = controls.get(b'a');
         let delete = action == Some(Value::Letter(b'd'));
         if delete {
+            if let Some(Ok(deletion)) = command.decode_delete()
+                && matches!(deletion.target, DeleteTarget::Frame { .. })
+            {
+                self.delete_frame(deletion, apply);
+                return None;
+            }
             self.abort_transfer();
         }
         let mut transfer = if let Some(mut pending) = self.pending.take() {
@@ -726,6 +733,7 @@ impl ImageStore {
             }
 
             if controls.get(b'm') == Some(Value::Unsigned(1)) {
+                transfer.pixels.check_pending_png(self.max_bytes)?;
                 self.pending = Some(transfer);
                 return Ok(false);
             }
@@ -735,9 +743,21 @@ impl ImageStore {
                 &mut self.inflater,
             )?;
             if let Some(frame) = transfer.frame {
-                self.apply_frame(transfer.key, |animation, canvas| {
-                    animation.upload(frame, pixels, canvas, transfer.transient)
-                })?;
+                let mut deferred = None;
+                let result = self.apply_frame(transfer.key, |animation, canvas| {
+                    animation.upload(
+                        frame,
+                        pixels,
+                        canvas,
+                        transfer.transient,
+                        Some(&mut deferred),
+                    )
+                });
+                if let Some(append) = deferred {
+                    self.append_under_pressure(transfer.key, append, &mut apply)?;
+                } else {
+                    result?;
+                }
             } else if transfer.action != b'q' && (id != 0 || transfer.placement.is_some()) {
                 self.store(
                     transfer.key,
@@ -835,6 +855,48 @@ impl ImageStore {
         Ok(())
     }
 
+    #[cold]
+    fn append_under_pressure(
+        &mut self,
+        key: ImageKey,
+        append: FrameAppend,
+        apply: &mut impl FnMut(ImageChange<'_>) -> Result<(), PlacementError>,
+    ) -> Result<(), &'static [u8]> {
+        let budget = self
+            .frame_budget
+            .get()
+            .expect("An append has a frame budget");
+        let needed = budget.shortfall(append.storage_bytes()?)?;
+        let evictions = if needed == 0 {
+            Evictions::None
+        } else {
+            self.frame_evictions(key, needed, apply)?
+        };
+        let Some(StoredImage::Named(image)) = self.images.get_mut(&key) else {
+            return Err(MISSING);
+        };
+        let animation = image
+            .animation
+            .as_mut()
+            .unwrap_or_else(|| self.animation_wakes.spare.get_or_insert_with(Box::default));
+        // Reserve the frame slot before notifying the host or dropping any image.
+        animation.reserve_append()?;
+
+        let evicted = evictions.as_slice();
+        if !evicted.is_empty() {
+            apply(ImageChange::Remove {
+                replaced: None,
+                evicted,
+            })
+            .map_err(placement_error)?;
+            let revision = next_image_revision();
+            for &victim in evicted {
+                self.remove_stored(victim, revision);
+            }
+        }
+        self.apply_frame(key, |animation, canvas| animation.append(append, &canvas))
+    }
+
     fn existing_key(&self, id: u32, image_number: u32) -> Result<ImageKey, &'static [u8]> {
         let id = if image_number != 0 {
             self.newest_id(image_number).ok_or(MISSING)?
@@ -912,7 +974,7 @@ impl ImageStore {
             return Err(INVALID);
         }
         let mut frame = frame.then(|| FrameUpload::parse(controls)).transpose()?;
-        let frame_key = if let Some(upload) = frame.as_mut() {
+        let (frame_key, frame_canvas) = if let Some(upload) = frame.as_mut() {
             let key = self.existing_key(id, image_number)?;
             let image = self.get(key.id()).ok_or(MISSING)?;
             if image.format() != ImageFormat::Rgba
@@ -922,9 +984,9 @@ impl ImageStore {
             }
             upload.resolve_number(image.animation.as_deref());
             *frame_number = upload.number;
-            Some(key)
+            (Some(key), Some(image.dimensions()))
         } else {
-            None
+            (None, None)
         };
         let local = LocalSource::parse(controls)?;
         let transient = match controls.get(b'N') {
@@ -932,7 +994,7 @@ impl ImageStore {
             Some(Value::Unsigned(hints)) => hints & 1 != 0,
             _ => return Err(INVALID),
         };
-        let pixels = PixelTransfer::begin(controls, self.max_bytes, local.is_none())?;
+        let pixels = PixelTransfer::begin(controls, self.max_bytes, local.is_none(), frame_canvas)?;
         let key = if let Some(key) = frame_key {
             key
         } else if id != 0 {

@@ -1,57 +1,88 @@
-use std::collections::VecDeque;
 use std::sync::Arc;
 
 use super::{FrameBudget, FrameCharge, MIN_SPLIT_SAVINGS_PIXELS, PixelRevision, Region, Surface};
 
-const MAX_INHERITED_EDITS: usize = 8;
+const MAX_RECENT_EDITS: usize = 8;
 
 #[derive(Debug, Default)]
-pub(super) struct InheritedDamage(VecDeque<InheritedEdit>);
+pub(super) struct RecentDamage {
+    edits: Vec<RecentEdit>,
+    next: usize,
+}
 
 #[derive(Debug)]
-struct InheritedEdit {
+pub(super) struct RecentEdit {
     previous: u64,
-    current: u64,
+    pub(super) current: u64,
     region: Region,
 }
 
-impl InheritedDamage {
+impl RecentDamage {
     pub(super) fn record(&mut self, previous: u64, current: u64, region: Region) {
-        let edits = &mut self.0;
-        if edits.capacity() == 0 && edits.try_reserve_exact(MAX_INHERITED_EDITS).is_err() {
-            return;
-        }
-        if edits.back().is_some_and(|edit| edit.current != previous) {
-            edits.clear();
-        } else if edits.len() == MAX_INHERITED_EDITS {
-            edits.pop_front();
-        }
-        edits.push_back(InheritedEdit {
+        let edit = RecentEdit {
             previous,
             current,
             region,
-        });
+        };
+        if let Some(slot) = self.edits.get_mut(self.next) {
+            *slot = edit;
+        } else {
+            if self.edits.capacity() == 0 && self.edits.try_reserve_exact(MAX_RECENT_EDITS).is_err()
+            {
+                return;
+            }
+            self.edits.push(edit);
+        }
+        self.next = (self.next + 1) % MAX_RECENT_EDITS;
+    }
+
+    pub(super) fn latest(&self) -> Option<&RecentEdit> {
+        self.edits
+            .get((self.next + MAX_RECENT_EDITS - 1) % MAX_RECENT_EDITS)
     }
 
     #[inline]
-    pub(super) fn since(&self, previous: u64, current: u64) -> Option<[Region; 2]> {
-        let latest = self.0.back().filter(|edit| edit.current == current)?;
-        if latest.previous == previous {
+    pub(super) fn since(
+        &self,
+        latest: &RecentEdit,
+        previous: u64,
+        current: u64,
+    ) -> Option<[Region; 2]> {
+        if current > latest.current || current <= previous {
+            return None;
+        }
+        if latest.current == current && latest.previous == previous {
             return Some([latest.region, Region::default()]);
         }
-        self.merge_since(previous)
+        self.merge_since(previous, current)
     }
 
     #[cold]
-    fn merge_since(&self, previous: u64) -> Option<[Region; 2]> {
+    fn merge_since(&self, previous: u64, mut revision: u64) -> Option<[Region; 2]> {
         let mut damage = Damage::default();
-        for edit in self.0.iter().rev() {
+        for edit in self.newest_first() {
+            if edit.current != revision {
+                continue;
+            }
             damage.add(edit.region);
-            if edit.previous == previous {
+            revision = edit.previous;
+            if revision == previous {
                 return Some(damage.regions);
             }
         }
         None
+    }
+
+    fn edge(&self, revision: u64) -> Option<(u64, Region)> {
+        self.newest_first()
+            .find(|edit| edit.current == revision)
+            .map(|edit| (edit.previous, edit.region))
+    }
+
+    fn newest_first(&self) -> impl Iterator<Item = &RecentEdit> {
+        // After wrapping, entries before the next write are newer than the suffix.
+        let (newer, older) = self.edits.split_at(self.next);
+        newer.iter().rev().chain(older.iter().rev())
     }
 }
 
@@ -81,6 +112,7 @@ pub(super) fn damage_between(
     current: Option<&Surface>,
     previous: &PixelRevision,
     original: u64,
+    recent: &RecentDamage,
 ) -> Option<[Region; 2]> {
     let mut before = DamagePath {
         revision: previous.revision,
@@ -93,14 +125,14 @@ pub(super) fn damage_between(
         older: current.and_then(|surface| surface.ancestors.as_deref()),
     };
     let mut damage = Damage::default();
-    // Each immutable patch is newer than its base.
+    // Edges point to older revisions.
     while before.revision != after.revision {
         let path = if before.revision > after.revision {
             &mut before
         } else {
             &mut after
         };
-        damage.add(path.step()?);
+        damage.add(path.step(recent)?);
     }
     Some(damage.regions)
 }
@@ -112,8 +144,8 @@ struct DamagePath<'a> {
 }
 
 impl DamagePath<'_> {
-    fn step(&mut self) -> Option<Region> {
-        let (base, region) = self.edge.take()?;
+    fn step(&mut self, recent: &RecentDamage) -> Option<Region> {
+        let (base, region) = self.edge.take().or_else(|| recent.edge(self.revision))?;
         self.revision = base;
         self.edge = self.older.map(|link| link.edge);
         self.older = self.older.and_then(|link| link.older.as_deref());

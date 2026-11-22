@@ -255,6 +255,7 @@ fn kitty_partial_uploads_resume_in_their_own_screen_buffer() {
         concat!(
             "\x1b_Gi=7,f=24,s=2,v=1,o=z,m=1;eJz7z8DA\x1b\\",
             "\x1b[?47h\x1b_Gi=7,f=24,s=2,v=1,o=z,m=1;eJxj+M/w\x1b\\",
+            "\x1b_Ga=q,i=30,e=f,r=2\x1b\\",
             "\x1b[?47l\x1b_Gm=0;wPAfAAb/Af8=\x1b\\",
         )
         .as_bytes(),
@@ -289,8 +290,32 @@ fn kitty_partial_uploads_resume_in_their_own_screen_buffer() {
     );
     assert_eq!(
         session.transport.written,
-        b"\x1b_Gi=7;OK\x1b\\\x1b_Gi=7;OK\x1b\\"
+        b"\x1b_Gi=30,e=f,r=2;OK\x1b\\\x1b_Gi=7;OK\x1b\\\x1b_Gi=7;OK\x1b\\"
     );
+
+    session.transport.written.clear();
+    session.transport.source = Cursor::new(
+        concat!(
+            "\x1b_Gi=8,f=24,s=2,v=1,m=1;/wAA\x1b\\",
+            "\x1b[?47l\x1b_Gi=8,f=24,s=2,v=1,m=1;AAD/\x1b\\",
+            "\x1b[?47h\x1b_Ga=d,d=f,i=7\x1b\\\x1b_Gm=0;AAD/\x1b\\",
+            "\x1b[?47l\x1b_Gm=0;/wAA\x1b\\",
+        )
+        .as_bytes(),
+    );
+    session.pump().unwrap();
+    let alternate = session.processor().graphics_images(ScreenBuffer::Alternate);
+    assert!(alternate.get(8).is_none());
+    assert!(alternate.get(7).is_some());
+    assert_eq!(
+        session
+            .graphics_image(8)
+            .unwrap()
+            .pixels(&mut scratch)
+            .unwrap(),
+        &[0, 0, 255, 255, 255, 0, 0, 255]
+    );
+    assert_eq!(session.transport.written, b"\x1b_Gi=8;OK\x1b\\");
 }
 
 #[test]
@@ -1830,7 +1855,7 @@ fn kitty_images_compose_in_an_offscreen_wgpu_pass() {
     session.transport.source = Cursor::new(
         concat!(
             "\x1b[5;1H\x1bD\x1b_Ga=d,d=I,i=44\x1b\\",
-            "\x1b_Ga=T,i=45,P=42,H=1,V=-1,s=1,v=1,q=2;/wD//w==\x1b\\",
+            "\x1b_Ga=T,i=45,P=42,H=1,V=-1,s=2,v=1,q=2;/wD///8A//8=\x1b\\",
             "\x1b[38;5;42m\u{10eeee}\x1b[0m",
         )
         .as_bytes(),
@@ -1860,7 +1885,7 @@ fn kitty_images_compose_in_an_offscreen_wgpu_pass() {
     session.transport.source = Cursor::new(
         concat!(
             "\x1b[5;3H\x1b[X\x1b[5;1H\x1b[38;5;42m\u{10eeee}\x1b[0m",
-            "\x1b_Ga=f,i=45,r=1,s=1,v=1,q=2;AAD//w==\x1b\\",
+            "\x1b_Ga=f,i=45,r=1,s=2,v=1,q=2;AAD//wAA//8=\x1b\\",
         )
         .as_bytes(),
     );
@@ -1870,6 +1895,71 @@ fn kitty_images_compose_in_an_offscreen_wgpu_pass() {
     let moved_and_updated = read_frame(&renderer);
     assert_eq!(pixel(&moved_and_updated, 4, 8), [0, 0, 255, 255]);
     assert_eq!(pixel(&moved_and_updated, 12, 8), [0, 0, 0, 0]);
+
+    let image = frame
+        .graphics_placements()
+        .iter()
+        .find(|placement| placement.placement.image.id() == 45)
+        .unwrap()
+        .placement
+        .image;
+    let texture = renderer.cached_texture(image).unwrap().clone();
+    session.transport.source =
+        Cursor::new(b"\x1b_Ga=f,i=45,r=1,s=2,v=1,X=1,q=2;AP8A/wD/AP8=\x1b\\");
+    session.pump().unwrap();
+    let frame = session.presentation_frame().unwrap();
+    assert_eq!(renderer.prepare(&device, &queue, &frame), 0);
+    assert_eq!(renderer.cached_texture(image), Some(&texture));
+    assert_eq!(pixel(&read_frame(&renderer), 4, 8), [0, 255, 0, 255]);
+
+    session.transport.source = Cursor::new(
+        concat!(
+            "\x1b_Ga=f,i=45,s=1,v=1,q=2;AAD//w==\x1b\\",
+            "\x1b_Ga=c,i=45,r=2,c=1,x=1,w=1,h=1,C=1,q=2\x1b\\",
+        )
+        .as_bytes(),
+    );
+    session.pump().unwrap();
+    let frame = session.presentation_frame().unwrap();
+    assert_eq!(renderer.prepare(&device, &queue, &frame), 0);
+    assert_eq!(renderer.cached_texture(image), Some(&texture));
+    let composed = read_frame(&renderer);
+    assert_eq!(
+        [pixel(&composed, 4, 8), pixel(&composed, 5, 8)],
+        [[0, 255, 0, 255], [0, 0, 255, 255]]
+    );
+
+    let previous = session.graphics_image(45).unwrap().pixel_revision();
+    session.transport.source = Cursor::new(
+        concat!(
+            "\x1b_Ga=f,i=45,s=2,v=1,X=1,q=2;AAAA/wAAAP8=\x1b\\",
+            "\x1b_Ga=c,i=45,r=1,c=1,X=1,w=1,h=1,C=1,q=2\x1b\\",
+            "\x1b_Ga=a,i=45,c=3\x1b\\",
+            "\x1b_Ga=c,i=45,r=2,c=3,w=1,h=1,C=1,q=2\x1b\\",
+            "\x1b_Ga=c,i=45,r=3,c=1,X=1,w=1,h=1,C=1,q=2\x1b\\",
+            "\x1b_Ga=a,i=45,c=1\x1b\\",
+        )
+        .as_bytes(),
+    );
+    session.pump().unwrap();
+    let [changed, rest] = session
+        .graphics_image(45)
+        .unwrap()
+        .pixel_update_plan(Some(&previous))
+        .damage()
+        .expect("An interleaved edit preserves the cached frame's damage");
+    assert_eq!(
+        (changed.origin, changed.size, rest.size),
+        ([0, 0], [1, 1], [0, 0])
+    );
+    let frame = session.presentation_frame().unwrap();
+    assert_eq!(renderer.prepare(&device, &queue, &frame), 0);
+    assert_eq!(renderer.cached_texture(image), Some(&texture));
+    let composed = read_frame(&renderer);
+    assert_eq!(
+        [pixel(&composed, 4, 8), pixel(&composed, 5, 8)],
+        [[0, 0, 0, 255], [0, 0, 255, 255]]
+    );
 
     let mut letterbox = session_with_size(
         concat!(
@@ -2073,7 +2163,7 @@ fn kitty_images_compose_in_an_offscreen_wgpu_pass() {
     let image = frame.graphics_placements()[0].placement.image;
     assert_eq!(renderer.resident_image_tiles(image), 2);
     assert_eq!(pixel(&read_frame(&renderer), 0, 0), [0, 255, 0, 255]);
-    assert!(renderer.pixel_scratch_capacity() <= 4);
+    assert_eq!(renderer.pixel_scratch_capacity(), 0);
     for (wire, tiles, expected) in [
         (
             b"\x1b_Ga=a,i=47,c=1,q=2\x1b\\".as_slice(),

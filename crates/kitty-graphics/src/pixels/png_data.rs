@@ -11,12 +11,16 @@ use png::{
     ScaledFloat, SourceChromaticities, Transformations,
 };
 
-use super::{ENCODED_OVERHEAD, INVALID, ImageFormat, Pixels, QUOTA, pixel_size, zeroed};
+use super::{
+    ENCODED_OVERHEAD, INVALID, ImageFormat, Pixels, QUOTA, check_frame_canvas, pixel_size, zeroed,
+};
 
 mod hdr;
 use hdr::HdrTransform;
 
 const BAD_PNG: &[u8] = b"EBADPNG:Invalid PNG image data";
+// PNG signature and complete IHDR chunk.
+pub(super) const PNG_HEADER_BYTES: usize = 33;
 const DISPLAY_GAMMA: f64 = 2.2;
 const GAMMA_THRESHOLD: f64 = 0.05;
 const GAMMA_SAMPLE_SHIFT: u32 = 5;
@@ -71,9 +75,53 @@ impl ProfileSource<'_> {
     }
 }
 
+pub(super) fn check_png_frame_bounds(
+    header: &[u8; PNG_HEADER_BYTES],
+    max_bytes: usize,
+    frame_canvas: (u32, u32),
+) -> Result<(), &'static [u8]> {
+    let (prefix, dimensions) = header.split_at(16);
+    if prefix != b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR" {
+        return Err(BAD_PNG);
+    }
+    let width = u32::from_be_bytes(dimensions[..4].try_into().unwrap());
+    let height = u32::from_be_bytes(dimensions[4..8].try_into().unwrap());
+    if width != 0 && height != 0 && width <= frame_canvas.0 && height <= frame_canvas.1 {
+        // The final decode verifies the complete header and its CRC.
+        return Ok(());
+    }
+    validate_png_frame_header(header, max_bytes, frame_canvas)
+}
+
+#[cold]
+fn validate_png_frame_header(
+    header: &[u8],
+    max_bytes: usize,
+    frame_canvas: (u32, u32),
+) -> Result<(), &'static [u8]> {
+    let mut decoder = png::Decoder::new(Cursor::new(header));
+    let dimensions = decoder.read_header_info().map_err(png_error)?.size();
+    png_rgba_size(dimensions, max_bytes, Some(frame_canvas))?;
+    Ok(())
+}
+
+fn png_rgba_size(
+    dimensions: (u32, u32),
+    max_bytes: usize,
+    frame_canvas: Option<(u32, u32)>,
+) -> Result<usize, &'static [u8]> {
+    let size = pixel_size(dimensions, 4, max_bytes).map_err(|error| match error {
+        INVALID => b"ENOMEM:PNG image is too large",
+        _ => error,
+    })?;
+    check_frame_canvas(dimensions, frame_canvas)?;
+    Ok(size)
+}
+
 pub(super) fn decode_png(
     bytes: &[u8],
     max_bytes: usize,
+    frame_canvas: Option<(u32, u32)>,
     profiles: &mut PngProfiles,
 ) -> Result<Pixels, &'static [u8]> {
     let mut decoder = png::Decoder::new_with_limits(
@@ -86,10 +134,7 @@ pub(super) fn decode_png(
     decoder.set_ignore_text_chunk(true);
     decoder.ignore_checksums(false);
     let dimensions = decoder.read_header_info().map_err(png_error)?.size();
-    let rgba_size = pixel_size(dimensions, 4, max_bytes).map_err(|error| match error {
-        INVALID => b"ENOMEM:PNG image is too large",
-        _ => error,
-    })?;
+    let rgba_size = png_rgba_size(dimensions, max_bytes, frame_canvas)?;
     let mut reader = decoder.read_info().map_err(png_error)?;
     if reader
         .info()

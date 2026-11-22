@@ -1389,7 +1389,6 @@ impl Graphics {
                 match self.decoder.finish() {
                     Some(Ok(command)) => {
                         if let Some(Ok(delete)) = command.decode_delete() {
-                            images.abort_transfer();
                             delete_images(delete, screen, images, styles);
                             return false;
                         }
@@ -1439,6 +1438,7 @@ fn delete_images(
         images.delete_frame(delete, |change| screen.apply_image(change));
         return;
     }
+    images.abort_transfer();
     if let DeleteTarget::Number {
         number,
         placement_id,

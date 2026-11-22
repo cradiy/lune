@@ -10,13 +10,18 @@ const WORD_BITS: usize = u64::BITS as usize;
 pub(super) struct TimedFrames(Vec<u64>);
 
 impl TimedFrames {
-    pub(super) fn push(&mut self, index: usize, timed: bool) -> Result<(), &'static [u8]> {
+    pub(super) fn reserve_next(&mut self, index: usize) -> Result<(), &'static [u8]> {
         if index.is_multiple_of(WORD_BITS) {
             self.0.try_reserve(1).map_err(|_| QUOTA)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn push(&mut self, index: usize, timed: bool) {
+        if index.is_multiple_of(WORD_BITS) {
             self.0.push(0);
         }
         self.set(index, timed);
-        Ok(())
     }
 
     pub(super) fn set(&mut self, index: usize, timed: bool) {

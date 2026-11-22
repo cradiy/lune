@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -13,13 +14,14 @@ use crate::{
 
 mod damage;
 mod playback;
-use damage::{DamageLink, InheritedDamage, damage_between, split_saves_pixels};
+use damage::{DamageLink, RecentDamage, damage_between, split_saves_pixels};
 use playback::{Playback, PlaybackMode, TimedFrames};
 
 const MAX_PATCH_DEPTH: u8 = 24;
 const DEFAULT_GAP_MS: u32 = 40;
 const TRANSIENT_FRAME: u32 = 1 << 31;
 const MIN_SPLIT_SAVINGS_PIXELS: usize = 1024;
+const MAX_EAGER_HIDDEN_BLEND_PIXELS: usize = 64;
 pub(crate) const LOAD_FIELDS: &[u8] = b"xycrzXY";
 pub(crate) const CONTROL_FIELDS: &[u8] = b"svrcz";
 pub(crate) const COMPOSE_FIELDS: &[u8] = b"rcxywhXYC";
@@ -164,10 +166,17 @@ impl FrameBudget {
         revision: u64,
         original_revision: u64,
     ) -> Result<Arc<Surface>, &'static [u8]> {
-        // Include the surface allocation and allowance for the frame list's spare capacity.
-        let overhead = size_of::<Surface>() + 2 * (size_of::<Frame>() + size_of::<usize>());
-        let bytes = data.capacity().checked_add(overhead).ok_or(QUOTA)?;
-        let charge = self.charge(bytes)?;
+        let charge = self.charge(Self::surface_bytes(data.capacity())?)?;
+        Ok(self.store_charged(data, revision, original_revision, charge))
+    }
+
+    fn store_charged(
+        self: &Arc<Self>,
+        data: SurfaceData,
+        revision: u64,
+        original_revision: u64,
+        charge: FrameCharge,
+    ) -> Arc<Surface> {
         let ancestors = match &data {
             SurfaceData::Patch(Patch {
                 base: Base::Frame(parent),
@@ -175,12 +184,25 @@ impl FrameBudget {
             }) => DamageLink::from_surface(parent, original_revision, self),
             _ => None,
         };
-        Ok(Arc::new(Surface {
+        Arc::new(Surface {
             revision,
             data,
             ancestors,
             _charge: charge,
-        }))
+        })
+    }
+
+    fn surface_bytes(capacity: usize) -> Result<usize, &'static [u8]> {
+        // Include the surface allocation and allowance for the frame list's spare capacity.
+        let overhead = size_of::<Surface>() + 2 * (size_of::<Frame>() + size_of::<usize>());
+        capacity.checked_add(overhead).ok_or(QUOTA)
+    }
+
+    pub(crate) fn shortfall(&self, bytes: usize) -> Result<usize, &'static [u8]> {
+        if bytes > self.limit {
+            return Err(QUOTA);
+        }
+        Ok(bytes.saturating_sub(self.limit - self.used.load(Ordering::Relaxed)))
     }
 
     fn charge(self: &Arc<Self>, bytes: usize) -> Result<FrameCharge, &'static [u8]> {
@@ -202,6 +224,27 @@ struct Frame {
     // The gap is at most i32::MAX, leaving its high bit for the usage hint.
     gap_and_hint: u32,
     parent: Option<NonZeroU32>,
+}
+
+pub(crate) struct FrameAppend {
+    data: SurfaceData,
+    parent: Option<NonZeroU32>,
+    gap_ms: u32,
+    transient: bool,
+}
+
+impl FrameAppend {
+    pub(crate) fn storage_bytes(&self) -> Result<usize, &'static [u8]> {
+        // A live patch moves its owned capacity into the shared pixel charge.
+        let shared = if self.parent.is_some() {
+            size_of::<SharedPatchPixels>()
+        } else {
+            0
+        };
+        FrameBudget::surface_bytes(self.data.capacity())?
+            .checked_add(shared)
+            .ok_or(QUOTA)
+    }
 }
 
 struct FrameReplacement {
@@ -287,7 +330,7 @@ pub(crate) struct Animation {
     linked_frames: usize,
     total_gap_ms: u64,
     playback: Playback,
-    inherited_damage: InheritedDamage,
+    recent_damage: RecentDamage,
     pub(crate) scheduled_at: Option<Instant>,
 }
 
@@ -329,6 +372,48 @@ impl PixelRevision {
 }
 
 impl Animation {
+    #[cold]
+    pub(crate) fn reclaimable_bytes(&self, needed: usize) -> Result<usize, &'static [u8]> {
+        let mut seen = HashSet::new();
+        let mut count = 0;
+        let mut account = |charge: &FrameCharge, shared| {
+            if shared {
+                seen.try_reserve(1).map_err(|_| QUOTA)?;
+                return Ok(seen.insert(std::ptr::from_ref(charge)));
+            }
+            Ok(true)
+        };
+        // Pixel revisions can outlive the image and keep its damage links charged.
+        for frame in std::iter::once(&self.root).chain(&self.extra) {
+            let mut next = frame.surface.as_ref();
+            while let Some(surface) = next {
+                if !account(&surface._charge, Arc::strong_count(surface) > 1)? {
+                    break;
+                }
+                count += surface._charge.bytes;
+                if count >= needed {
+                    return Ok(count);
+                }
+                let SurfaceData::Patch(patch) = &surface.data else {
+                    break;
+                };
+                if let PatchPixels::Shared(pixels) = &patch.pixels
+                    && account(&pixels._charge, Arc::strong_count(pixels) > 1)?
+                {
+                    count += pixels._charge.bytes;
+                    if count >= needed {
+                        return Ok(count);
+                    }
+                }
+                next = match &patch.base {
+                    Base::Frame(parent) => Some(parent),
+                    _ => None,
+                };
+            }
+        }
+        Ok(count)
+    }
+
     pub(crate) fn is_redundant(&self) -> bool {
         self.extra.is_empty()
             && self.root.surface.is_none()
@@ -433,14 +518,21 @@ impl Animation {
         original_revision: u64,
     ) -> Option<FrameDamage<'_>> {
         let surface = self.current_surface();
-        if let Some(regions) = surface.and_then(|surface| {
-            self.inherited_damage
-                .since(previous.revision, surface.revision)
-        }) {
+        let revision = surface.map_or(original_revision, |surface| surface.revision);
+        let latest = self.recent_damage.latest();
+        if let Some(latest) = latest
+            && let Some(regions) = self
+                .recent_damage
+                .since(latest, previous.revision, revision)
+        {
             return Some(FrameDamage::Regions(regions));
         }
+        let patch = match surface.map(|surface| &surface.data) {
+            Some(SurfaceData::Patch(patch)) => Some(patch),
+            _ => None,
+        };
         let mut region = None;
-        if let Some(SurfaceData::Patch(patch)) = surface.map(|surface| &surface.data)
+        if let Some(patch) = patch
             && let Some(base) = patch.base.revision(original_revision)
         {
             if base == previous.revision {
@@ -461,14 +553,20 @@ impl Animation {
             }
         }
         if let Some((base, previous_region)) = previous.patch
-            && base == surface.map_or(original_revision, |surface| surface.revision)
+            && base == revision
         {
             region = Some(previous_region);
         }
         if region.is_none()
             && (previous.ancestors.is_some()
-                || surface.is_some_and(|surface| surface.ancestors.is_some()))
-            && let Some(regions) = damage_between(surface, previous, original_revision)
+                || surface.is_some_and(|surface| surface.ancestors.is_some())
+                || latest.is_some_and(|latest| {
+                    patch.is_some()
+                        || previous.patch.is_some()
+                        || previous.revision.max(revision) <= latest.current
+                }))
+            && let Some(regions) =
+                damage_between(surface, previous, original_revision, &self.recent_damage)
         {
             return Some(FrameDamage::Regions(regions));
         }
@@ -494,6 +592,7 @@ impl Animation {
         pixels: Pixels,
         canvas: Canvas<'_>,
         transient: bool,
+        deferred: Option<&mut Option<FrameAppend>>,
     ) -> Result<(), &'static [u8]> {
         let Canvas {
             dimensions,
@@ -505,9 +604,6 @@ impl Animation {
             return Err(INDEXED);
         }
         let (width, height) = dimensions;
-        if pixels.dimensions.0 > width || pixels.dimensions.1 > height {
-            return Err(INVALID_REGION);
-        }
         let index = upload.number.checked_sub(1).ok_or(NO_FRAME)? as usize;
         if index > self.extra.len() + 1 {
             return Err(NO_FRAME);
@@ -523,7 +619,6 @@ impl Animation {
             (None, None) => None,
         };
         let transient = transient || base_frame.is_some_and(Frame::is_transient);
-        let base = base_frame.map_or(Base::Color(upload.background), Base::from_frame);
         let (x, y) = upload.origin;
         let (patch_width, patch_height) = pixels.dimensions;
         let region = Region {
@@ -533,9 +628,9 @@ impl Animation {
             height: patch_height.min(height.saturating_sub(y)) as usize,
         };
         let is_full = upload.origin == (0, 0) && pixels.dimensions == dimensions;
-        let data = if is_full
+        let mut data = if is_full
             && (upload.overwrite
-                || matches!(base, Base::Color([_, _, _, 0]))
+                || (base_frame.is_none() && upload.background[3] == 0)
                 || pixels
                     .bytes
                     .as_chunks::<4>()
@@ -545,36 +640,124 @@ impl Animation {
         {
             SurfaceData::Full(pixels.bytes)
         } else {
+            let base = base_frame.map_or(Base::Color(upload.background), Base::from_frame);
             let (bytes, stride) =
                 region.retain_patch_pixels(pixels.bytes, patch_width as usize * 4)?;
-            let pixels = if parent.is_some() {
-                PatchPixels::shared(bytes, budget)?
-            } else {
-                PatchPixels::Owned(bytes)
-            };
-            Patch::new(base, region, stride, pixels, !upload.overwrite).into_data(&canvas)?
+            Patch::new(
+                base,
+                region,
+                stride,
+                PatchPixels::Owned(bytes),
+                !upload.overwrite,
+            )
+            .into_data(&canvas)?
         };
         if matches!(data, SurfaceData::Full(_)) {
             parent = None;
         }
-        let surface = budget.store(data, revision, canvas.original_revision)?;
         if existing.is_some() {
-            let replacement = FrameReplacement::new(index, parent, surface, transient);
-            self.edit_frame(replacement, region, upload.gap_ms, &canvas)?;
+            if let SurfaceData::Full(bytes) = &mut data
+                && self.overwrite_full_frame(index, bytes, revision, transient)
+            {
+                self.finish_frame_edit(index, upload.gap_ms);
+            } else {
+                let surface = budget.store(data, revision, canvas.original_revision)?;
+                let replacement = FrameReplacement::new(index, parent, surface, transient);
+                self.edit_frame(replacement, region, upload.gap_ms, &canvas)?;
+            }
         } else {
-            self.extra.try_reserve(1).map_err(|_| QUOTA)?;
-            let gap_ms = upload.gap_ms.unwrap_or(DEFAULT_GAP_MS);
-            self.timed_extra.push(index - 1, gap_ms != 0)?;
-            self.original_users += usize::from(surface.data.uses_original());
-            self.linked_frames += usize::from(parent.is_some());
-            self.extra.push(Frame {
-                surface: Some(surface),
-                gap_and_hint: gap_ms | (u32::from(transient) * TRANSIENT_FRAME),
+            let append = FrameAppend {
+                data,
                 parent,
-            });
-            self.total_gap_ms += u64::from(gap_ms);
+                gap_ms: upload.gap_ms.unwrap_or(DEFAULT_GAP_MS),
+                transient,
+            };
+            let Ok(charge) = budget.charge(append.storage_bytes()?) else {
+                if let Some(deferred) = deferred {
+                    *deferred = Some(append);
+                }
+                return Err(QUOTA);
+            };
+            self.reserve_append()?;
+            self.commit_append(append, &canvas, charge);
         }
         Ok(())
+    }
+
+    fn overwrite_full_frame(
+        &mut self,
+        index: usize,
+        bytes: &mut Vec<u8>,
+        revision: u64,
+        transient: bool,
+    ) -> bool {
+        // A live dependent can bypass the frame's surface while retaining its parent index.
+        if self.linked_frames != 0 {
+            return false;
+        }
+        let frame = self.frame_mut(index).expect("Existing frame");
+        let Some(Surface {
+            data: SurfaceData::Full(previous),
+            revision: current,
+            ..
+        }) = frame.surface.as_mut().and_then(Arc::get_mut)
+        else {
+            return false;
+        };
+        if bytes.capacity() != previous.capacity() {
+            return false;
+        }
+        std::mem::swap(previous, bytes);
+        *current = revision;
+        frame.gap_and_hint = frame.gap_ms() | (u32::from(transient) * TRANSIENT_FRAME);
+        true
+    }
+
+    pub(crate) fn reserve_append(&mut self) -> Result<(), &'static [u8]> {
+        self.extra.try_reserve(1).map_err(|_| QUOTA)?;
+        self.timed_extra.reserve_next(self.extra.len())
+    }
+
+    pub(crate) fn append(
+        &mut self,
+        append: FrameAppend,
+        canvas: &Canvas<'_>,
+    ) -> Result<(), &'static [u8]> {
+        let charge = canvas.budget.charge(append.storage_bytes()?)?;
+        self.commit_append(append, canvas, charge);
+        Ok(())
+    }
+
+    fn commit_append(&mut self, append: FrameAppend, canvas: &Canvas<'_>, mut charge: FrameCharge) {
+        let FrameAppend {
+            mut data,
+            parent,
+            gap_ms,
+            transient,
+        } = append;
+        if parent.is_some()
+            && let SurfaceData::Patch(patch) = &mut data
+            && let PatchPixels::Owned(bytes) = &mut patch.pixels
+        {
+            let bytes = std::mem::take(bytes);
+            patch.pixels = PatchPixels::Shared(Arc::new(SharedPatchPixels {
+                _charge: charge.split(bytes.capacity() + size_of::<SharedPatchPixels>()),
+                bytes,
+            }));
+        }
+        let surface =
+            canvas
+                .budget
+                .store_charged(data, canvas.revision, canvas.original_revision, charge);
+        self.timed_extra.push(self.extra.len(), gap_ms != 0);
+        self.original_users += usize::from(surface.data.uses_original());
+        self.linked_frames += usize::from(parent.is_some());
+        self.extra.push(Frame {
+            surface: Some(surface),
+            gap_and_hint: gap_ms | (u32::from(transient) * TRANSIENT_FRAME),
+            parent,
+        });
+        self.total_gap_ms += u64::from(gap_ms);
     }
 
     fn edit_frame(
@@ -590,13 +773,17 @@ impl Animation {
         } else {
             self.replace_with_dependents(replacement, region, canvas)?;
         }
+        self.finish_frame_edit(index, gap_ms);
+        Ok(())
+    }
+
+    fn finish_frame_edit(&mut self, index: usize, gap_ms: Option<u32>) {
         if let Some(gap_ms) = gap_ms {
             self.set_gap(index, gap_ms);
         }
         if index == self.current {
             self.playback.restart_frame();
         }
-        Ok(())
     }
 
     fn replace_with_dependents(
@@ -643,7 +830,7 @@ impl Animation {
         if let Ok(current) =
             replacements.binary_search_by_key(&self.current, |replacement| replacement.index)
         {
-            self.inherited_damage.record(
+            self.recent_damage.record(
                 self.revision().expect("A dependent frame has a revision"),
                 replacements[current].surface.revision,
                 region,
@@ -703,6 +890,22 @@ impl Animation {
             return Err(INVALID_REGION);
         }
         if composition.overwrite && size == dimensions {
+            if self.linked_frames == 0
+                && target_frame
+                    .surface
+                    .as_ref()
+                    .is_some_and(|destination| match &frame.surface {
+                        Some(source) => Arc::ptr_eq(source, destination),
+                        None => matches!(destination.data, SurfaceData::Original),
+                    })
+            {
+                let frame = self
+                    .frame_mut(target)
+                    .expect("Destination frame was validated");
+                frame.gap_and_hint = frame.gap_ms() | (u32::from(transient) * TRANSIENT_FRAME);
+                self.finish_frame_edit(target, None);
+                return Ok(());
+            }
             let surface = match &frame.surface {
                 Some(surface) => Arc::clone(surface),
                 None => canvas.budget.store(
@@ -714,11 +917,34 @@ impl Animation {
             let replacement = FrameReplacement::new(target, None, surface, transient);
             return self.edit_frame(replacement, target_region, None, &canvas);
         }
+        let pixels = source_region.area();
+        let len = pixels * 4;
+        if self.linked_frames == 0
+            && target_frame
+                .surface
+                .as_ref()
+                .is_some_and(|surface| matches!(surface.data, SurfaceData::Full(_)))
+            // Defer large blends on hidden frames while the patch fits the budget.
+            && (composition.overwrite
+                || target == self.current
+                || pixels <= MAX_EAGER_HIDDEN_BLEND_PIXELS
+                || !FrameBudget::surface_bytes(len)
+                    .and_then(|bytes| canvas.budget.shortfall(bytes))
+                    .is_ok_and(|needed| needed == 0))
+            && self.compose_into_full(
+                [source, target],
+                [source_region, target_region],
+                composition.overwrite,
+                transient,
+                &canvas,
+            )?
+        {
+            return Ok(());
+        }
         let mut bytes = Vec::new();
-        let len = source_region.width * source_region.height * 4;
-        bytes.try_reserve_exact(len).map_err(|_| QUOTA)?;
-        bytes.resize(len, 0);
+        resize_scratch(&mut bytes, len)?;
         let width = dimensions.0 as usize;
+        let frame = self.frame(source).expect("Source frame was validated");
         if let Some(surface) = &frame.surface {
             surface
                 .data
@@ -742,7 +968,69 @@ impl Animation {
             },
             canvas,
             transient,
+            None,
         )
+    }
+
+    fn compose_into_full(
+        &mut self,
+        [source, target]: [usize; 2],
+        [from, to]: [Region; 2],
+        overwrite: bool,
+        transient: bool,
+        canvas: &Canvas<'_>,
+    ) -> Result<bool, &'static [u8]> {
+        let separate = source != target;
+        let source_surface = if separate {
+            self.frame(source)
+                .expect("Source frame was validated")
+                .surface
+                .clone()
+        } else {
+            None
+        };
+        let frame = self
+            .frame_mut(target)
+            .expect("Destination frame was validated");
+        let Some(Surface {
+            data: SurfaceData::Full(pixels),
+            revision,
+            ..
+        }) = frame.surface.as_mut().and_then(Arc::get_mut)
+        else {
+            return Ok(false);
+        };
+        let width = canvas.dimensions.0 as usize;
+        let stride = width * 4;
+        if separate {
+            let mut scratch = Vec::new();
+            let source = render_region(
+                source_surface.as_deref().map(|surface| &surface.data),
+                canvas.original,
+                width,
+                from,
+                &mut scratch,
+            )?;
+            for (destination, row) in to
+                .rows(stride)
+                .zip(source.bytes.chunks(source.bytes_per_row as usize))
+            {
+                let incoming = &row[..destination.len()];
+                composite_row(&mut pixels[destination], incoming, overwrite);
+            }
+        } else {
+            for (from, to) in from.rows(stride).zip(to.rows(stride)) {
+                let [source, target] = pixels
+                    .get_disjoint_mut([from, to])
+                    .expect("Disjoint composition regions");
+                composite_row(target, source, overwrite);
+            }
+        }
+        let previous = std::mem::replace(revision, canvas.revision);
+        frame.gap_and_hint = frame.gap_ms() | (u32::from(transient) * TRANSIENT_FRAME);
+        self.recent_damage.record(previous, canvas.revision, to);
+        self.finish_frame_edit(target, None);
+        Ok(true)
     }
 
     pub(crate) fn control(&mut self, command: FrameControl) {
@@ -869,6 +1157,16 @@ struct FrameCharge {
     bytes: usize,
 }
 
+impl FrameCharge {
+    fn split(&mut self, bytes: usize) -> Self {
+        self.bytes -= bytes;
+        Self {
+            budget: Arc::clone(&self.budget),
+            bytes,
+        }
+    }
+}
+
 impl Drop for FrameCharge {
     fn drop(&mut self) {
         self.budget.used.fetch_sub(self.bytes, Ordering::Relaxed);
@@ -941,24 +1239,17 @@ impl SurfaceData {
             Self::Original => region.copy_pixels(original, width, output),
             Self::Full(pixels) => region.copy_pixels(pixels, width, output),
             Self::Patch(patch) => {
-                match &patch.base {
-                    Base::Color([0, 0, 0, 0]) => output.fill(0),
-                    Base::Color(color) => {
-                        for pixel in output.as_chunks_mut::<4>().0 {
-                            *pixel = *color;
-                        }
-                    }
-                    Base::Original => region.copy_pixels(original, width, output),
-                    Base::Frame(surface) => surface.data.render(original, width, region, output),
+                patch.render_base(original, width, region, output);
+                if let Some(overlap) = patch.region.intersection(region) {
+                    patch.apply(region, overlap, output);
                 }
-                patch.apply(region, output);
             }
         }
     }
 }
 
 fn render_region<'a>(
-    data: Option<&'a SurfaceData>,
+    mut data: Option<&'a SurfaceData>,
     original: &'a [u8],
     width: usize,
     region: Region,
@@ -967,16 +1258,33 @@ fn render_region<'a>(
     if region.is_empty() {
         return Ok(region.update(&[], 0));
     }
-    match data {
-        Some(SurfaceData::Original) | None => Ok(region.update_from(original, width, 4)),
-        Some(SurfaceData::Full(bytes)) => Ok(region.update_from(bytes, width, 4)),
-        Some(data) => {
-            let stride = region.width * 4;
-            resize_scratch(scratch, stride * region.height)?;
-            data.render(original, width, region, scratch);
-            Ok(region.update(scratch, stride))
+    let (patch, overlap) = loop {
+        let patch = match data {
+            Some(SurfaceData::Original) | None => return Ok(region.update_from(original, width, 4)),
+            Some(SurfaceData::Full(bytes)) => return Ok(region.update_from(bytes, width, 4)),
+            Some(SurfaceData::Patch(patch)) => patch,
+        };
+        match patch.region.intersection(region) {
+            Some(overlap) if !patch.blend && overlap == region => {
+                let relative = region.relative_to(patch.region);
+                let bytes = relative.strided_bytes(patch.pixels.bytes(), patch.stride, 4);
+                return Ok(region.update(bytes, patch.stride));
+            }
+            Some(overlap) => break (patch, Some(overlap)),
+            None => match &patch.base {
+                Base::Frame(surface) => data = Some(&surface.data),
+                Base::Original => data = None,
+                Base::Color(_) => break (patch, None),
+            },
         }
+    };
+    let stride = region.width * 4;
+    resize_scratch(scratch, stride * region.height)?;
+    patch.render_base(original, width, region, scratch);
+    if let Some(overlap) = overlap {
+        patch.apply(region, overlap, scratch);
     }
+    Ok(region.update(scratch, stride))
 }
 
 fn render_two_regions<'a>(
@@ -1078,17 +1386,6 @@ struct SharedPatchPixels {
 }
 
 impl PatchPixels {
-    fn shared(bytes: Vec<u8>, budget: &Arc<FrameBudget>) -> Result<Self, &'static [u8]> {
-        let capacity = bytes
-            .capacity()
-            .checked_add(size_of::<SharedPatchPixels>())
-            .ok_or(QUOTA)?;
-        Ok(Self::Shared(Arc::new(SharedPatchPixels {
-            bytes,
-            _charge: budget.charge(capacity)?,
-        })))
-    }
-
     fn share(&self) -> Self {
         let Self::Shared(pixels) = self else {
             unreachable!("A live dependency shares its pixels");
@@ -1140,28 +1437,26 @@ impl Patch {
         Ok(patch)
     }
 
-    fn apply(&self, target: Region, output: &mut [u8]) {
-        let Some(overlap) = self.region.intersection(target) else {
-            return;
-        };
+    fn render_base(&self, original: &[u8], width: usize, region: Region, output: &mut [u8]) {
+        match &self.base {
+            Base::Color([0, 0, 0, 0]) => output.fill(0),
+            Base::Color(color) => {
+                for pixel in output.as_chunks_mut::<4>().0 {
+                    *pixel = *color;
+                }
+            }
+            Base::Original => region.copy_pixels(original, width, output),
+            Base::Frame(surface) => surface.data.render(original, width, region, output),
+        }
+    }
+
+    #[inline]
+    fn apply(&self, target: Region, overlap: Region, output: &mut [u8]) {
         let rows = overlap.relative_to(target).rows(target.width * 4);
         let overlay_rows = overlap.relative_to(self.region).rows(self.stride);
         let pixels = self.pixels.bytes();
         for (target, source) in rows.zip(overlay_rows) {
-            let target = &mut output[target];
-            let source = &pixels[source];
-            if self.blend {
-                for (dst, src) in target
-                    .as_chunks_mut::<4>()
-                    .0
-                    .iter_mut()
-                    .zip(source.as_chunks::<4>().0)
-                {
-                    blend(dst, src);
-                }
-            } else {
-                target.copy_from_slice(source);
-            }
+            composite_row(&mut output[target], &pixels[source], !self.blend);
         }
     }
 }
@@ -1250,9 +1545,13 @@ impl Region {
         bytes_per_pixel: usize,
     ) -> PixelUpdate<'_> {
         let stride = width * bytes_per_pixel;
+        self.update(self.strided_bytes(pixels, stride, bytes_per_pixel), stride)
+    }
+
+    fn strided_bytes(self, pixels: &[u8], stride: usize, bytes_per_pixel: usize) -> &[u8] {
         let start = self.y * stride + self.x * bytes_per_pixel;
         let len = (self.height - 1) * stride + self.width * bytes_per_pixel;
-        self.update(&pixels[start..start + len], stride)
+        &pixels[start..start + len]
     }
 
     pub(crate) fn checked(
@@ -1323,6 +1622,21 @@ impl Region {
         {
             out.copy_from_slice(&pixels[row]);
         }
+    }
+}
+
+fn composite_row(target: &mut [u8], source: &[u8], overwrite: bool) {
+    if overwrite {
+        target.copy_from_slice(source);
+        return;
+    }
+    for (dst, src) in target
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(source.as_chunks::<4>().0)
+    {
+        blend(dst, src);
     }
 }
 

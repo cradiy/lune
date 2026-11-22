@@ -34,6 +34,72 @@ impl Evictions {
 }
 
 impl ImageStore {
+    pub(super) fn frame_evictions(
+        &mut self,
+        target: ImageKey,
+        mut bytes_needed: usize,
+        apply: &mut impl FnMut(ImageChange<'_>) -> Result<(), PlacementError>,
+    ) -> Result<Evictions, &'static [u8]> {
+        let ranking = &mut self.eviction_scratch.ranking;
+        ranking.placed.clear();
+        ranking.protected.clear();
+        apply(ImageChange::RankEvictions {
+            placement: None,
+            ranking,
+        })
+        .map_err(placement_error)?;
+        ranking.placed.sort_unstable();
+        ranking.protected.sort_unstable();
+        let eligible = &mut self.eviction_scratch.eligible;
+        eligible.clear();
+        eligible
+            .try_reserve_exact(self.images.len())
+            .map_err(|_| QUOTA)?;
+        eligible.extend(self.images.iter().filter_map(|(&key, entry)| {
+            let StoredImage::Named(image) = entry else {
+                return None;
+            };
+            if key == target
+                || image.animation.is_none()
+                || ranking.placed.binary_search(&key).is_ok()
+                || ranking.protected.binary_search(&key).is_ok()
+            {
+                return None;
+            }
+            Some(Candidate {
+                priority: (false, !image.transient_for_eviction(), image.age),
+                image: key,
+                bytes: 0,
+            })
+        }));
+        eligible.sort_unstable_by_key(|candidate| candidate.priority);
+        let mut evicted = Vec::new();
+        for candidate in eligible {
+            let StoredImage::Named(image) = &self.images[&candidate.image] else {
+                unreachable!("Only named images have animation frames");
+            };
+            let bytes = image
+                .animation
+                .as_ref()
+                .unwrap()
+                .reclaimable_bytes(bytes_needed)?;
+            if bytes == 0 {
+                continue;
+            }
+            bytes_needed = bytes_needed.saturating_sub(bytes);
+            if evicted.is_empty() && bytes_needed == 0 {
+                return Ok(Evictions::One(candidate.image));
+            }
+            evicted.try_reserve(1).map_err(|_| QUOTA)?;
+            evicted.push(candidate.image);
+            if bytes_needed == 0 {
+                evicted.sort_unstable();
+                return Ok(Evictions::Many(evicted));
+            }
+        }
+        Err(QUOTA)
+    }
+
     pub(super) fn eviction_plan(
         &mut self,
         key: ImageKey,
