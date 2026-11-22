@@ -18,6 +18,7 @@ use playback::{Playback, PlaybackMode, TimedFrames};
 
 const MAX_PATCH_DEPTH: u8 = 24;
 const DEFAULT_GAP_MS: u32 = 40;
+const TRANSIENT_FRAME: u32 = 1 << 31;
 const MIN_SPLIT_SAVINGS_PIXELS: usize = 1024;
 pub(crate) const LOAD_FIELDS: &[u8] = b"xycrzXY";
 pub(crate) const CONTROL_FIELDS: &[u8] = b"svrcz";
@@ -198,7 +199,8 @@ impl FrameBudget {
 #[derive(Debug, Default)]
 struct Frame {
     surface: Option<Arc<Surface>>,
-    gap_ms: u32,
+    // The gap is at most i32::MAX, leaving its high bit for the usage hint.
+    gap_and_hint: u32,
     parent: Option<NonZeroU32>,
 }
 
@@ -207,15 +209,22 @@ struct FrameReplacement {
     parent: Option<NonZeroU32>,
     surface: Arc<Surface>,
     flat_base: Option<Arc<Surface>>,
+    transient: bool,
 }
 
 impl FrameReplacement {
-    fn new(index: usize, parent: Option<NonZeroU32>, surface: Arc<Surface>) -> Self {
+    fn new(
+        index: usize,
+        parent: Option<NonZeroU32>,
+        surface: Arc<Surface>,
+        transient: bool,
+    ) -> Self {
         Self {
             index,
             parent,
             surface,
             flat_base: None,
+            transient,
         }
     }
 
@@ -253,6 +262,14 @@ impl FrameReplacement {
 }
 
 impl Frame {
+    fn gap_ms(&self) -> u32 {
+        self.gap_and_hint & !TRANSIENT_FRAME
+    }
+
+    fn is_transient(&self) -> bool {
+        self.gap_and_hint & TRANSIENT_FRAME != 0
+    }
+
     fn uses_original_surface(&self) -> bool {
         self.surface
             .as_ref()
@@ -315,7 +332,7 @@ impl Animation {
     pub(crate) fn is_redundant(&self) -> bool {
         self.extra.is_empty()
             && self.root.surface.is_none()
-            && self.root.gap_ms == 0
+            && self.root.gap_ms() == 0
             && !self.playback.retains_settings()
     }
 
@@ -467,11 +484,16 @@ impl Animation {
             .is_some_and(|surface| matches!(surface.data, SurfaceData::Patch(_)))
     }
 
+    pub(crate) fn current_frame_is_transient(&self) -> bool {
+        self.frame(self.current).is_some_and(Frame::is_transient)
+    }
+
     pub(crate) fn upload(
         &mut self,
         upload: FrameUpload,
         pixels: Pixels,
         canvas: Canvas<'_>,
+        transient: bool,
     ) -> Result<(), &'static [u8]> {
         let Canvas {
             dimensions,
@@ -492,16 +514,16 @@ impl Animation {
         }
         let existing = self.frame(index);
         let mut parent = NonZeroU32::new(upload.base).filter(|_| existing.is_none());
-        let base = if let Some(frame) = existing {
-            Base::from_frame(frame)
-        } else if let Some(parent) = parent {
-            Base::from_frame(
+        let base_frame = match (existing, parent) {
+            (Some(frame), _) => Some(frame),
+            (None, Some(parent)) => Some(
                 self.frame(parent.get() as usize - 1)
                     .ok_or(b"EINVAL:Animation base frame not found".as_slice())?,
-            )
-        } else {
-            Base::Color(upload.background)
+            ),
+            (None, None) => None,
         };
+        let transient = transient || base_frame.is_some_and(Frame::is_transient);
+        let base = base_frame.map_or(Base::Color(upload.background), Base::from_frame);
         let (x, y) = upload.origin;
         let (patch_width, patch_height) = pixels.dimensions;
         let region = Region {
@@ -537,7 +559,7 @@ impl Animation {
         }
         let surface = budget.store(data, revision, canvas.original_revision)?;
         if existing.is_some() {
-            let replacement = FrameReplacement::new(index, parent, surface);
+            let replacement = FrameReplacement::new(index, parent, surface, transient);
             self.edit_frame(replacement, region, upload.gap_ms, &canvas)?;
         } else {
             self.extra.try_reserve(1).map_err(|_| QUOTA)?;
@@ -547,7 +569,7 @@ impl Animation {
             self.linked_frames += usize::from(parent.is_some());
             self.extra.push(Frame {
                 surface: Some(surface),
-                gap_ms,
+                gap_and_hint: gap_ms | (u32::from(transient) * TRANSIENT_FRAME),
                 parent,
             });
             self.total_gap_ms += u64::from(gap_ms);
@@ -605,12 +627,18 @@ impl Animation {
                 unreachable!("A dependent frame has a patch surface");
             };
             let data = base.rebase(patch, canvas)?;
+            let transient = frame.is_transient() || base.transient;
             let surface =
                 canvas
                     .budget
                     .store(data, next_image_revision(), canvas.original_revision)?;
             replacements.try_reserve(1).map_err(|_| QUOTA)?;
-            replacements.push(FrameReplacement::new(position + 1, Some(parent), surface));
+            replacements.push(FrameReplacement::new(
+                position + 1,
+                Some(parent),
+                surface,
+                transient,
+            ));
         }
         if let Ok(current) =
             replacements.binary_search_by_key(&self.current, |replacement| replacement.index)
@@ -637,6 +665,7 @@ impl Animation {
         let frame = self.frame_mut(replacement.index).expect("Existing frame");
         frame.parent = replacement.parent;
         frame.surface = Some(replacement.surface);
+        frame.gap_and_hint = frame.gap_ms() | (u32::from(replacement.transient) * TRANSIENT_FRAME);
         self.original_users = original_users;
         self.linked_frames = linked_frames;
     }
@@ -654,7 +683,8 @@ impl Animation {
         let source = composition.source.checked_sub(1).ok_or(NO_FRAME)? as usize;
         let target = composition.target.checked_sub(1).ok_or(NO_FRAME)? as usize;
         let frame = self.frame(source).ok_or(NO_FRAME)?;
-        self.frame(target).ok_or(NO_FRAME)?;
+        let target_frame = self.frame(target).ok_or(NO_FRAME)?;
+        let transient = frame.is_transient() || target_frame.is_transient();
         let size = (
             if composition.size.0 == 0 {
                 dimensions.0
@@ -681,7 +711,7 @@ impl Animation {
                     canvas.original_revision,
                 )?,
             };
-            let replacement = FrameReplacement::new(target, None, surface);
+            let replacement = FrameReplacement::new(target, None, surface, transient);
             return self.edit_frame(replacement, target_region, None, &canvas);
         }
         let mut bytes = Vec::new();
@@ -711,6 +741,7 @@ impl Animation {
                 bytes,
             },
             canvas,
+            transient,
         )
     }
 
@@ -760,7 +791,7 @@ impl Animation {
                 }
             }
         }
-        self.total_gap_ms -= u64::from(removed.gap_ms);
+        self.total_gap_ms -= u64::from(removed.gap_ms());
         if self.extra.capacity() > self.extra.len().saturating_mul(4).max(8) {
             self.extra.shrink_to_fit();
             self.timed_extra.shrink_to_fit();
@@ -776,7 +807,8 @@ impl Animation {
 
     fn set_gap(&mut self, index: usize, gap_ms: u32) {
         let frame = self.frame_mut(index).expect("Frame index was validated");
-        let old = std::mem::replace(&mut frame.gap_ms, gap_ms);
+        let old = frame.gap_ms();
+        frame.gap_and_hint = (frame.gap_and_hint & TRANSIENT_FRAME) | gap_ms;
         if index != 0 && (old == 0) != (gap_ms == 0) {
             self.timed_extra.set(index - 1, gap_ms != 0);
         }

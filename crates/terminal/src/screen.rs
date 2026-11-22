@@ -1342,7 +1342,8 @@ impl Screen {
     /// Zero counts and cursors outside the region preserve all state. Effective
     /// edits cancel pending wrapping and preserve cursor coordinates and region
     /// boundaries. Recycled rows use `style`; retained rows keep their text and
-    /// style. Buffers are reused without allocating.
+    /// style. Cursor-anchored graphics retain their positions.
+    /// Buffers are reused without allocating.
     pub fn insert_lines(&mut self, count: usize, style: StyleId) {
         if count == 0 || !self.scroll_region.contains(&self.cursor.row) {
             return;
@@ -1351,7 +1352,6 @@ impl Screen {
         self.grid
             .scroll_down(self.cursor.row..self.scroll_region.end, count, style)
             .expect("The cursor suffix is a valid row range");
-        self.scroll_graphics(self.cursor.row, count, true);
         self.cursor.wrap_pending = false;
     }
 
@@ -1366,7 +1366,6 @@ impl Screen {
         self.grid
             .scroll_up(self.cursor.row..self.scroll_region.end, count, style)
             .expect("The cursor suffix is a valid row range");
-        self.scroll_graphics(self.cursor.row, count, false);
         self.cursor.wrap_pending = false;
     }
 

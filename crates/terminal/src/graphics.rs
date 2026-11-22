@@ -78,6 +78,10 @@ impl GraphicsPlacement {
             .map(|root| root.serial)
     }
 
+    fn draw_order(&self) -> (i32, u32) {
+        (self.placement.z, self.placement.image.id())
+    }
+
     fn shift_relative(&mut self, delta: [i64; 2]) {
         self.column += delta[0];
         self.row += delta[1];
@@ -870,6 +874,14 @@ impl GraphicsPlacements {
                 self.changed();
                 return Ok(());
             }
+            if !self.anchors.is_empty()
+                && previous.placement.z != spec.z
+                && let Some(delta) =
+                    placement_offset_delta(previous.placement.position, spec.position)
+            {
+                self.reorder_linked(index, image, delta);
+                return Ok(());
+            }
         }
         let removes_existing = replacement.is_some();
         let evicts =
@@ -932,10 +944,7 @@ impl GraphicsPlacements {
         }
         self.next_serial = self.next_serial.max(image.serial);
         let graph = !self.anchors.is_empty() || image.parent.is_some();
-        let sort_key = |entry: &GraphicsPlacement| (entry.placement.z, entry.placement.image.id());
-        let position = self
-            .images
-            .partition_point(|entry| sort_key(entry) <= sort_key(&image));
+        let position = self.draw_position(&image);
         self.virtual_count += usize::from(image.is_virtual());
         self.images.insert(position, image);
         if graph {
@@ -947,6 +956,43 @@ impl GraphicsPlacements {
         }
         self.changed();
         Ok(())
+    }
+
+    fn draw_position(&self, placement: &GraphicsPlacement) -> usize {
+        let order = placement.draw_order();
+        self.images
+            .partition_point(|entry| entry.draw_order() <= order)
+    }
+
+    #[cold]
+    fn reorder_linked(&mut self, index: usize, mut image: GraphicsPlacement, delta: [i64; 2]) {
+        let previous = &self.images[index];
+        image.serial = previous.serial;
+        image.parent = previous.parent;
+        image.root = previous.root;
+        let moved = if image.parent.is_some() {
+            image.row = previous.row;
+            image.column = previous.column;
+            false
+        } else {
+            image.row != previous.row || image.column != previous.column
+        };
+        if delta != [0; 2] {
+            image.shift_relative(delta);
+            self.shift_relative_descendants(index, delta);
+        }
+
+        self.images.remove(index);
+        let position = self.draw_position(&image);
+        self.images.insert(position, image);
+        if index != position {
+            self.reindex();
+            self.refresh_root_indices();
+        }
+        if moved {
+            self.sync_graph(false);
+        }
+        self.changed();
     }
 
     fn shift_relative_descendants(&mut self, index: usize, delta: [i64; 2]) {

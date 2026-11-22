@@ -231,19 +231,30 @@ fn visit_indexed_rows<'a>(
             let left = previous
                 .filter(|(index, old_colors, _)| *index + 1 == column && *old_colors == colors)
                 .map(|(_, _, placeholder)| placeholder);
-            let marks = if cell.has_extended_text() {
-                row.next_extended_text(column, &mut next_extended)
+            let glyph = if cell.has_extended_text() {
+                let marks = row
+                    .next_extended_text(column, &mut next_extended)
                     .strip_prefix(GRAPHICS_PLACEHOLDER)
-                    .unwrap_or_default()
+                    .unwrap_or_default();
+                GraphicsPlaceholder::decode(
+                    marks.chars(),
+                    color_id(colors[0]),
+                    color_id(colors[1]),
+                    left,
+                )
+            } else if let Some(previous) = left
+                && let Some(column) = previous.column.checked_add(1)
+            {
+                Some(GraphicsPlaceholder { column, ..previous })
             } else {
-                ""
+                GraphicsPlaceholder::decode(
+                    std::iter::empty(),
+                    color_id(colors[0]),
+                    color_id(colors[1]),
+                    left,
+                )
             };
-            let Some(glyph) = GraphicsPlaceholder::decode(
-                marks.chars(),
-                color_id(colors[0]),
-                color_id(colors[1]),
-                left,
-            ) else {
+            let Some(glyph) = glyph else {
                 continue;
             };
             previous = Some((column, colors, glyph));

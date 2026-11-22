@@ -123,6 +123,7 @@ pub(super) enum ImageTextures {
 pub(super) struct TextureTiles {
     pub tiles: Vec<TextureTile>,
     pub layout: u64,
+    pub max_tile_pixels: u32,
     step: [u32; 2],
     count: [u32; 2],
 }
@@ -286,6 +287,7 @@ impl TextureTiles {
         });
         let count = [width.div_ceil(step_x), height.div_ceil(step_y)];
         let mut tiles = Vec::with_capacity((count[0] * count[1]) as usize);
+        let mut max_tile_pixels = 0;
         for y in (0..height).step_by(step_y as usize) {
             for x in (0..width).step_by(step_x as usize) {
                 let visible = PixelRegion {
@@ -302,6 +304,7 @@ impl TextureTiles {
                             - origin[axis]
                     }),
                 };
+                max_tile_pixels = max_tile_pixels.max(storage.pixel_count());
                 tiles.push(TextureTile {
                     region: TileRegion { visible, storage },
                     resident: None,
@@ -313,6 +316,7 @@ impl TextureTiles {
         Self {
             tiles,
             layout: 0,
+            max_tile_pixels,
             step: [step_x, step_y],
             count,
         }
@@ -348,17 +352,23 @@ impl TextureTiles {
                 let Some(clip) = tile.resident_clip(region) else {
                     continue;
                 };
+                if tile.needs_upload() {
+                    return Some(false);
+                }
                 let limit = *visible_limit.get_or_insert_with(|| {
-                    damage_regions(bounds)
+                    let pixels = damage_regions(bounds)
                         .map(PixelRegion::pixel_count)
-                        .sum::<u32>()
-                        * 3
-                        / 4
+                        .sum::<u32>();
+                    if pixels <= self.max_tile_pixels {
+                        pixels * 3 / 4
+                    } else {
+                        u32::MAX
+                    }
                 });
                 let pixels = clip.pixel_count();
                 visible_pixels += pixels;
-                // Keep the shared rasterization path when the visible clips cover most of the damage.
-                if visible_pixels > limit || tile.needs_upload() {
+                // Share small rasterizations when most of their pixels will be used.
+                if visible_pixels > limit {
                     return None;
                 }
                 largest = largest.max(pixels);
@@ -498,60 +508,50 @@ impl ImageTextures {
         image: &GraphicsImage,
         scratch: &mut Vec<u8>,
     ) -> bool {
-        let bytes_per_pixel = image.format().bytes_per_pixel();
-        if let Self::Tiled(tiles) = self
-            && tiles
-                .tiles
-                .iter()
-                .any(|tile| tile.needs_upload() || tile.visible_layout != tiles.layout)
-        {
-            let largest = tiles
-                .tiles
-                .iter()
-                .filter(|tile| tile.visible_layout == tiles.layout && tile.resident.is_some())
-                .map(|tile| {
-                    let [width, height] = tile.region.storage.size;
-                    width as usize * height as usize * bytes_per_pixel as usize
-                })
-                .max()
-                .unwrap_or(0);
-            // Reserve before queuing writes to preserve the resident revision on allocation failure.
-            if scratch
-                .try_reserve_exact(largest.saturating_sub(scratch.len()))
-                .is_err()
-            {
-                return false;
-            }
-            for tile in &mut tiles.tiles {
-                let Some(binding) = &tile.resident else {
-                    continue;
-                };
-                if tile.visible_layout != tiles.layout {
-                    tile.damage = TileDamage::Full;
-                    continue;
-                }
-                let region = tile.region.storage;
-                let Some(update) = image.pixel_region(region.origin, region.size, scratch) else {
+        let tiles = match self {
+            Self::Single(binding) => {
+                let Some(bytes) = image.pixels(scratch) else {
                     return false;
                 };
-                write_texture(queue, &binding.texture, update.bytes, update.bytes_per_row);
-                tile.damage = TileDamage::Clean;
+                write_texture(
+                    queue,
+                    &binding.texture,
+                    bytes,
+                    image.dimensions().0 * image.format().bytes_per_pixel(),
+                );
+                return true;
             }
-        } else {
-            let Some(bytes) = image.pixels(scratch) else {
+            Self::Tiled(tiles) => tiles,
+        };
+        let largest = tiles
+            .tiles
+            .iter()
+            .filter(|tile| tile.visible_layout == tiles.layout && tile.resident.is_some())
+            .map(|tile| tile.region.storage.pixel_count() as usize)
+            .max()
+            .unwrap_or(0)
+            * image.format().bytes_per_pixel() as usize;
+        // Reserve before queuing writes to preserve the resident revision on allocation failure.
+        if scratch
+            .try_reserve_exact(largest.saturating_sub(scratch.len()))
+            .is_err()
+        {
+            return false;
+        }
+        for tile in &mut tiles.tiles {
+            let Some(binding) = &tile.resident else {
+                continue;
+            };
+            if tile.visible_layout != tiles.layout {
+                tile.damage = TileDamage::Full;
+                continue;
+            }
+            let region = tile.region.storage;
+            let Some(update) = image.pixel_region(region.origin, region.size, scratch) else {
                 return false;
             };
-            let (width, height) = image.dimensions();
-            self.write(
-                queue,
-                PixelRegion {
-                    origin: [0, 0],
-                    size: [width, height],
-                },
-                bytes,
-                width * bytes_per_pixel,
-                bytes_per_pixel,
-            );
+            write_texture(queue, &binding.texture, update.bytes, update.bytes_per_row);
+            tile.damage = TileDamage::Clean;
         }
         true
     }

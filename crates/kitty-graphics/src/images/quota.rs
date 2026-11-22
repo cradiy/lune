@@ -93,7 +93,9 @@ impl ImageStore {
                     return None;
                 }
                 let (anonymous, transient, age) = match entry {
-                    StoredImage::Named(image_data) => (false, image_data.transient, image_data.age),
+                    StoredImage::Named(image_data) => {
+                        (false, image_data.transient_for_eviction(), image_data.age)
+                    }
                     StoredImage::Anonymous {
                         revision,
                         transient,

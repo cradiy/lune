@@ -222,17 +222,22 @@ impl ImageTextureResources {
         instances: &[(usize, ImageInstance)],
         scratch: &mut Vec<u8>,
     ) -> bool {
-        let previous_layout = tiles.layout.wrapping_sub(1);
-        // Keep tile-sized scratch when expanding a previously cropped resident image.
-        if instances.len() == tiles.tiles.len()
-            && tiles.tiles.iter().all(|tile| {
-                tile.needs_full_upload()
-                    && (tile.resident.is_none() || tile.visible_layout == previous_layout)
-            })
-        {
-            return self.upload_all_tiles(device, queue, image, tiles, scratch);
-        }
         let format = image.format();
+        if instances.len() == tiles.tiles.len()
+            && tiles.tiles.iter().all(|tile| tile.needs_full_upload())
+        {
+            if let Some(GraphicsPixelUpdates::One(update)) = image.pixel_updates(None, scratch) {
+                self.upload_all_tiles(device, queue, format, tiles, update);
+                return true;
+            }
+            let largest = tiles.max_tile_pixels as usize * format.bytes_per_pixel() as usize;
+            if scratch
+                .try_reserve_exact(largest.saturating_sub(scratch.len()))
+                .is_err()
+            {
+                return false;
+            }
+        }
         for &(index, _) in instances {
             let tile = &mut tiles.tiles[index];
             let storage = tile.region.storage;
@@ -261,34 +266,27 @@ impl ImageTextureResources {
         &self,
         device: &Device,
         queue: &Queue,
-        image: &GraphicsImage,
+        format: GraphicsImageFormat,
         tiles: &mut TextureTiles,
-        scratch: &mut Vec<u8>,
-    ) -> bool {
-        let Some(pixels) = image.pixels(scratch) else {
-            return false;
-        };
-        let format = image.format();
-        let bind = self.bindings(device, format, pixels);
+        update: GraphicsPixelUpdate<'_>,
+    ) {
+        let bind = self.bindings(device, format, update.bytes);
         for tile in &mut tiles.tiles {
             tile.resident
                 .get_or_insert_with(|| bind(tile.region.storage.size));
             tile.visible_layout = tiles.layout;
             tile.damage = TileDamage::Clean;
         }
-        let (width, height) = image.dimensions();
-        let bytes_per_pixel = format.bytes_per_pixel();
         tiles.write(
             queue,
             PixelRegion {
-                origin: [0, 0],
-                size: [width, height],
+                origin: update.origin,
+                size: update.size,
             },
-            pixels,
-            width * bytes_per_pixel,
-            bytes_per_pixel,
+            update.bytes,
+            update.bytes_per_row,
+            format.bytes_per_pixel(),
         );
-        true
     }
 }
 

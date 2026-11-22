@@ -122,6 +122,13 @@ impl Animation {
         }
     }
 
+    #[inline]
+    pub(crate) fn awaiting_frame(&self) -> bool {
+        self.playback.mode == PlaybackMode::Loading
+            && matches!(self.playback.timing, Timing::Showing(_))
+            && self.timed_frame_at_or_after(self.current + 1).is_none()
+    }
+
     pub(crate) fn playing(&self) -> bool {
         self.playback.mode != PlaybackMode::Stopped
     }
@@ -156,19 +163,12 @@ impl Animation {
         let gap = self
             .frame(self.current)
             .expect("Current animation frame")
-            .gap_ms;
+            .gap_ms();
         let gap = Duration::from_millis(u64::from(gap));
         let (mut shown, mut next_at) = match timing {
             Timing::Showing(shown) => (shown, shown.checked_add(gap)?),
             Timing::Start => (now, now.checked_add(gap)?),
-            Timing::Waiting(shown) => {
-                // Keep the current frame's remaining gap and start new frames at this wake.
-                let deadline = shown.checked_add(gap)?;
-                if deadline > now {
-                    return Some(deadline);
-                }
-                (shown, now)
-            }
+            Timing::Waiting(shown) => (shown, shown.checked_add(gap)?.max(now)),
         };
         let mut index = self.current + 1;
         while next_at <= now {
@@ -197,12 +197,12 @@ impl Animation {
 
     #[inline]
     fn timed_frame_at_or_after(&self, index: usize) -> Option<(usize, u32)> {
-        let gap = self.frame(index)?.gap_ms;
+        let gap = self.frame(index)?.gap_ms();
         if gap != 0 {
             return Some((index, gap));
         }
         let frame = self.timed_extra.first_from(index.saturating_sub(1))?;
-        Some((frame + 1, self.extra[frame].gap_ms))
+        Some((frame + 1, self.extra[frame].gap_ms()))
     }
 
     fn skip_elapsed_loops(&mut self, at: Instant, now: Instant) -> Option<Instant> {
@@ -221,7 +221,7 @@ impl Animation {
             let end =
                 at.checked_add(Duration::from_millis(self.total_gap_ms).checked_mul(remaining)?)?;
             let last = self.timed_extra.last().map_or(0, |index| index + 1);
-            let gap = self.frame(last).expect("A timed frame").gap_ms;
+            let gap = self.frame(last).expect("A timed frame").gap_ms();
             self.current = last;
             self.playback.completed_loops = limit.get();
             self.playback.timing =

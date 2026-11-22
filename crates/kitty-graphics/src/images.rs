@@ -142,6 +142,14 @@ impl<'a> PixelUpdate<'a> {
 }
 
 impl Image {
+    fn transient_for_eviction(&self) -> bool {
+        self.transient
+            || self
+                .animation
+                .as_ref()
+                .is_some_and(|animation| animation.current_frame_is_transient())
+    }
+
     pub fn dimensions(&self) -> (u32, u32) {
         (self.width, self.height)
     }
@@ -231,7 +239,13 @@ impl Image {
             return Err(INDEXED);
         }
         if let Some(animation) = self.animation.as_mut() {
-            return operation(animation, &self.bytes);
+            // A frame can arrive before the loading tail's expired wake is polled.
+            let awaiting_frame = animation.awaiting_frame();
+            operation(animation, &self.bytes)?;
+            if awaiting_frame {
+                animation.suspend();
+            }
+            return Ok(());
         }
         if let Some(animation) = spare.as_mut() {
             if let Err(error) = operation(animation, &self.bytes) {
@@ -722,7 +736,7 @@ impl ImageStore {
             )?;
             if let Some(frame) = transfer.frame {
                 self.apply_frame(transfer.key, |animation, canvas| {
-                    animation.upload(frame, pixels, canvas)
+                    animation.upload(frame, pixels, canvas, transfer.transient)
                 })?;
             } else if transfer.action != b'q' && (id != 0 || transfer.placement.is_some()) {
                 self.store(
@@ -886,7 +900,8 @@ impl ImageStore {
         let extra = if display {
             Placement::KEYS
         } else if frame {
-            const { control_keys(LOAD_FIELDS) }
+            // icat can include C on frame uploads. Kitty uses X for their blend mode.
+            const { control_keys(LOAD_FIELDS) | control_keys(b"C") }
         } else {
             0
         };

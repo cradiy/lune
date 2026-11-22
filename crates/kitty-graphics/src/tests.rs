@@ -100,6 +100,68 @@ fn quota_and_query_preserve_stored_pixels() {
 }
 
 #[test]
+fn quota_uses_the_selected_frames_transient_hint_after_composition() {
+    let receive = |images: &mut ImageStore, input: &[u8]| {
+        feed(input, 7, |command| {
+            let command = command.unwrap();
+            if let Some(delete) = command.decode_delete() {
+                images.delete_frame(delete.unwrap(), |_| Ok(()));
+            } else if let Some(reply) = images.receive(command, |_| Ok(())) {
+                assert_eq!(reply.message, b"OK");
+            }
+        });
+    };
+    for (wire, evicted) in [
+        (b"".as_slice(), 1),
+        (b"\x1b_Ga=a,i=2,c=2,r=2,z=15\x1b\\", 2),
+        (
+            concat!(
+                "\x1b_Ga=f,i=2,c=2,s=1,v=1,x=1,X=1;AP8A/w==\x1b\\",
+                "\x1b_Ga=d,d=f,i=2,r=2\x1b\\\x1b_Ga=a,i=2,c=2\x1b\\",
+            )
+            .as_bytes(),
+            2,
+        ),
+        (
+            concat!(
+                "\x1b_Ga=f,i=2,s=1,v=1;AP8A/w==\x1b\\",
+                "\x1b_Ga=c,i=2,r=2,c=3,w=1,h=1,C=1\x1b\\",
+                "\x1b_Ga=d,d=f,i=2,r=2\x1b\\\x1b_Ga=a,i=2,c=2\x1b\\",
+            )
+            .as_bytes(),
+            2,
+        ),
+        (
+            concat!(
+                "\x1b_Ga=f,i=2,s=1,v=1;AP8A/w==\x1b\\",
+                "\x1b_Ga=c,i=2,r=3,c=2,C=1\x1b\\",
+                "\x1b_Ga=d,d=f,i=2,r=3\x1b\\\x1b_Ga=a,i=2,c=2\x1b\\",
+            )
+            .as_bytes(),
+            2,
+        ),
+    ] {
+        let mut images = ImageStore::new(4096, 2);
+        receive(
+            &mut images,
+            concat!(
+                "\x1b_Gi=1,s=1,v=1;AAAA/w==\x1b\\",
+                "\x1b_Gi=2,s=2,v=1;AAAA/wAAAP8=\x1b\\",
+                "\x1b_Ga=f,i=2,s=1,v=1,N=1;/wAA/w==\x1b\\",
+            )
+            .as_bytes(),
+        );
+        receive(&mut images, wire);
+        receive(&mut images, b"\x1b_Gi=3,s=1,v=1;AAAA/w==\x1b\\");
+        assert!(
+            images.get(evicted).is_none(),
+            "Expected to evict image {evicted}"
+        );
+        assert!(images.get(3 - evicted).is_some());
+    }
+}
+
+#[test]
 fn quota_evicts_the_shortest_priority_prefix_after_placement_succeeds() {
     let mut images = ImageStore::new(28, 6);
     let wire = concat!(
@@ -245,7 +307,7 @@ fn animation_frames_commit_complete_patches_and_keep_the_current_surface_on_fail
     assert!(
         receive(
             &mut images,
-            b"\x1b_Ga=f,I=17,c=1,x=1,s=1,v=1,m=1;AP8A\x1b\\"
+            b"\x1b_Ga=f,I=17,c=1,x=1,s=1,v=1,C=1,m=1;AP8A\x1b\\"
         )
         .is_none()
     );
@@ -256,7 +318,7 @@ fn animation_frames_commit_complete_patches_and_keep_the_current_surface_on_fail
 
     let reply = receive(
         &mut images,
-        b"\x1b_Ga=f,I=17,c=1,x=1,s=1,v=1,m=1;AP8A\x1b\\\x1b_Ga=f,m=0;gA==\x1b\\",
+        b"\x1b_Ga=f,I=17,c=1,x=1,s=1,v=1,C=1,m=1;AP8A\x1b\\\x1b_Ga=f,m=0;gA==\x1b\\",
     )
     .unwrap();
     assert_eq!((reply.id, reply.number, reply.frame_number), (0, 17, 2));

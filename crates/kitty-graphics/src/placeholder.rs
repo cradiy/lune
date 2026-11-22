@@ -18,12 +18,7 @@ impl Placeholder {
         if low_image_id > 0xff_ffff {
             return None;
         }
-        let mut marks = marks.map(|mark| {
-            DIACRITICS
-                .binary_search(&(mark as u32))
-                .ok()
-                .map(|i| i as u16)
-        });
+        let mut marks = marks.map(diacritic_index);
         let mut next = || match marks.next() {
             Some(Some(value)) => Some(Some(value)),
             Some(None) => None,
@@ -59,6 +54,53 @@ impl Placeholder {
     }
 }
 
+const BLOCK_SIZE: usize = 64;
+const BLOCK_MAP_SIZE: usize = DIACRITICS[DIACRITICS.len() - 1] as usize / BLOCK_SIZE + 1;
+const BLOCK_COUNT: usize = {
+    let mut count = 2;
+    let mut index = 1;
+    while index < DIACRITICS.len() {
+        if DIACRITICS[index] as usize / BLOCK_SIZE != DIACRITICS[index - 1] as usize / BLOCK_SIZE {
+            count += 1;
+        }
+        index += 1;
+    }
+    count
+};
+
+struct DiacriticIndex {
+    blocks: [u8; BLOCK_MAP_SIZE],
+    values: [[u16; BLOCK_SIZE]; BLOCK_COUNT],
+}
+
+// Block zero represents all unassigned blocks. A stored value is the protocol index plus one.
+static DIACRITIC_INDEX: DiacriticIndex = {
+    let mut table = DiacriticIndex {
+        blocks: [0; BLOCK_MAP_SIZE],
+        values: [[0; BLOCK_SIZE]; BLOCK_COUNT],
+    };
+    let mut next_block = 1;
+    let mut index = 0;
+    while index < DIACRITICS.len() {
+        let scalar = DIACRITICS[index] as usize;
+        let block = &mut table.blocks[scalar / BLOCK_SIZE];
+        if *block == 0 {
+            *block = next_block;
+            next_block += 1;
+        }
+        table.values[*block as usize][scalar % BLOCK_SIZE] = index as u16 + 1;
+        index += 1;
+    }
+    table
+};
+
+#[inline]
+fn diacritic_index(mark: char) -> Option<u16> {
+    let scalar = mark as usize;
+    let block = usize::from(*DIACRITIC_INDEX.blocks.get(scalar / BLOCK_SIZE)?);
+    DIACRITIC_INDEX.values[block][scalar % BLOCK_SIZE].checked_sub(1)
+}
+
 // Index order is defined by Kitty's row/column diacritics table.
 const DIACRITICS: [u32; 297] = [
     0x305, 0x30d, 0x30e, 0x310, 0x312, 0x33d, 0x33e, 0x33f, 0x346, 0x34a, 0x34b, 0x34c, 0x350,
@@ -87,3 +129,21 @@ const DIACRITICS: [u32; 297] = [
     0x1d185, 0x1d186, 0x1d187, 0x1d188, 0x1d189, 0x1d1aa, 0x1d1ab, 0x1d1ac, 0x1d1ad, 0x1d242,
     0x1d243, 0x1d244,
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::{BLOCK_MAP_SIZE, BLOCK_SIZE, DIACRITICS, diacritic_index};
+
+    #[test]
+    fn diacritic_index_preserves_protocol_order_and_rejects_unassigned_scalars() {
+        for scalar in (0..=(BLOCK_MAP_SIZE * BLOCK_SIZE) as u32).chain([char::MAX as u32]) {
+            if let Some(mark) = char::from_u32(scalar) {
+                let expected = DIACRITICS
+                    .binary_search(&scalar)
+                    .ok()
+                    .map(|index| index as u16);
+                assert_eq!(diacritic_index(mark), expected, "U+{scalar:04X}");
+            }
+        }
+    }
+}

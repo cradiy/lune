@@ -85,7 +85,7 @@ fn kitty_images_commit_after_the_last_chunk_and_keep_reply_order() {
             "\x1b_Ga=q,i=39,e=T;ignored\x18",
             "\x1b_Ga=q,i=31,e=T,t=d,U=1,C=1,f=32,s=10000,v=10001,N=1,P=2,H=-3,m=1;%%ignored%%\x1b\\",
             "\x1b_Ga=q,i=32,e=a,s=3,c=2\x1b\\",
-            "\x1b_Ga=q,i=33,e=f,r=1,X=1,f=16,N=1\x1b\\",
+            "\x1b_Ga=q,i=33,e=f,r=1,X=1,C=1,f=16,N=1\x1b\\",
             "\x1b_Ga=q,i=34,e=W,c=2\x1b\\",
             "\x1b_Ga=q,i=35,I=0,e=T\x1b\\",
             "\x1b_Ga=q,i=36,e=d,d=a\x1b\\",
@@ -1160,6 +1160,14 @@ fn kitty_relative_placements_follow_parent_replacement_and_release_descendants()
     );
     assert_eq!(session.screen().graphics_placements()[3].placement.z, 2);
 
+    session.transport.source = Cursor::new(b"\x1b[2;7H\x1b_Ga=p,i=20,p=1,z=2,C=1,q=1\x1b\\");
+    session.pump().unwrap();
+    assert_eq!(points(&session), [(6, 2), (8, 1), (7, 1), (6, 1)]);
+
+    session.transport.source = Cursor::new(b"\x1b_Ga=p,i=21,p=2,P=20,Q=1,H=-3,V=1,z=3,q=1\x1b\\");
+    session.pump().unwrap();
+    assert_eq!(points(&session), [(5, 1), (7, 1), (6, 1), (3, 2)]);
+
     session.transport.source = Cursor::new(
         concat!(
             "\x1b[3;7H\x1b_Ga=T,i=23,s=1,v=1,C=1,q=1;AAAA/w==\x1b\\",
@@ -2157,6 +2165,20 @@ fn kitty_images_compose_in_an_offscreen_wgpu_pass() {
     assert_eq!(renderer.cached_texture(image), Some(&first_tile));
     assert!(renderer.pixel_scratch_capacity() <= 128 * 128 * 4);
     assert_eq!(pixel(&read_frame(&renderer), 0, 0), [255, 0, 0, 255]);
+    {
+        let mut whole = crate::ImageRenderer::new(&device, format);
+        for (wire, color) in [
+            (b"".as_slice(), [255, 0, 0, 255]),
+            (b"\x1b_Ga=a,i=47,c=4,q=2\x1b\\", [0, 255, 0, 255]),
+        ] {
+            send(&mut tiled, wire);
+            let frame = tiled.presentation_frame().unwrap();
+            assert_eq!(whole.prepare(&device, &queue, &frame), 0);
+            assert_eq!(whole.resident_image_tiles(image), 4);
+            assert_eq!(pixel(&read_frame(&whole), 0, 0), color);
+            assert!(whole.pixel_scratch_capacity() <= 128 * 128 * 4, "{color:?}");
+        }
+    }
     send(
         &mut tiled,
         concat!(
@@ -2167,6 +2189,40 @@ fn kitty_images_compose_in_an_offscreen_wgpu_pass() {
         )
         .as_bytes(),
     );
+    {
+        let mut overlapping = crate::ImageRenderer::new(&device, format);
+        for (row, pixels) in [(0, "/wAAgP8AAID/AACA"), (49, "AP8AgAD/AIAA/wCA")] {
+            let wire = format!(
+                "\x1b_Ga=f,i=47,c=1,y={row},s=129,v=80,q=2;{}\x1b\\",
+                pixels.repeat(129 * 80 / 3),
+            );
+            send(&mut tiled, wire.as_bytes());
+        }
+        send(
+            &mut tiled,
+            b"\x1b[H\x1b_Ga=p,i=47,p=7,c=2,r=2,C=1,q=2\x1b\\",
+        );
+        for (current, top, bottom) in [
+            (2, [128, 0, 0, 255], [0, 0, 0, 255]),
+            (3, [0, 0, 0, 255], [0, 128, 0, 255]),
+            (2, [128, 0, 0, 255], [0, 0, 0, 255]),
+        ] {
+            let wire = format!("\x1b_Ga=a,i=47,c={current},q=2\x1b\\");
+            send(&mut tiled, wire.as_bytes());
+            let frame = tiled.presentation_frame().unwrap();
+            assert_eq!(overlapping.prepare(&device, &queue, &frame), 0);
+            let output = read_frame(&overlapping);
+            assert_eq!([pixel(&output, 0, 0), pixel(&output, 0, 3)], [top, bottom]);
+            assert!(
+                overlapping.pixel_scratch_capacity() <= 128 * 128 * 4,
+                "frame {current}"
+            );
+        }
+        send(
+            &mut tiled,
+            b"\x1b_Ga=a,i=47,c=1,q=2\x1b\\\x1b_Ga=d,d=f,i=47,r=3\x1b\\\x1b_Ga=d,d=f,i=47,r=2\x1b\\\x1b_Ga=d,d=i,i=47,p=7\x1b\\",
+        );
+    }
     {
         let mut renderer = crate::ImageRenderer::new(&device, format);
         let mut render = |tiled: &Session<Transport>| {
@@ -3186,6 +3242,66 @@ fn kitty_placeholder_damage_follows_placeholder_rows() {
 }
 
 #[test]
+fn kitty_text_line_edits_move_only_unicode_placeholders_and_their_children() {
+    let mut session = session_with_size(
+        concat!(
+            "\x1b[3;2H\x1b_Ga=T,i=1,p=1,s=1,v=1,C=1,q=2;AAAA/w==\x1b\\",
+            "\x1b_Ga=T,i=2,P=1,Q=1,H=1,s=1,v=1,q=2;AAAA/w==\x1b\\",
+            "\x1b_Ga=T,i=3,p=1,U=1,c=1,r=1,s=1,v=1,q=2;AAAA/w==\x1b\\",
+            "\x1b_Ga=T,i=4,P=3,Q=1,H=1,s=1,v=1,q=2;AAAA/w==\x1b\\",
+            "\x1b[3;5H\x1b[38;5;3;58;5;1m\u{10eeee}\x1b[0m",
+        )
+        .as_bytes(),
+        PtySize {
+            pixel_width: 16,
+            pixel_height: 12,
+            ..PtySize::new(6, 8)
+        },
+    );
+    let mut cache = lune_terminal::GraphicsPlaceholderCache::default();
+    let mut check = |session: &Session<Transport>, anchored_row, placeholder_row| {
+        let frame = session.presentation_frame().unwrap();
+        let placements = frame.graphics_placements();
+        let mut cells = Vec::new();
+        cache
+            .visit(
+                frame.graphics_revision.unwrap(),
+                placements,
+                frame.viewport,
+                frame.styles,
+                frame.geometry.cell_pixels().unwrap(),
+                Some(|run: lune_terminal::GraphicsPlaceholderRun| cells.push(run.position)),
+            )
+            .unwrap();
+        assert_eq!(cells, [[4, placeholder_row]]);
+        let origins: Vec<_> = placements
+            .iter()
+            .filter(|placement| !placement.is_virtual())
+            .map(|placement| {
+                placement
+                    .origin_in_view(frame.viewport.offset(), |parent| cache.origin(parent))
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(
+            origins,
+            [[1, anchored_row], [2, anchored_row], [5, placeholder_row]]
+        );
+    };
+    session.pump().unwrap();
+    check(&session, 2, 2);
+    for (command, anchored_row, placeholder_row) in [
+        (b"\x1b[2;1H\x1b[2L".as_slice(), 2, 4),
+        (b"\x1b[M", 2, 3),
+        (b"\x1b[S", 1, 2),
+    ] {
+        session.transport.source = Cursor::new(command);
+        session.pump().unwrap();
+        check(&session, anchored_row, placeholder_row);
+    }
+}
+
+#[test]
 fn kitty_virtual_children_use_live_placeholder_bounds_for_coordinate_deletion() {
     for delete in [
         b"\x1b[2;3H\x1b_Ga=d,d=C\x1b\\".as_slice(),
@@ -3461,8 +3577,19 @@ fn kitty_animation_waits_for_placement_and_only_damages_visible_images() {
     assert_eq!(current(&session), [0, 255, 0, 255]);
     assert_eq!(session.presentation_deadline(), Some(at(120)));
 
+    session.transport.source = Cursor::new(b"\x1b[?1049h");
+    session.pump_with_clock(|| at(104)).unwrap();
+    assert_eq!(session.presentation_deadline(), None);
+    assert!(session.graphics_image(1).is_none());
+    session.transport.source = Cursor::new(b"\x1b[?1049l");
+    session.pump_with_clock(|| at(112)).unwrap();
+    assert_eq!(session.presentation_deadline(), Some(at(120)));
+    session.pump_with_clock(|| at(137)).unwrap();
+    assert_eq!(current(&session), [0, 255, 0, 255]);
+    assert_eq!(session.presentation_deadline(), Some(at(150)));
+
     session.transport.source = Cursor::new(b"\x1b_Ga=d,d=i,i=1\x1b\\");
-    session.pump_with_clock(|| at(115)).unwrap();
+    session.pump_with_clock(|| at(145)).unwrap();
     assert_eq!(session.presentation_deadline(), None);
     session.pump_with_clock(|| at(800)).unwrap();
     assert_eq!(current(&session), [0, 255, 0, 255]);
@@ -3686,24 +3813,28 @@ fn kitty_streamed_animation_preserves_frame_time_across_loading_waits() {
         ([0, 255, 0, 255], Some(at(120)))
     );
     assert_eq!(pump(120, b""), ([0, 0, 255, 255], Some(at(150))));
-    assert_eq!(pump(150, b""), ([0, 0, 255, 255], None));
     assert_eq!(
-        pump(160, b"\x1b_Ga=a,i=1,r=3,z=80\x1b\\"),
-        ([0, 0, 255, 255], Some(at(200)))
+        pump(155, b"\x1b_Ga=f,i=1,s=1,v=1,z=40,q=1;/////w==\x1b\\"),
+        ([255, 255, 255, 255], Some(at(195)))
+    );
+    assert_eq!(pump(195, b""), ([255, 255, 255, 255], None));
+    assert_eq!(
+        pump(205, b"\x1b_Ga=a,i=1,r=4,z=80\x1b\\"),
+        ([255, 255, 255, 255], Some(at(235)))
     );
     assert_eq!(
-        pump(170, b"\x1b_Ga=f,i=1,s=1,v=1,z=40,q=1;/////w==\x1b\\"),
-        ([0, 0, 255, 255], Some(at(200)))
+        pump(215, b"\x1b_Ga=f,i=1,s=1,v=1,z=25,q=1;/wD//w==\x1b\\"),
+        ([255, 255, 255, 255], Some(at(235)))
     );
-    assert_eq!(pump(200, b""), ([255, 255, 255, 255], Some(at(240))));
+    assert_eq!(pump(240, b""), ([255, 0, 255, 255], Some(at(260))));
     assert_eq!(
         pump(300, b"\x1b_Ga=a,i=1,c=1,s=3,v=3\x1b\\"),
         ([255, 0, 0, 255], Some(at(310)))
     );
-    assert_eq!(pump(700, b""), ([255, 255, 255, 255], None));
+    assert_eq!(pump(700, b""), ([255, 0, 255, 255], None));
     assert_eq!(
-        pump(700, b"\x1b_Ga=a,i=1,v=1,r=4,z=200\x1b\\"),
-        ([255, 255, 255, 255], Some(at(760)))
+        pump(700, b"\x1b_Ga=a,i=1,v=1,r=5,z=200\x1b\\"),
+        ([255, 0, 255, 255], Some(at(805)))
     );
 }
 
