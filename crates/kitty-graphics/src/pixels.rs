@@ -231,6 +231,7 @@ impl PixelTransfer {
     ) -> Result<Pixels, &'static [u8]> {
         let bytes = match self.compression {
             Compression::Zlib => {
+                // A local file or shared memory range can contain bytes after the zlib stream.
                 let decoder = &mut inflater.restart().decoder;
                 match self.expected {
                     Some(size) => inflate(
@@ -360,7 +361,8 @@ impl InflateState {
         capacity: usize,
         output: &mut Vec<u8>,
     ) -> Result<(), &'static [u8]> {
-        let remaining = wire_limit - self.decoder.total_in() as usize;
+        let input_offset = self.decoder.total_in() as usize;
+        let remaining = wire_limit - input_offset;
         let estimated = base64::decoded_len_estimate(encoded).min(remaining);
         self.input
             .try_reserve_exact(estimated.saturating_sub(self.input.len()))
@@ -385,6 +387,10 @@ impl InflateState {
             output.try_reserve_exact(capacity).map_err(|_| QUOTA)?;
         }
         self.ended = inflate_chunk(&mut self.decoder, input, size, capacity, output, more)?;
+        // Direct blocks contain only zlib stream bytes.
+        if self.ended && self.decoder.total_in() as usize - input_offset != length {
+            return Err(INVALID);
+        }
         Ok(())
     }
 }
@@ -415,7 +421,7 @@ fn inflate_chunk(
             return Err(INVALID);
         }
         if status == Status::StreamEnd {
-            if !input.is_empty() || total != size {
+            if total != size {
                 return Err(INVALID);
             }
             return Ok(true);
@@ -463,12 +469,8 @@ fn inflate_limited(
             return Err(QUOTA);
         }
         if status == Status::StreamEnd {
-            return if decoder.total_in() == bytes.len() as u64 {
-                output.truncate(decoded);
-                Ok(output)
-            } else {
-                Err(INVALID)
-            };
+            output.truncate(decoded);
+            return Ok(output);
         }
         if decoded == filled && input == decoder.total_in() {
             return Err(INVALID);
@@ -547,7 +549,7 @@ mod tests {
         assert_eq!(inflate(&stream[..stream.len() - 1], limit), Err(INVALID));
         let mut trailing = stream.clone();
         trailing.push(0);
-        assert_eq!(inflate(&trailing, limit), Err(INVALID));
+        assert_eq!(inflate(&trailing, limit).unwrap(), data);
         assert_eq!(inflate(&stream, limit).unwrap(), data);
     }
 }

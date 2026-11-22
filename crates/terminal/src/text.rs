@@ -69,26 +69,28 @@ impl<'a> ScreenView<'a> {
         self.grid.iter_rows()
     }
 
-    /// Row revisions of the oldest and newest retained history entries.
-    pub fn history_endpoints(&self) -> Option<[crate::RowRevision; 2]> {
-        let history = self.history?;
-        let first = history.row(0)?.revision();
-        let last = history.row(history.len() - 1)?.revision();
-        Some([first, last])
+    /// Revision of retained history rows within the screen.
+    pub fn history_revision(&self) -> Option<u64> {
+        self.history.and_then(RowHistory::revision)
     }
 
     pub(crate) fn placeholder_rows(&self) -> impl Iterator<Item = (i64, &'a Row)> + use<'a> {
+        self.history_placeholder_rows().chain(
+            self.grid
+                .iter_rows()
+                .enumerate()
+                .map(|(index, row)| (index as i64, row)),
+        )
+    }
+
+    pub(crate) fn history_placeholder_rows(
+        &self,
+    ) -> impl Iterator<Item = (i64, &'a Row)> + use<'a> {
         let history_rows = self.history_rows() as i64;
         self.history
             .into_iter()
             .flat_map(RowHistory::placeholder_rows)
             .map(move |(index, row)| (index as i64 - history_rows, row))
-            .chain(
-                self.grid
-                    .iter_rows()
-                    .enumerate()
-                    .map(|(index, row)| (index as i64, row)),
-            )
     }
 
     /// Borrows rows in chronological order. Skipping rows and reverse traversal

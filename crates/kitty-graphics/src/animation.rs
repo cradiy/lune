@@ -41,13 +41,15 @@ pub(crate) struct FrameUpload {
 
 impl FrameUpload {
     pub(crate) fn parse(controls: &Controls) -> Result<Self, &'static [u8]> {
+        // icat can send C for the frame upload composition mode.
+        let blend = controls.get(b'X').or_else(|| controls.get(b'C'));
         Ok(Self {
             origin: (unsigned(controls, b'x')?, unsigned(controls, b'y')?),
             number: unsigned(controls, b'r')?,
             base: unsigned(controls, b'c')?,
             gap_ms: gap(controls)?,
             background: unsigned(controls, b'Y')?.to_be_bytes(),
-            overwrite: overwrite(controls, b'X')?,
+            overwrite: overwrite(blend)?,
         })
     }
 
@@ -80,15 +82,15 @@ impl FrameComposition {
             source_origin: (unsigned(controls, b'X')?, unsigned(controls, b'Y')?),
             target_origin: (unsigned(controls, b'x')?, unsigned(controls, b'y')?),
             size: (unsigned(controls, b'w')?, unsigned(controls, b'h')?),
-            overwrite: overwrite(controls, b'C')?,
+            overwrite: overwrite(controls.get(b'C'))?,
         })
     }
 }
 
-fn overwrite(controls: &Controls, key: u8) -> Result<bool, &'static [u8]> {
-    match unsigned(controls, key)? {
-        0 => Ok(false),
-        1 => Ok(true),
+fn overwrite(value: Option<Value>) -> Result<bool, &'static [u8]> {
+    match value {
+        None | Some(Value::Unsigned(0)) => Ok(false),
+        Some(Value::Unsigned(1)) => Ok(true),
         _ => Err(INVALID),
     }
 }
@@ -510,6 +512,21 @@ impl Animation {
             dimensions,
             ImageFormat::Rgba,
         )))
+    }
+
+    pub(crate) fn pixel_region_scratch_bytes(
+        &self,
+        original: &[u8],
+        width: usize,
+        region: Region,
+    ) -> usize {
+        region_source(
+            self.current_surface().map(|surface| &surface.data),
+            original,
+            width,
+            region,
+        )
+        .scratch_len(region)
     }
 
     pub(crate) fn frame_damage(
@@ -1180,24 +1197,6 @@ enum SurfaceData {
 }
 
 impl SurfaceData {
-    fn update_two_regions<'a>(
-        &self,
-        original: &[u8],
-        width: usize,
-        [first, second]: [Region; 2],
-        scratch: &'a mut Vec<u8>,
-    ) -> Result<PixelUpdates<'a>, &'static [u8]> {
-        let first_len = first.area() * 4;
-        resize_scratch(scratch, first_len + second.area() * 4)?;
-        let (first_bytes, second_bytes) = scratch.split_at_mut(first_len);
-        self.render(original, width, first, first_bytes);
-        self.render(original, width, second, second_bytes);
-        Ok(PixelUpdates::Two([
-            first.update(first_bytes, first.width * 4),
-            second.update(second_bytes, second.width * 4),
-        ]))
-    }
-
     fn uses_original(&self) -> bool {
         matches!(self, Self::Original) || matches!(self, Self::Patch(patch) if patch.uses_original)
     }
@@ -1248,43 +1247,113 @@ impl SurfaceData {
     }
 }
 
-fn render_region<'a>(
+enum RegionSource<'a> {
+    Borrowed {
+        bytes: &'a [u8],
+        stride: usize,
+    },
+    Rasterize {
+        patch: &'a Patch,
+        overlap: Option<Region>,
+    },
+}
+
+impl<'a> RegionSource<'a> {
+    fn scratch_len(&self, region: Region) -> usize {
+        match self {
+            Self::Borrowed { .. } => 0,
+            Self::Rasterize { .. } => region.area() * 4,
+        }
+    }
+
+    #[inline]
+    fn update(
+        self,
+        original: &[u8],
+        width: usize,
+        region: Region,
+        scratch: &'a mut [u8],
+    ) -> PixelUpdate<'a> {
+        match self {
+            Self::Borrowed { bytes, stride } => region.update(bytes, stride),
+            Self::Rasterize { patch, overlap } => {
+                patch.render_base(original, width, region, scratch);
+                if let Some(overlap) = overlap {
+                    patch.apply(region, overlap, scratch);
+                }
+                region.update(scratch, region.width * 4)
+            }
+        }
+    }
+}
+
+#[inline]
+fn region_source<'a>(
     mut data: Option<&'a SurfaceData>,
     original: &'a [u8],
     width: usize,
     region: Region,
-    scratch: &'a mut Vec<u8>,
-) -> Result<PixelUpdate<'a>, &'static [u8]> {
+) -> RegionSource<'a> {
     if region.is_empty() {
-        return Ok(region.update(&[], 0));
+        return RegionSource::Borrowed {
+            bytes: &[],
+            stride: 0,
+        };
     }
-    let (patch, overlap) = loop {
+    let bytes = loop {
         let patch = match data {
-            Some(SurfaceData::Original) | None => return Ok(region.update_from(original, width, 4)),
-            Some(SurfaceData::Full(bytes)) => return Ok(region.update_from(bytes, width, 4)),
+            Some(SurfaceData::Original) | None => break original,
+            Some(SurfaceData::Full(bytes)) => break bytes,
             Some(SurfaceData::Patch(patch)) => patch,
         };
         match patch.region.intersection(region) {
             Some(overlap) if !patch.blend && overlap == region => {
                 let relative = region.relative_to(patch.region);
                 let bytes = relative.strided_bytes(patch.pixels.bytes(), patch.stride, 4);
-                return Ok(region.update(bytes, patch.stride));
+                return RegionSource::Borrowed {
+                    bytes,
+                    stride: patch.stride,
+                };
             }
-            Some(overlap) => break (patch, Some(overlap)),
+            Some(overlap) => {
+                return RegionSource::Rasterize {
+                    patch,
+                    overlap: Some(overlap),
+                };
+            }
             None => match &patch.base {
                 Base::Frame(surface) => data = Some(&surface.data),
                 Base::Original => data = None,
-                Base::Color(_) => break (patch, None),
+                Base::Color(_) => {
+                    return RegionSource::Rasterize {
+                        patch,
+                        overlap: None,
+                    };
+                }
             },
         }
     };
-    let stride = region.width * 4;
-    resize_scratch(scratch, stride * region.height)?;
-    patch.render_base(original, width, region, scratch);
-    if let Some(overlap) = overlap {
-        patch.apply(region, overlap, scratch);
+    let stride = width * 4;
+    RegionSource::Borrowed {
+        bytes: region.strided_bytes(bytes, stride, 4),
+        stride,
     }
-    Ok(region.update(scratch, stride))
+}
+
+fn render_region<'a>(
+    data: Option<&'a SurfaceData>,
+    original: &'a [u8],
+    width: usize,
+    region: Region,
+    scratch: &'a mut Vec<u8>,
+) -> Result<PixelUpdate<'a>, &'static [u8]> {
+    let source = region_source(data, original, width, region);
+    let len = source.scratch_len(region);
+    if len == 0 {
+        return Ok(source.update(original, width, region, &mut []));
+    }
+    resize_scratch(scratch, len)?;
+    Ok(source.update(original, width, region, scratch))
 }
 
 fn render_two_regions<'a>(
@@ -1301,7 +1370,23 @@ fn render_two_regions<'a>(
         Some(SurfaceData::Full(pixels)) => Ok(PixelUpdates::Two(
             regions.map(|region| region.update_from(pixels, width, 4)),
         )),
-        Some(data) => data.update_two_regions(original, width, regions, scratch),
+        Some(data) => {
+            let [first, second] = regions;
+            let first_source = region_source(Some(data), original, width, first);
+            let second_source = region_source(Some(data), original, width, second);
+            let first_len = first_source.scratch_len(first);
+            let len = first_len + second_source.scratch_len(second);
+            let (first_scratch, second_scratch) = if len == 0 {
+                (&mut [][..], &mut [][..])
+            } else {
+                resize_scratch(scratch, len)?;
+                scratch.split_at_mut(first_len)
+            };
+            Ok(PixelUpdates::Two([
+                first_source.update(original, width, first, first_scratch),
+                second_source.update(original, width, second, second_scratch),
+            ]))
+        }
     }
 }
 

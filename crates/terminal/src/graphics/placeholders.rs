@@ -32,13 +32,7 @@ impl VirtualParentOrigins {
         styles: &StyleTable,
         mut visit: impl FnMut(GraphicsPlaceholderRun),
     ) -> &Origins {
-        self.origins.clear();
-        for parent in placements
-            .iter()
-            .filter_map(GraphicsPlacement::virtual_parent)
-        {
-            self.origins.entry(parent).or_insert(None);
-        }
+        reset_origins(&mut self.origins, placements);
         index_placeholders(placements, &mut self.lookup);
         visit_indexed_rows(
             placements,
@@ -46,15 +40,29 @@ impl VirtualParentOrigins {
             styles,
             &self.lookup,
             |tile| {
-                if let Some(origin) = self.origins.get_mut(&tile.placement) {
-                    let minimum = origin.get_or_insert(tile.position);
-                    minimum[0] = minimum[0].min(tile.position[0]);
-                    minimum[1] = minimum[1].min(tile.position[1]);
-                }
+                record_origin(&mut self.origins, tile);
                 visit(tile);
             },
         );
         &self.origins
+    }
+}
+
+fn reset_origins(origins: &mut Origins, placements: &[GraphicsPlacement]) {
+    origins.clear();
+    origins.extend(
+        placements
+            .iter()
+            .filter_map(GraphicsPlacement::virtual_parent)
+            .map(|serial| (serial, None)),
+    );
+}
+
+fn record_origin(origins: &mut Origins, run: GraphicsPlaceholderRun) {
+    if let Some(origin) = origins.get_mut(&run.placement) {
+        let minimum = origin.get_or_insert(run.position);
+        minimum[0] = minimum[0].min(run.position[0]);
+        minimum[1] = minimum[1].min(run.position[1]);
     }
 }
 
@@ -71,12 +79,13 @@ pub struct GraphicsPlaceholderCache {
     sources: Option<ParentSources>,
     live_rows: Vec<Option<RowRevision>>,
     parents: VirtualParentOrigins,
+    history_origins: Origins,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct ParentSources {
     placement_revision: u64,
-    history: Option<[RowRevision; 2]>,
+    history: Option<u64>,
     cell: PixelSize,
 }
 
@@ -100,14 +109,15 @@ impl GraphicsPlaceholderCache {
         let view = viewport.source();
         let sources = ParentSources {
             placement_revision,
-            history: view.history_endpoints(),
+            history: view.history_revision(),
             cell,
         };
         let revisions = || {
             view.iter_live_rows()
                 .map(Row::graphics_placeholder_revision)
         };
-        if self.sources == Some(sources) && revisions().eq(self.live_rows.iter().copied()) {
+        let same_sources = self.sources == Some(sources);
+        if same_sources && revisions().eq(self.live_rows.iter().copied()) {
             if let Some(visit) = visit {
                 visit_indexed_rows(
                     placements,
@@ -124,11 +134,10 @@ impl GraphicsPlaceholderCache {
         self.parents.origins.clear();
         self.live_rows.clear();
         self.live_rows.try_reserve(revisions().len())?;
-        let virtual_count = placements.iter().filter(|entry| entry.is_virtual()).count();
-        self.parents.reserve(virtual_count)?;
+        let visit_history = visit.is_some() && viewport.offset() != 0;
         let offset = viewport.offset() as i64;
         let rows = 0..viewport.rows() as i64;
-        self.parents.collect(placements, view, styles, |mut run| {
+        let mut emit = |mut run: GraphicsPlaceholderRun| {
             if let Some(visit) = &mut visit {
                 run.position[1] += offset;
                 if rows.contains(&run.position[1]) {
@@ -136,7 +145,49 @@ impl GraphicsPlaceholderCache {
                     visit(run);
                 }
             }
-        });
+        };
+        if !same_sources {
+            let virtual_count = placements.iter().filter(|entry| entry.is_virtual()).count();
+            self.parents.reserve(virtual_count)?;
+            self.history_origins
+                .try_reserve(virtual_count.saturating_sub(self.history_origins.len()))?;
+            index_placeholders(placements, &mut self.parents.lookup);
+            reset_origins(&mut self.history_origins, placements);
+            visit_indexed_rows(
+                placements,
+                view.history_placeholder_rows(),
+                styles,
+                &self.parents.lookup,
+                |run| {
+                    record_origin(&mut self.history_origins, run);
+                    emit(run);
+                },
+            );
+        } else if visit_history {
+            let visible = viewport.iter_rows().take(viewport.offset());
+            visit_indexed_rows(
+                placements,
+                number_rows(visible).map(|(row, cells)| (row - offset, cells)),
+                styles,
+                &self.parents.lookup,
+                &mut emit,
+            );
+        }
+        self.parents.origins.extend(
+            self.history_origins
+                .iter()
+                .map(|(&serial, &origin)| (serial, origin)),
+        );
+        visit_indexed_rows(
+            placements,
+            number_rows(view.iter_live_rows()),
+            styles,
+            &self.parents.lookup,
+            |run| {
+                record_origin(&mut self.parents.origins, run);
+                emit(run);
+            },
+        );
         self.live_rows.extend(revisions());
         self.sources = Some(sources);
         Ok(())

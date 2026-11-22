@@ -343,7 +343,8 @@ impl TextureTiles {
     ) -> Option<bool> {
         let mut visible_limit = None;
         let mut visible_pixels = 0;
-        let mut largest = 0;
+        let mut capacity = scratch.capacity();
+        let bytes_per_pixel = image.format().bytes_per_pixel() as usize;
         for region in damage_regions(bounds) {
             for (_, tile) in self.candidates(region, FILTER_BORDER) {
                 if tile.visible_layout != self.layout {
@@ -371,14 +372,20 @@ impl TextureTiles {
                 if visible_pixels > limit {
                     return None;
                 }
-                largest = largest.max(pixels);
+                if pixels as usize * bytes_per_pixel > capacity {
+                    let Some(needed) = image.pixel_region_scratch_bytes(clip.origin, clip.size)
+                    else {
+                        return Some(false);
+                    };
+                    capacity = capacity.max(needed);
+                }
             }
         }
         if visible_pixels == 0 {
             self.mark_damage(Some(bounds));
             return Some(true);
         }
-        Some(self.rasterize_clipped_regions(queue, image, scratch, bounds, largest))
+        Some(self.rasterize_clipped_regions(queue, image, scratch, bounds, capacity))
     }
 
     #[cold]
@@ -388,9 +395,8 @@ impl TextureTiles {
         image: &GraphicsImage,
         scratch: &mut Vec<u8>,
         bounds: [GraphicsPixelBounds; 2],
-        largest: u32,
+        capacity: usize,
     ) -> bool {
-        let capacity = largest as usize * image.format().bytes_per_pixel() as usize;
         if scratch
             .try_reserve_exact(capacity.saturating_sub(scratch.len()))
             .is_err()

@@ -210,17 +210,12 @@ mod linux {
             .ok()?
             .checked_sub(source.offset)?;
         let requested = source.size.map_or(available, |size| size as u64);
-        if requested > available {
+        // A fixed-size transfer only needs the bytes covered by its pixel dimensions.
+        let len = fixed_capacity.map_or(requested, |_| limit as u64);
+        if len > requested.min(available) || len > limit as u64 {
             return None;
         }
-        let len = if fixed_capacity.is_some() {
-            limit
-        } else {
-            usize::try_from(requested).ok()?
-        };
-        if len > limit || len as u64 > requested {
-            return None;
-        }
+        let len = len as usize;
         let mut bytes = Vec::new();
         bytes
             .try_reserve_exact(fixed_capacity.unwrap_or(len))

@@ -54,6 +54,7 @@ struct Entry {
 #[derive(Debug, Default)]
 pub struct RowHistory {
     rows: VecDeque<Entry>,
+    revision: u64,
     bytes: usize,
     limits: HistoryLimits,
     // Preflight replacements for a whole atomic ASCII callback. Evicted buffers
@@ -108,6 +109,15 @@ impl RowHistory {
         self.rows.is_empty()
     }
 
+    pub(crate) fn revision(&self) -> Option<u64> {
+        (!self.rows.is_empty()).then_some(self.revision)
+    }
+
+    pub(crate) fn commit_reflow(&mut self, mut history: Self) {
+        history.revision = self.revision.wrapping_add(1);
+        *self = history;
+    }
+
     /// Allocated row-owned heap capacity, excluding the queue allocation.
     pub fn retained_bytes(&self) -> usize {
         self.bytes
@@ -142,8 +152,12 @@ impl RowHistory {
     pub(crate) fn set_limits(&mut self, limits: HistoryLimits) -> Result<(), StorageError> {
         limits.validate()?;
         self.limits = limits;
+        let before = self.rows.len();
         while self.rows.len() > limits.max_rows || self.bytes > limits.max_bytes {
             self.evict();
+        }
+        if self.rows.len() != before {
+            self.revision = self.revision.wrapping_add(1);
         }
         Ok(())
     }
@@ -152,6 +166,9 @@ impl RowHistory {
     pub(crate) fn clear(&mut self) {
         self.finish();
         self.warm_count = 0;
+        if !self.rows.is_empty() {
+            self.revision = self.revision.wrapping_add(1);
+        }
         self.rows.clear();
         self.bytes = 0;
     }
@@ -348,6 +365,7 @@ impl RowHistory {
         }
         self.rows.push_back(Entry { row, bytes });
         self.bytes += bytes;
+        self.revision = self.revision.wrapping_add(1);
         if end > 1 && (wrap.is_some() || end != grid.rows()) {
             grid.set_wrap_end(end - 2, wrap);
         }
@@ -404,6 +422,9 @@ impl RowHistory {
         grid.set_wrap_end(end - 1, None);
         if resized_join {
             self.disconnect();
+        }
+        if count != 0 {
+            self.revision = self.revision.wrapping_add(1);
         }
         Ok(())
     }

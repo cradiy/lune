@@ -190,6 +190,14 @@ impl Image {
         ))
     }
 
+    /// Returns the scratch capacity required to read an in-bounds pixel rectangle.
+    pub fn pixel_region_scratch_bytes(&self, origin: [u32; 2], size: [u32; 2]) -> Option<usize> {
+        let region = Region::checked(origin.into(), size.into(), self.dimensions()).ok()?;
+        Some(self.animation.as_ref().map_or(0, |animation| {
+            animation.pixel_region_scratch_bytes(&self.bytes, self.width as usize, region)
+        }))
+    }
+
     pub fn revision(&self) -> u64 {
         self.animation
             .as_ref()
@@ -962,7 +970,6 @@ impl ImageStore {
         let extra = if display {
             Placement::KEYS
         } else if frame {
-            // icat can include C on frame uploads. Kitty uses X for their blend mode.
             const { control_keys(LOAD_FIELDS) | control_keys(b"C") }
         } else {
             0

@@ -1852,6 +1852,21 @@ fn kitty_images_compose_in_an_offscreen_wgpu_pass() {
     assert_eq!(renderer.prepare(&device, &queue, &frame), 0);
     assert_eq!(pixel(&read_frame(&renderer), 4, 0), [0, 0, 0, 0]);
 
+    let mut recaptured = session_with_historical_graphics_parent(size);
+    recaptured.pump_with_clock(|| now).unwrap();
+    assert_eq!(
+        renderer.prepare(&device, &queue, &recaptured.presentation_frame().unwrap()),
+        0
+    );
+    assert_eq!(pixel(&read_frame(&renderer), 10, 0), [255, 0, 0, 255]);
+    recaptured.transport.source = Cursor::new(RECAPTURE_MOVED_PLACEHOLDER);
+    recaptured.pump_with_clock(|| now).unwrap();
+    assert_eq!(
+        renderer.prepare(&device, &queue, &recaptured.presentation_frame().unwrap()),
+        0
+    );
+    assert_eq!(pixel(&read_frame(&renderer), 10, 0), [0, 0, 0, 0]);
+
     session.transport.source = Cursor::new(
         concat!(
             "\x1b[5;1H\x1bD\x1b_Ga=d,d=I,i=44\x1b\\",
@@ -2406,6 +2421,25 @@ fn kitty_images_compose_in_an_offscreen_wgpu_pass() {
         for wire in [left, right, left] {
             assert_eq!(render(wire), ([0, 0, 0, 255], 0));
         }
+        let green = format!(
+            "\x1b_Ga=f,i=47,c=1,x=125,y=4,s=4,v=27,f=24,X=1,q=2;{}\x1b\\\x1b_Ga=a,i=47,c=2,q=2\x1b\\",
+            "AP8A".repeat(4 * 27),
+        );
+        assert_eq!(render(green.as_bytes()), ([0, 255, 0, 255], 0));
+        let blue = format!(
+            "\x1b_Ga=f,i=47,c=1,x=4,y=90,s=1,v=27,f=24,X=1,q=2;{}\x1b\\\x1b_Ga=a,i=47,c=3,q=2\x1b\\",
+            "AAD/".repeat(27),
+        );
+        assert_eq!(render(blue.as_bytes()), ([0, 0, 0, 255], 0));
+        assert_eq!(
+            render(b"\x1b_Ga=p,i=47,p=7,x=4,y=90,w=1,h=1,C=1,q=2\x1b\\"),
+            ([0, 0, 255, 255], 0)
+        );
+        assert_eq!(
+            render(b"\x1b_Ga=a,i=47,c=1,q=2\x1b\\\x1b_Ga=d,d=f,i=47,r=3\x1b\\\x1b_Ga=d,d=f,i=47,r=2\x1b\\"),
+            ([0, 0, 0, 255], 0)
+        );
+        assert_eq!(render(left), ([0, 0, 0, 255], 0));
         let wire = format!(
             "\x1b_Ga=f,i=47,c=1,x=125,y=4,s=4,v=27,q=2;{}\x1b\\\x1b_Ga=a,i=47,c=2,q=2\x1b\\",
             "/wAAgP8AAID/AACA".repeat(36),
@@ -3392,6 +3426,147 @@ fn kitty_text_line_edits_move_only_unicode_placeholders_and_their_children() {
 }
 
 #[test]
+fn kitty_virtual_anchor_combines_retained_and_live_placeholders() {
+    let mut session = session_with_size(
+        concat!(
+            "\x1b_Ga=T,i=42,U=1,c=2,r=2,s=1,v=1,q=2;AAAA/w==\x1b\\",
+            "\x1b_Ga=T,i=43,P=42,H=1,V=1,s=1,v=1,q=2;/wAA/w==\x1b\\",
+            "\x1b[1;5H\x1b[38;5;42m\u{10eeee}\u{305}\u{305}",
+            "\x1b[2;2H\u{10eeee}\u{30d}\u{305}\x1b[0m\x1b[S",
+        )
+        .as_bytes(),
+        PtySize {
+            pixel_width: 16,
+            pixel_height: 6,
+            ..PtySize::new(3, 8)
+        },
+    );
+    session
+        .set_history_limits(HistoryLimits {
+            max_rows: 4,
+            max_bytes: 4096,
+        })
+        .unwrap();
+    let mut cache = lune_terminal::GraphicsPlaceholderCache::default();
+    let mut check = |session: &Session<Transport>, positions: &[[i64; 2]], origin| {
+        let frame = session.presentation_frame().unwrap();
+        let [parent, child] = frame.graphics_placements() else {
+            panic!("Expected the virtual prototype and its child");
+        };
+        let mut seen = Vec::new();
+        cache
+            .visit(
+                frame.graphics_revision.unwrap(),
+                frame.graphics_placements(),
+                frame.viewport,
+                frame.styles,
+                frame.geometry.cell_pixels().unwrap(),
+                Some(|run: lune_terminal::GraphicsPlaceholderRun| seen.push(run.position)),
+            )
+            .unwrap();
+        assert_eq!(seen, positions);
+        assert_eq!(cache.origin(parent.serial()), Some(origin));
+        assert_eq!(
+            child.origin_in_view(frame.viewport.offset(), |serial| cache.origin(serial)),
+            Some([
+                origin[0] + 1,
+                origin[1] + 1 + frame.viewport.offset() as i64
+            ])
+        );
+    };
+
+    session.pump().unwrap();
+    check(&session, &[[1, 0]], [1, -1]);
+    assert!(session.scroll_history(1));
+    session.transport.source = Cursor::new(
+        "\x1b[1;2H\x1b[X\x1b[2;7H\x1b[38;5;42m\u{10eeee}\u{30d}\u{305}\x1b[0m".as_bytes(),
+    );
+    session.pump().unwrap();
+    check(&session, &[[4, 0], [6, 2]], [4, -1]);
+    session
+        .set_history_limits(HistoryLimits::default())
+        .unwrap();
+    check(&session, &[[6, 1]], [6, 1]);
+}
+
+const RECAPTURE_MOVED_PLACEHOLDER: &[u8] =
+    "\x1b[2+T\x1b[1;2H\x1b[X\x1b[1;5H\x1b[38;5;42m\u{10eeee}\x1b[0m\x1b[2S".as_bytes();
+
+fn session_with_historical_graphics_parent(size: PtySize) -> Session<Transport> {
+    let mut session = session_with_size(
+        concat!(
+            "\x1b_Ga=T,i=42,U=1,c=1,r=1,s=1,v=1,q=2;AAAA/w==\x1b\\",
+            "\x1b_Ga=T,i=43,P=42,H=4,V=2,s=1,v=1,q=2;/wAA/w==\x1b\\",
+            "\x1b_Ga=f,i=43,s=1,v=1,z=20,q=2;AP8A/w==\x1b\\",
+            "\x1b_Ga=a,i=43,r=1,z=10,s=3,q=2\x1b\\",
+            "A\x1b[2;2H\x1b[38;5;42m\u{10eeee}\x1b[0m\x1b[3;1HB\x1b[3S",
+        )
+        .as_bytes(),
+        size,
+    );
+    session
+        .set_history_limits(HistoryLimits {
+            max_rows: 4,
+            max_bytes: 4096,
+        })
+        .unwrap();
+    session
+}
+
+#[test]
+fn kitty_virtual_anchor_rechecks_history_after_unscroll_and_recapture() {
+    let mut session = session_with_historical_graphics_parent(PtySize {
+        pixel_width: 16,
+        pixel_height: 6,
+        ..PtySize::new(3, 8)
+    });
+    let mut cache = lune_terminal::GraphicsPlaceholderCache::default();
+    let origin = |session: &Session<Transport>,
+                  cache: &mut lune_terminal::GraphicsPlaceholderCache| {
+        let frame = session.presentation_frame().unwrap();
+        let [_, child] = frame.graphics_placements() else {
+            panic!("Expected the virtual prototype and its child");
+        };
+        cache
+            .visit(
+                frame.graphics_revision.unwrap(),
+                frame.graphics_placements(),
+                frame.viewport,
+                frame.styles,
+                frame.geometry.cell_pixels().unwrap(),
+                None::<fn(lune_terminal::GraphicsPlaceholderRun)>,
+            )
+            .unwrap();
+        child.origin_in_view(0, |serial| cache.origin(serial))
+    };
+    let mut tracker = PresentationTracker::default();
+    let now = Instant::now();
+    session.pump_with_clock(|| now).unwrap();
+    assert_eq!(origin(&session, &mut cache), Some([5, 0]));
+    assert_eq!(
+        session.presentation_deadline(),
+        Some(now + Duration::from_millis(10))
+    );
+    tracker
+        .prepare(&session.presentation_frame().unwrap(), now)
+        .unwrap()
+        .commit();
+
+    session.transport.source = Cursor::new(RECAPTURE_MOVED_PLACEHOLDER);
+    session.pump_with_clock(|| now).unwrap();
+    assert_eq!(session.screen().history().len(), 3);
+    assert_eq!(origin(&session, &mut cache), Some([8, 0]));
+    assert_eq!(session.presentation_deadline(), None);
+    assert!(
+        tracker
+            .prepare(&session.presentation_frame().unwrap(), now)
+            .unwrap()
+            .damage()
+            .graphics_changed
+    );
+}
+
+#[test]
 fn kitty_virtual_children_use_live_placeholder_bounds_for_coordinate_deletion() {
     for delete in [
         b"\x1b[2;3H\x1b_Ga=d,d=C\x1b\\".as_slice(),
@@ -3573,6 +3748,42 @@ fn kitty_animation_deadlines_follow_loading_and_finite_loops() {
     session.transport.source = Cursor::new(b"\x1b_Gi=2,s=1,v=1,q=1;AAAA/w==\x1b\\");
     session.pump_with_clock(|| at(70_630)).unwrap();
     assert_eq!(session.presentation_deadline(), Some(at(70_670)));
+}
+
+#[test]
+fn kitty_frame_overwrite_clears_pixels_through_a_gapless_base() {
+    let mut session = session(
+        concat!(
+            "\x1b_Ga=T,i=1,s=2,v=1,C=1,q=2;/wAA//8AAP8=\x1b\\",
+            "\x1b_Ga=f,i=1,c=1,x=1,s=1,v=1,z=20,q=2;AP8A/w==\x1b\\",
+            "\x1b_Ga=f,i=1,r=2,x=1,s=1,v=1,X=0,C=1,q=2;AAAAAA==\x1b\\",
+            "\x1b_Ga=f,i=1,c=2,x=1,s=1,v=1,C=1,z=-1,q=2;AAAAAA==\x1b\\",
+            "\x1b_Ga=f,i=1,c=3,s=1,v=1,z=30,q=2;AAD//w==\x1b\\",
+            "\x1b_Ga=a,i=1,s=3,r=1,z=10,v=2\x1b\\",
+        )
+        .as_bytes(),
+    );
+    let start = Instant::now();
+    let at = |ms| start + Duration::from_millis(ms);
+    for (ms, next, pixels) in [
+        (0, Some(10), [255, 0, 0, 255, 255, 0, 0, 255]),
+        (10, Some(30), [255, 0, 0, 255, 0, 255, 0, 255]),
+        (30, Some(60), [0, 0, 255, 255, 0, 0, 0, 0]),
+        (60, None, [0, 0, 255, 255, 0, 0, 0, 0]),
+    ] {
+        session.pump_with_clock(|| at(ms)).unwrap();
+        assert_eq!(session.presentation_deadline(), next.map(at));
+        let mut scratch = Vec::new();
+        assert_eq!(
+            session
+                .graphics_image(1)
+                .unwrap()
+                .pixels(&mut scratch)
+                .unwrap(),
+            pixels,
+            "Frame at {ms} ms"
+        );
+    }
 }
 
 #[test]

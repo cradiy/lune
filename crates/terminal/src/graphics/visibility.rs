@@ -23,7 +23,7 @@ struct VisibilityStamp {
     offset: usize,
     dimensions: [usize; 2],
     cell: PixelSize,
-    history: Option<[RowRevision; 2]>,
+    history: Option<u64>,
 }
 
 impl AnimationVisibility {
@@ -68,7 +68,7 @@ impl AnimationVisibility {
             dimensions: [screen.grid().columns(), view.rows()],
             cell: screen.graphics_cell_extent(),
             history: if has_parents {
-                view.source().history_endpoints()
+                view.source().history_revision()
             } else {
                 None
             },

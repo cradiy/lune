@@ -405,7 +405,7 @@ fn animation_frames_commit_complete_patches_and_keep_the_current_surface_on_fail
     assert!(
         receive(
             &mut images,
-            b"\x1b_Ga=f,I=17,c=1,x=1,s=1,v=1,C=1,m=1;AP8A\x1b\\"
+            b"\x1b_Ga=f,I=17,c=1,x=1,s=1,v=1,m=1;AP8A\x1b\\"
         )
         .is_none()
     );
@@ -416,7 +416,7 @@ fn animation_frames_commit_complete_patches_and_keep_the_current_surface_on_fail
 
     let reply = receive(
         &mut images,
-        b"\x1b_Ga=f,I=17,c=1,x=1,s=1,v=1,C=1,m=1;AP8A\x1b\\\x1b_Ga=f,m=0;gA==\x1b\\",
+        b"\x1b_Ga=f,I=17,c=1,x=1,s=1,v=1,m=1;AP8A\x1b\\\x1b_Ga=f,m=0;gA==\x1b\\",
     )
     .unwrap();
     assert_eq!((reply.id, reply.number, reply.frame_number), (0, 17, 2));
@@ -1204,10 +1204,20 @@ fn patch_transitions_restore_pixels_from_a_shared_base() {
     else {
         panic!("Expected two updates for distant patches");
     };
-    assert_eq!((restored.origin, restored.size), ([1, 0], [1, 2]));
-    assert_eq!(restored.bytes.as_chunks::<4>().0, &[red, red]);
-    assert_eq!((blended.origin, blended.size), ([63, 63], [1, 1]));
+    assert_eq!(
+        (restored.origin, restored.size, restored.bytes_per_row),
+        ([1, 0], [1, 2], 256)
+    );
+    assert_eq!(
+        [&restored.bytes[..4], &restored.bytes[256..]],
+        [&red[..]; 2]
+    );
+    assert_eq!(
+        (blended.origin, blended.size, blended.bytes_per_row),
+        ([63, 63], [1, 1], 4)
+    );
     assert_eq!(blended.bytes, &[127, 128, 0, 255]);
+    assert_eq!(scratch, [127, 128, 0, 255]);
 
     apply(
         &mut images,
@@ -1229,10 +1239,31 @@ fn patch_transitions_restore_pixels_from_a_shared_base() {
     );
     assert_eq!((near.origin, near.size), ([1, 0], [1, 2]));
     assert_eq!(near.bytes.as_chunks::<4>().0, &[[0, 0, 255, 255]; 2]);
+    assert_eq!(scratch, [127, 128, 0, 255]);
 
     apply(
         &mut images,
-        b"\x1b_Ga=d,d=f,i=1,r=5\x1b\\\x1b_Ga=a,i=1,c=1,q=2\x1b\\",
+        b"\x1b_Ga=f,i=1,c=4,x=1,s=1,v=1,q=2;AAD/gA==\x1b\\\x1b_Ga=a,i=1,c=6,q=2\x1b\\",
+    );
+    let image = images.get(1).unwrap();
+    let PixelUpdates::Two([near, far]) = image.pixel_updates(Some(&root), &mut scratch).unwrap()
+    else {
+        panic!("Expected separate updates for two blends");
+    };
+    assert_eq!((near.origin, near.size), ([1, 0], [1, 1]));
+    assert_eq!(near.bytes, &[127, 0, 128, 255]);
+    assert_eq!((far.origin, far.size), ([63, 63], [1, 1]));
+    assert_eq!(far.bytes, &[127, 128, 0, 255]);
+    assert_eq!(scratch.len(), 8);
+
+    apply(
+        &mut images,
+        concat!(
+            "\x1b_Ga=a,i=1,c=5,q=2\x1b\\",
+            "\x1b_Ga=d,d=f,i=1,r=5\x1b\\",
+            "\x1b_Ga=a,i=1,c=1,q=2\x1b\\",
+        )
+        .as_bytes(),
     );
     scratch.clear();
     let restored = images.get(1).unwrap();
@@ -1306,6 +1337,7 @@ fn batched_base_edits_upload_only_changed_parts_of_the_displayed_frame() {
     assert_eq!(far.bytes, &[255; 4]);
     assert_eq!((near.origin, near.size), ([0, 0], [1, 1]));
     assert_eq!(near.bytes, &[0, 0, 255, 255]);
+    assert_eq!(scratch.capacity(), 0);
     let PixelUpdates::One(update) = image
         .pixel_updates(Some(&intermediate), &mut scratch)
         .unwrap()
@@ -1985,7 +2017,12 @@ fn local_transfers_use_checked_ranges_and_unlink_only_tagged_temp_files() {
         b"OK"
     );
     let revision = images.get(1).unwrap().source_revision();
-    for controls in ["a=q,i=1,t=f,s=1,v=1,S=3,O=2", "i=1,t=f,s=1,v=1,S=6,O=2"] {
+    assert_eq!(
+        local_reply(&mut images, "a=q,i=1,t=f,s=1,v=1,S=80,O=2", &b(&link)).message,
+        b"OK"
+    );
+    assert_eq!(images.get(1).unwrap().source_revision(), revision);
+    for controls in ["a=q,i=1,t=f,s=1,v=1,S=3,O=2", "i=1,t=f,s=1,v=1,S=6,O=4"] {
         assert_eq!(
             local_reply(&mut images, controls, &b(&link)).message,
             b"EBADF:Failed to read image file"
@@ -2002,6 +2039,7 @@ fn local_transfers_use_checked_ranges_and_unlink_only_tagged_temp_files() {
             b"EBADPNG:Invalid PNG image data".as_slice(),
         ),
         ("a=q,i=1,t=f,f=100,O=7", b"EBADPNG:Invalid PNG image data"),
+        ("a=q,i=1,t=f,f=100,S=8", b"EBADF:Failed to read image file"),
         (
             "a=q,i=1,t=f,f=100,o=z",
             b"EINVAL:Invalid image data".as_slice(),
@@ -2036,7 +2074,7 @@ fn local_transfers_use_checked_ranges_and_unlink_only_tagged_temp_files() {
     stored.extend_from_slice(&encoded);
     stored.push(0);
     fs::write(&temporary, stored).unwrap();
-    let controls = format!("i=2,t=t,f=100,o=z,O=2,S={}", encoded.len());
+    let controls = format!("i=2,t=t,f=100,o=z,O=2,S={}", encoded.len() + 1);
     assert_eq!(
         local_reply(&mut images, &controls, &b(&temporary)).message,
         b"OK"
@@ -2093,31 +2131,52 @@ fn posix_shared_transfer_reads_and_unlinks_the_object() {
     }
     let _cleanup = Cleanup(&name);
     let mut images = ImageStore::new(4, 1);
-    for (size, expected) in [
-        (3, b"OK".as_slice()),
-        (4, b"EBADF:Failed to read image file"),
-    ] {
+    let transfer = |images: &mut ImageStore, controls: &str, data: &[u8]| {
         let file = shm::open(
             name.as_str(),
             OFlags::CREATE | OFlags::EXCL | OFlags::RDWR,
             Mode::RUSR | Mode::WUSR,
         )
         .unwrap();
-        File::from(file).write_all(&[0, 3, 17, 0]).unwrap();
-        let controls = format!("i={size},t=s,f=16,s=1,v=1,O=1,S={size}");
-        assert_eq!(
-            local_reply(&mut images, &controls, name.as_bytes()).message,
-            expected
-        );
+        File::from(file).write_all(data).unwrap();
+        let reply = local_reply(images, controls, name.as_bytes());
         assert_eq!(
             shm::open(name.as_str(), OFlags::RDONLY, Mode::empty()).unwrap_err(),
             rustix::io::Errno::NOENT
         );
+        reply.message
+    };
+    for (controls, expected) in [
+        ("i=3,t=s,f=16,s=1,v=1,O=1,S=3", b"OK".as_slice()),
+        (
+            "i=4,t=s,f=16,s=1,v=1,O=3,S=4",
+            b"EBADF:Failed to read image file",
+        ),
+        ("a=q,i=4,t=s,f=24,s=1,v=1,O=1,S=80", b"OK"),
+    ] {
+        assert_eq!(transfer(&mut images, controls, &[0, 3, 17, 0]), expected);
     }
     let image = images.get(3).unwrap();
     assert_eq!(image.format(), ImageFormat::IndexedAlpha);
     assert_eq!(image.pixels(&mut Vec::new()).unwrap(), &[3, 17]);
     assert!(images.get(4).is_none());
+
+    let compressed = PAYLOAD_ENGINE.decode("eJxjZGJmAQAAGAAL").unwrap();
+    let mut padded = vec![0; 4096];
+    padded[1..][..compressed.len()].copy_from_slice(&compressed);
+    let controls = "i=3,t=s,s=1,v=1,o=z,O=1";
+    assert_eq!(transfer(&mut images, controls, &padded), b"OK");
+    let revision = images.get(3).unwrap().source_revision();
+    let short = format!("{controls},S={}", compressed.len() - 1);
+    for controls in [short.as_str(), "i=3,t=s,f=24,s=1,v=1,o=z,O=1"] {
+        assert_eq!(
+            transfer(&mut images, controls, &padded),
+            b"EINVAL:Invalid image data"
+        );
+    }
+    let image = images.get(3).unwrap();
+    assert_eq!(image.source_revision(), revision);
+    assert_eq!(image.pixels(&mut Vec::new()).unwrap(), &[1, 2, 3, 4]);
 }
 
 #[test]

@@ -54,7 +54,7 @@ pub(crate) struct GraphicsStamp {
     placement_revision: u64,
     pixel_revision: u64,
     viewport_offset: usize,
-    history_endpoints: Option<[RowRevision; 2]>,
+    history_revision: Option<u64>,
 }
 
 #[cfg(feature = "wgpu-renderer")]
@@ -62,7 +62,7 @@ impl GraphicsStamp {
     pub(crate) fn same_layout(self, other: Self) -> bool {
         self.placement_revision == other.placement_revision
             && self.viewport_offset == other.viewport_offset
-            && self.history_endpoints == other.history_endpoints
+            && self.history_revision == other.history_revision
     }
 
     pub(crate) fn placement_revision(self) -> u64 {
@@ -123,9 +123,9 @@ impl<'a> PresentationFrame<'a> {
                 placement_revision,
                 pixel_revision: self.image_store().visual_revision(),
                 viewport_offset: self.viewport.offset(),
-                history_endpoints: self
+                history_revision: self
                     .virtual_parents
-                    .then(|| self.viewport.source().history_endpoints())
+                    .then(|| self.viewport.source().history_revision())
                     .flatten(),
             })
     }
