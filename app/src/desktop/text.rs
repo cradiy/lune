@@ -4,12 +4,12 @@ use std::ops::Range;
 
 use guillotiere::{Allocation, AtlasAllocator, size2};
 use lune_terminal::{
-    CellPosition, CellText, CursorShape, DisplayUnit, PixelPosition, PixelSize, Rgb, SizedTextRow,
-    Style, Underline,
+    CellPosition, CellText, Color, CursorShape, DisplayUnit, PixelPosition, PixelSize, Rgb,
+    SizedTextRow, Style, Underline,
 };
 
 use crate::gpu::{create_quad_pipeline, linear_colors, write_instances};
-use crate::{PixelRect, PresentationFrame, PresentedCursor};
+use crate::{PixelRect, PresentationFrame, PresentationStyle, PresentedCursor};
 
 use super::font::{Font, FontMetrics};
 
@@ -40,6 +40,55 @@ struct SizedRaster {
     font_size: u32,
     baseline: i32,
     rendition: usize,
+}
+
+#[derive(Clone, Copy)]
+struct TextArea {
+    row: PixelRect,
+    top: i32,
+    font: FontMetrics,
+}
+
+impl TextArea {
+    fn sized(mut row: PixelRect, part: &SizedTextRow, base: FontMetrics) -> Option<Self> {
+        let size = part.size();
+        let fraction = size.fraction();
+        if fraction == 0.0 {
+            return None;
+        }
+        let width = row.size.width.get();
+        let cell_height = row.size.height.get();
+        let height = cell_height * u32::from(size.scale);
+        let scaled_width = (width as f32 * fraction).round().max(1.0) as u32;
+        let scaled_height = (height as f32 * fraction).round().max(1.0) as u32;
+        row.origin.x += aligned_offset(width - scaled_width, size.horizontal);
+        let top = aligned_offset(height - scaled_height, size.vertical);
+        let scale = f32::from(size.scale) * fraction;
+        Some(Self {
+            row,
+            top: top as i32 - (part.row_offset as u32 * cell_height) as i32,
+            font: FontMetrics {
+                size: base.size * scale,
+                cell: PixelSize {
+                    width: NonZeroU32::new(scaled_width).unwrap(),
+                    height: NonZeroU32::new(scaled_height).unwrap(),
+                },
+                baseline: (base.baseline as f32 * scale).round() as i32,
+            },
+        })
+    }
+
+    fn slice(self, width: NonZeroU32, y: u32, height: u32) -> Option<(PixelRect, u32)> {
+        let top = self.top + y as i32;
+        let first = top.max(0);
+        let last = (top + height as i32).min(self.row.size.height.get() as i32);
+        if first >= last {
+            return None;
+        }
+        let mut rect = horizontal(self.row, first as u32, (last - first) as u32);
+        rect.size.width = width;
+        Some((rect, (first - top) as u32))
+    }
 }
 
 pub(super) struct TextRenderer {
@@ -150,7 +199,8 @@ impl TextRenderer {
                 .sized_text_at(pos.column)
                 .map(|part| (cursor, part))
         });
-        for row in 0..frame.viewport.rows() {
+        for (row, source) in frame.viewport.iter_rows().enumerate() {
+            let mut sized = source.sized_text_rows().peekable();
             let selected =
                 selection.and_then(|range| super::selection::columns(range, row, columns));
             if let Some(rect) = selected
@@ -186,68 +236,84 @@ impl TextRenderer {
                             self.unit(rect, unit, style.style, color, alpha);
                         }
                     }
-                    if let Some(rect) = frame.geometry.row_rect(row, run.columns()) {
-                        self.decorations(
-                            rect,
-                            style.style,
-                            style.foreground,
-                            style.underline_color,
-                            alpha,
-                        );
+                    if style.style.strikethrough || style.style.underline != Underline::None {
+                        let mut columns = run.columns();
+                        while let Some(part) = sized.peek().map(|part| part.columns()) {
+                            if part.start >= columns.end {
+                                break;
+                            }
+                            if columns.start < part.start {
+                                self.row_decorations(
+                                    frame,
+                                    row,
+                                    columns.start..part.start,
+                                    style,
+                                    alpha,
+                                );
+                            }
+                            columns.start = columns.start.max(part.end);
+                            if part.end > columns.end {
+                                break;
+                            }
+                            sized.next();
+                        }
+                        self.row_decorations(frame, row, columns, style, alpha);
                     }
                 }
             }
-            if let Some(source) = frame.viewport.row(row) {
-                for part in source.sized_text_rows() {
-                    let Some(rect) = frame.geometry.row_rect(row, part.columns()) else {
-                        continue;
-                    };
-                    let style = frame
-                        .resolve_style(source.cells()[part.column].style())
-                        .ok_or(lune_terminal::StyleError::InvalidId(
-                            source.cells()[part.column].style(),
-                        ))?;
-                    let covering = sized_cursor
-                        .filter(|(_, target)| part.belongs_to(target))
-                        .map(|(cursor, _)| cursor);
-                    let block_cursor =
-                        covering.filter(|cursor| cursor.appearance.shape == CursorShape::Block);
-                    if let Some(cursor) = block_cursor {
-                        self.rect(rect, cursor.color, 1.0);
-                    }
-                    if !style.style.hidden {
-                        let color = if block_cursor.is_some() {
-                            style.background
-                        } else {
-                            style.foreground
-                        };
-                        let alpha = if style.style.faint { 0.6 } else { 1.0 };
-                        let rendition =
-                            usize::from(style.style.bold) | (usize::from(style.style.italic) << 1);
-                        self.sized_glyph(rect, part, rendition, color, alpha);
-                    }
-                    if let Some(cursor) = covering {
-                        let mut edge = rect;
-                        match cursor.appearance.shape {
-                            CursorShape::Bar => {
-                                edge.size.width = NonZeroU32::new(2).unwrap().min(edge.size.width);
-                                self.rect(edge, cursor.color, 1.0);
-                            }
-                            CursorShape::Underline
-                                if part.row_offset + 1 == usize::from(part.size().scale) =>
-                            {
-                                self.rect(
-                                    horizontal(
-                                        edge,
-                                        edge.size.height.get().saturating_sub(2),
-                                        edge.size.height.get().min(2),
-                                    ),
-                                    cursor.color,
-                                    1.0,
-                                );
-                            }
-                            _ => {}
+            for part in source.sized_text_rows() {
+                let Some(rect) = frame.geometry.row_rect(row, part.columns()) else {
+                    continue;
+                };
+                let mut style = frame
+                    .resolve_style(source.cells()[part.column].style())
+                    .ok_or(lune_terminal::StyleError::InvalidId(
+                        source.cells()[part.column].style(),
+                    ))?;
+                let covering = sized_cursor
+                    .filter(|(_, target)| part.belongs_to(target))
+                    .map(|(cursor, _)| cursor);
+                let block_cursor =
+                    covering.filter(|cursor| cursor.appearance.shape == CursorShape::Block);
+                if let Some(cursor) = block_cursor {
+                    self.rect(rect, cursor.color, 1.0);
+                }
+                if !style.style.hidden
+                    && let Some(area) = TextArea::sized(rect, part, self.metrics)
+                {
+                    if block_cursor.is_some() {
+                        if style.style.underline_color == Color::Default {
+                            style.underline_color = style.background;
                         }
+                        style.foreground = style.background;
+                    }
+                    let alpha = if style.style.faint { 0.6 } else { 1.0 };
+                    let rendition =
+                        usize::from(style.style.bold) | (usize::from(style.style.italic) << 1);
+                    self.sized_glyph(area, part.text(), rendition, style.foreground, alpha);
+                    self.decorations(area, style, alpha);
+                }
+                if let Some(cursor) = covering {
+                    let mut edge = rect;
+                    match cursor.appearance.shape {
+                        CursorShape::Bar => {
+                            edge.size.width = NonZeroU32::new(2).unwrap().min(edge.size.width);
+                            self.rect(edge, cursor.color, 1.0);
+                        }
+                        CursorShape::Underline
+                            if part.row_offset + 1 == usize::from(part.size().scale) =>
+                        {
+                            self.rect(
+                                horizontal(
+                                    edge,
+                                    edge.size.height.get().saturating_sub(2),
+                                    edge.size.height.get().min(2),
+                                ),
+                                cursor.color,
+                                1.0,
+                            );
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -363,80 +429,57 @@ impl TextRenderer {
 
     fn sized_glyph(
         &mut self,
-        mut rect: PixelRect,
-        part: &SizedTextRow,
+        area: TextArea,
+        text: &str,
         rendition: usize,
         color: Rgb,
         alpha: f32,
     ) {
-        let size = part.size();
-        let fraction = size.fraction();
-        if fraction == 0.0 || part.text().trim().is_empty() {
+        if text.trim().is_empty() {
             return;
         }
-        let width = rect.size.width.get();
-        let cell_height = rect.size.height.get();
-        let height = cell_height * u32::from(size.scale);
-        let scaled_width = (width as f32 * fraction).round().max(1.0) as u32;
-        let scaled_height = (height as f32 * fraction).round().max(1.0) as u32;
-        let paint_width = scaled_width.min(ATLAS_SIDE as u32);
-        let paint_height = scaled_height.min(ATLAS_SIDE as u32);
-        let left = aligned_offset(width - scaled_width, size.horizontal);
-        let top = aligned_offset(height - scaled_height, size.vertical);
-        let row_start = part.row_offset as u32 * cell_height;
-        let first = row_start.max(top);
-        let last = (row_start + cell_height).min(top + paint_height);
-        if first >= last {
+        let maximum = NonZeroU32::new(ATLAS_SIDE as u32).unwrap();
+        let paint = PixelSize {
+            width: area.font.cell.width.min(maximum),
+            height: area.font.cell.height.min(maximum),
+        };
+        let Some((rect, offset)) = area.slice(paint.width, 0, paint.height.get()) else {
             return;
-        }
-        let scale = f32::from(size.scale) * fraction;
-        let baseline = (self.metrics.baseline as f32 * scale).round() as i32;
-        let font_size = self.metrics.size * scale;
+        };
         let key = SizedRaster {
-            width: paint_width,
-            height: paint_height,
-            font_size: font_size.to_bits(),
-            baseline,
+            width: paint.width.get(),
+            height: paint.height.get(),
+            font_size: area.font.size.to_bits(),
+            baseline: area.font.baseline,
             rendition,
         };
         let sprite = if let Some(sprite) = self
             .sized_glyphs
             .get_mut(&key)
-            .and_then(|cache| cache.get_mut(part.text()))
+            .and_then(|cache| cache.get_mut(text))
         {
             sprite.generation = self.generation;
             *sprite
         } else {
             let metrics = FontMetrics {
-                size: font_size,
-                cell: PixelSize {
-                    width: NonZeroU32::new(paint_width).unwrap(),
-                    height: NonZeroU32::new(paint_height).unwrap(),
-                },
-                baseline,
+                cell: paint,
+                ..area.font
             };
-            let Some(colored) = self.font.rasterize(
-                metrics,
-                part.text(),
-                rendition,
-                paint_width,
-                &mut self.image,
-            ) else {
+            let Some(colored) =
+                self.font
+                    .rasterize(metrics, text, rendition, key.width, &mut self.image)
+            else {
                 return;
             };
-            let Some(sprite) = self.upload_sprite(paint_width, paint_height, colored) else {
+            let Some(sprite) = self.upload_sprite(key.width, key.height, colored) else {
                 return;
             };
             self.sized_glyphs
                 .entry(key)
                 .or_default()
-                .insert(part.text().into(), sprite);
+                .insert(text.into(), sprite);
             sprite
         };
-        rect.origin.x += left;
-        rect.origin.y += first - row_start;
-        rect.size.width = NonZeroU32::new(paint_width).unwrap();
-        rect.size.height = NonZeroU32::new(last - first).unwrap();
         let corner = sprite.allocation.rectangle.min;
         self.quad(
             rect,
@@ -444,9 +487,9 @@ impl TextRenderer {
             alpha,
             [
                 corner.x as f32,
-                corner.y as f32 + (first - top) as f32,
-                paint_width as f32,
-                (last - first) as f32,
+                corner.y as f32 + offset as f32,
+                key.width as f32,
+                rect.size.height.get() as f32,
             ],
             [if sprite.colored { 2 } else { 1 }, sprite.layer as u32],
         );
@@ -531,20 +574,48 @@ impl TextRenderer {
             .map(|allocation| (layer, allocation))
     }
 
-    fn decorations(&mut self, rect: PixelRect, style: &Style, fg: Rgb, underline: Rgb, alpha: f32) {
-        let height = rect.size.height.get();
-        let thickness = (self.metrics.size / 14.0).round().max(1.0) as u32;
-        let baseline = self.metrics.baseline.max(0) as u32;
-        if style.strikethrough {
-            let y = baseline.saturating_sub(height / 4);
-            self.rect(horizontal(rect, y, thickness), fg, alpha);
+    fn row_decorations(
+        &mut self,
+        frame: &PresentationFrame<'_>,
+        row: usize,
+        columns: Range<usize>,
+        style: PresentationStyle<'_>,
+        alpha: f32,
+    ) {
+        if let Some(rect) = frame.geometry.row_rect(row, columns) {
+            let area = TextArea {
+                row: rect,
+                top: 0,
+                font: FontMetrics {
+                    cell: rect.size,
+                    ..self.metrics
+                },
+            };
+            self.decorations(area, style, alpha);
         }
-        if style.underline != Underline::None {
+    }
+
+    fn decorations(&mut self, area: TextArea, style: PresentationStyle<'_>, alpha: f32) {
+        let height = area.font.cell.height.get();
+        let thickness = ((area.font.size / 14.0).round().max(1.0) as u32).min(height);
+        let baseline = area.font.baseline.clamp(0, height as i32 - 1) as u32;
+        let mut line = |y, color| {
+            if let Some((rect, _)) = area.slice(area.font.cell.width, y, thickness) {
+                self.rect(rect, color, alpha);
+            }
+        };
+        if style.style.strikethrough {
+            let y = baseline.saturating_sub(height / 4);
+            line(y, style.foreground);
+        }
+        if style.style.underline != Underline::None {
             let y = (baseline + thickness).min(height - thickness);
-            self.rect(horizontal(rect, y, thickness), underline, alpha);
-            if style.underline == Underline::Double {
+            line(y, style.underline_color);
+            if style.style.underline == Underline::Double {
                 let second = y.saturating_sub(2 * thickness);
-                self.rect(horizontal(rect, second, thickness), underline, alpha);
+                if second != y {
+                    line(second, style.underline_color);
+                }
             }
         }
     }
