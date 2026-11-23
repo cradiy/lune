@@ -9,8 +9,10 @@ const EXTENDED: u32 = 1 << 23;
 // preceding cell, so replacing either edge cell invalidates the connection.
 const ROW_WRAP: u32 = 1 << 24;
 const ROW_GAP: u32 = 1 << 25;
-const ROW_MASK: u32 = ROW_WRAP | ROW_GAP;
 const ERASED: u32 = 1 << 26;
+const WRAP_GAP_SHIFT: u32 = 27;
+const WRAP_GAP_LOW: u32 = 31;
+const ROW_MASK: u32 = ROW_WRAP | ROW_GAP | (WRAP_GAP_LOW << WRAP_GAP_SHIFT);
 
 /// An opaque style key supplied and interpreted by the caller. Zero is the default
 /// key. Keys issued by [`crate::StyleTable`] belong to that table's lifetime.
@@ -60,8 +62,9 @@ impl Cell {
         }
     }
 
-    pub(crate) fn row_wrap(self) -> Option<bool> {
-        (self.text & ROW_WRAP != 0).then_some(self.text & ROW_GAP != 0)
+    pub(crate) fn row_wrap(self) -> Option<usize> {
+        (self.text & ROW_WRAP != 0)
+            .then(|| ((self.text >> WRAP_GAP_SHIFT) | (u32::from(self.is_row_gap()) << 5)) as usize)
     }
 
     pub(crate) fn is_row_gap(self) -> bool {
@@ -72,13 +75,14 @@ impl Cell {
         self.text = (self.text & !ROW_GAP) | if gap { ROW_GAP } else { 0 };
     }
 
-    pub(crate) fn set_row_wrap(&mut self, gap: Option<bool>) {
-        self.text = (self.text & !ROW_MASK)
-            | match gap {
-                None => 0,
-                Some(false) => ROW_WRAP,
-                Some(true) => ROW_WRAP | ROW_GAP,
-            };
+    pub(crate) fn set_row_wrap(&mut self, gap: Option<usize>) {
+        self.text &= !ROW_MASK;
+        if let Some(gap) = gap {
+            debug_assert!(gap < 64);
+            let gap = gap as u32;
+            self.text |= ROW_WRAP | ((gap & WRAP_GAP_LOW) << WRAP_GAP_SHIFT);
+            self.set_row_gap(gap > WRAP_GAP_LOW);
+        }
     }
 
     pub(crate) fn scalar(character: char, width: CellWidth, style: StyleId) -> Self {

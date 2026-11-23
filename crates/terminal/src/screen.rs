@@ -1,4 +1,4 @@
-use std::{num::NonZeroU32, ops::Range};
+use std::{num::NonZeroU32, ops::Range, sync::Arc};
 
 use lune_kitty_graphics::{
     DeleteTarget, EvictionRanking, ImageChange, ImageStore, PlacementError, PlacementPosition,
@@ -6,9 +6,11 @@ use lune_kitty_graphics::{
 
 mod reflow;
 
+use crate::row::SizedRows;
+use crate::sizing::{SizedBlock, SizedBudget};
 use crate::{
     CellPosition, CellWidth, GraphicsPlacement, Grid, HistoryLimits, MAX_CELL_TEXT_BYTES,
-    PixelSize, RowHistory, ScreenView, StorageError, StyleId, Viewport,
+    PixelSize, RowHistory, ScreenView, SizedTextRow, StorageError, StyleId, TextSize, Viewport,
 };
 use crate::{graphics::GraphicsPlacements, grid::validate_dimensions, tabs::TabStops};
 
@@ -88,6 +90,7 @@ pub struct Screen {
     insert_mode: bool,
     cursor_appearance: CursorAppearance,
     reverse_video: bool,
+    sized_budget: Option<Arc<SizedBudget>>,
 }
 
 #[derive(Debug)]
@@ -233,6 +236,12 @@ impl Screen {
     /// Releases retained rows and follows the primary live buffer. Limits, both
     /// display buffers, cursor, and modes are preserved.
     pub fn clear_history(&mut self) {
+        let primary = if self.active_buffer == ScreenBuffer::Primary {
+            &mut self.grid
+        } else {
+            &mut self.inactive.grid
+        };
+        primary.split_sized_text(0);
         self.history.clear();
         self.discard_evicted_graphics();
         self.display_offset = 0;
@@ -296,7 +305,7 @@ impl Screen {
         length: usize,
         style: StyleId,
     ) -> Result<bool, StorageError> {
-        if !self.history_capture || !self.auto_wrap || length == 0 {
+        if !self.history_capture || length == 0 {
             return Ok(false);
         }
         let Some(rows_before_scroll) = (self.scroll_region.end - 1).checked_sub(self.cursor.row)
@@ -304,6 +313,15 @@ impl Screen {
             return Ok(false);
         };
         let columns = self.grid.columns();
+        if self.grid.has_sized_text() {
+            // Once scrolling starts, the new bottom row has no protected fragments.
+            return self
+                .history
+                .prepare(columns, (length - 1) / columns + 1, style);
+        }
+        if !self.auto_wrap {
+            return Ok(false);
+        }
         let start = if self.cursor.wrap_pending {
             columns
         } else {
@@ -343,6 +361,7 @@ impl Screen {
             insert_mode: false,
             cursor_appearance: CursorAppearance::default(),
             reverse_video: false,
+            sized_budget: None,
         })
     }
 
@@ -848,11 +867,213 @@ impl Screen {
         width: CellWidth,
         style: StyleId,
     ) -> Result<(), StorageError> {
+        self.write_unit(text, width, style).map(|_| ())
+    }
+
+    #[inline]
+    pub(crate) fn write_unit(
+        &mut self,
+        text: &str,
+        width: CellWidth,
+        style: StyleId,
+    ) -> Result<Option<CellPosition>, StorageError> {
+        if self.grid.has_sized_text() {
+            return self.write_unit_around_blocks(text, width, style);
+        }
+        self.write_unit_at_cursor(text, width, style)
+    }
+
+    #[inline]
+    fn write_unit_at_cursor(
+        &mut self,
+        text: &str,
+        width: CellWidth,
+        style: StyleId,
+    ) -> Result<Option<CellPosition>, StorageError> {
         if self.insert_mode {
             self.write_inserted(text, width, style)
         } else {
             self.write_mode::<false>(text, width, style)
         }
+    }
+
+    #[cold]
+    fn write_unit_around_blocks(
+        &mut self,
+        text: &str,
+        width: CellWidth,
+        style: StyleId,
+    ) -> Result<Option<CellPosition>, StorageError> {
+        let previous = self.cursor;
+        let Some(candidate) = self.skip_sized_lower_rows(previous, width.columns()) else {
+            return Ok(None);
+        };
+        self.cursor = candidate;
+        let result = self.write_unit_at_cursor(text, width, style);
+        if result.is_err() {
+            self.cursor = previous;
+        }
+        result
+    }
+
+    pub(crate) fn has_sized_text(&self) -> bool {
+        self.grid.has_sized_text()
+    }
+
+    fn skip_sized_lower_rows(&self, mut candidate: Cursor, width: usize) -> Option<Cursor> {
+        let columns = self.grid.columns();
+        loop {
+            let wraps =
+                candidate.wrap_pending || (self.auto_wrap && candidate.column + width > columns);
+            let (row, column) = if wraps {
+                if candidate.row == self.scroll_region.end - 1 {
+                    return Some(candidate);
+                }
+                ((candidate.row + 1).min(self.grid.rows() - 1), 0)
+            } else {
+                (candidate.row, candidate.column)
+            };
+            let next = self
+                .grid
+                .row(row)
+                .unwrap()
+                .sized_text_rows_from(column)
+                .take_while(|part| part.column < column + width)
+                .find(|part| part.row_offset != 0);
+            let Some(part) = next else {
+                return Some(candidate);
+            };
+            let end = part.columns().end;
+            candidate = Cursor {
+                row,
+                column: end.min(columns - 1),
+                wrap_pending: end == columns || (!self.auto_wrap && end + width > columns),
+            };
+            if candidate.wrap_pending
+                && row == self.grid.rows() - 1
+                && row != self.scroll_region.end - 1
+            {
+                return None;
+            }
+        }
+    }
+
+    pub(crate) fn write_sized_text(
+        &mut self,
+        text: &str,
+        size: TextSize,
+        width: usize,
+        style: StyleId,
+    ) -> Result<(), StorageError> {
+        let height = usize::from(size.scale);
+        let width = width * height;
+        let columns = self.grid.columns();
+        if width > columns || height > self.grid.rows() || width == 0 {
+            return Ok(());
+        }
+        let mut candidate = self.cursor;
+        if !self.auto_wrap && !candidate.wrap_pending {
+            candidate.column = candidate.column.min(columns - width);
+        }
+        if self.grid.has_sized_text() {
+            let Some(adjusted) = self.skip_sized_lower_rows(candidate, width) else {
+                return Ok(());
+            };
+            candidate = adjusted;
+        }
+        let region = self.scroll_region.clone();
+        let mut scroll = 0;
+        let mut wrap = None;
+        if candidate.wrap_pending || candidate.column + width > columns {
+            let end = if candidate.wrap_pending {
+                columns
+            } else {
+                candidate.column
+            };
+            if candidate.row == region.end - 1 {
+                scroll = 1;
+                wrap = Some((candidate.row, end));
+                candidate.column = 0;
+            } else if candidate.row + 1 < self.grid.rows() {
+                wrap = Some((candidate.row, end));
+                candidate.row += 1;
+                candidate.column = 0;
+            } else {
+                candidate.column = 0;
+            }
+        }
+        let in_region = region.contains(&candidate.row);
+        let bottom = if in_region {
+            if height > region.len() {
+                return Ok(());
+            }
+            region.end
+        } else {
+            self.grid.rows()
+        };
+        let overflow = (candidate.row + height).saturating_sub(bottom);
+        if in_region {
+            scroll += overflow;
+        } else if overflow != 0 {
+            return Ok(());
+        }
+        let row = candidate.row - overflow;
+        let column = candidate.column;
+        let mut exposed: [Option<Box<SizedRows>>; 7] = std::array::from_fn(|_| None);
+        for (offset, prepared) in exposed[..height].iter_mut().enumerate() {
+            let target = row + offset;
+            let source = if region.contains(&target) {
+                target + scroll
+            } else {
+                target
+            };
+            if region.contains(&target) && source >= region.end {
+                *prepared = Some(crate::Row::prepare_sized()?);
+            } else {
+                self.grid.row_mut(source)?.reserve_sized()?;
+            }
+        }
+        let budget = self.sized_budget.get_or_insert_with(Default::default);
+        let Some(block) = SizedBlock::new(size, width, text, budget)? else {
+            return Ok(());
+        };
+        self.scroll_up(scroll, style)?;
+        if let Some((previous, end)) = wrap {
+            if !region.contains(&previous) {
+                self.grid.set_wrap_end(previous, Some(end));
+            } else if previous >= region.start + scroll {
+                self.grid.set_wrap_end(previous - scroll, Some(end));
+            } else if self.history_capture && previous + 1 == scroll {
+                self.history.connect_latest(end);
+            }
+        }
+        for (row_offset, prepared) in exposed.into_iter().take(height).enumerate() {
+            let target = self
+                .grid
+                .row_mut(row + row_offset)
+                .expect("The placement fits");
+            if let Some(prepared) = prepared {
+                target.install_prepared_sized(prepared);
+            }
+            if self.insert_mode {
+                target
+                    .insert_cells(column, width, style)
+                    .expect("The placement fits");
+            }
+            target.add_sized(
+                SizedTextRow {
+                    column,
+                    row_offset,
+                    block: Arc::clone(&block),
+                },
+                style,
+            );
+        }
+        if height > 1 {
+            self.grid.mark_sized_text(row);
+        }
+        self.advance(row, column + width);
+        Ok(())
     }
 
     /// Replaces a leading display unit and returns its resulting physical position.
@@ -927,7 +1148,7 @@ impl Screen {
         text: &str,
         width: CellWidth,
         style: StyleId,
-    ) -> Result<(), StorageError> {
+    ) -> Result<Option<CellPosition>, StorageError> {
         self.write_mode::<true>(text, width, style)
     }
 
@@ -937,7 +1158,7 @@ impl Screen {
         text: &str,
         width: CellWidth,
         style: StyleId,
-    ) -> Result<(), StorageError> {
+    ) -> Result<Option<CellPosition>, StorageError> {
         let columns = self.grid.columns();
         let width_columns = width.columns();
         if width_columns > columns {
@@ -951,7 +1172,7 @@ impl Screen {
             if text.len() > MAX_CELL_TEXT_BYTES {
                 return Err(StorageError::TextTooLong);
             }
-            return Ok(());
+            return Ok(None);
         }
         let wrap = self.cursor.wrap_pending || gap;
         let (row, column) = if wrap {
@@ -1024,7 +1245,7 @@ impl Screen {
             (self.cursor.row, self.cursor.column)
         };
         self.advance(row, column + width_columns);
-        Ok(())
+        Ok(Some(CellPosition { row, column }))
     }
 
     /// Writes printable ASCII in row-sized batches. The entire input is validated
@@ -1042,11 +1263,78 @@ impl Screen {
         if bytes.iter().any(|&byte| !(b' '..=b'~').contains(&byte)) {
             return Err(StorageError::InvalidAscii);
         }
+        if self.grid.has_sized_text() {
+            return self.write_ascii_over_sized(bytes, style).map(|_| ());
+        }
         if self.insert_mode {
             self.write_ascii_inserting(bytes, style)
         } else {
             self.write_ascii_mode::<false>(bytes, style)
         }
+    }
+
+    #[cold]
+    pub(crate) fn write_ascii_over_sized(
+        &mut self,
+        bytes: &[u8],
+        style: StyleId,
+    ) -> Result<Option<CellPosition>, StorageError> {
+        debug_assert!(bytes.iter().all(|byte| (b' '..=b'~').contains(byte)));
+        let prepared = bytes.len() > 1 && self.prepare_ascii_text(bytes.len(), style)?;
+        let result = self.write_ascii_around_blocks(bytes, style);
+        if prepared {
+            self.history.finish();
+        }
+        self.grid.refresh_sized_text();
+        result
+    }
+
+    fn write_ascii_around_blocks(
+        &mut self,
+        mut bytes: &[u8],
+        style: StyleId,
+    ) -> Result<Option<CellPosition>, StorageError> {
+        let columns = self.grid.columns();
+        let mut last = None;
+        while let Some((&first, tail)) = bytes.split_first() {
+            let Some(cursor) = self.skip_sized_lower_rows(self.cursor, 1) else {
+                return Ok(None);
+            };
+            if cursor.wrap_pending {
+                last = self.write_unit(
+                    char::from(first).encode_utf8(&mut [0; 4]),
+                    CellWidth::Single,
+                    style,
+                )?;
+                bytes = tail;
+                continue;
+            }
+            let end = self
+                .grid
+                .row(cursor.row)
+                .unwrap()
+                .sized_text_rows_from(cursor.column)
+                .find(|part| part.row_offset != 0 && part.column > cursor.column)
+                .map_or(columns, |part| part.column);
+            let fitting = (end - cursor.column).min(bytes.len());
+            let count = if self.auto_wrap || end < columns {
+                fitting
+            } else {
+                bytes.len()
+            };
+            self.cursor = cursor;
+            if self.insert_mode {
+                self.write_ascii_inserting(&bytes[..count], style)?;
+            } else {
+                self.write_ascii_mode::<false>(&bytes[..count], style)?;
+            }
+            last = Some(CellPosition {
+                row: cursor.row,
+                column: cursor.column + fitting - 1,
+            });
+            bytes = &bytes[count..];
+        }
+        Ok(last)
     }
 
     #[inline(never)]
@@ -1327,6 +1615,7 @@ impl Screen {
             blank,
             style,
         )?;
+        self.grid.refresh_sized_text();
         self.display_offset = self.display_offset.saturating_sub(restored);
         self.shift_graphics_with_history(restored as i64);
         self.scroll_graphics(0, blank, true);

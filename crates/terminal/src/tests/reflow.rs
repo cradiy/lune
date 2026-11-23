@@ -117,10 +117,10 @@ fn reflow_partitions_complete_units_across_widths_and_source_wrap_gaps() {
                             assert_eq!(
                                 cell.row_wrap(),
                                 (column + 1 == columns)
-                                    .then_some(gap)
+                                    .then_some(usize::from(gap))
                                     .filter(|_| row.wrap_end().is_some())
                             );
-                            assert_eq!(cell.is_row_gap(), gap && column + 2 >= columns);
+                            assert_eq!(cell.is_row_gap(), gap && column + 2 == columns);
                         }
                         joined.push_str(&expected);
                     }

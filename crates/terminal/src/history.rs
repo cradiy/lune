@@ -154,7 +154,7 @@ impl RowHistory {
         self.limits = limits;
         let before = self.rows.len();
         while self.rows.len() > limits.max_rows || self.bytes > limits.max_bytes {
-            self.evict();
+            self.evict().erase_sized();
         }
         if self.rows.len() != before {
             self.revision = self.revision.wrapping_add(1);
@@ -331,6 +331,7 @@ impl RowHistory {
         let future = self.remaining.saturating_sub(1);
         for index in 0..evicted {
             let mut row = self.evict();
+            row.erase_sized();
             if reuse == Some(index) {
                 if unit.is_none() {
                     row.clear(style);
@@ -398,12 +399,13 @@ impl RowHistory {
         let resized_join = retained != 0 && self.rows[first].row.cells().len() != columns;
 
         let shift = blank + retained;
+        grid.split_sized_text(end);
         if shift < end {
             grid.rotate_top_down(end, shift);
         }
         // Newer history rows beyond the final screen are scrolled out by this batch.
         for _ in retained..count {
-            self.pop_recent();
+            self.pop_recent().erase_sized();
         }
         for index in (0..retained).rev() {
             let mut source = self.pop_recent();
@@ -416,7 +418,9 @@ impl RowHistory {
                 source.resize_prepared(columns, style);
                 source
             };
-            *grid.row_mut(blank + index).expect("A restored screen row") = restored;
+            let target = grid.row_mut(blank + index).expect("A restored screen row");
+            target.erase_sized();
+            *target = restored;
         }
         grid.clear_rows(0..blank, style);
         grid.set_wrap_end(end - 1, None);

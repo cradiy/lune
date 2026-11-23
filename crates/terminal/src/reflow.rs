@@ -106,7 +106,7 @@ impl<'a> ReflowRows<'a> {
 
 /// One output row of a borrowed logical-line layout.
 /// Source coordinates refer to the complete chronological [`ScreenView`].
-/// An early wide-unit wrap leaves one destination column available for padding.
+/// An early wrap leaves destination columns available for padding.
 #[derive(Clone, Copy, Debug)]
 pub struct ReflowRow<'a> {
     view: ScreenView<'a>,
@@ -304,6 +304,14 @@ impl<'a> Iterator for ReflowRows<'a> {
             // A continuation at the cut moves its complete wide unit to the next row.
             if boundary < end && row.cells()[boundary].is_continuation() {
                 boundary -= 1;
+            }
+            if boundary < end
+                && let Some(part) = row.sized_text_at(boundary)
+                && part.column >= self.next.column
+                && part.column < boundary
+                && part.columns().len() <= self.columns
+            {
+                boundary = part.column;
             }
             used += boundary - self.next.column;
             self.next.column = boundary;

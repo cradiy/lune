@@ -13,6 +13,7 @@ pub const MAX_CELLS: usize = 1 << 20;
 pub struct Grid {
     columns: usize,
     rows: VecDeque<Row>,
+    sized_row: Option<usize>,
 }
 
 pub(crate) struct GridResize {
@@ -70,13 +71,46 @@ impl Grid {
         debug_assert!(!rows.is_empty());
         debug_assert!(rows.iter().all(|row| row.cells().len() == columns));
         rows.back_mut().unwrap().set_wrap_end(None);
-        Self { columns, rows }
+        let sized_row = rows.iter().position(Row::has_multiline_sized_text);
+        Self {
+            columns,
+            rows,
+            sized_row,
+        }
+    }
+
+    pub(crate) fn has_sized_text(&self) -> bool {
+        self.sized_row.is_some()
+    }
+
+    pub(crate) fn mark_sized_text(&mut self, row: usize) {
+        self.sized_row = Some(row);
+    }
+
+    #[cold]
+    pub(crate) fn refresh_sized_text(&mut self) {
+        if !self
+            .sized_row
+            .and_then(|index| self.rows.get(index))
+            .is_some_and(Row::has_multiline_sized_text)
+        {
+            self.sized_row = self.rows.iter().position(Row::has_multiline_sized_text);
+        }
+    }
+
+    pub(crate) fn split_sized_text(&mut self, boundary: usize) {
+        if self.sized_row.is_some()
+            && let Some(row) = self.rows.get_mut(boundary)
+        {
+            row.erase_split_sized();
+        }
     }
 
     pub(crate) fn exchange_top(&mut self, end: usize, replacement: Row) -> Row {
         let rows = self.rows.len();
         debug_assert!((1..=rows).contains(&end));
         debug_assert_eq!(replacement.cells().len(), self.columns);
+        self.split_sized_text(end);
         let outgoing = std::mem::replace(&mut self.rows[0], replacement);
         let fixed = rows - end;
         if fixed == 0 {
@@ -114,6 +148,7 @@ impl Grid {
         Ok(Self {
             columns,
             rows: storage,
+            sized_row: None,
         })
     }
 
@@ -275,12 +310,14 @@ impl Grid {
         for row in &mut self.rows {
             row.clear(style);
         }
+        self.sized_row = None;
     }
 
     pub(crate) fn fill_scalar(&mut self, character: char, style: StyleId) {
         for row in &mut self.rows {
             row.fill_scalar(character, style);
         }
+        self.sized_row = None;
     }
 
     #[inline]
@@ -306,6 +343,7 @@ impl Grid {
         if region.start == 0 && region.end == self.rows.len() {
             self.rows.rotate_left(1);
         } else if region.len() > 1 {
+            self.split_sized_text(region.end);
             self.rotate_rows_left(region.clone(), 1);
         }
         self.disconnect_before(region.start);
@@ -362,6 +400,10 @@ impl Grid {
         }
         self.validate_region(&region)?;
         let height = region.len();
+        if lines != 0 {
+            self.split_sized_text(region.start);
+            self.split_sized_text(region.end);
+        }
         if lines >= height {
             self.clear_rows(region, style);
         } else if lines != 0 {
@@ -398,6 +440,10 @@ impl Grid {
         }
         self.validate_region(&region)?;
         let height = region.len();
+        if lines != 0 {
+            self.split_sized_text(region.start);
+            self.split_sized_text(region.end);
+        }
         if lines >= height {
             self.clear_rows(region, style);
         } else if lines != 0 {
@@ -541,6 +587,7 @@ impl Grid {
             rows,
             added,
         } = prepared;
+        self.split_sized_text(rows);
         self.rows.truncate(rows);
         for row in &mut self.rows {
             row.resize_prepared(columns, style);

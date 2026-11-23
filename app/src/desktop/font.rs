@@ -85,7 +85,9 @@ impl Font {
         self.buffer.shape_until_scroll(&mut self.system, false);
     }
 
-    pub(super) fn measure_text(&mut self, text: &str) -> u32 {
+    pub(super) fn measure_text(&mut self, metrics: FontMetrics, text: &str) -> u32 {
+        self.buffer
+            .set_metrics(Metrics::new(metrics.size, metrics.cell.height.get() as f32));
         self.shape(text, 0);
         self.buffer
             .layout_runs()

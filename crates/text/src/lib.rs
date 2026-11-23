@@ -69,7 +69,8 @@ impl WidthPolicy {
         }
     }
 
-    fn columns(self, text: &str) -> usize {
+    /// Returns the number of columns for a complete grapheme.
+    pub fn columns(self, text: &str) -> usize {
         match self {
             Self::Narrow => text.width(),
             Self::Wide => text.width_cjk(),

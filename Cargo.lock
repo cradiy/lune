@@ -878,6 +878,7 @@ dependencies = [
  "lune-kitty-graphics",
  "lune-text",
  "lune-vt",
+ "unicode-segmentation",
 ]
 
 [[package]]

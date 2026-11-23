@@ -273,3 +273,135 @@ fn title_updates_follow_text_failures_reply_backpressure_and_resets() {
     advance(&mut processor, &mut screen, b"\x1b]2;new\x07");
     assert_eq!(processor.take_window_title_change(), Some("new"));
 }
+
+#[test]
+fn sized_text_tracks_blocks_across_chunk_boundaries_and_edits() {
+    use crate::{CellPosition, UnicodeWriter};
+
+    let mut processor = support::processor();
+    let mut screen = Screen::new(12, 6).unwrap();
+    let mut writer = UnicodeWriter::default();
+    let input = "\x1b]66;s=2;A中\x1b\\";
+    for chunk in input.as_bytes().chunks(2) {
+        processor.advance(chunk, &mut screen, &mut writer).unwrap();
+    }
+    assert_eq!((screen.cursor().row, screen.cursor().column), (0, 6));
+    for row_offset in 0..2 {
+        let row = screen.grid().row(row_offset).unwrap();
+        let mut blocks = row.sized_text_rows();
+        let a = blocks.next().unwrap();
+        let han = blocks.next().unwrap();
+        assert_eq!(
+            (a.text(), a.columns(), a.row_offset),
+            ("A", 0..2, row_offset)
+        );
+        assert_eq!(
+            (han.text(), han.columns(), han.row_offset),
+            ("中", 2..6, row_offset)
+        );
+        assert!(blocks.next().is_none());
+    }
+    assert_eq!(
+        screen
+            .grid()
+            .text(CellPosition { row: 0, column: 0 }..CellPosition { row: 0, column: 6 })
+            .unwrap()
+            .to_string(),
+        "A中",
+    );
+
+    processor
+        .advance(b"\x1b[2;1Hxy", &mut screen, &mut writer)
+        .unwrap();
+    assert_eq!(
+        screen.grid().row(1).unwrap().cells()[6].character(),
+        Some('x')
+    );
+    assert_eq!(
+        screen.grid().row(1).unwrap().cells()[7].character(),
+        Some('y')
+    );
+    assert_eq!(screen.grid().row(0).unwrap().sized_text_rows().count(), 2);
+
+    let original = screen.grid().row(0).unwrap().revision();
+    processor
+        .advance(b"\x1b[2;4H\x1b[X", &mut screen, &mut writer)
+        .unwrap();
+    assert_eq!(screen.grid().row(0).unwrap().sized_text_rows().count(), 1);
+    assert_eq!(screen.grid().row(1).unwrap().sized_text_rows().count(), 1);
+    assert_ne!(screen.grid().row(0).unwrap().revision(), original);
+}
+
+#[test]
+fn sized_text_validates_metadata_and_honors_the_explicit_footprint() {
+    let mut processor = support::processor();
+    let mut screen = Screen::new(8, 5).unwrap();
+    advance(
+        &mut processor,
+        &mut screen,
+        b"\x1b]66;s=8;bad\x07\x1b]66;n=2:d=1;bad\x07\x1b]66;s=3;cancelled\x18",
+    );
+    assert_eq!(screen.cursor().column, 0);
+    advance(
+        &mut processor,
+        &mut screen,
+        b"\x1b]66;s=3:w=1:n=1:d=2:v=1:h=2;ab\x07",
+    );
+    assert_eq!(screen.cursor().column, 3);
+    let row = screen.grid().row(2).unwrap();
+    let part = row.sized_text_rows().next().unwrap();
+    assert_eq!(
+        (part.text(), part.columns(), part.row_offset),
+        ("ab", 0..3, 2)
+    );
+    assert_eq!(
+        (
+            part.size().fraction(),
+            part.size().horizontal,
+            part.size().vertical
+        ),
+        (0.5, 2, 1)
+    );
+
+    advance(
+        &mut processor,
+        &mut screen,
+        b"\x1b[4;6H\x1b]66;s=2:w=2;next\x07",
+    );
+    assert_eq!((screen.cursor().row, screen.cursor().column), (3, 4));
+    assert_eq!(screen.grid().row(2).unwrap().wrap_end(), Some(5));
+    processor
+        .advance(
+            b"\x1b[3;7Hx",
+            &mut screen,
+            &mut crate::UnicodeWriter::default(),
+        )
+        .unwrap();
+    assert_eq!(screen.grid().row(2).unwrap().wrap_end(), None);
+}
+
+#[test]
+fn sized_text_survives_reflow_until_a_row_is_evicted() {
+    use crate::{HistoryLimits, StyleId};
+
+    let mut processor = support::processor();
+    let mut screen = Screen::new(8, 4).unwrap();
+    screen
+        .set_history_limits(HistoryLimits {
+            max_rows: 4,
+            max_bytes: 4096,
+        })
+        .unwrap();
+    advance(&mut processor, &mut screen, b"\x1b]66;s=2;A\x07");
+    screen.scroll_up(1, StyleId::default()).unwrap();
+    screen.reflow(10, 4, StyleId::default()).unwrap();
+
+    let view = screen.view();
+    let head = view.row(0).unwrap().sized_text_at(0).unwrap();
+    let tail = view.row(1).unwrap().sized_text_at(0).unwrap();
+    assert!(head.belongs_to(tail));
+    assert_eq!((head.row_offset, tail.row_offset), (0, 1));
+
+    screen.set_history_limits(HistoryLimits::default()).unwrap();
+    assert!(screen.grid().row(0).unwrap().sized_text_at(0).is_none());
+}

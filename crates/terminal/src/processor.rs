@@ -15,6 +15,7 @@ use crate::{
     PixelSize, Rgb, Screen, ScreenBuffer, StorageError, Style, StyleError, StyleId, StyleTable,
     TextSink,
 };
+use unicode_segmentation::UnicodeSegmentation;
 
 const INPUT_PENDING_CAPACITY: usize = 2;
 const PENDING_CAPACITY: usize = INPUT_PENDING_CAPACITY + 2;
@@ -100,6 +101,7 @@ pub struct TerminalNotifications<'a> {
 #[derive(Clone, Copy)]
 enum Pending {
     Text(char),
+    SizedText { offset: usize },
     Repeat { character: char, remaining: usize },
     Boundary,
     Execute(u8),
@@ -825,6 +827,10 @@ impl Processor {
                             pending[*end] = Some(Pending::OscReplies);
                             *end += 1;
                         }
+                        Outcome::SizedText => {
+                            pending[*end] = Some(Pending::SizedText { offset: 0 });
+                            *end += 1;
+                        }
                     }
                 }
                 Event::Dcs(event) => {
@@ -949,6 +955,31 @@ impl Processor {
                 Pending::Text(character) => text
                     .write(screen, character.encode_utf8(&mut [0; 4]), self.state.style)
                     .map_err(ProcessFailure::Text)?,
+                Pending::SizedText { offset } => {
+                    text.boundary();
+                    let (size, width, payload) =
+                        self.state.osc.sized_text().expect("Validated OSC 66");
+                    let mut offset = offset;
+                    if width != 0 {
+                        if !payload.is_empty() {
+                            screen
+                                .write_sized_text(payload, size, width, self.state.style)
+                                .map_err(ProcessFailure::Screen)?;
+                        }
+                    } else {
+                        let policy = text.width_policy();
+                        for unit in payload[offset..].graphemes(true) {
+                            let width = policy.columns(unit).clamp(1, 2);
+                            if let Err(error) =
+                                screen.write_sized_text(unit, size, width, self.state.style)
+                            {
+                                self.pending[self.head] = Some(Pending::SizedText { offset });
+                                return Err(ProcessFailure::Screen(error));
+                            }
+                            offset += unit.len();
+                        }
+                    }
+                }
                 Pending::Repeat {
                     character,
                     mut remaining,

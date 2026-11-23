@@ -69,6 +69,28 @@ fn transfer_text(target: &mut Row, source: &mut Source<'_>, transfer: RowTransfe
     debug_assert_eq!(target.retained_bytes(), transfer.bytes);
 }
 
+fn erase_incomplete_sized_text(view: ScreenView<'_>) {
+    for index in 0..view.rows() {
+        let row = view.row(index).expect("The retained row exists");
+        for part in row.sized_text_rows().filter(|part| part.size().scale > 1) {
+            let complete = index.checked_sub(part.row_offset).is_some_and(|origin| {
+                (0..usize::from(part.size().scale)).all(|offset| {
+                    view.row(origin + offset)
+                        .and_then(|row| row.sized_text_at(part.column))
+                        .is_some_and(|other| {
+                            other.column == part.column
+                                && other.row_offset == offset
+                                && part.belongs_to(other)
+                        })
+                })
+            });
+            if !complete {
+                part.block.erase();
+            }
+        }
+    }
+}
+
 fn resolve(saved: SavedCursor, region: Range<usize>, columns: usize, rows: usize) -> Cursor {
     let (top, height) = if saved.origin_mode {
         (region.start, region.len())
@@ -498,6 +520,12 @@ impl Screen {
                     .expect("A prepared alternate row exists");
                 transfer_text(target, &mut source, transfer);
             }
+        }
+        if self.sized_budget.is_some() {
+            erase_incomplete_sized_text(ScreenView::new(&primary, Some(&history)));
+            erase_incomplete_sized_text(ScreenView::new(&alternate, None));
+            primary.refresh_sized_text();
+            alternate.refresh_sized_text();
         }
         if primary_active {
             self.grid = primary;

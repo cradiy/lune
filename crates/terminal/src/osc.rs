@@ -3,6 +3,7 @@ use std::collections::{TryReserveError, VecDeque};
 use lune_vt::{OscEvent, OscTerminator};
 
 use crate::reply::{ColorReport, ColorTarget};
+use crate::sizing::{self, MAX_SIZED_TEXT_BYTES, MAX_SIZING_METADATA_BYTES};
 use crate::{Palette, PaletteEntry, Rgb};
 
 /// Maximum UTF-8 byte length of an OSC 0/2 window title.
@@ -24,6 +25,7 @@ enum Phase {
     },
     Title,
     WorkingDirectory,
+    SizedText,
     Color(u8),
     Index,
     IndexedColor(u8),
@@ -36,6 +38,7 @@ pub(crate) enum Outcome {
     Ignored,
     Reply(ColorReport),
     Replies,
+    SizedText,
 }
 
 #[derive(Clone, Copy)]
@@ -68,6 +71,7 @@ pub(crate) struct Osc {
     directory: [u8; MAX_WORKING_DIRECTORY_URI_BYTES],
     directory_length: usize,
     directory_changed: bool,
+    sized_text: Vec<u8>,
 }
 
 impl Osc {
@@ -91,6 +95,7 @@ impl Osc {
             directory: [0; MAX_WORKING_DIRECTORY_URI_BYTES],
             directory_length: 0,
             directory_changed: false,
+            sized_text: Vec::new(),
         }
     }
 
@@ -206,6 +211,7 @@ impl Osc {
             Phase::Selector { .. }
                 | Phase::Title
                 | Phase::WorkingDirectory
+                | Phase::SizedText
                 | Phase::Color(_)
                 | Phase::Index
                 | Phase::IndexedColor(_)
@@ -217,6 +223,8 @@ impl Osc {
     pub(crate) fn data(&mut self, bytes: &[u8]) {
         if matches!(self.phase, Phase::Title) {
             self.append_text(bytes);
+        } else if matches!(self.phase, Phase::SizedText) {
+            self.append_sized_text(bytes);
         } else if matches!(self.phase, Phase::Selector { .. }) {
             self.command_data(bytes);
         } else {
@@ -234,6 +242,10 @@ impl Osc {
             match byte {
                 b';' if matches!(value, 0 | 2) => self.phase = Phase::Title,
                 b';' if value == 7 => self.phase = Phase::WorkingDirectory,
+                b';' if value == 66 => {
+                    self.sized_text.clear();
+                    self.phase = Phase::SizedText;
+                }
                 b';' if matches!(value, 10..=12) => self.phase = Phase::Color(value as u8),
                 b';' if value == 4 => self.phase = Phase::Index,
                 b';' if value == 104 => self.phase = Phase::ResetIndex,
@@ -258,6 +270,8 @@ impl Osc {
         }
         if matches!(self.phase, Phase::Title) {
             self.append_text(bytes);
+        } else if matches!(self.phase, Phase::SizedText) {
+            self.append_sized_text(bytes);
         } else {
             self.batch_data(bytes);
         }
@@ -277,6 +291,21 @@ impl Osc {
             _ => self.buffers[candidate][length..length + bytes.len()].copy_from_slice(bytes),
         }
         self.lengths[candidate] += bytes.len();
+    }
+
+    fn append_sized_text(&mut self, bytes: &[u8]) {
+        const LIMIT: usize = MAX_SIZED_TEXT_BYTES + MAX_SIZING_METADATA_BYTES + 1;
+        if bytes.len() > LIMIT - self.sized_text.len()
+            || self.sized_text.try_reserve(bytes.len()).is_err()
+        {
+            self.phase = Phase::Discard;
+            return;
+        }
+        self.sized_text.extend_from_slice(bytes);
+    }
+
+    pub(crate) fn sized_text(&self) -> Option<(crate::TextSize, usize, &str)> {
+        sizing::parse(&self.sized_text)
     }
 
     #[inline(never)]
@@ -308,6 +337,7 @@ impl Osc {
                         Outcome::Done
                     }
                     Phase::WorkingDirectory => self.commit_directory(candidate),
+                    Phase::SizedText if self.sized_text().is_some() => Outcome::SizedText,
                     Phase::Color(selector) if self.operation_count == 0 => {
                         let entry = role(u16::from(selector));
                         if bytes == b"?" {

@@ -4,12 +4,12 @@ use std::{
     num::NonZeroU64,
     ops::Range,
     slice,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 
 use crate::{
     Cell, CellPosition, CellText, CellWidth, GRAPHICS_PLACEHOLDER, MAX_CELL_TEXT_BYTES,
-    StorageError, StyleId,
+    SizedTextRow, StorageError, StyleId,
 };
 
 static NEXT_ROW_REVISION: AtomicU64 = AtomicU64::new(1);
@@ -27,12 +27,19 @@ struct ExtendedText {
     text: String,
 }
 
+#[derive(Debug, Default)]
+pub(crate) struct SizedRows {
+    parts: Vec<SizedTextRow>,
+    visible: AtomicUsize,
+}
+
 /// An owned display row with read-only cell and text access.
 /// Grid mutations preserve its width and wide-cell pairs.
 #[derive(Debug)]
 pub struct Row {
     cells: Vec<Cell>,
     extended: Vec<ExtendedText>,
+    sized: Option<Box<SizedRows>>,
     revision: AtomicU64,
 }
 
@@ -121,6 +128,8 @@ impl PreparedRow {
         range: Range<usize>,
     ) -> Result<(), StorageError> {
         self.row.copy_cells(column, source, range.clone());
+        self.row
+            .copy_sized_partitions(column, source, range.clone(), true)?;
         if source.extended.is_empty() {
             return Ok(());
         }
@@ -191,6 +200,7 @@ impl Row {
                 .is_none_or(|entry| entry.column < column)
         );
         self.copy_cells(column, source, range.clone());
+        self.copy_sized_partitions(column, source, range.clone(), false)?;
         let entries = source.extended_range(range.clone());
         self.extended.try_reserve(entries.len())?;
         for entry in &source.extended[entries] {
@@ -231,7 +241,8 @@ impl Row {
         self.cells[column..column + range.len()].copy_from_slice(&source.cells[range.clone()]);
         self.invalidate_revision();
         // Source edge markers can become interior cells in the destination.
-        for edge in source.cells.len().saturating_sub(2)..source.cells.len() {
+        let gap = source.cells.last().unwrap().row_wrap().unwrap_or(0);
+        for edge in source.cells.len().saturating_sub(gap.max(1) + 1)..source.cells.len() {
             if range.contains(&edge) {
                 let cell = &mut self.cells[column + edge - range.start];
                 *cell = cell.without_row_metadata();
@@ -246,7 +257,14 @@ impl Row {
             .extended_index(column)
             .ok()
             .map_or(0, |index| self.extended[index].text.capacity());
-        self.retained_bytes().saturating_sub(removed)
+        let sized = self.sized.as_ref().map_or(0, |rows| {
+            rows.parts
+                .iter()
+                .filter(|part| part.columns().end > column)
+                .map(SizedTextRow::retained_bytes)
+                .sum()
+        });
+        self.retained_bytes().saturating_sub(removed + sized)
     }
 
     pub(crate) fn reset_write(
@@ -317,6 +335,15 @@ impl Row {
                     .capacity()
                     .saturating_mul(size_of::<ExtendedText>()),
             )
+            .saturating_add(self.sized.as_ref().map_or(0, |sized| {
+                size_of::<SizedRows>()
+                    + sized.parts.capacity() * size_of::<SizedTextRow>()
+                    + sized
+                        .parts
+                        .iter()
+                        .map(SizedTextRow::retained_bytes)
+                        .sum::<usize>()
+            }))
     }
 
     pub(crate) fn fits_columns(&self, columns: usize) -> bool {
@@ -330,6 +357,7 @@ impl Row {
         Ok(Self {
             cells,
             extended: Vec::new(),
+            sized: None,
             revision: AtomicU64::new(0),
         })
     }
@@ -338,7 +366,121 @@ impl Row {
     /// Successful edits can publish a new key even when the visible values match.
     #[inline]
     pub fn revision(&self) -> RowRevision {
+        if let Some(sized) = &self.sized {
+            let visible = self.sized_text_rows().count();
+            if sized.visible.swap(visible, Ordering::Relaxed) != visible {
+                self.revision.store(0, Ordering::Relaxed);
+            }
+        }
         self.revision_from_packed(self.revision.load(Ordering::Relaxed))
+    }
+
+    pub fn sized_text_rows(&self) -> impl Iterator<Item = &SizedTextRow> {
+        self.sized
+            .iter()
+            .flat_map(|sized| &sized.parts)
+            .filter(|part| part.block.is_visible())
+    }
+
+    pub(crate) fn has_multiline_sized_text(&self) -> bool {
+        self.sized_text_rows().any(|part| part.block.size.scale > 1)
+    }
+
+    pub(crate) fn sized_text_rows_from(
+        &self,
+        column: usize,
+    ) -> impl Iterator<Item = &SizedTextRow> {
+        let parts = self.sized.as_ref().map_or(&[][..], |sized| &sized.parts);
+        let start = parts.partition_point(|part| part.columns().end <= column);
+        parts[start..].iter().filter(|part| part.block.is_visible())
+    }
+
+    pub fn sized_text_at(&self, column: usize) -> Option<&SizedTextRow> {
+        let parts = &self.sized.as_ref()?.parts;
+        let index = parts
+            .partition_point(|part| part.column <= column)
+            .checked_sub(1)?;
+        let part = &parts[index];
+        (part.columns().contains(&column) && part.block.is_visible()).then_some(part)
+    }
+
+    pub(crate) fn reserve_sized(&mut self) -> Result<(), StorageError> {
+        let parts = &mut self.sized.get_or_insert_with(Default::default).parts;
+        parts.retain(|part| part.block.is_visible());
+        parts.try_reserve(1)?;
+        Ok(())
+    }
+
+    pub(crate) fn prepare_sized() -> Result<Box<SizedRows>, StorageError> {
+        let mut sized = Box::<SizedRows>::default();
+        sized.parts.try_reserve(1)?;
+        Ok(sized)
+    }
+
+    pub(crate) fn install_prepared_sized(&mut self, sized: Box<SizedRows>) {
+        debug_assert!(self.sized.as_ref().is_none_or(|rows| rows.parts.is_empty()));
+        self.sized = Some(sized);
+    }
+
+    pub(crate) fn add_sized(&mut self, part: SizedTextRow, style: StyleId) {
+        self.clear_range(part.columns(), style)
+            .expect("The sized text fits");
+        let parts = &mut self
+            .sized
+            .as_mut()
+            .expect("The sized row was reserved")
+            .parts;
+        let index = parts.partition_point(|existing| existing.column < part.column);
+        parts.insert(index, part);
+        self.invalidate_revision();
+    }
+
+    fn copy_sized_partitions(
+        &mut self,
+        column: usize,
+        source: &Self,
+        range: Range<usize>,
+        multiline: bool,
+    ) -> Result<(), StorageError> {
+        for part in source.sized_text_rows().filter(|part| {
+            (multiline || part.size().scale == 1)
+                && part.column >= range.start
+                && part.columns().end <= range.end
+        }) {
+            self.reserve_sized()?;
+            self.sized.as_mut().unwrap().parts.push(SizedTextRow {
+                column: column + part.column - range.start,
+                ..part.clone()
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn erase_split_sized(&mut self) {
+        for part in self.sized_text_rows().filter(|part| part.row_offset != 0) {
+            part.block.erase();
+        }
+    }
+
+    pub(crate) fn erase_sized(&mut self) {
+        if let Some(sized) = &mut self.sized {
+            for part in sized.parts.drain(..) {
+                part.block.erase();
+            }
+        }
+    }
+
+    fn erase_sized_intersections(&mut self, range: Range<usize>) {
+        if let Some(sized) = &mut self.sized {
+            sized.parts.retain(|part| {
+                if part.column < range.end && part.columns().end > range.start {
+                    part.block.erase();
+                    false
+                } else {
+                    true
+                }
+            });
+        }
     }
 
     #[inline]
@@ -461,29 +603,35 @@ impl Row {
     }
 
     /// Exclusive column where this row joins the next row through automatic
-    /// wrapping. A wide unit may leave one excluded column at the right edge.
+    /// wrapping. A complete display unit may leave excluded columns at the right edge.
     /// The last row of a [`crate::Grid`] returns `None`. A retained history row
     /// can preserve its connection to the following primary-screen row.
     /// A materialized [`crate::ReflowRow`] can retain an outgoing connection independently.
     pub fn wrap_end(&self) -> Option<usize> {
         let columns = self.cells.len();
-        // A gap join requires both edge markers. Replacing either cell leaves
-        // any remaining marker inactive until an explicit connection is set.
-        match self.cells[columns - 1].row_wrap() {
-            Some(false) => Some(columns),
-            Some(true) if columns > 1 && self.cells[columns - 2].is_row_gap() => Some(columns - 1),
-            _ => None,
-        }
+        let gap = self.cells[columns - 1].row_wrap()?;
+        let end = columns - gap;
+        // Replacing the last used cell or any skipped cell cancels an early wrap.
+        self.cells[end - 1..columns - 1]
+            .iter()
+            .all(|cell| cell.is_row_gap())
+            .then_some(end)
     }
 
     pub(crate) fn set_wrap_end(&mut self, end: Option<usize>) {
         let columns = self.cells.len();
-        debug_assert!(end.is_none_or(|end| end > 0 && (end == columns || end + 1 == columns)));
-        let gap = end.is_some_and(|end| end != columns);
-        if columns > 1 {
-            self.cells[columns - 2].set_row_gap(gap);
+        debug_assert!(end.is_none_or(|end| (1..=columns).contains(&end)));
+        if let Some(previous) = self.cells[columns - 1].row_wrap() {
+            for cell in &mut self.cells[columns - previous - 1..columns - 1] {
+                cell.set_row_gap(false);
+            }
         }
-        self.cells[columns - 1].set_row_wrap(end.map(|_| gap));
+        if let Some(end) = end {
+            for cell in &mut self.cells[end - 1..columns - 1] {
+                cell.set_row_gap(true);
+            }
+        }
+        self.cells[columns - 1].set_row_wrap(end.map(|end| columns - end));
     }
 
     pub fn text(&self, column: usize) -> Option<CellText<'_>> {
@@ -524,6 +672,28 @@ impl Row {
         range: Range<usize>,
         output: &mut impl fmt::Write,
     ) -> fmt::Result {
+        if self.sized.is_none() {
+            return self.write_cell_text(range, output);
+        }
+        let mut column = range.start;
+        for part in self
+            .sized_text_rows()
+            .filter(|part| part.column < range.end && part.columns().end > range.start)
+        {
+            self.write_cell_text(column..part.column, output)?;
+            if part.row_offset == 0 {
+                output.write_str(part.text())?;
+            } else {
+                for _ in column.max(part.column)..part.columns().end.min(range.end) {
+                    output.write_char(' ')?;
+                }
+            }
+            column = part.columns().end;
+        }
+        self.write_cell_text(column..range.end, output)
+    }
+
+    fn write_cell_text(&self, range: Range<usize>, output: &mut impl fmt::Write) -> fmt::Result {
         if range.start >= range.end {
             return Ok(());
         }
@@ -577,6 +747,8 @@ impl Row {
             cell.set_extended();
         } else if !self.cells[column].is_inline_with_width(width) {
             self.prepare_overwrite(column..end, style, None);
+        } else if self.sized.is_some() {
+            self.erase_sized_intersections(column..end);
         }
         self.cells[column] = cell;
         if width == CellWidth::Double {
@@ -806,12 +978,14 @@ impl Row {
 
     #[inline]
     pub(crate) fn clear(&mut self, style: StyleId) {
+        self.erase_sized();
         self.extended.clear();
         self.cells.fill(Cell::blank(style));
         self.invalidate_revision();
     }
 
     pub(crate) fn fill_scalar(&mut self, character: char, style: StyleId) {
+        self.erase_sized();
         self.extended.clear();
         self.cells
             .fill(Cell::scalar(character, CellWidth::Single, style));
@@ -822,6 +996,7 @@ impl Row {
     #[inline]
     pub(crate) fn reset_ascii(&mut self, bytes: &[u8], style: StyleId) {
         debug_assert_eq!(bytes.len(), self.cells.len());
+        self.erase_sized();
         self.extended.clear();
         for (cell, &byte) in self.cells.iter_mut().zip(bytes) {
             *cell = Cell::scalar(char::from(byte), CellWidth::Single, style);
@@ -842,6 +1017,9 @@ impl Row {
         }
 
         self.set_wrap_end(None);
+        if self.sized.is_some() {
+            self.shift_sized(column, count, true);
+        }
 
         if self.cells[column].is_continuation() {
             self.prepare_overwrite(column..column + 1, style, None);
@@ -872,6 +1050,9 @@ impl Row {
         }
 
         self.set_wrap_end(None);
+        if self.sized.is_some() {
+            self.shift_sized(column, count, false);
+        }
 
         let end = column + count;
         self.prepare_overwrite(column..end, style, None);
@@ -898,6 +1079,7 @@ impl Row {
             self.invalidate_revision();
         }
         if columns < self.cells.len() {
+            self.erase_sized_intersections(columns..self.cells.len());
             self.cells.truncate(columns);
             let text_columns = if self.cells[columns - 1].width() == 2 {
                 self.cells[columns - 1] = Cell::blank(style);
@@ -927,6 +1109,9 @@ impl Row {
     }
 
     fn prepare_overwrite(&mut self, range: Range<usize>, style: StyleId, keep: Option<usize>) {
+        if self.sized.is_some() {
+            self.erase_sized_intersections(range.clone());
+        }
         let mut start = range.start;
         let mut end = range.end;
         if self.cells[start].is_continuation() {
@@ -946,6 +1131,32 @@ impl Row {
                 None => self.remove_extended(start..end),
             }
         }
+    }
+
+    fn shift_sized(&mut self, column: usize, count: usize, insert: bool) {
+        let width = self.cells.len();
+        let Some(sized) = &mut self.sized else { return };
+        sized.parts.retain_mut(|part| {
+            let end = part.columns().end;
+            if end <= column {
+                return part.block.is_visible();
+            }
+            let source = if insert {
+                column..width - count
+            } else {
+                column + count..width
+            };
+            if part.size().scale != 1 || part.column < source.start || end > source.end {
+                part.block.erase();
+                return false;
+            }
+            if insert {
+                part.column += count;
+            } else {
+                part.column -= count;
+            }
+            part.block.is_visible()
+        });
     }
 
     fn remove_extended(&mut self, range: Range<usize>) {

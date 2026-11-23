@@ -4,7 +4,8 @@ use std::ops::Range;
 
 use guillotiere::{Allocation, AtlasAllocator, size2};
 use lune_terminal::{
-    CellPosition, CellText, DisplayUnit, PixelPosition, PixelSize, Rgb, Style, Underline,
+    CellPosition, CellText, CursorShape, DisplayUnit, PixelPosition, PixelSize, Rgb, SizedTextRow,
+    Style, Underline,
 };
 
 use crate::gpu::{create_quad_pipeline, linear_colors, write_instances};
@@ -32,6 +33,15 @@ struct Sprite {
     generation: u64,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct SizedRaster {
+    width: u32,
+    height: u32,
+    font_size: u32,
+    baseline: i32,
+    rendition: usize,
+}
+
 pub(super) struct TextRenderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -40,6 +50,7 @@ pub(super) struct TextRenderer {
     bind_group: wgpu::BindGroup,
     layers: Vec<AtlasAllocator>,
     glyphs: [HashMap<Box<str>, Sprite>; 9],
+    sized_glyphs: HashMap<SizedRaster, HashMap<Box<str>, Sprite>>,
     font: Font,
     metrics: FontMetrics,
     generation: u64,
@@ -85,6 +96,7 @@ impl TextRenderer {
             bind_group,
             layers: vec![AtlasAllocator::new(size2(ATLAS_SIDE, ATLAS_SIDE))],
             glyphs: Default::default(),
+            sized_glyphs: HashMap::new(),
             font,
             metrics,
             generation: 0,
@@ -115,6 +127,7 @@ impl TextRenderer {
         for cache in &mut self.glyphs {
             cache.clear();
         }
+        self.sized_glyphs.clear();
     }
 
     pub(super) fn prepare(
@@ -129,6 +142,14 @@ impl TextRenderer {
         self.evicted = false;
         self.instances.clear();
         let columns = usize::from(frame.geometry.pty_size().columns);
+        let sized_cursor = cursor.and_then(|cursor| {
+            let pos = cursor.position;
+            frame
+                .viewport
+                .row(pos.row)?
+                .sized_text_at(pos.column)
+                .map(|part| (cursor, part))
+        });
         for row in 0..frame.viewport.rows() {
             let selected =
                 selection.and_then(|range| super::selection::columns(range, row, columns));
@@ -176,8 +197,63 @@ impl TextRenderer {
                     }
                 }
             }
+            if let Some(source) = frame.viewport.row(row) {
+                for part in source.sized_text_rows() {
+                    let Some(rect) = frame.geometry.row_rect(row, part.columns()) else {
+                        continue;
+                    };
+                    let style = frame
+                        .resolve_style(source.cells()[part.column].style())
+                        .ok_or(lune_terminal::StyleError::InvalidId(
+                            source.cells()[part.column].style(),
+                        ))?;
+                    let covering = sized_cursor
+                        .filter(|(_, target)| part.belongs_to(target))
+                        .map(|(cursor, _)| cursor);
+                    let block_cursor =
+                        covering.filter(|cursor| cursor.appearance.shape == CursorShape::Block);
+                    if let Some(cursor) = block_cursor {
+                        self.rect(rect, cursor.color, 1.0);
+                    }
+                    if !style.style.hidden {
+                        let color = if block_cursor.is_some() {
+                            style.background
+                        } else {
+                            style.foreground
+                        };
+                        let alpha = if style.style.faint { 0.6 } else { 1.0 };
+                        let rendition =
+                            usize::from(style.style.bold) | (usize::from(style.style.italic) << 1);
+                        self.sized_glyph(rect, part, rendition, color, alpha);
+                    }
+                    if let Some(cursor) = covering {
+                        let mut edge = rect;
+                        match cursor.appearance.shape {
+                            CursorShape::Bar => {
+                                edge.size.width = NonZeroU32::new(2).unwrap().min(edge.size.width);
+                                self.rect(edge, cursor.color, 1.0);
+                            }
+                            CursorShape::Underline
+                                if part.row_offset + 1 == usize::from(part.size().scale) =>
+                            {
+                                self.rect(
+                                    horizontal(
+                                        edge,
+                                        edge.size.height.get().saturating_sub(2),
+                                        edge.size.height.get().min(2),
+                                    ),
+                                    cursor.color,
+                                    1.0,
+                                );
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
         }
         if let Some(cursor) = cursor
+            && sized_cursor.is_none()
             && let Some(paint) = frame.cursor_paint(cursor, NonZeroU32::new(2).unwrap())?
         {
             self.rect(paint.rect, paint.color, 1.0);
@@ -191,7 +267,7 @@ impl TextRenderer {
         {
             let width = self
                 .font
-                .measure_text(preedit)
+                .measure_text(self.metrics, preedit)
                 .min(rect.size.width.get())
                 .min(ATLAS_SIDE as u32);
             if let Some(width) = NonZeroU32::new(width) {
@@ -264,39 +340,8 @@ impl TextRenderer {
                 return;
             };
             let height = rect.size.height.get();
-            let Some((layer, allocation)) =
-                self.allocate_sprite(size2(width as i32, height as i32))
-            else {
+            let Some(sprite) = self.upload_sprite(width, height, colored) else {
                 return;
-            };
-            self.queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &self.atlas,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d {
-                        x: allocation.rectangle.min.x as u32,
-                        y: allocation.rectangle.min.y as u32,
-                        z: layer as u32,
-                    },
-                    aspect: wgpu::TextureAspect::All,
-                },
-                &self.image,
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(width * 4),
-                    rows_per_image: None,
-                },
-                wgpu::Extent3d {
-                    width,
-                    height,
-                    depth_or_array_layers: 1,
-                },
-            );
-            let sprite = Sprite {
-                allocation,
-                layer,
-                colored,
-                generation: self.generation,
             };
             self.glyphs[cache_index].insert(text.into(), sprite);
             sprite
@@ -316,13 +361,137 @@ impl TextRenderer {
         );
     }
 
+    fn sized_glyph(
+        &mut self,
+        mut rect: PixelRect,
+        part: &SizedTextRow,
+        rendition: usize,
+        color: Rgb,
+        alpha: f32,
+    ) {
+        let size = part.size();
+        let fraction = size.fraction();
+        if fraction == 0.0 || part.text().trim().is_empty() {
+            return;
+        }
+        let width = rect.size.width.get();
+        let cell_height = rect.size.height.get();
+        let height = cell_height * u32::from(size.scale);
+        let scaled_width = (width as f32 * fraction).round().max(1.0) as u32;
+        let scaled_height = (height as f32 * fraction).round().max(1.0) as u32;
+        let paint_width = scaled_width.min(ATLAS_SIDE as u32);
+        let paint_height = scaled_height.min(ATLAS_SIDE as u32);
+        let left = aligned_offset(width - scaled_width, size.horizontal);
+        let top = aligned_offset(height - scaled_height, size.vertical);
+        let row_start = part.row_offset as u32 * cell_height;
+        let first = row_start.max(top);
+        let last = (row_start + cell_height).min(top + paint_height);
+        if first >= last {
+            return;
+        }
+        let scale = f32::from(size.scale) * fraction;
+        let baseline = (self.metrics.baseline as f32 * scale).round() as i32;
+        let font_size = self.metrics.size * scale;
+        let key = SizedRaster {
+            width: paint_width,
+            height: paint_height,
+            font_size: font_size.to_bits(),
+            baseline,
+            rendition,
+        };
+        let sprite = if let Some(sprite) = self
+            .sized_glyphs
+            .get_mut(&key)
+            .and_then(|cache| cache.get_mut(part.text()))
+        {
+            sprite.generation = self.generation;
+            *sprite
+        } else {
+            let metrics = FontMetrics {
+                size: font_size,
+                cell: PixelSize {
+                    width: NonZeroU32::new(paint_width).unwrap(),
+                    height: NonZeroU32::new(paint_height).unwrap(),
+                },
+                baseline,
+            };
+            let Some(colored) = self.font.rasterize(
+                metrics,
+                part.text(),
+                rendition,
+                paint_width,
+                &mut self.image,
+            ) else {
+                return;
+            };
+            let Some(sprite) = self.upload_sprite(paint_width, paint_height, colored) else {
+                return;
+            };
+            self.sized_glyphs
+                .entry(key)
+                .or_default()
+                .insert(part.text().into(), sprite);
+            sprite
+        };
+        rect.origin.x += left;
+        rect.origin.y += first - row_start;
+        rect.size.width = NonZeroU32::new(paint_width).unwrap();
+        rect.size.height = NonZeroU32::new(last - first).unwrap();
+        let corner = sprite.allocation.rectangle.min;
+        self.quad(
+            rect,
+            color,
+            alpha,
+            [
+                corner.x as f32,
+                corner.y as f32 + (first - top) as f32,
+                paint_width as f32,
+                (last - first) as f32,
+            ],
+            [if sprite.colored { 2 } else { 1 }, sprite.layer as u32],
+        );
+    }
+
+    fn upload_sprite(&mut self, width: u32, height: u32, colored: bool) -> Option<Sprite> {
+        let (layer, allocation) = self.allocate_sprite(size2(width as i32, height as i32))?;
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.atlas,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: allocation.rectangle.min.x as u32,
+                    y: allocation.rectangle.min.y as u32,
+                    z: layer as u32,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            &self.image,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(width * 4),
+                rows_per_image: None,
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        Some(Sprite {
+            allocation,
+            layer,
+            colored,
+            generation: self.generation,
+        })
+    }
+
     fn allocate_sprite(&mut self, size: guillotiere::Size) -> Option<(usize, Allocation)> {
         if let Some(allocation) = allocate(&mut self.layers, size) {
             return Some(allocation);
         }
         if !self.evicted {
             self.evicted = true;
-            for cache in &mut self.glyphs {
+            for cache in self.glyphs.iter_mut().chain(self.sized_glyphs.values_mut()) {
                 cache.retain(|_, sprite| {
                     if sprite.generation == self.generation {
                         return true;
@@ -331,6 +500,7 @@ impl TextRenderer {
                     false
                 });
             }
+            self.sized_glyphs.retain(|_, cache| !cache.is_empty());
             if let Some(allocation) = allocate(&mut self.layers, size) {
                 return Some(allocation);
             }
@@ -403,6 +573,14 @@ impl TextRenderer {
             ],
             sprite,
         });
+    }
+}
+
+fn aligned_offset(space: u32, alignment: u8) -> u32 {
+    match alignment {
+        1 => space,
+        2 => space / 2,
+        _ => 0,
     }
 }
 

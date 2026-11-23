@@ -21,6 +21,10 @@ pub trait TextSink {
     -> Result<(), Self::Error>;
     /// Ends the opportunity to extend the previous text unit.
     fn boundary(&mut self);
+
+    fn width_policy(&self) -> WidthPolicy {
+        WidthPolicy::default()
+    }
 }
 
 impl<E, F: FnMut(&mut Screen, &str, StyleId) -> Result<(), E>> TextSink for F {
@@ -77,6 +81,10 @@ impl UnicodeWriter {
 impl TextSink for UnicodeWriter {
     type Error = StorageError;
 
+    fn width_policy(&self) -> WidthPolicy {
+        self.grapheme.policy()
+    }
+
     fn boundary(&mut self) {
         self.grapheme.clear();
         self.position = None;
@@ -110,7 +118,7 @@ impl TextSink for UnicodeWriter {
                     Ok::<_, core::convert::Infallible>(())
                 })
                 .expect("A printable ASCII tail starts a bounded cluster");
-            self.position = Some(position);
+            self.position = position;
             return Ok(());
         }
         if ascii && screen.history_capture_enabled() {
@@ -162,13 +170,16 @@ impl UnicodeWriter {
             .advance(text, |update| {
                 match update {
                     TextUpdate::Ascii(run) => {
-                        *position = Some(place_ascii(screen, run, style)?);
+                        *position = place_ascii(screen, run, style)?;
                     }
                     TextUpdate::Start(unit) | TextUpdate::Extend(unit) => {
                         let extending = matches!(update, TextUpdate::Extend(_));
                         let columns = screen.grid().columns();
                         let column = if extending {
-                            position.expect("An extension has a screen position").column
+                            let Some(previous) = position else {
+                                return Ok(());
+                            };
+                            previous.column
                         } else {
                             screen.cursor().column
                         };
@@ -184,27 +195,11 @@ impl UnicodeWriter {
                         } else {
                             CellWidth::Single
                         };
-                        *position = Some(if extending {
-                            screen.revise_unit(
-                                position.expect("An extension has a screen position"),
-                                unit.text,
-                                width,
-                                style,
-                            )?
+                        *position = if extending {
+                            Some(screen.revise_unit(position.unwrap(), unit.text, width, style)?)
                         } else {
-                            let cursor = screen.cursor();
-                            let target_column =
-                                if cursor.wrap_pending || column + width.columns() > columns {
-                                    0
-                                } else {
-                                    column
-                                };
-                            screen.write(unit.text, width, style)?;
-                            CellPosition {
-                                row: screen.cursor().row,
-                                column: target_column,
-                            }
-                        });
+                            screen.write_unit(unit.text, width, style)?
+                        };
                     }
                 }
                 Ok(())
@@ -223,11 +218,14 @@ fn place_ascii(
     screen: &mut Screen,
     text: &str,
     style: StyleId,
-) -> Result<CellPosition, StorageError> {
+) -> Result<Option<CellPosition>, StorageError> {
+    if screen.has_sized_text() {
+        return screen.write_ascii_over_sized(text.as_bytes(), style);
+    }
     let initial_column = screen.cursor().column;
     screen.write_ascii(text.as_bytes(), style)?;
     let cursor = screen.cursor();
-    Ok(CellPosition {
+    Ok(Some(CellPosition {
         row: cursor.row,
         column: if !screen.auto_wrap() {
             initial_column
@@ -238,5 +236,5 @@ fn place_ascii(
         } else {
             cursor.column - 1
         },
-    })
+    }))
 }
