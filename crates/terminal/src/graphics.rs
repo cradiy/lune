@@ -17,9 +17,7 @@ use crate::{
 
 mod placeholders;
 mod visibility;
-pub use placeholders::{
-    GraphicsPlaceholderCache, GraphicsPlaceholderRun, visit_graphics_placeholders,
-};
+pub use placeholders::{GraphicsPlaceholderCache, GraphicsPlaceholderRun};
 use placeholders::{Origins, VirtualParentOrigins};
 use visibility::AnimationVisibility;
 
@@ -384,6 +382,30 @@ pub(crate) struct GraphicsPlacements {
     anchors: HashMap<u64, usize>,
     relative_indices: Vec<u16>,
     orphaned: Vec<OrphanedImage>,
+    anonymous: AnonymousPlacements,
+}
+
+#[derive(Debug, Default)]
+struct AnonymousPlacements {
+    live: usize,
+    retired: Vec<ImageKey>,
+}
+
+impl AnonymousPlacements {
+    fn reserve_insertion(&mut self) -> Result<(), PlacementError> {
+        // Reserve a retirement slot for every live placement before it is inserted.
+        self.retired
+            .try_reserve(self.live + 1)
+            .map_err(|_| PlacementError::Quota)
+    }
+
+    fn record_removal(&mut self, image: &GraphicsPlacement) {
+        if image.anonymous.is_some() {
+            self.live -= 1;
+            debug_assert!(self.retired.len() < self.retired.capacity());
+            self.retired.push(image.placement.image);
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -439,7 +461,10 @@ impl GraphicsPlacements {
     }
 
     pub(crate) fn clear(&mut self) {
-        self.clear_placements();
+        self.retain(|_| false);
+        self.anchors.clear();
+        self.relative_indices.clear();
+        self.virtual_parents = false;
         self.orphaned.clear();
     }
 
@@ -515,7 +540,7 @@ impl GraphicsPlacements {
         anchors.sort_unstable_by_key(|anchor| anchor.index);
         let mut anchors = anchors.into_iter();
         let count = self.images.len();
-        self.images.retain_mut(|image| {
+        self.retain(|image| {
             if image.placement.position != PlacementPosition::Cursor {
                 return true;
             }
@@ -548,14 +573,6 @@ impl GraphicsPlacements {
         self.remove_matching(|image| !image.is_virtual());
     }
 
-    fn clear_placements(&mut self) {
-        self.images.clear();
-        self.anchors.clear();
-        self.relative_indices.clear();
-        self.virtual_count = 0;
-        self.virtual_parents = false;
-    }
-
     pub(crate) fn clear_live(&mut self, view: ScreenView<'_>, styles: &StyleTable) {
         self.remove_matching_with_origins(Some((view, styles)), |image, origins| {
             if image.is_virtual() {
@@ -576,7 +593,7 @@ impl GraphicsPlacements {
         }
         let count = self.images.len();
         let mut changed = false;
-        self.images.retain_mut(|image| {
+        self.retain(|image| {
             if image.is_virtual() || image.parent.is_some() || image.row >= first_row {
                 return true;
             }
@@ -651,7 +668,7 @@ impl GraphicsPlacements {
         }
         let count = self.images.len();
         let mut changed = false;
-        self.images.retain_mut(|image| {
+        self.retain(|image| {
             if image.is_virtual() || image.parent.is_some() {
                 return true;
             }
@@ -773,7 +790,7 @@ impl GraphicsPlacements {
 
     fn remove_matching(&mut self, mut matches: impl FnMut(&GraphicsPlacement) -> bool) {
         let count = self.images.len();
-        Self::retain_placements(&mut self.images, &mut self.virtual_count, &mut matches);
+        self.retain(|image| !matches(image));
         self.finish_removal(count);
     }
 
@@ -790,23 +807,39 @@ impl GraphicsPlacements {
             .parent_origins
             .collect(&self.images, view, styles, |_| {});
         let count = self.images.len();
-        Self::retain_placements(&mut self.images, &mut self.virtual_count, |image| {
-            matches(image, Some(origins))
-        });
+        Self::retain_placements(
+            &mut self.images,
+            &mut self.virtual_count,
+            &mut self.anonymous,
+            |image| !matches(image, Some(origins)),
+        );
         self.finish_removal(count);
+    }
+
+    fn retain(&mut self, keep: impl FnMut(&mut GraphicsPlacement) -> bool) {
+        Self::retain_placements(
+            &mut self.images,
+            &mut self.virtual_count,
+            &mut self.anonymous,
+            keep,
+        );
     }
 
     fn retain_placements(
         images: &mut Vec<GraphicsPlacement>,
         virtual_count: &mut usize,
-        mut matches: impl FnMut(&GraphicsPlacement) -> bool,
+        anonymous: &mut AnonymousPlacements,
+        mut keep: impl FnMut(&mut GraphicsPlacement) -> bool,
     ) {
-        images.retain(|image| {
-            let removed = matches(image);
-            if removed && image.is_virtual() {
+        images.retain_mut(|image| {
+            if keep(image) {
+                return true;
+            }
+            if image.is_virtual() {
                 *virtual_count -= 1;
             }
-            !removed
+            anonymous.record_removal(image);
+            false
         });
     }
 
@@ -884,6 +917,10 @@ impl GraphicsPlacements {
             }
         }
         let removes_existing = replacement.is_some();
+        let anonymous = image.anonymous.is_some();
+        if anonymous {
+            self.anonymous.reserve_insertion()?;
+        }
         let evicts =
             |existing: &GraphicsPlacement| evicted.binary_search(&existing.placement.image).is_ok();
         if !removes_existing && (evicted.is_empty() || !self.images.iter().any(evicts)) {
@@ -933,19 +970,13 @@ impl GraphicsPlacements {
             validation?;
         }
         if removes_existing || !evicted.is_empty() {
-            let virtual_count = &mut self.virtual_count;
-            self.images.retain(|existing| {
-                let removed = remove(existing) || evicts(existing);
-                if removed && existing.is_virtual() {
-                    *virtual_count -= 1;
-                }
-                !removed
-            });
+            self.retain(|existing| !remove(existing) && !evicts(existing));
         }
         self.next_serial = self.next_serial.max(image.serial);
         let graph = !self.anchors.is_empty() || image.parent.is_some();
         let position = self.draw_position(&image);
         self.virtual_count += usize::from(image.is_virtual());
+        self.anonymous.live += usize::from(anonymous);
         self.images.insert(position, image);
         if graph {
             if removes_existing || !evicted.is_empty() {
@@ -1199,12 +1230,15 @@ impl GraphicsPlacements {
         }
         if invalid {
             let orphaned = &mut self.orphaned;
+            let anonymous = &mut self.anonymous;
             self.images.retain(|image| {
                 if image.parent != Some(0) {
                     return true;
                 }
                 let id = image.placement.image.id();
-                if id != 0 {
+                if id == 0 {
+                    anonymous.record_removal(image);
+                } else {
                     orphaned.push(OrphanedImage::new(id));
                 }
                 false
@@ -1221,11 +1255,14 @@ impl GraphicsPlacements {
     }
 
     pub(crate) fn has_orphans(&self) -> bool {
-        !self.orphaned.is_empty()
+        !self.orphaned.is_empty() || !self.anonymous.retired.is_empty()
     }
 
+    #[cold]
     pub(crate) fn reap_orphans(&mut self, images: &mut ImageStore) {
-        if !self.has_orphans() {
+        images.remove_keys(self.anonymous.retired.iter().copied());
+        self.anonymous.retired.clear();
+        if self.orphaned.is_empty() {
             return;
         }
         self.orphaned.sort_unstable_by_key(|orphan| orphan.id);
@@ -1270,7 +1307,7 @@ pub(crate) struct Graphics {
     retained_ids: Vec<u32>,
     reply: Option<Reply>,
     active: bool,
-    has_relative: bool,
+    has_orphanable_placements: bool,
     animation_buffer: Option<ScreenBuffer>,
     animation_visibility: AnimationVisibility,
 }
@@ -1283,7 +1320,7 @@ impl Default for Graphics {
             retained_ids: Vec::new(),
             reply: None,
             active: false,
-            has_relative: false,
+            has_orphanable_placements: false,
             animation_buffer: None,
             animation_visibility: AnimationVisibility::default(),
         }
@@ -1342,12 +1379,13 @@ impl Graphics {
         store.poll_animations(clock);
     }
 
-    pub(crate) fn reset(&mut self) {
+    pub(crate) fn reset(&mut self, screen: &mut Screen) {
         self.decoder.cancel();
         self.images.iter_mut().for_each(ImageStore::clear);
+        self.reap_orphans(screen);
         self.reply = None;
         self.active = false;
-        self.has_relative = false;
+        self.has_orphanable_placements = false;
         self.animation_visibility.invalidate();
     }
 
@@ -1394,17 +1432,17 @@ impl Graphics {
                         }
                         debug_assert!(self.reply.is_none());
                         self.reply = images.receive(command, |change| {
-                            let relative = matches!(&change, lune_kitty_graphics::ImageChange::Place { placement, .. }
-                                if matches!(placement.position, PlacementPosition::Relative(_)));
+                            let orphanable = matches!(&change, lune_kitty_graphics::ImageChange::Place { placement, anonymous, .. }
+                                if anonymous.is_some() || matches!(placement.position, PlacementPosition::Relative(_)));
                             screen.apply_image(change)?;
-                            self.has_relative |= relative;
+                            self.has_orphanable_placements |= orphanable;
                             Ok(())
                         });
                         return self.reply.is_some();
                     }
-                    Some(Err(error)) => {
+                    Some(Err(_)) => {
                         debug_assert!(self.reply.is_none());
-                        self.reply = images.reject_chunk(error);
+                        self.reply = images.reject_chunk();
                         return self.reply.is_some();
                     }
                     None => {}
@@ -1422,7 +1460,7 @@ impl Graphics {
 
     #[inline]
     pub(crate) fn reap_orphans(&mut self, screen: &mut Screen) {
-        if self.has_relative && screen.has_graphics_orphans() {
+        if self.has_orphanable_placements {
             screen.reap_graphics_orphans(&mut self.images);
         }
     }
@@ -1465,9 +1503,6 @@ fn delete_images(
                         .any(|placement| placement.placement.image.id() == id))
             {
                 images.remove_id(id);
-            }
-            if images.has_anonymous_images() {
-                images.retain_ids(|_| true);
             }
             return;
         }
@@ -1524,11 +1559,7 @@ fn delete_unreferenced<const N: usize>(
             images.retain_ids(|id| {
                 removed.binary_search(&id).is_err() || referenced.binary_search(&id).is_ok()
             });
-            return;
         }
-    }
-    if images.has_anonymous_images() {
-        images.retain_ids(|_| true);
     }
 }
 

@@ -179,7 +179,7 @@ impl State {
         }
     }
 
-    fn reset(&mut self) {
+    fn reset(&mut self, screen: &mut Screen) {
         self.style = StyleId(0);
         self.last_graphic = '\0';
         self.saved_style = [StyleId(0); 2];
@@ -193,7 +193,8 @@ impl State {
         self.resize_reporting = None;
         self.osc.reset();
         self.dcs = Dcs::default();
-        self.graphics.reset();
+        screen.reset(self.style);
+        self.graphics.reset(screen);
     }
 
     #[cold]
@@ -921,9 +922,8 @@ impl Processor {
         self.parse_errors = 0;
         self.ignored_sequences = 0;
         self.bell_pending = false;
-        self.state.reset();
+        self.state.reset(screen);
         self.reply = Reply::default();
-        screen.reset(StyleId(0));
     }
 
     #[inline]
@@ -1248,10 +1248,7 @@ fn escape(screen: &mut Screen, sequence: EscapeSequence<'_>, state: &mut State) 
         b'=' => state.input.application_keypad = true,
         b'>' => state.input.application_keypad = false,
         b'M' => screen.reverse_index(state.style),
-        b'c' => {
-            state.reset();
-            screen.reset(state.style);
-        }
+        b'c' => state.reset(screen),
         _ => return false,
     }
     true

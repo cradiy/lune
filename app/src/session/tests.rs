@@ -958,6 +958,117 @@ fn kitty_delete_preserves_surviving_references_and_cancels_pending_uploads() {
 }
 
 #[test]
+fn kitty_coordinate_deletion_retires_only_the_selected_anonymous_source() {
+    let mut session = session(
+        concat!(
+            "\x1b[1;2H\x1b_Ga=T,i=41,p=1,s=1,v=1,C=1,q=2;AP8A/w==\x1b\\\x1b[S",
+            "\x1b[2;2H\x1b_Ga=p,i=41,p=2,C=1,q=2\x1b\\",
+            "\x1b_Ga=T,s=1,v=1,C=1,q=2;/wAA/w==\x1b\\",
+            "\x1b[2;3H\x1b_Ga=T,s=1,v=1,C=1,q=2;AAD//w==\x1b\\",
+        )
+        .as_bytes(),
+    );
+    session
+        .set_history_limits(HistoryLimits {
+            max_rows: 2,
+            max_bytes: 4096,
+        })
+        .unwrap();
+    session.pump().unwrap();
+    let frame = session.presentation_frame().unwrap();
+    let store = frame.image_store();
+    let before = store.storage_revision();
+    let mut anonymous = frame
+        .graphics_placements()
+        .iter()
+        .filter(|placement| placement.placement.image.id() == 0)
+        .map(|placement| placement.placement.image);
+    let removed = anonymous.next().unwrap();
+    let retained = anonymous.next().unwrap();
+    let retained_revision = store.source_revision(retained).unwrap();
+
+    session.transport.source = Cursor::new(b"\x1b_Ga=d,d=p,x=2,y=2\x1b\\");
+    session.pump().unwrap();
+    let frame = session.presentation_frame().unwrap();
+    let store = frame.image_store();
+    let [other, history] = frame.graphics_placements() else {
+        panic!("Expected the other anonymous placement and the historical placement");
+    };
+    assert_eq!(other.placement.image, retained);
+    assert_eq!((history.placement.id, history.row), (1, -1));
+    assert_eq!(store.invalidated_source(before), Some(removed));
+    assert_eq!(store.source_revision(retained), Some(retained_revision));
+    assert!(store.get(41).is_some());
+
+    session.transport.source = Cursor::new(b"\x1b_Ga=d,d=P,x=3,y=2\x1b\\");
+    session.pump().unwrap();
+    let frame = session.presentation_frame().unwrap();
+    assert!(!frame.image_store().has_anonymous_images());
+    assert_eq!(frame.graphics_placements().len(), 1);
+}
+
+#[test]
+fn kitty_history_eviction_retires_sources_in_their_own_buffer() {
+    let mut session = session(
+        concat!(
+            "\x1b_Ga=T,s=1,v=1,C=1,q=2;/wAA/w==\x1b\\\x1b[S",
+            "\x1b_Ga=T,s=1,v=1,C=1,q=2;AP8A/w==\x1b\\\x1b[S",
+            "\x1b[2;1H\x1b_Ga=T,s=1,v=1,C=1,q=2;AAD//w==\x1b\\",
+        )
+        .as_bytes(),
+    );
+    session
+        .set_history_limits(HistoryLimits {
+            max_rows: 2,
+            max_bytes: 4096,
+        })
+        .unwrap();
+    session.pump().unwrap();
+    let frame = session.presentation_frame().unwrap();
+    let [oldest, newer, live] = frame.graphics_placements() else {
+        panic!("Expected two historical placements and one live placement");
+    };
+    let (oldest, newer, live) = (
+        oldest.placement.image,
+        newer.placement.image,
+        live.placement.image,
+    );
+    let before = frame.image_store().storage_revision();
+
+    session.transport.source = Cursor::new(b"\x1b[S");
+    session.pump().unwrap();
+    let frame = session.presentation_frame().unwrap();
+    assert_eq!(frame.image_store().invalidated_source(before), Some(oldest));
+    assert!(frame.image_store().source_revision(newer).is_some());
+    assert!(frame.image_store().source_revision(live).is_some());
+    let before = frame.image_store().storage_revision();
+
+    session.transport.source = Cursor::new(b"\x1b[?47h");
+    session.pump().unwrap();
+    session
+        .set_history_limits(HistoryLimits::default())
+        .unwrap();
+    let frame = session.presentation_frame().unwrap();
+    let primary = session.processor().graphics_images(ScreenBuffer::Primary);
+    assert_eq!(primary.invalidated_source(before), Some(newer));
+    assert!(primary.source_revision(live).is_some());
+    assert!(frame.image_store().is_empty());
+
+    session
+        .set_history_limits(HistoryLimits {
+            max_rows: 2,
+            max_bytes: 4096,
+        })
+        .unwrap();
+    session.transport.source =
+        Cursor::new(b"\x1b[?47l\x1b_Ga=T,s=1,v=1,C=1,q=2;AP8A/w==\x1b\\\x1b[S\x1b[S\x1b[3J");
+    session.pump().unwrap();
+    let frame = session.presentation_frame().unwrap();
+    assert!(frame.image_store().is_empty());
+    assert!(!frame.image_store().has_anonymous_images());
+}
+
+#[test]
 fn kitty_numbered_images_use_the_newest_live_id() {
     let mut session = session(
         concat!(
@@ -1405,6 +1516,17 @@ fn kitty_images_compose_in_an_offscreen_wgpu_pass() {
         let start = y * stride as usize + x * 4;
         <[u8; 4]>::try_from(&mapped[start..start + 4]).unwrap()
     };
+    {
+        let mut session = session_with_size(b"\x1b_Ga=T,i=1,s=1,v=1,C=1,q=2;/wAA/w==\x1b\\", size);
+        session.pump().unwrap();
+        let frame = session.presentation_frame().unwrap();
+        let mut renderer = crate::ImageRenderer::new(&device, format);
+        renderer.fail_next_upload();
+        assert_eq!(renderer.prepare(&device, &queue, &frame), 1);
+        assert_eq!(pixel(&read_frame(&renderer), 0, 0), [0; 4]);
+        assert_eq!(renderer.prepare(&device, &queue, &frame), 0);
+        assert_eq!(pixel(&read_frame(&renderer), 0, 0), [255, 0, 0, 255]);
+    }
     let before = read_frame(&renderer);
     for ((x, y), expected) in [
         ((0, 0), [255, 0, 0, 255]),
@@ -2136,6 +2258,45 @@ fn kitty_images_compose_in_an_offscreen_wgpu_pass() {
             .unwrap();
         assert_eq!(consumed, wire.len());
     };
+    {
+        let upload = format!(
+            concat!(
+                "\x1b_Gi=46,f=24,s=129,v=6,q=2;{}\x1b\\",
+                "\x1b_Ga=f,i=46,c=1,f=24,s=127,v=6,X=1,q=2;{}\x1b\\",
+                "\x1b_Ga=a,i=46,c=2\x1b\\",
+            ),
+            "AP8A".repeat(129 * 6),
+            "/wAA".repeat(127 * 6),
+        );
+        let mut session = session_with_size(b"", size);
+        send(&mut session, upload.as_bytes());
+        let full = b"\x1b_Ga=p,i=46,p=1,c=8,C=1,q=2\x1b\\";
+        for start_cropped in [false, true] {
+            let mut renderer = crate::ImageRenderer::new(&device, format);
+            if start_cropped {
+                send(&mut session, b"\x1b_Ga=p,i=46,p=1,w=1,h=1,C=1,q=2\x1b\\");
+                let frame = session.presentation_frame().unwrap();
+                assert_eq!(renderer.prepare(&device, &queue, &frame), 0);
+                assert_eq!(pixel(&read_frame(&renderer), 0, 0), [255, 0, 0, 255]);
+                assert_eq!(renderer.pixel_scratch_capacity(), 0);
+            }
+            send(&mut session, full);
+            let frame = session.presentation_frame().unwrap();
+            assert_eq!(renderer.prepare(&device, &queue, &frame), 0);
+            let key = frame.graphics_placements()[0].placement.image;
+            assert_eq!(renderer.resident_image_tiles(key), 2);
+            assert_eq!(pixel(&read_frame(&renderer), 0, 0), [255, 0, 0, 255]);
+            assert_eq!(renderer.pixel_scratch_capacity(), 4 * 6 * 4);
+
+            send(
+                &mut session,
+                b"\x1b_Ga=p,i=46,p=1,x=128,w=1,h=1,C=1,q=2\x1b\\",
+            );
+            let frame = session.presentation_frame().unwrap();
+            assert_eq!(renderer.prepare(&device, &queue, &frame), 0);
+            assert_eq!(pixel(&read_frame(&renderer), 0, 0), [0, 255, 0, 255]);
+        }
+    }
     let prefix = "AAAA".repeat(124);
     let rows = [
         "AAAAAAAAAAAAAAAA",
@@ -3326,6 +3487,24 @@ fn kitty_large_crop_uploads_only_the_needed_tiles() {
     assert_eq!(virtual_whole.cached_texture(key).unwrap().width(), 1024);
     assert_eq!(virtual_whole.image_instance_count(), 1);
     queue.submit([]);
+
+    for (wire, instances) in [
+        (b"\x1b[3;1H\x1b[5X".as_slice(), 2),
+        (
+            "\x1b[3;1H\x1b[38;5;73m\u{10eeee}\u{30e}\u{10eeee}\u{10eeee}\u{10eeee}\u{10eeee}\x1b[0m"
+                .as_bytes(),
+            1,
+        ),
+        (b"\x1b[2J", 0),
+    ] {
+        send(&mut session, wire);
+        assert_eq!(
+            virtual_whole.prepare(&device, &queue, &session.presentation_frame().unwrap()),
+            0
+        );
+        assert_eq!(virtual_whole.image_instance_count(), instances);
+        queue.submit([]);
+    }
 }
 
 #[test]

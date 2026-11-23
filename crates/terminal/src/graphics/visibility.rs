@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use lune_kitty_graphics::ImageStore;
 
-use super::{GraphicsPlaceholderCache, GraphicsPlaceholderRun, visit_graphics_placeholders};
+use super::{GraphicsPlaceholderCache, GraphicsPlaceholderRun};
 use crate::{PixelSize, Row, RowRevision, Screen, StyleTable};
 
 #[derive(Default)]
@@ -100,7 +100,15 @@ impl AnimationVisibility {
                 )
                 .is_ok()
         } else if self.has_virtual {
-            visit_graphics_placeholders(placements, view.iter_rows(), styles, record).is_ok()
+            self.parents
+                .visit_viewport(
+                    graphics.expect("A virtual placement has a graphics revision"),
+                    placements,
+                    view,
+                    styles,
+                    record,
+                )
+                .is_ok()
         } else {
             true
         };

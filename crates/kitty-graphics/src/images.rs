@@ -6,8 +6,8 @@ use std::sync::{
 use std::time::Instant;
 
 use super::{
-    Command, Controls, DecodeError, Delete, DeleteTarget, EvictionRanking, FeatureReply,
-    INLINE_DECODED_BYTES, ImageChange, Placement, PlacementError, Value, control_keys,
+    Command, Controls, Delete, DeleteTarget, EvictionRanking, FeatureReply, INLINE_DECODED_BYTES,
+    ImageChange, Placement, PlacementError, Value, control_keys,
 };
 use crate::animation::{
     Animation, Canvas, FrameAppend, FrameBudget, FrameComposition, FrameControl, FrameDamage,
@@ -89,9 +89,7 @@ impl<'a> PixelUpdatePlan<'a> {
     #[inline]
     pub fn raster_regions(&self) -> Option<[PixelBounds; 2]> {
         match self.damage.as_ref()? {
-            FrameDamage::Regions(regions)
-                if self.image.animation.as_ref()?.needs_rasterization() =>
-            {
+            FrameDamage::Regions(regions) if self.image.pixel_regions_may_need_scratch() => {
                 Some(regions.map(Region::bounds))
             }
             FrameDamage::Overwrite(_) => None,
@@ -188,6 +186,13 @@ impl Image {
             self.width as usize,
             self.format.bytes_per_pixel() as usize,
         ))
+    }
+
+    /// Returns whether a pixel rectangle of the current frame can require rasterization.
+    pub fn pixel_regions_may_need_scratch(&self) -> bool {
+        self.animation
+            .as_deref()
+            .is_some_and(Animation::needs_rasterization)
     }
 
     /// Returns the scratch capacity required to read an in-bounds pixel rectangle.
@@ -477,9 +482,16 @@ impl ImageStore {
     }
 
     pub fn remove_id(&mut self, id: u32) {
-        let key = ImageKey(u64::from(id));
-        if let Some(entry) = self.images.remove(&key) {
-            self.release_stored(key, entry, next_image_revision());
+        self.remove_keys([ImageKey(u64::from(id))]);
+    }
+
+    pub fn remove_keys(&mut self, keys: impl IntoIterator<Item = ImageKey>) {
+        let mut revision = None;
+        for key in keys {
+            if let Some(entry) = self.images.remove(&key) {
+                let revision = *revision.get_or_insert_with(next_image_revision);
+                self.release_stored(key, entry, revision);
+            }
         }
     }
 
@@ -562,12 +574,8 @@ impl ImageStore {
     }
 
     /// Rejects an in-progress transfer when a Kitty APC fails decoding.
-    pub fn reject_chunk(&mut self, error: DecodeError) -> Option<Reply> {
-        let transfer = self.pending.take()?;
-        transfer.error_reply(match error {
-            DecodeError::PayloadAllocation => QUOTA,
-            _ => INVALID,
-        })
+    pub fn reject_chunk(&mut self) -> Option<Reply> {
+        self.pending.take()?.error_reply(INVALID)
     }
 
     pub fn clear(&mut self) {

@@ -366,15 +366,15 @@ impl Screen {
             .chain(self.inactive.graphics.as_slice())
     }
 
-    pub(crate) fn has_graphics_orphans(&self) -> bool {
-        self.graphics.has_orphans() || self.inactive.graphics.has_orphans()
-    }
-
-    #[cold]
+    #[inline]
     pub(crate) fn reap_graphics_orphans(&mut self, images: &mut [ImageStore; 2]) {
         let active = self.active_buffer as usize;
-        self.graphics.reap_orphans(&mut images[active]);
-        self.inactive.graphics.reap_orphans(&mut images[1 - active]);
+        if self.graphics.has_orphans() {
+            self.graphics.reap_orphans(&mut images[active]);
+        }
+        if self.inactive.graphics.has_orphans() {
+            self.inactive.graphics.reap_orphans(&mut images[1 - active]);
+        }
     }
 
     #[inline]
@@ -409,10 +409,6 @@ impl Screen {
 
     pub fn graphics_revision(&self) -> Option<u64> {
         self.graphics.revision()
-    }
-
-    pub fn inactive_graphics_revision(&self) -> Option<u64> {
-        self.inactive.graphics.revision()
     }
 
     pub fn has_virtual_graphics(&self) -> bool {

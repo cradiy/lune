@@ -2180,6 +2180,50 @@ fn posix_shared_transfer_reads_and_unlinks_the_object() {
 }
 
 #[test]
+fn payload_allocation_failures_keep_reply_identity_and_quiet() {
+    for (pending, header, report) in [
+        (
+            b"".as_slice(),
+            b"Ga=T,i=41,p=9,f=24,s=2000,v=1,C=1;".as_slice(),
+            true,
+        ),
+        (
+            b"\x1b_Ga=T,i=41,p=9,f=24,s=2001,v=1,C=1,q=2,m=1;/wAA\x1b\\",
+            b"Gm=0,q=1;",
+            true,
+        ),
+        (
+            b"\x1b_Ga=T,i=41,p=9,f=24,s=2001,v=1,C=1,m=1;/wAA\x1b\\",
+            b"Gm=0,q=2;",
+            false,
+        ),
+    ] {
+        let mut images = ImageStore::new(8192, 1);
+        feed(b"\x1b_Gi=41,f=24,s=1,v=1,q=2;/wAA\x1b\\", 9, |command| {
+            assert!(images.receive(command.unwrap(), |_| Ok(())).is_none());
+        });
+        feed(pending, 5, |command| {
+            assert!(images.receive(command.unwrap(), |_| Ok(())).is_none());
+        });
+
+        let mut decoder = Decoder::default();
+        decoder.start();
+        decoder.push(header);
+        decoder.state = State::DiscardedPayload(PayloadDiscard::Allocation);
+        let command = decoder.finish().unwrap().unwrap();
+        assert_eq!(command.encoded_payload(), Err(PayloadError::Allocation));
+        let reply = images.receive(command, |_| {
+            panic!("Failed uploads cannot change placements")
+        });
+        assert_eq!(
+            reply.map(|reply| (reply.id, reply.placement_id, reply.message)),
+            report.then_some((41, 9, b"ENOSPC:Image quota exceeded".as_slice())),
+        );
+        assert_eq!(images.get(41).unwrap().dimensions(), (1, 1));
+    }
+}
+
+#[test]
 fn payload_bounds_and_nonfinal_block_alignment_are_enforced() {
     let mut decoder = Decoder::default();
     decoder.start();

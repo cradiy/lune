@@ -147,12 +147,12 @@ pub enum DecodeError {
     ControlTooLong,
     InvalidControl,
     DuplicateKey(u8),
-    PayloadAllocation,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum PayloadError {
     TooLong,
+    Allocation,
     InvalidChunk,
     Base64(DecodeSliceError),
 }
@@ -160,7 +160,13 @@ pub enum PayloadError {
 #[derive(Debug, PartialEq, Eq)]
 pub struct Command<'a> {
     pub controls: Controls,
-    encoded_payload: Option<&'a [u8]>,
+    encoded_payload: Result<&'a [u8], PayloadDiscard>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PayloadDiscard {
+    TooLong,
+    Allocation,
 }
 
 impl Command<'_> {
@@ -173,11 +179,14 @@ impl Command<'_> {
     }
 
     fn encoded_transfer(&self) -> Result<&[u8], PayloadError> {
-        self.encoded_payload.ok_or(PayloadError::TooLong)
+        self.encoded_payload.map_err(|discard| match discard {
+            PayloadDiscard::TooLong => PayloadError::TooLong,
+            PayloadDiscard::Allocation => PayloadError::Allocation,
+        })
     }
 
     fn has_payload(&self) -> bool {
-        self.encoded_payload.is_none_or(|bytes| !bytes.is_empty())
+        !matches!(self.encoded_payload, Ok([]))
     }
 
     /// Decodes this command's payload block into caller-provided storage.
@@ -208,7 +217,7 @@ enum State {
     Control,
     Payload,
     LargePayload,
-    PayloadOverflow,
+    DiscardedPayload(PayloadDiscard),
     Ignore,
     Failed(DecodeError),
 }
@@ -292,7 +301,7 @@ impl Decoder {
     fn push_large_payload(&mut self, bytes: &[u8]) {
         let needed = self.payload_len.saturating_add(bytes.len());
         if needed > MAX_DIRECT_PAYLOAD_BYTES {
-            self.state = State::PayloadOverflow;
+            self.state = State::DiscardedPayload(PayloadDiscard::TooLong);
             return;
         }
         let first = matches!(self.state, State::Payload);
@@ -307,7 +316,7 @@ impl Decoder {
             if controls.is_feature_query()
                 || matches!(controls.get(b't'), Some(Value::Letter(b'f' | b't' | b's')))
             {
-                self.state = State::PayloadOverflow;
+                self.state = State::DiscardedPayload(PayloadDiscard::TooLong);
                 return;
             }
         }
@@ -317,7 +326,7 @@ impl Decoder {
                 .try_reserve_exact(needed.next_power_of_two() - self.large_payload.len())
                 .is_err()
         {
-            self.state = State::Failed(DecodeError::PayloadAllocation);
+            self.state = State::DiscardedPayload(PayloadDiscard::Allocation);
             return;
         }
         if first {
@@ -332,21 +341,21 @@ impl Decoder {
     pub fn finish(&mut self) -> Option<Result<Command<'_>, DecodeError>> {
         let state = core::mem::replace(&mut self.state, State::Idle);
         match state {
-            State::Control | State::Payload | State::LargePayload | State::PayloadOverflow => Some(
-                Controls::parse(&self.control[..self.control_len]).map(|controls| {
-                    // Keep the request identity after discarding an oversized payload.
-                    let encoded_payload = match state {
-                        State::PayloadOverflow if controls.is_feature_query() => Some(&[][..]),
-                        State::PayloadOverflow => None,
-                        State::LargePayload => Some(self.large_payload.as_slice()),
-                        _ => Some(&self.payload[..self.payload_len]),
-                    };
-                    Command {
-                        controls,
-                        encoded_payload,
-                    }
-                }),
-            ),
+            State::Control | State::Payload | State::LargePayload | State::DiscardedPayload(_) => {
+                Some(
+                    Controls::parse(&self.control[..self.control_len]).map(|controls| {
+                        let encoded_payload = match state {
+                            State::LargePayload => Ok(self.large_payload.as_slice()),
+                            State::DiscardedPayload(reason) => Err(reason),
+                            _ => Ok(&self.payload[..self.payload_len]),
+                        };
+                        Command {
+                            controls,
+                            encoded_payload,
+                        }
+                    }),
+                )
+            }
             State::Failed(error) => Some(Err(error)),
             _ => None,
         }

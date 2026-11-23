@@ -334,6 +334,33 @@ impl TextureTiles {
         }
     }
 
+    pub fn reserve_upload_scratch(
+        &self,
+        image: &GraphicsImage,
+        scratch: &mut Vec<u8>,
+        regions: impl IntoIterator<Item = PixelRegion>,
+    ) -> bool {
+        let bytes_per_pixel = image.format().bytes_per_pixel() as usize;
+        let mut capacity = scratch.capacity();
+        if capacity >= self.max_tile_pixels as usize * bytes_per_pixel
+            || !image.pixel_regions_may_need_scratch()
+        {
+            return true;
+        }
+        for region in regions {
+            if region.pixel_count() as usize * bytes_per_pixel > capacity {
+                let Some(needed) = image.pixel_region_scratch_bytes(region.origin, region.size)
+                else {
+                    return false;
+                };
+                capacity = capacity.max(needed);
+            }
+        }
+        scratch
+            .try_reserve_exact(capacity.saturating_sub(scratch.len()))
+            .is_ok()
+    }
+
     pub fn update_clipped_regions(
         &mut self,
         queue: &Queue,
@@ -529,19 +556,12 @@ impl ImageTextures {
             }
             Self::Tiled(tiles) => tiles,
         };
-        let largest = tiles
+        let regions = tiles
             .tiles
             .iter()
             .filter(|tile| tile.visible_layout == tiles.layout && tile.resident.is_some())
-            .map(|tile| tile.region.storage.pixel_count() as usize)
-            .max()
-            .unwrap_or(0)
-            * image.format().bytes_per_pixel() as usize;
-        // Reserve before queuing writes to preserve the resident revision on allocation failure.
-        if scratch
-            .try_reserve_exact(largest.saturating_sub(scratch.len()))
-            .is_err()
-        {
+            .map(|tile| tile.region.storage);
+        if !tiles.reserve_upload_scratch(image, scratch, regions) {
             return false;
         }
         for tile in &mut tiles.tiles {

@@ -76,6 +76,7 @@ pub struct GraphicsPlaceholderRun {
 
 #[derive(Default)]
 pub struct GraphicsPlaceholderCache {
+    indexed: Option<(u64, usize)>,
     sources: Option<ParentSources>,
     live_rows: Vec<Option<RowRevision>>,
     parents: VirtualParentOrigins,
@@ -93,6 +94,27 @@ impl GraphicsPlaceholderCache {
     /// Returns a virtual parent's origin in live-buffer coordinates.
     pub fn origin(&self, serial: u64) -> Option<[i64; 2]> {
         self.parents.origins.get(&serial).copied().flatten()
+    }
+
+    /// Visits visible placeholder runs using an index for the supplied placement revision.
+    pub fn visit_viewport(
+        &mut self,
+        placement_revision: u64,
+        placements: &[GraphicsPlacement],
+        viewport: Viewport<'_>,
+        styles: &StyleTable,
+        visit: impl FnMut(GraphicsPlaceholderRun),
+    ) -> Result<(), StorageError> {
+        if self.index(placement_revision, placements)? != 0 {
+            visit_indexed_rows(
+                placements,
+                number_rows(viewport.iter_rows()),
+                styles,
+                &self.parents.lookup,
+                visit,
+            );
+        }
+        Ok(())
     }
 
     /// Resolves virtual parents for the supplied placement revision and optionally visits
@@ -147,11 +169,10 @@ impl GraphicsPlaceholderCache {
             }
         };
         if !same_sources {
-            let virtual_count = placements.iter().filter(|entry| entry.is_virtual()).count();
-            self.parents.reserve(virtual_count)?;
+            let virtual_count = self.index(placement_revision, placements)?;
+            self.parents.origins.try_reserve(virtual_count)?;
             self.history_origins
                 .try_reserve(virtual_count.saturating_sub(self.history_origins.len()))?;
-            index_placeholders(placements, &mut self.parents.lookup);
             reset_origins(&mut self.history_origins, placements);
             visit_indexed_rows(
                 placements,
@@ -192,17 +213,26 @@ impl GraphicsPlaceholderCache {
         self.sources = Some(sources);
         Ok(())
     }
-}
 
-/// Visits runs of adjacent placeholder cells covered by the image in view order.
-/// Coordinates are local to the supplied rows.
-pub fn visit_graphics_placeholders<'a>(
-    placements: &[GraphicsPlacement],
-    rows: impl IntoIterator<Item = &'a Row>,
-    styles: &StyleTable,
-    visit: impl FnMut(GraphicsPlaceholderRun),
-) -> Result<(), StorageError> {
-    visit_placeholder_rows(placements, number_rows(rows), styles, visit)
+    fn index(
+        &mut self,
+        placement_revision: u64,
+        placements: &[GraphicsPlacement],
+    ) -> Result<usize, StorageError> {
+        if let Some((revision, count)) = self.indexed
+            && revision == placement_revision
+        {
+            return Ok(count);
+        }
+        let count = placements.iter().filter(|entry| entry.is_virtual()).count();
+        let lookup = &mut self.parents.lookup;
+        lookup.try_reserve((count * 2).saturating_sub(lookup.len()))?;
+        index_placeholders(placements, lookup);
+        self.indexed = Some((placement_revision, count));
+        self.parents.origins.clear();
+        self.sources = None;
+        Ok(count)
+    }
 }
 
 fn number_rows<'a>(
@@ -211,26 +241,6 @@ fn number_rows<'a>(
     rows.into_iter()
         .enumerate()
         .map(|(index, row)| (index as i64, row))
-}
-
-fn visit_placeholder_rows<'a>(
-    placements: &[GraphicsPlacement],
-    rows: impl IntoIterator<Item = (i64, &'a Row)>,
-    styles: &StyleTable,
-    visit: impl FnMut(GraphicsPlaceholderRun),
-) -> Result<(), StorageError> {
-    let count = placements
-        .iter()
-        .filter(|placement| placement.is_virtual())
-        .count();
-    if count == 0 {
-        return Ok(());
-    }
-    let mut lookup = HashMap::new();
-    lookup.try_reserve(count * 2).map_err(StorageError::from)?;
-    index_placeholders(placements, &mut lookup);
-    visit_indexed_rows(placements, rows, styles, &lookup, visit);
-    Ok(())
 }
 
 fn index_placeholders(placements: &[GraphicsPlacement], lookup: &mut PlaceholderIndex) {

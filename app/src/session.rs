@@ -80,8 +80,6 @@ pub struct PresentationFrame<'a> {
     pub palette: &'a Palette,
     graphics: &'a [GraphicsPlacement],
     graphics_revision: Option<u64>,
-    #[cfg(feature = "wgpu-renderer")]
-    pub(crate) inactive_graphics_revision: Option<u64>,
     virtual_graphics: bool,
     virtual_parents: bool,
     buffer: ScreenBuffer,
@@ -445,8 +443,6 @@ impl<T: Read + Write> Session<T> {
             palette: self.processor.palette(),
             graphics: screen.graphics_placements(),
             graphics_revision: screen.graphics_revision(),
-            #[cfg(feature = "wgpu-renderer")]
-            inactive_graphics_revision: screen.inactive_graphics_revision(),
             virtual_graphics: screen.has_virtual_graphics(),
             virtual_parents: screen.has_virtual_graphics_parents(),
             buffer: screen.active_buffer(),

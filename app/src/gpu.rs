@@ -130,26 +130,27 @@ struct PreparedImages {
     stamp: Option<GraphicsStamp>,
     texture_stamp: TextureStamp,
     animation_membership: Option<u64>,
+    outcome: PrepareOutcome,
+}
+
+#[derive(Default)]
+struct PrepareOutcome {
     rejected: usize,
+    retry: bool,
+}
+
+impl PrepareOutcome {
+    fn reject_retryable(&mut self) {
+        self.rejected += 1;
+        self.retry = true;
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct TextureStamp {
-    sources: u64,
-    anonymous_placements: Option<u64>,
-}
+struct TextureStamp(u64);
 
 impl TextureStamp {
-    fn new(store: &GraphicsImageStore, placements: Option<u64>) -> Self {
-        Self {
-            sources: store.storage_revision(),
-            // Anonymous sources can expire when their last placement is dropped.
-            anonymous_placements: placements.filter(|_| store.has_anonymous_images()),
-        }
-    }
-
     fn prune(
-        self,
         previous: Option<Self>,
         store: &GraphicsImageStore,
         images: &mut HashMap<GraphicsImageKey, CachedImage>,
@@ -157,10 +158,7 @@ impl TextureStamp {
         if images.is_empty() {
             return;
         }
-        if let Some(key) = previous
-            .filter(|stamp| stamp.anonymous_placements == self.anonymous_placements)
-            .and_then(|stamp| store.invalidated_source(stamp.sources))
-        {
+        if let Some(key) = previous.and_then(|stamp| store.invalidated_source(stamp.0)) {
             images.remove(&key);
         } else {
             images
@@ -225,27 +223,30 @@ impl ImageTextureResources {
         let format = image.format();
         if instances.len() == tiles.tiles.len()
             && tiles.tiles.iter().all(|tile| tile.needs_full_upload())
+            && let Some(GraphicsPixelUpdates::One(update)) = image.pixel_updates(None, scratch)
         {
-            if let Some(GraphicsPixelUpdates::One(update)) = image.pixel_updates(None, scratch) {
-                self.upload_all_tiles(device, queue, format, tiles, update);
-                return true;
-            }
-            let largest = tiles.max_tile_pixels as usize * format.bytes_per_pixel() as usize;
-            if scratch
-                .try_reserve_exact(largest.saturating_sub(scratch.len()))
-                .is_err()
-            {
-                return false;
-            }
+            self.upload_all_tiles(device, queue, format, tiles, update);
+            return true;
         }
+        let mut first_upload = true;
         for &(index, _) in instances {
-            let tile = &mut tiles.tiles[index];
-            let storage = tile.region.storage;
-            for region in tile.upload_regions() {
+            let storage = tiles.tiles[index].region.storage;
+            for region in tiles.tiles[index].upload_regions() {
+                if std::mem::take(&mut first_upload)
+                    && (instances.len() > 1
+                        || matches!(tiles.tiles[index].damage, TileDamage::Two(_)))
+                {
+                    let regions = instances
+                        .iter()
+                        .flat_map(|&(index, _)| tiles.tiles[index].upload_regions());
+                    if !tiles.reserve_upload_scratch(image, scratch, regions) {
+                        return false;
+                    }
+                }
                 let Some(update) = image.pixel_region(region.origin, region.size, scratch) else {
                     return false;
                 };
-                let texture = tile.resident.get_or_insert_with(|| {
+                let texture = tiles.tiles[index].resident.get_or_insert_with(|| {
                     self.bindings(device, format, update.bytes)(storage.size)
                 });
                 write_region(
@@ -256,6 +257,7 @@ impl ImageTextureResources {
                     update.bytes_per_row,
                 );
             }
+            let tile = &mut tiles.tiles[index];
             tile.visible_layout = tiles.layout;
             tile.damage = TileDamage::Clean;
         }
@@ -309,7 +311,11 @@ pub struct ImageRenderer {
     layout_generation: u64,
     placeholder_rows: Vec<Option<RowRevision>>,
     parent_origins: GraphicsPlaceholderCache,
+    placeholder_locations: placeholders::PlaceholderLocations,
+    tile_instances: Vec<(usize, ImageInstance)>,
     pixel_scratch: Vec<u8>,
+    #[cfg(test)]
+    fail_next_upload: bool,
 }
 
 impl ImageRenderer {
@@ -375,7 +381,11 @@ impl ImageRenderer {
             layout_generation: 0,
             placeholder_rows: Vec::new(),
             parent_origins: GraphicsPlaceholderCache::default(),
+            placeholder_locations: placeholders::PlaceholderLocations::default(),
+            tile_instances: Vec::new(),
             pixel_scratch: Vec::new(),
+            #[cfg(test)]
+            fail_next_upload: false,
         }
     }
 
@@ -420,9 +430,14 @@ impl ImageRenderer {
         self.instances.len()
     }
 
-    /// Builds the image pass for a viewport. Returns the number of placements
-    /// whose pixels could not be uploaded. Submit the pass before preparing
-    /// another frame with the same renderer.
+    #[cfg(test)]
+    pub(crate) fn fail_next_upload(&mut self) {
+        self.fail_next_upload = true;
+    }
+
+    /// Builds the image pass and returns the number of preparation failures.
+    /// Later calls retry temporary failures. Submit the pass before preparing
+    /// another frame.
     pub fn prepare(
         &mut self,
         device: &Device,
@@ -440,9 +455,9 @@ impl ImageRenderer {
             self.prepared.as_ref().map(|p| p.texture_stamp)
         };
         let inactive_store = frame.inactive_image_store();
-        let inactive_stamp = TextureStamp::new(inactive_store, frame.inactive_graphics_revision);
+        let inactive_stamp = TextureStamp(inactive_store.storage_revision());
         if self.inactive_texture_stamp != Some(inactive_stamp) {
-            inactive_stamp.prune(
+            TextureStamp::prune(
                 self.inactive_texture_stamp,
                 inactive_store,
                 &mut self.inactive_images,
@@ -451,14 +466,15 @@ impl ImageRenderer {
         }
         let stamp = frame.graphics_stamp();
         let store = frame.image_store();
-        let texture_stamp = TextureStamp::new(store, stamp.map(GraphicsStamp::placement_revision));
+        let texture_stamp = TextureStamp(store.storage_revision());
         if previous_texture != Some(texture_stamp) {
-            texture_stamp.prune(previous_texture, store, &mut self.images);
+            TextureStamp::prune(previous_texture, store, &mut self.images);
         }
         if let Some(prepared) = &self.prepared
+            && !prepared.outcome.retry
             && prepared.geometry == frame.geometry
             && (prepared.stamp == stamp
-                || (prepared.rejected == 0
+                || (prepared.outcome.rejected == 0
                     && prepared
                         .stamp
                         .zip(stamp)
@@ -477,11 +493,12 @@ impl ImageRenderer {
             prepared.texture_stamp = texture_stamp;
             prepared.stamp = stamp;
             prepared.animation_membership = store.animation_membership();
-            let rejected = prepared.rejected;
+            let rejected = prepared.outcome.rejected;
             self.update_palette(queue, frame);
             return rejected;
         }
-        let rejected = self.prepare_changed(device, queue, frame, stamp);
+        let outcome = self.prepare_changed(device, queue, frame, stamp);
+        let rejected = outcome.rejected;
         self.placeholder_rows.clear();
         self.placeholder_rows
             .extend(frame.graphics_placeholder_revisions());
@@ -491,7 +508,7 @@ impl ImageRenderer {
             stamp,
             texture_stamp,
             animation_membership: store.animation_membership(),
-            rejected,
+            outcome,
         });
         rejected
     }
@@ -554,7 +571,7 @@ impl ImageRenderer {
         queue: &Queue,
         frame: &PresentationFrame<'_>,
         stamp: Option<GraphicsStamp>,
-    ) -> usize {
+    ) -> PrepareOutcome {
         self.layout_generation = self.layout_generation.wrapping_add(1);
         self.draws.clear();
         self.instances.clear();
@@ -567,14 +584,22 @@ impl ImageRenderer {
             .cell_pixels()
             .zip(frame.geometry.text_area_pixels())
         else {
-            return 0;
+            self.placeholder_locations.clear();
+            return PrepareOutcome::default();
         };
         let [cell_pixels, area_pixels] =
             [cell, area].map(|size| [f64::from(size.width.get()), f64::from(size.height.get())]);
-        let mut rejected = 0;
-        let placeholders = frame
-            .has_virtual_graphics()
-            .then(|| placeholders::collect(frame, cell, stamp, &mut self.parent_origins));
+        let mut placeholders = std::mem::take(&mut self.placeholder_locations);
+        let placeholders_failed =
+            if let Some(stamp) = stamp.filter(|_| frame.has_virtual_graphics()) {
+                placeholders
+                    .collect(frame, cell, stamp, &mut self.parent_origins)
+                    .is_err()
+            } else {
+                placeholders.clear();
+                false
+            };
+        let mut outcome = PrepareOutcome::default();
         let size = frame.geometry.pty_size();
         let viewport_cells = [usize::from(size.columns), usize::from(size.rows)];
         let history_offset = frame.viewport.offset();
@@ -582,17 +607,20 @@ impl ImageRenderer {
         let buffer_limit = limits.max_buffer_size;
         let max_instances =
             (buffer_limit / size_of::<ImageInstance>() as u64).min(u64::from(u32::MAX)) as usize;
-        let mut tile_instances = Vec::new();
+        let mut tile_instances = std::mem::take(&mut self.tile_instances);
         for placement in frame.graphics_placements() {
+            if placeholders_failed
+                && (placement.is_virtual() || placement.virtual_parent().is_some())
+            {
+                outcome.reject_retryable();
+                continue;
+            }
             let location;
             let locations = if placement.is_virtual() {
-                let Some(pieces) = placeholders
-                    .as_ref()
-                    .and_then(|pieces| pieces.get(&placement.serial()))
-                else {
+                let Some(pieces) = placeholders.get(placement.serial()) else {
                     continue;
                 };
-                pieces.as_slice()
+                pieces
             } else {
                 let Some(origin) = placement
                     .origin_in_view(history_offset, |parent| self.parent_origins.origin(parent))
@@ -623,7 +651,7 @@ impl ImageRenderer {
                     return;
                 };
                 if self.instances.len() >= max_instances {
-                    rejected += 1;
+                    outcome.rejected += 1;
                     return;
                 }
                 let Some(tiled) = *uploaded.get_or_insert_with(|| {
@@ -640,7 +668,7 @@ impl ImageRenderer {
                         )
                     })
                 }) else {
-                    rejected += 1;
+                    outcome.reject_retryable();
                     return;
                 };
                 let (width, height) = image.dimensions();
@@ -666,17 +694,19 @@ impl ImageRenderer {
                             .map(|vertices| (index, vertices))
                     },
                 ));
-                if tile_instances.len() > max_instances - self.instances.len()
-                    || !self.texture_resources.upload_tiles(
-                        device,
-                        queue,
-                        image,
-                        tiles,
-                        &tile_instances,
-                        &mut self.pixel_scratch,
-                    )
-                {
-                    rejected += 1;
+                if tile_instances.len() > max_instances - self.instances.len() {
+                    outcome.rejected += 1;
+                    return;
+                }
+                if !self.texture_resources.upload_tiles(
+                    device,
+                    queue,
+                    image,
+                    tiles,
+                    &tile_instances,
+                    &mut self.pixel_scratch,
+                ) {
+                    outcome.reject_retryable();
                     return;
                 }
                 for &(tile, vertices) in &tile_instances {
@@ -692,8 +722,10 @@ impl ImageRenderer {
         }
         self.visible_images.sort_unstable();
         self.visible_images.dedup();
+        self.placeholder_locations = placeholders;
+        self.tile_instances = tile_instances;
         write_instances(device, queue, &mut self.buffer, &self.instances);
-        rejected
+        outcome
     }
 
     fn push_instance(
@@ -750,6 +782,10 @@ impl ImageRenderer {
         image: &GraphicsImage,
         crop: impl FnOnce([u32; 2]) -> Option<TextureTiles>,
     ) -> Option<bool> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_upload) {
+            return None;
+        }
         if let Some(cached) = self.images.get_mut(&id)
             && cached.source_revision == image.source_revision()
         {

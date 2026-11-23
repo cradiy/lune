@@ -143,7 +143,13 @@ impl PixelTransfer {
         command: &Command<'_>,
         inflater: &mut Inflater,
     ) -> Result<(), &'static [u8]> {
-        let encoded = command.encoded_transfer().map_err(|_| INVALID)?.len();
+        let encoded = command
+            .encoded_transfer()
+            .map_err(|error| match error {
+                PayloadError::Allocation => QUOTA,
+                _ => INVALID,
+            })?
+            .len();
         if !matches!(self.compression, Compression::None) {
             let state = if matches!(self.compression, Compression::Zlib) {
                 self.compression = Compression::Streaming;
