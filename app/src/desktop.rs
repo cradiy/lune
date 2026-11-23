@@ -168,13 +168,15 @@ struct Client {
     pointer: Option<PhysicalPosition<f64>>,
     pressed: Option<MouseButton>,
     wheel: f64,
-    selection_anchor: Option<CellPosition>,
+    selection_click: Option<selection::Click>,
+    selection_drag: Option<selection::Drag>,
     selection: Option<Selection>,
 }
 
 struct Selection {
     range: Range<CellPosition>,
     rows: Vec<RowRevision>,
+    anchor: selection::Anchor,
 }
 
 impl Client {
@@ -238,7 +240,8 @@ impl Client {
             pointer: None,
             pressed: None,
             wheel: 0.0,
-            selection_anchor: None,
+            selection_click: None,
+            selection_drag: None,
             selection: None,
         })
     }
@@ -272,7 +275,8 @@ impl Client {
                     if let Some(button) = self.pressed.take() {
                         self.mouse_event(MouseEvent::Release(button));
                     }
-                    self.selection_anchor = None;
+                    self.selection_click = None;
+                    self.selection_drag = None;
                     self.modifiers = ModifiersState::empty();
                     self.set_preedit(String::new());
                 }
@@ -312,14 +316,14 @@ impl Client {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.pointer = Some(position);
-                if self.selection_anchor.is_some() {
+                if self.selection_drag.is_some() {
                     self.extend_selection();
                 } else {
                     self.mouse_event(MouseEvent::Motion(self.pressed));
                 }
             }
             WindowEvent::CursorLeft { .. }
-                if self.pressed.is_none() && self.selection_anchor.is_none() =>
+                if self.pressed.is_none() && self.selection_drag.is_none() =>
             {
                 self.pointer = None;
             }
@@ -647,12 +651,11 @@ impl Client {
         if state.is_pressed() {
             let mouse_reporting = self.mouse_reporting();
             let local = !mouse_reporting || self.modifiers.shift_key();
+            if button != MouseButton::Left || !local {
+                self.selection_click = None;
+            }
             if button == MouseButton::Left && local {
-                self.clear_selection();
-                self.selection_anchor = self
-                    .pointer_pixel(false)
-                    .and_then(|pixel| self.session.geometry().cell_at(pixel));
-                self.extend_selection();
+                self.start_selection();
             } else if button == MouseButton::Middle && local {
                 if self.pointer_pixel(false).is_some() {
                     self.paste(ClipboardType::Primary);
@@ -661,9 +664,9 @@ impl Client {
                 self.pressed = Some(button);
                 self.mouse_event(MouseEvent::Press(button));
             }
-        } else if button == MouseButton::Left && self.selection_anchor.is_some() {
+        } else if button == MouseButton::Left && self.selection_drag.is_some() {
             self.extend_selection();
-            self.selection_anchor = None;
+            self.selection_drag = None;
             self.publish_primary_selection();
         } else if self.pressed == Some(button) {
             self.mouse_event(MouseEvent::Release(button));
@@ -710,22 +713,58 @@ impl Client {
         }
     }
 
-    fn extend_selection(&mut self) {
-        let Some(anchor) = self.selection_anchor else {
+    fn start_selection(&mut self) {
+        let previous = self.selection_click.take();
+        let shift = self.modifiers.shift_key();
+        let Some(position) = self
+            .pointer_pixel(false)
+            .and_then(|pixel| self.session.geometry().cell_at(pixel))
+        else {
+            if !shift {
+                self.clear_selection();
+            }
             return;
         };
+        let now = Instant::now();
+        let next = previous.and_then(|click| click.next(position, now, shift));
+        let repeated = next.is_some();
+        let click = next.unwrap_or_else(|| selection::Click::new(position, now, shift));
+        if shift
+            && !repeated
+            && let Some(selection) = &self.selection
+        {
+            self.selection_drag = Some(selection.anchor.clone().drag(true));
+        } else {
+            self.clear_selection();
+            self.selection_drag = Some(click.drag(self.session.screen().viewport()));
+        }
+        self.extend_selection();
+        self.selection_click = Some(click);
+    }
+
+    fn extend_selection(&mut self) {
         let Some(focus) = self
             .pointer_pixel(true)
             .and_then(|pixel| self.session.geometry().cell_at(pixel))
         else {
             return;
         };
+        let Some(drag) = &mut self.selection_drag else {
+            return;
+        };
+        if !drag.move_to(focus) {
+            return;
+        }
+        if drag.moved() {
+            self.selection_click = None;
+        }
         let viewport = self.session.screen().viewport();
-        let range = selection::range(viewport, anchor, focus);
+        let range = drag.range(viewport);
         if self.selection.as_ref().map(|selection| &selection.range) == range.as_ref() {
             return;
         }
         self.selection = range.map(|range| Selection {
+            anchor: drag.anchor.clone(),
             rows: (range.start.row..=range.end.row)
                 .filter_map(|row| viewport.row(row).map(|row| row.revision()))
                 .collect(),
@@ -736,7 +775,8 @@ impl Client {
     }
 
     fn clear_selection(&mut self) {
-        self.selection_anchor = None;
+        self.selection_click = None;
+        self.selection_drag = None;
         if self.selection.take().is_some() {
             self.painter.invalidate_overlay();
             self.window.request_redraw();
