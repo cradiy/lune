@@ -6,14 +6,14 @@ use crate::grid::validate_dimensions;
 use crate::reflow::normalize_position;
 use crate::row::RowTransfer;
 use crate::{
-    Cell, CellPosition, Grid, ReflowAffinity, ReflowRows, Row, RowHistory, ScreenView,
-    StorageError, StyleId,
+    Cell, CellPosition, Grid, LogicalLines, ReflowAffinity, ReflowRows, Row, RowHistory,
+    ScreenView, StorageError, StyleId,
 };
 
 struct Checkpoint<'a> {
     index: usize,
-    source_row: usize,
     rows: ReflowRows<'a>,
+    following: LogicalLines<'a>,
 }
 
 struct Layout {
@@ -21,6 +21,8 @@ struct Layout {
     cursor: Cursor,
     saved: Cursor,
     anchor: Option<usize>,
+    // Final columns indexed by the retained logical line's last source row.
+    history_ends: Vec<u16>,
 }
 
 #[derive(Clone, Copy)]
@@ -31,12 +33,7 @@ struct PrimaryReflow<'a> {
 }
 
 impl<'a> PrimaryReflow<'a> {
-    fn line(
-        self,
-        rows: Range<usize>,
-        images: &[GraphicsAnchor],
-    ) -> Result<ReflowRows<'a>, StorageError> {
-        let last = rows.end - 1;
+    fn end_column(self, last: usize, images: &[GraphicsAnchor]) -> usize {
         let row = self.view.row(last).expect("A logical line row exists");
         let mut end = row.reflow_end();
         for point in self.required {
@@ -50,7 +47,7 @@ impl<'a> PrimaryReflow<'a> {
         {
             end = end.max(anchor.source.column + 1);
         }
-        ReflowRows::with_end(self.view, rows, self.columns, end.min(row.cells().len()))
+        end.min(row.cells().len())
     }
 }
 
@@ -176,6 +173,10 @@ fn layout<'a>(
 ) -> Result<(Layout, Checkpoint<'a>), StorageError> {
     let (view, columns) = (reflow.view, reflow.columns);
     let history = view.history_rows();
+    const _: () = assert!(crate::MAX_DIMENSION <= u16::MAX as usize);
+    let mut history_ends = Vec::new();
+    history_ends.try_reserve_exact(history)?;
+    history_ends.resize(history, 0);
     let sources = [
         Some(position(pivot, history)),
         Some(position(saved, history)),
@@ -226,8 +227,15 @@ fn layout<'a>(
     let mut checkpoints = [None, None, None];
     let mut slot = 0;
     let mut replay = None;
-    for line in view.logical_lines() {
-        let mut rows = reflow.line(line.range(), image_anchors)?;
+    let mut lines = view.logical_lines();
+    while let Some(line) = lines.next() {
+        let range = line.range();
+        let last = range.end - 1;
+        let end = reflow.end_column(last, image_anchors);
+        if let Some(cached) = history_ends.get_mut(last) {
+            *cached = end as u16;
+        }
+        let mut rows = ReflowRows::with_end(view, range, columns, end)?;
         while let Some(row) = rows.next() {
             if row.used_columns() != 0 {
                 content_end = count + 1;
@@ -235,8 +243,8 @@ fn layout<'a>(
             if mapped[0].is_none() && count == checkpoint_at {
                 checkpoints[slot] = Some(Checkpoint {
                     index: count,
-                    source_row: row.source_range().start.row,
                     rows: rows.replay_from(row),
+                    following: lines.clone(),
                 });
                 slot = (slot + 1) % checkpoints.len();
                 checkpoint_at = count.saturating_add(interval);
@@ -320,6 +328,7 @@ fn layout<'a>(
             cursor: clipped(cursor, start..end),
             saved: clipped(saved, start..end),
             anchor: mapped[2].map(|point| point.row),
+            history_ends,
         },
         replay.expect("The primary cursor selects a replay checkpoint"),
     ))
@@ -432,18 +441,18 @@ impl Screen {
         let mut transfers: VecDeque<RowTransfer> = VecDeque::new();
         debug_assert!(checkpoint.index <= skip);
         let mut index = checkpoint.index;
-        let source_row = checkpoint.source_row;
-        let mut replay = Some(checkpoint.rows);
         let mut offset = 0;
-        'copy: for line in view
-            .logical_lines()
-            .skip_while(|line| line.range().end <= source_row)
-        {
-            let rows = match replay.take() {
-                Some(rows) => rows,
-                None => reflow.line(line.range(), &graphics_anchors)?,
-            };
-            for row in rows {
+        let following = checkpoint.following.map(|line| {
+            let range = line.range();
+            let last = range.end - 1;
+            let end = plan.history_ends.get(last).map_or_else(
+                || reflow.end_column(last, &graphics_anchors),
+                |&cached| usize::from(cached),
+            );
+            ReflowRows::with_end(view, range, columns, end)
+        });
+        'copy: for rows in std::iter::once(Ok(checkpoint.rows)).chain(following) {
+            for row in rows? {
                 if index == plan.window.end {
                     break 'copy;
                 }
