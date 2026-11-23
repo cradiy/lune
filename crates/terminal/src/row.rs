@@ -738,13 +738,54 @@ impl Row {
         &remaining[index].text
     }
 
+    pub(crate) fn written_columns(&self, range: Range<usize>) -> Option<Range<usize>> {
+        if range.is_empty() {
+            return None;
+        }
+        let mut first = range.end;
+        let mut last = range.start;
+        let cells = &self.cells[range.clone()];
+        if let Some(start) = cells.iter().position(|cell| !cell.is_erased()) {
+            first = range.start + start;
+            last = range.end
+                - cells[start..]
+                    .iter()
+                    .rev()
+                    .take_while(|cell| cell.is_erased())
+                    .count();
+        }
+        for part in self
+            .sized_text_rows_from(range.start)
+            .take_while(|part| part.column < range.end)
+        {
+            first = first.min(part.column.max(range.start));
+            last = last.max(part.columns().end.min(range.end));
+        }
+        (first < last).then_some(first..last)
+    }
+
+    #[inline]
     pub(crate) fn write_text(
         &self,
         range: Range<usize>,
         output: &mut impl fmt::Write,
+        include_text: impl Fn(&SizedTextRow) -> bool,
     ) -> fmt::Result {
-        if self.sized.is_none() {
-            return self.write_cell_text(range, output);
+        if self.sized.is_some() {
+            return self.write_sized_text(range, output, include_text);
+        }
+        self.write_cell_text(range, output)
+    }
+
+    #[cold]
+    fn write_sized_text(
+        &self,
+        range: Range<usize>,
+        output: &mut impl fmt::Write,
+        include_text: impl Fn(&SizedTextRow) -> bool,
+    ) -> fmt::Result {
+        if range.is_empty() {
+            return Ok(());
         }
         let mut column = range.start;
         for part in self
@@ -752,7 +793,7 @@ impl Row {
             .filter(|part| part.column < range.end && part.columns().end > range.start)
         {
             self.write_cell_text(column..part.column, output)?;
-            if part.row_offset == 0 {
+            if include_text(part) {
                 output.write_str(part.text())?;
             } else {
                 for _ in column.max(part.column)..part.columns().end.min(range.end) {

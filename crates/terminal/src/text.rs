@@ -4,7 +4,7 @@ use std::{
     ops::Range,
 };
 
-use crate::{Grid, Row, RowHistory, StorageError};
+use crate::{Grid, Row, RowHistory, SizedTextRow, StorageError};
 
 /// A row index and a column boundary in the addressed grid or screen view.
 /// Column `row.cells().len()` is that row's end. Positions are ordered by row,
@@ -126,13 +126,13 @@ impl<'a> ScreenView<'a> {
 /// space. The output sink owns allocation and may retain a prefix on failure.
 /// The range can be formatted repeatedly for the lifetime of its source borrow.
 #[derive(Clone, Copy, Debug)]
-pub struct TextRange<'a> {
+pub struct TextRange<'a, const TRIM_ERASED: bool = false> {
     view: ScreenView<'a>,
     start: CellPosition,
     end: CellPosition,
 }
 
-impl<'a> TextRange<'a> {
+impl<'a, const TRIM_ERASED: bool> TextRange<'a, TRIM_ERASED> {
     pub(crate) fn new(
         view: ScreenView<'a>,
         range: Range<CellPosition>,
@@ -153,25 +153,102 @@ impl<'a> TextRange<'a> {
             end: range.end,
         })
     }
+
+    pub(crate) fn trim_erased(self) -> TextRange<'a, true> {
+        TextRange {
+            view: self.view,
+            start: self.start,
+            end: self.end,
+        }
+    }
+
+    pub(crate) fn content_bounds(&self) -> Option<Range<CellPosition>> {
+        let (first, start) = (self.start.row..=self.end.row)
+            .find_map(|row| self.columns_on_row(row).map(|columns| (row, columns)))?;
+        let (last, end) = (first + 1..=self.end.row)
+            .rev()
+            .find_map(|row| self.columns_on_row(row).map(|columns| (row, columns.end)))
+            .unwrap_or((first, start.end));
+        Some(
+            CellPosition {
+                row: first,
+                column: start.start,
+            }..CellPosition {
+                row: last,
+                column: end,
+            },
+        )
+    }
+
+    /// Columns used by this text range at a row in the source view.
+    pub fn columns_on_row(&self, index: usize) -> Option<Range<usize>> {
+        if !(self.start.row..=self.end.row).contains(&index) {
+            return None;
+        }
+        let row = self.view.row(index)?;
+        let columns = self.text_columns(index, row, row.wrap_end().unwrap_or(row.cells().len()));
+        (!columns.is_empty()).then_some(columns)
+    }
+
+    /// Whether a sized block intersects this range. The row index is in the source view.
+    pub fn includes_sized_text(&self, row: usize, part: &SizedTextRow) -> bool {
+        let Some(head) = row.checked_sub(part.row_offset) else {
+            return false;
+        };
+        let end = head.saturating_add(usize::from(part.size().scale));
+        self.overlaps_sized(head.max(self.start.row)..end.min(self.end.row + 1), part)
+    }
+
+    fn overlaps_sized(&self, mut rows: Range<usize>, part: &SizedTextRow) -> bool {
+        let footprint = part.columns();
+        rows.any(|index| {
+            let Some(row) = self.view.row(index) else {
+                return false;
+            };
+            let columns = self.columns(index, row.wrap_end().unwrap_or(row.cells().len()));
+            !columns.is_empty()
+                && columns.start < footprint.end
+                && columns.end > footprint.start
+                && row
+                    .sized_text_at(part.column)
+                    .is_some_and(|fragment| fragment.belongs_to(part))
+        })
+    }
+
+    fn columns(&self, index: usize, limit: usize) -> Range<usize> {
+        let start = if index == self.start.row {
+            self.start.column
+        } else {
+            0
+        };
+        let end = if index == self.end.row {
+            self.end.column.min(limit)
+        } else {
+            limit
+        };
+        start..end
+    }
+
+    fn text_columns(&self, index: usize, row: &Row, limit: usize) -> Range<usize> {
+        let columns = self.columns(index, limit);
+        if TRIM_ERASED {
+            row.written_columns(columns).unwrap_or(0..0)
+        } else {
+            columns
+        }
+    }
 }
 
-impl fmt::Display for TextRange<'_> {
+impl<const TRIM_ERASED: bool> fmt::Display for TextRange<'_, TRIM_ERASED> {
     fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
         for index in self.start.row..=self.end.row {
             let row = self.view.row(index).expect("Range endpoints are validated");
-            let columns = row.cells().len();
-            let start = if index == self.start.row {
-                self.start.column
-            } else {
-                0
-            };
-            let end = if index == self.end.row {
-                self.end.column
-            } else {
-                columns
-            };
             let wrap = row.wrap_end();
-            row.write_text(start..end.min(wrap.unwrap_or(columns)), output)?;
+            let columns = self.text_columns(index, row, wrap.unwrap_or(row.cells().len()));
+            row.write_text(columns, output, |part| {
+                let first = index.saturating_sub(part.row_offset).max(self.start.row);
+                !self.overlaps_sized(first..index, part)
+            })?;
             if index != self.end.row && wrap.is_none() {
                 output.write_char('\n')?;
             }

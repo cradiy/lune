@@ -191,6 +191,9 @@ impl TextRenderer {
         self.evicted = false;
         self.instances.clear();
         let columns = usize::from(frame.geometry.pty_size().columns);
+        let first_row = frame.viewport.range().start;
+        let text_selection =
+            selection.and_then(|range| frame.viewport.selection_text(range.clone()).ok());
         let sized_cursor = cursor.and_then(|cursor| {
             let pos = cursor.position;
             frame
@@ -201,13 +204,18 @@ impl TextRenderer {
         });
         for (row, source) in frame.viewport.iter_rows().enumerate() {
             let mut sized = source.sized_text_rows().peekable();
-            let selected =
-                selection.and_then(|range| super::selection::columns(range, row, columns));
-            if let Some(rect) = selected
-                .clone()
-                .and_then(|span| frame.geometry.row_rect(row, span))
-            {
-                self.rect(rect, frame.palette.graphics_color(250), 1.0);
+            let selected = text_selection.and_then(|range| range.columns_on_row(first_row + row));
+            if let Some(mut span) = selected.clone() {
+                for part in source.sized_text_rows() {
+                    if part.column >= span.end {
+                        break;
+                    }
+                    if span.start < part.column {
+                        self.selection_background(frame, row, span.start..part.column);
+                    }
+                    span.start = span.start.max(part.columns().end);
+                }
+                self.selection_background(frame, row, span);
             }
             if let Some(runs) = frame.row_runs(row, 0..columns) {
                 for run in runs {
@@ -275,17 +283,28 @@ impl TextRenderer {
                     .map(|(cursor, _)| cursor);
                 let block_cursor =
                     covering.filter(|cursor| cursor.appearance.shape == CursorShape::Block);
+                let selected = text_selection
+                    .is_some_and(|range| range.includes_sized_text(first_row + row, part));
                 if let Some(cursor) = block_cursor {
                     self.rect(rect, cursor.color, 1.0);
+                } else if selected {
+                    self.rect(rect, frame.palette.graphics_color(250), 1.0);
                 }
                 if !style.style.hidden
                     && let Some(area) = TextArea::sized(rect, part, self.metrics)
                 {
-                    if block_cursor.is_some() {
+                    let foreground = if block_cursor.is_some() {
+                        Some(style.background)
+                    } else if selected {
+                        Some(frame.palette.graphics_color(251))
+                    } else {
+                        None
+                    };
+                    if let Some(foreground) = foreground {
                         if style.style.underline_color == Color::Default {
-                            style.underline_color = style.background;
+                            style.underline_color = foreground;
                         }
-                        style.foreground = style.background;
+                        style.foreground = foreground;
                     }
                     let alpha = if style.style.faint { 0.6 } else { 1.0 };
                     let rendition =
@@ -572,6 +591,17 @@ impl TextRenderer {
         self.layers[layer]
             .allocate(size)
             .map(|allocation| (layer, allocation))
+    }
+
+    fn selection_background(
+        &mut self,
+        frame: &PresentationFrame<'_>,
+        row: usize,
+        span: Range<usize>,
+    ) {
+        if let Some(rect) = frame.geometry.row_rect(row, span) {
+            self.rect(rect, frame.palette.graphics_color(250), 1.0);
+        }
     }
 
     fn row_decorations(

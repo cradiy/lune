@@ -6,6 +6,33 @@ fn point(row: usize, column: usize) -> CellPosition {
 }
 
 #[test]
+fn viewport_selection_trims_unwritten_padding_and_retains_printed_spaces() {
+    let mut screen = Screen::new(10, 6).unwrap();
+    screen.set_cursor(1, 2);
+    screen.write_ascii(b"A B", StyleId::default()).unwrap();
+    screen.set_cursor(3, 4);
+    screen.write_ascii(b"C", StyleId::default()).unwrap();
+
+    let view = screen.viewport();
+    assert_eq!(view.selection_bounds(point(5, 2)..point(5, 3)), None);
+    assert_eq!(view.selection_bounds(point(3, 5)..point(5, 9)), None);
+    let printed_space = point(1, 3)..point(1, 4);
+    assert_eq!(
+        view.selection_bounds(printed_space.clone()),
+        Some(printed_space.clone())
+    );
+    assert_eq!(view.selection_text(printed_space).unwrap().to_string(), " ");
+
+    let extent = view.selection_bounds(point(0, 0)..point(5, 10)).unwrap();
+    assert_eq!(extent, point(1, 2)..point(3, 5));
+    let text = view.selection_text(extent).unwrap();
+    assert_eq!(text.columns_on_row(1), Some(2..5));
+    assert_eq!(text.columns_on_row(2), None);
+    assert_eq!(text.columns_on_row(3), Some(4..5));
+    assert_eq!(text.to_string(), "A B\n\nC");
+}
+
+#[test]
 fn text_ranges_join_rows_preserve_units_and_validate_physical_boundaries() {
     let mut screen = Screen::new(4, 4).unwrap();
     screen.write_ascii(b"abc", StyleId(1)).unwrap();

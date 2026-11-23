@@ -94,4 +94,20 @@ impl<'a> Viewport<'a> {
         range.end.row += self.start;
         self.view.text(range)
     }
+
+    /// Contracts a selection to the first and last occupied cells in the viewport.
+    pub fn selection_bounds(&self, range: Range<CellPosition>) -> Option<Range<CellPosition>> {
+        let mut bounds = self.selection_text(range).ok()?.content_bounds()?;
+        bounds.start.row -= self.start;
+        bounds.end.row -= self.start;
+        Some(bounds)
+    }
+
+    /// Copies each selected row without unwritten padding outside its text.
+    pub fn selection_text(
+        &self,
+        range: Range<CellPosition>,
+    ) -> Result<TextRange<'a, true>, StorageError> {
+        self.text(range).map(TextRange::trim_erased)
+    }
 }

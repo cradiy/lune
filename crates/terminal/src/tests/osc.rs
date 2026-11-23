@@ -604,6 +604,46 @@ fn sized_text_widens_at_the_history_join() {
 }
 
 #[test]
+fn sized_text_selection_copies_the_first_selected_fragment_once() {
+    use crate::{CellPosition, HistoryLimits};
+
+    let mut processor = support::processor();
+    let mut screen = Screen::new(8, 4).unwrap();
+    screen
+        .set_history_limits(HistoryLimits {
+            max_rows: 4,
+            max_bytes: 4096,
+        })
+        .unwrap();
+    advance(
+        &mut processor,
+        &mut screen,
+        b"\x1b]66;s=2:w=2;AB\x07\x1b]66;s=2;Q\x07",
+    );
+    let cell = |row, column| CellPosition { row, column };
+    let viewport = screen.viewport();
+    let hit = cell(1, 2)..cell(1, 3);
+    assert_eq!(viewport.selection_bounds(hit.clone()), Some(hit.clone()));
+    let tail = viewport.selection_text(hit).unwrap();
+    let head = viewport.row(0).unwrap();
+    assert!(tail.includes_sized_text(0, head.sized_text_at(2).unwrap()));
+    assert!(!tail.includes_sized_text(0, head.sized_text_at(4).unwrap()));
+    assert_eq!(tail.to_string(), "AB");
+    let multiple = viewport.text(cell(0, 2)..cell(1, 3)).unwrap();
+    assert_eq!(multiple.to_string().matches("AB").count(), 1);
+    assert_eq!(
+        viewport.text(cell(0, 1)..cell(0, 1)).unwrap().to_string(),
+        ""
+    );
+
+    screen.scroll_up(1, StyleId::default()).unwrap();
+    let viewport = screen.viewport();
+    let tail = viewport.text(cell(0, 2)..cell(0, 3)).unwrap();
+    assert!(tail.includes_sized_text(1, viewport.row(0).unwrap().sized_text_at(2).unwrap()));
+    assert_eq!(tail.to_string(), "AB");
+}
+
+#[test]
 fn sized_text_survives_reflow_until_a_row_is_evicted() {
     use crate::{HistoryLimits, UnicodeWriter};
 

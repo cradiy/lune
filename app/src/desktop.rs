@@ -744,7 +744,7 @@ impl Client {
                 .session
                 .screen()
                 .viewport()
-                .text(selection.range.clone())
+                .selection_text(selection.range.clone())
         {
             match clipboard::write(text.to_string(), self.proxy.clone()) {
                 Ok(()) => self.copy_pending = true,
