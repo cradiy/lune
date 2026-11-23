@@ -140,13 +140,12 @@ impl Painter {
         &mut self,
         window: &Arc<Window>,
         frame: &PresentationFrame<'_>,
-        padding: u32,
         selection: Option<&std::ops::Range<CellPosition>>,
         preedit: &str,
     ) -> Result<()> {
         let area = frame.geometry.text_area_pixels().unwrap();
         let (width, height) = (area.width.get(), area.height.get());
-        if width + padding > self.config.width || height + padding > self.config.height {
+        if width > self.config.width || height > self.config.height {
             return Ok(());
         }
 
@@ -228,15 +227,8 @@ impl Painter {
                 })],
                 ..Default::default()
             });
-            pass.set_viewport(
-                padding as f32,
-                padding as f32,
-                width as f32,
-                height as f32,
-                0.0,
-                1.0,
-            );
-            pass.set_scissor_rect(padding, padding, width, height);
+            pass.set_viewport(0.0, 0.0, width as f32, height as f32, 0.0, 1.0);
+            pass.set_scissor_rect(0, 0, width, height);
             self.images
                 .draw_frame(&mut pass, &self.backgrounds, |pass| self.text.draw(pass));
         }

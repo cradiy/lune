@@ -56,6 +56,7 @@ struct Entry {
 pub struct RowHistory {
     rows: VecDeque<Entry>,
     revision: u64,
+    discarded_rows: u64,
     bytes: usize,
     limits: HistoryLimits,
     // Preflight replacements for a whole atomic ASCII callback. Evicted buffers
@@ -176,7 +177,12 @@ impl RowHistory {
 
     pub(crate) fn commit_reflow(&mut self, mut history: Self) {
         history.revision = self.revision.wrapping_add(1);
+        history.discarded_rows = self.discarded_rows;
         *self = history;
+    }
+
+    pub(crate) fn discarded_rows(&self) -> u64 {
+        self.discarded_rows
     }
 
     /// Allocated row-owned heap capacity, excluding the queue allocation.
@@ -229,6 +235,7 @@ impl RowHistory {
         self.warm_count = 0;
         if !self.rows.is_empty() {
             self.revision = self.revision.wrapping_add(1);
+            self.discarded_rows = self.discarded_rows.wrapping_add(self.rows.len() as u64);
         }
         self.rows.clear();
         self.bytes = 0;
@@ -502,6 +509,7 @@ impl RowHistory {
 
     fn evict(&mut self) -> Row {
         let entry = self.rows.pop_front().expect("A retained row is present");
+        self.discarded_rows = self.discarded_rows.wrapping_add(1);
         self.remove_entry(entry)
     }
 

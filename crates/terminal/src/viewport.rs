@@ -86,18 +86,25 @@ impl<'a> Viewport<'a> {
     /// Borrows a half-open text range using window-local row coordinates.
     /// Endpoint rows must lie inside this window; each column uses its row's width.
     /// Complete-unit, soft-wrap, and sink-failure rules follow [`ScreenView::text`].
-    pub fn text(&self, mut range: Range<CellPosition>) -> Result<TextRange<'a>, StorageError> {
+    pub fn text(&self, range: Range<CellPosition>) -> Result<TextRange<'a>, StorageError> {
+        self.view.text(self.source_range(range)?)
+    }
+
+    fn source_range(
+        &self,
+        mut range: Range<CellPosition>,
+    ) -> Result<Range<CellPosition>, StorageError> {
         if range.start.row >= self.height || range.end.row >= self.height {
             return Err(StorageError::OutOfBounds);
         }
         range.start.row += self.start;
         range.end.row += self.start;
-        self.view.text(range)
+        Ok(range)
     }
 
     /// Contracts a selection to the first and last occupied cells in the viewport.
     pub fn selection_bounds(&self, range: Range<CellPosition>) -> Option<Range<CellPosition>> {
-        let mut bounds = self.selection_text(range).ok()?.content_bounds()?;
+        let mut bounds = self.view.selection_bounds(self.source_range(range).ok()?)?;
         bounds.start.row -= self.start;
         bounds.end.row -= self.start;
         Some(bounds)
@@ -108,6 +115,6 @@ impl<'a> Viewport<'a> {
         &self,
         range: Range<CellPosition>,
     ) -> Result<TextRange<'a, true>, StorageError> {
-        self.text(range).map(TextRange::trim_erased)
+        self.view.selection_text(self.source_range(range)?)
     }
 }

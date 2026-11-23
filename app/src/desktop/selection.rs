@@ -1,9 +1,53 @@
 use std::ops::Range;
 use std::time::{Duration, Instant};
 
-use lune_terminal::{CellPosition, Row, Viewport};
+use lune_terminal::{CellPosition, Row, RowRevision, ScreenView};
 
 const MULTI_CLICK_INTERVAL: Duration = Duration::from_millis(500);
+
+pub(super) struct Selection {
+    pub(super) range: Range<CellPosition>,
+    pub(super) anchor: Option<Anchor>,
+    rows: Vec<RowRevision>,
+    discarded_rows: u64,
+}
+
+impl Selection {
+    pub(super) fn new(view: ScreenView<'_>, range: Range<CellPosition>, anchor: Anchor) -> Self {
+        let rows = view
+            .iter_rows()
+            .skip(range.start.row)
+            .take(range.end.row - range.start.row + 1)
+            .map(Row::revision)
+            .collect();
+        Self {
+            range,
+            anchor: Some(anchor),
+            rows,
+            discarded_rows: view.discarded_history_rows(),
+        }
+    }
+
+    pub(super) fn refresh(&mut self, view: ScreenView<'_>) -> bool {
+        let discarded_rows = view.discarded_history_rows();
+        let removed = discarded_rows.wrapping_sub(self.discarded_rows);
+        if removed > self.range.start.row as u64 {
+            return false;
+        }
+        if removed != 0 {
+            let removed = removed as usize;
+            self.range.start.row -= removed;
+            self.range.end.row -= removed;
+            self.anchor = self.anchor.take().and_then(|anchor| anchor.rebase(removed));
+            self.discarded_rows = discarded_rows;
+        }
+        view.iter_rows()
+            .skip(self.range.start.row)
+            .take(self.rows.len())
+            .map(Row::revision)
+            .eq(self.rows.iter().copied())
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Unit {
@@ -44,12 +88,11 @@ impl Click {
             })
     }
 
-    pub(super) fn drag(&self, viewport: Viewport<'_>) -> Drag {
+    pub(super) fn drag(&self, view: ScreenView<'_>) -> Drag {
         let position = self.position;
-        let anchor = (self.unit != Unit::Cell
-            && cell_range(viewport, position, position).is_some())
-        .then(|| self.unit.span(viewport, position))
-        .flatten();
+        let anchor = (self.unit != Unit::Cell && cell_range(view, position, position).is_some())
+            .then(|| self.unit.span(view, position))
+            .flatten();
         Anchor {
             position,
             unit: self.unit,
@@ -67,6 +110,15 @@ pub(super) struct Anchor {
 }
 
 impl Anchor {
+    fn rebase(mut self, removed: usize) -> Option<Self> {
+        self.position.row = self.position.row.checked_sub(removed)?;
+        if let Some(span) = &mut self.span {
+            span.start.row = span.start.row.checked_sub(removed)?;
+            span.end.row -= removed;
+        }
+        Some(self)
+    }
+
     pub(super) fn drag(self, select_on_click: bool) -> Drag {
         Drag {
             anchor: self,
@@ -95,53 +147,49 @@ impl Drag {
             .is_some_and(|focus| focus != self.anchor.position)
     }
 
-    pub(super) fn range(&self, viewport: Viewport<'_>) -> Option<Range<CellPosition>> {
+    pub(super) fn range(&self, view: ScreenView<'_>) -> Option<Range<CellPosition>> {
         let focus = self.focus?;
         let Some(anchor) = &self.anchor.span else {
-            return cell_range(viewport, self.anchor.position, focus);
+            return cell_range(view, self.anchor.position, focus);
         };
         if focus == self.anchor.position {
-            return viewport.selection_bounds(anchor.clone());
+            return view.selection_bounds(anchor.clone());
         }
-        let focus = self.anchor.unit.span(viewport, focus)?;
-        viewport.selection_bounds(anchor.start.min(focus.start)..anchor.end.max(focus.end))
+        let focus = self.anchor.unit.span(view, focus)?;
+        view.selection_bounds(anchor.start.min(focus.start)..anchor.end.max(focus.end))
     }
 }
 
 impl Unit {
-    fn span(self, viewport: Viewport<'_>, position: CellPosition) -> Option<Range<CellPosition>> {
-        let position = match sized_line(viewport, position) {
-            Some(row) => CellPosition {
-                row: row.saturating_sub(viewport.range().start),
-                ..position
-            },
+    fn span(self, view: ScreenView<'_>, position: CellPosition) -> Option<Range<CellPosition>> {
+        let position = match sized_line(view, position) {
+            Some(row) => CellPosition { row, ..position },
             None => position,
         };
         match self {
-            Self::Cell => cell_range(viewport, position, position),
-            Self::Word => word_span(viewport, position),
-            Self::Line => line_span(viewport, position.row),
+            Self::Cell => cell_range(view, position, position),
+            Self::Word => word_span(view, position),
+            Self::Line => line_span(view, position.row),
         }
     }
 }
 
 fn cell_range(
-    viewport: Viewport<'_>,
+    view: ScreenView<'_>,
     mut anchor: CellPosition,
     mut focus: CellPosition,
 ) -> Option<Range<CellPosition>> {
     if anchor.row != focus.row
-        && let Some(line) = sized_line(viewport, anchor)
-        && sized_line(viewport, focus) == Some(line)
+        && let Some(line) = sized_line(view, anchor)
+        && sized_line(view, focus) == Some(line)
     {
-        let row = line.saturating_sub(viewport.range().start);
-        anchor.row = row;
-        focus.row = row;
+        anchor.row = line;
+        focus.row = line;
     }
     let mut start = anchor.min(focus);
     let mut end = anchor.max(focus);
-    let start_cells = viewport.row(start.row)?.cells();
-    let end_cells = viewport.row(end.row)?.cells();
+    let start_cells = view.row(start.row)?.cells();
+    let end_cells = view.row(end.row)?.cells();
     start.column = start.column.min(start_cells.len());
     if start_cells
         .get(start.column)
@@ -156,7 +204,7 @@ fn cell_range(
     {
         end.column += 1;
     }
-    viewport.selection_bounds(start..end)
+    view.selection_bounds(start..end)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -175,19 +223,19 @@ fn word_class(ch: char) -> Option<WordClass> {
     }
 }
 
-fn word_span(viewport: Viewport<'_>, position: CellPosition) -> Option<Range<CellPosition>> {
-    let (mut span, class) = word_unit(viewport, position)?;
+fn word_span(view: ScreenView<'_>, position: CellPosition) -> Option<Range<CellPosition>> {
+    let (mut span, class) = word_unit(view, position)?;
     let Some(class) = class else {
         return Some(span);
     };
-    while let Some(before) = previous_cell(viewport, span.start)
-        && let Some((previous, Some(previous_class))) = word_unit(viewport, before)
+    while let Some(before) = previous_cell(view, span.start)
+        && let Some((previous, Some(previous_class))) = word_unit(view, before)
         && previous_class == class
     {
         span.start = previous.start;
     }
-    while let Some(after) = next_cell(viewport, span.end)
-        && let Some((next, Some(next_class))) = word_unit(viewport, after)
+    while let Some(after) = next_cell(view, span.end)
+        && let Some((next, Some(next_class))) = word_unit(view, after)
         && next_class == class
     {
         span.end = next.end;
@@ -196,10 +244,10 @@ fn word_span(viewport: Viewport<'_>, position: CellPosition) -> Option<Range<Cel
 }
 
 fn word_unit(
-    viewport: Viewport<'_>,
+    view: ScreenView<'_>,
     position: CellPosition,
 ) -> Option<(Range<CellPosition>, Option<WordClass>)> {
-    let row = viewport.row(position.row)?;
+    let row = view.row(position.row)?;
     let limit = row_end(row);
     let (columns, class) = if position.column >= limit {
         (limit..limit, None)
@@ -229,17 +277,17 @@ fn word_unit(
     ))
 }
 
-fn previous_cell(viewport: Viewport<'_>, position: CellPosition) -> Option<CellPosition> {
+fn previous_cell(view: ScreenView<'_>, position: CellPosition) -> Option<CellPosition> {
     if let Some(column) = position.column.checked_sub(1) {
         return Some(CellPosition { column, ..position });
     }
     let row = position.row.checked_sub(1)?;
-    let column = viewport.row(row)?.wrap_end()? - 1;
+    let column = view.row(row)?.wrap_end()? - 1;
     Some(CellPosition { row, column })
 }
 
-fn next_cell(viewport: Viewport<'_>, position: CellPosition) -> Option<CellPosition> {
-    let row = viewport.row(position.row)?;
+fn next_cell(view: ScreenView<'_>, position: CellPosition) -> Option<CellPosition> {
+    let row = view.row(position.row)?;
     if position.column < row_end(row) {
         Some(position)
     } else {
@@ -251,17 +299,17 @@ fn next_cell(viewport: Viewport<'_>, position: CellPosition) -> Option<CellPosit
     }
 }
 
-fn line_span(viewport: Viewport<'_>, row: usize) -> Option<Range<CellPosition>> {
+fn line_span(view: ScreenView<'_>, row: usize) -> Option<Range<CellPosition>> {
     let mut first = row;
     while let Some(previous) = first.checked_sub(1)
-        && viewport.row(previous)?.wrap_end().is_some()
+        && view.row(previous)?.wrap_end().is_some()
     {
         first = previous;
     }
     let mut last = row;
-    let mut end = viewport.row(last)?;
+    let mut end = view.row(last)?;
     while end.wrap_end().is_some()
-        && let Some(next) = viewport.row(last + 1)
+        && let Some(next) = view.row(last + 1)
     {
         last += 1;
         end = next;
@@ -281,14 +329,14 @@ fn row_end(row: &Row) -> usize {
     row.wrap_end().unwrap_or(row.cells().len())
 }
 
-fn sized_line(viewport: Viewport<'_>, position: CellPosition) -> Option<usize> {
-    let fragment = viewport.row(position.row)?.sized_text_at(position.column)?;
-    (viewport.range().start + position.row).checked_sub(fragment.row_offset)
+fn sized_line(view: ScreenView<'_>, position: CellPosition) -> Option<usize> {
+    let fragment = view.row(position.row)?.sized_text_at(position.column)?;
+    position.row.checked_sub(fragment.row_offset)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Click, MULTI_CLICK_INTERVAL, cell_range};
+    use super::{Click, MULTI_CLICK_INTERVAL, Selection, cell_range};
     use lune_terminal::{
         CellPosition, HistoryLimits, MAX_STYLES, Processor, Screen, StyleId, UnicodeWriter,
     };
@@ -312,26 +360,29 @@ mod tests {
             )
             .unwrap();
 
-        let left = CellPosition { row: 1, column: 1 };
-        let right = CellPosition { row: 0, column: 10 };
-        let now = std::time::Instant::now();
-        let word = Click::new(left, now, false).next(left, now, false).unwrap();
         for retained in [false, true] {
             if retained {
                 screen.scroll_up(1, StyleId::default()).unwrap();
             }
-            let viewport = screen.viewport();
-            let selected = cell_range(viewport, left, right).unwrap();
-            assert_eq!(cell_range(viewport, right, left), Some(selected.clone()));
-            assert_eq!(
-                viewport.selection_text(selected).unwrap().to_string(),
-                "ABCD"
-            );
-            let mut drag = word.drag(viewport);
+            let first = screen.viewport().range().start;
+            let left = CellPosition {
+                row: first + 1,
+                column: 1,
+            };
+            let right = CellPosition {
+                row: first,
+                column: 10,
+            };
+            let now = std::time::Instant::now();
+            let word = Click::new(left, now, false).next(left, now, false).unwrap();
+            let view = screen.view();
+            let selected = cell_range(view, left, right).unwrap();
+            assert_eq!(cell_range(view, right, left), Some(selected.clone()));
+            assert_eq!(view.selection_text(selected).unwrap().to_string(), "ABCD");
+            let mut drag = word.drag(view);
             drag.move_to(left);
             assert_eq!(
-                viewport
-                    .selection_text(drag.range(viewport).unwrap())
+                view.selection_text(drag.range(view).unwrap())
                     .unwrap()
                     .to_string(),
                 "ABCD"
@@ -351,7 +402,7 @@ mod tests {
                 &mut UnicodeWriter::default(),
             )
             .unwrap();
-        let view = screen.viewport();
+        let view = screen.view();
         let point = |row, column| CellPosition { row, column };
         let text = |click: &Click, focus| {
             let mut drag = click.drag(view);
@@ -396,5 +447,51 @@ mod tests {
             .next(blank, later, false)
             .unwrap();
         assert_eq!(text(&third, blank), None);
+    }
+
+    #[test]
+    fn selection_follows_retained_rows_until_its_content_is_evicted() {
+        let (palette, _) = super::super::theme::palette(winit::window::Theme::Dark);
+        let mut processor = Processor::new(MAX_STYLES, palette).unwrap();
+        let mut screen = Screen::new(8, 3).unwrap();
+        screen
+            .set_history_limits(HistoryLimits {
+                max_rows: 3,
+                max_bytes: 4096,
+            })
+            .unwrap();
+        let mut writer = UnicodeWriter::default();
+        processor
+            .advance(b"a\r\nb\r\nc\r\nd\r\ne\r\nf", &mut screen, &mut writer)
+            .unwrap();
+        let point = |row, column| CellPosition { row, column };
+        let view = screen.view();
+        let click = Click::new(point(1, 0), std::time::Instant::now(), false);
+        let mut drag = click.drag(view);
+        drag.move_to(point(2, 0));
+        let mut selection = Selection::new(view, drag.range(view).unwrap(), drag.anchor);
+
+        screen.scroll_viewport_up(3);
+        assert!(selection.refresh(screen.view()));
+        processor
+            .advance(b"\r\ng", &mut screen, &mut writer)
+            .unwrap();
+        let view = screen.view();
+        assert!(selection.refresh(view));
+        assert_eq!(selection.range, point(0, 0)..point(1, 1));
+        assert_eq!(
+            view.selection_text(selection.range.clone())
+                .unwrap()
+                .to_string(),
+            "b\nc"
+        );
+        let mut extension = selection.anchor.clone().unwrap().drag(true);
+        assert!(extension.move_to(point(2, 0)));
+        assert_eq!(extension.range(view), Some(point(0, 0)..point(2, 1)));
+
+        processor
+            .advance(b"\r\nh", &mut screen, &mut writer)
+            .unwrap();
+        assert!(!selection.refresh(screen.view()));
     }
 }

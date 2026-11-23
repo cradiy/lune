@@ -10,14 +10,13 @@ mod theme;
 use std::collections::VecDeque;
 use std::io;
 use std::num::NonZeroU32;
-use std::ops::Range;
 use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use lune_terminal::{
     CellPosition, HistoryLimits, Modifiers, MouseButton, MouseEvent, MouseTracking, PixelPosition,
-    PixelSize, RowRevision, ScreenBuffer,
+    PixelSize, ScreenBuffer,
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
@@ -38,7 +37,6 @@ use readiness::Readiness;
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 const FONT_SIZE: f32 = 15.0;
-const PADDING: f64 = 10.0;
 const INPUT_LIMIT: usize = 1024;
 const PASTE_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -158,7 +156,6 @@ struct Client {
     paste_worker: bool,
     paste_deadline: Option<Instant>,
     font_size: f32,
-    padding: u32,
     resize_pending: bool,
     modifiers: ModifiersState,
     focused: bool,
@@ -170,13 +167,7 @@ struct Client {
     wheel: f64,
     selection_click: Option<selection::Click>,
     selection_drag: Option<selection::Drag>,
-    selection: Option<Selection>,
-}
-
-struct Selection {
-    range: Range<CellPosition>,
-    rows: Vec<RowRevision>,
-    anchor: selection::Anchor,
+    selection: Option<selection::Selection>,
 }
 
 impl Client {
@@ -196,8 +187,7 @@ impl Client {
             Font::new(),
             FONT_SIZE * scale as f32,
         ))?;
-        let padding = padding(scale);
-        let geometry = geometry(window.inner_size(), painter.metrics(), padding)
+        let geometry = geometry(window.inner_size(), painter.metrics())
             .ok_or_else(|| io::Error::other("The terminal grid does not fit the Wayland window"))?;
         let shell = std::env::var_os("SHELL")
             .filter(|shell| !shell.is_empty())
@@ -230,7 +220,6 @@ impl Client {
             paste_worker: false,
             paste_deadline: None,
             font_size: FONT_SIZE,
-            padding,
             resize_pending: false,
             modifiers: ModifiersState::empty(),
             focused: false,
@@ -335,6 +324,16 @@ impl Client {
     }
 
     fn dispatch(&mut self, event_loop: &ActiveEventLoop, ready: SessionReady) -> Result<()> {
+        let selection_source = (self.selection.is_some()
+            || self.selection_click.is_some()
+            || self.selection_drag.is_some())
+        .then(|| {
+            let screen = self.session.screen();
+            (
+                screen.active_buffer(),
+                screen.view().discarded_history_rows(),
+            )
+        });
         let outcome = self.session.dispatch_ready(ready)?;
         let Some(mut outcome) = outcome else {
             return Ok(());
@@ -359,13 +358,20 @@ impl Client {
             self.window
                 .request_user_attention(Some(UserAttentionType::Informational));
         }
-        if self.selection.as_ref().is_some_and(|selection| {
-            let viewport = self.session.screen().viewport();
-            (selection.range.start.row..=selection.range.end.row)
-                .map(|row| viewport.row(row).map(|row| row.revision()))
-                .ne(selection.rows.iter().copied().map(Some))
-        }) {
-            self.clear_selection();
+        if let Some((buffer, discarded_rows)) = selection_source {
+            let screen = self.session.screen();
+            let view = screen.view();
+            if screen.active_buffer() != buffer
+                || self
+                    .selection
+                    .as_mut()
+                    .is_some_and(|selection| !selection.refresh(view))
+            {
+                self.clear_selection();
+            } else if view.discarded_history_rows() != discarded_rows {
+                self.selection_click = None;
+                self.selection_drag = None;
+            }
         }
         self.update_ime_area();
         if self.session.presentation_frame().is_some() {
@@ -443,15 +449,13 @@ impl Client {
         } else {
             self.painter.measure(physical_font)
         };
-        let padding = padding(scale);
-        let Some(geometry) = geometry(size, metrics, padding) else {
+        let Some(geometry) = geometry(size, metrics) else {
             self.resize_pending = false;
             return Ok(());
         };
         match self.session.resize(geometry.pty_size()) {
             Ok(()) => {
                 self.resize_pending = false;
-                self.padding = padding;
                 self.painter.set_metrics(metrics);
                 self.painter.resize(size);
                 self.clear_selection();
@@ -470,7 +474,6 @@ impl Client {
             self.painter.draw(
                 &self.window,
                 &frame,
-                self.padding,
                 self.selection.as_ref().map(|selection| &selection.range),
                 &self.preedit,
             )?;
@@ -489,10 +492,7 @@ impl Client {
         let Some(rect) = geometry.row_rect(cursor.row, cursor.column..cursor.column + 1) else {
             return;
         };
-        let origin = PixelPosition {
-            x: rect.origin.x + self.padding,
-            y: rect.origin.y + self.padding,
-        };
+        let origin = rect.origin;
         if self.ime_area != Some((origin, rect.size)) {
             self.window.set_ime_cursor_area(
                 PhysicalPosition::new(origin.x as i32, origin.y as i32),
@@ -579,13 +579,23 @@ impl Client {
                 }
                 return;
             }
-            (LogicalKey::Named(NamedKey::PageUp | NamedKey::PageDown), false, true, false) => {
+            (
+                LogicalKey::Named(
+                    key @ (NamedKey::Home | NamedKey::End | NamedKey::PageUp | NamedKey::PageDown),
+                ),
+                false,
+                true,
+                false,
+            ) if self.session.screen().active_buffer() == ScreenBuffer::Primary => {
                 let page = (self.session.geometry().pty_size().rows as isize - 1).max(1);
-                let up = event.logical_key == LogicalKey::Named(NamedKey::PageUp);
-                if self.session.scroll_history(if up { page } else { -page }) {
-                    self.clear_selection();
-                    self.window.request_redraw();
-                }
+                let steps = match key {
+                    NamedKey::Home => isize::MAX,
+                    NamedKey::End => isize::MIN,
+                    NamedKey::PageUp => page,
+                    NamedKey::PageDown => -page,
+                    _ => unreachable!(),
+                };
+                self.scroll_history(steps);
                 return;
             }
             _ => {}
@@ -608,8 +618,7 @@ impl Client {
     fn pointer_pixel(&self, clamp: bool) -> Option<PixelPosition> {
         let pointer = self.pointer?;
         let area = self.session.geometry().text_area_pixels()?;
-        let padding = f64::from(self.padding);
-        let (x, y) = (pointer.x - padding, pointer.y - padding);
+        let (x, y) = (pointer.x, pointer.y);
         if !clamp
             && (x < 0.0
                 || y < 0.0
@@ -690,10 +699,7 @@ impl Client {
         if self.session.screen().active_buffer() == ScreenBuffer::Primary
             && (!self.mouse_reporting() || self.modifiers.shift_key())
         {
-            if self.session.scroll_history(steps * 3) {
-                self.clear_selection();
-                self.window.request_redraw();
-            }
+            self.scroll_history(steps * 3);
         } else {
             let event = if steps > 0 {
                 MouseEvent::WheelUp
@@ -713,13 +719,25 @@ impl Client {
         }
     }
 
+    fn scroll_history(&mut self, steps: isize) {
+        if self.session.scroll_history(steps) {
+            self.selection_click = None;
+            self.selection_drag = None;
+            self.window.request_redraw();
+        }
+    }
+
+    fn selection_position(&self, clamp: bool) -> Option<CellPosition> {
+        let pixel = self.pointer_pixel(clamp)?;
+        let mut position = self.session.geometry().cell_at(pixel)?;
+        position.row += self.session.screen().viewport().range().start;
+        Some(position)
+    }
+
     fn start_selection(&mut self) {
         let previous = self.selection_click.take();
         let shift = self.modifiers.shift_key();
-        let Some(position) = self
-            .pointer_pixel(false)
-            .and_then(|pixel| self.session.geometry().cell_at(pixel))
-        else {
+        let Some(position) = self.selection_position(false) else {
             if !shift {
                 self.clear_selection();
             }
@@ -731,22 +749,22 @@ impl Client {
         let click = next.unwrap_or_else(|| selection::Click::new(position, now, shift));
         if shift
             && !repeated
-            && let Some(selection) = &self.selection
+            && let Some(anchor) = self
+                .selection
+                .as_ref()
+                .and_then(|selection| selection.anchor.as_ref())
         {
-            self.selection_drag = Some(selection.anchor.clone().drag(true));
+            self.selection_drag = Some(anchor.clone().drag(true));
         } else {
             self.clear_selection();
-            self.selection_drag = Some(click.drag(self.session.screen().viewport()));
+            self.selection_drag = Some(click.drag(self.session.screen().view()));
         }
         self.extend_selection();
         self.selection_click = Some(click);
     }
 
     fn extend_selection(&mut self) {
-        let Some(focus) = self
-            .pointer_pixel(true)
-            .and_then(|pixel| self.session.geometry().cell_at(pixel))
-        else {
+        let Some(focus) = self.selection_position(true) else {
             return;
         };
         let Some(drag) = &mut self.selection_drag else {
@@ -758,18 +776,13 @@ impl Client {
         if drag.moved() {
             self.selection_click = None;
         }
-        let viewport = self.session.screen().viewport();
-        let range = drag.range(viewport);
+        let view = self.session.screen().view();
+        let range = drag.range(view);
         if self.selection.as_ref().map(|selection| &selection.range) == range.as_ref() {
             return;
         }
-        self.selection = range.map(|range| Selection {
-            anchor: drag.anchor.clone(),
-            rows: (range.start.row..=range.end.row)
-                .filter_map(|row| viewport.row(row).map(|row| row.revision()))
-                .collect(),
-            range,
-        });
+        self.selection =
+            range.map(|range| selection::Selection::new(view, range, drag.anchor.clone()));
         self.painter.invalidate_overlay();
         self.window.request_redraw();
     }
@@ -800,7 +813,7 @@ impl Client {
         let text = self
             .session
             .screen()
-            .viewport()
+            .view()
             .selection_text(selection.range.clone())
             .ok()?
             .to_string();
@@ -845,14 +858,10 @@ impl Client {
     }
 }
 
-fn padding(scale: f64) -> u32 {
-    (PADDING * scale).round() as u32
-}
-
-fn geometry(size: PhysicalSize<u32>, metrics: FontMetrics, padding: u32) -> Option<GridGeometry> {
+fn geometry(size: PhysicalSize<u32>, metrics: FontMetrics) -> Option<GridGeometry> {
     let area = PixelSize {
-        width: NonZeroU32::new(size.width.checked_sub(2 * padding)?)?,
-        height: NonZeroU32::new(size.height.checked_sub(2 * padding)?)?,
+        width: NonZeroU32::new(size.width)?,
+        height: NonZeroU32::new(size.height)?,
     };
     GridGeometry::fit(area, metrics.cell)
 }

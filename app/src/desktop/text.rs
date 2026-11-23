@@ -193,7 +193,7 @@ impl TextRenderer {
         let columns = usize::from(frame.geometry.pty_size().columns);
         let first_row = frame.viewport.range().start;
         let text_selection =
-            selection.and_then(|range| frame.viewport.selection_text(range.clone()).ok());
+            selection.and_then(|range| frame.viewport.source().selection_text(range.clone()).ok());
         let sized_cursor = cursor.and_then(|cursor| {
             let pos = cursor.position;
             frame

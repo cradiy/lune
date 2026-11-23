@@ -48,6 +48,12 @@ impl<'a> ScreenView<'a> {
         self.history.map_or(0, RowHistory::len)
     }
 
+    /// Counts oldest history rows discarded by eviction or clearing. Reflow can
+    /// change row indices independently. Alternate views report zero.
+    pub fn discarded_history_rows(&self) -> u64 {
+        self.history.map_or(0, RowHistory::discarded_rows)
+    }
+
     pub fn rows(&self) -> usize {
         self.history_rows() + self.grid.rows()
     }
@@ -116,6 +122,19 @@ impl<'a> ScreenView<'a> {
     /// ranges fail. Borrowed coordinates remain fixed until the borrow ends.
     pub fn text(&self, range: Range<CellPosition>) -> Result<TextRange<'a>, StorageError> {
         TextRange::new(*self, range)
+    }
+
+    /// Trims unwritten padding in a range addressed in the full screen view.
+    pub fn selection_text(
+        &self,
+        range: Range<CellPosition>,
+    ) -> Result<TextRange<'a, true>, StorageError> {
+        self.text(range).map(TextRange::trim_erased)
+    }
+
+    /// Contracts a selection to its first and last occupied cells.
+    pub fn selection_bounds(&self, range: Range<CellPosition>) -> Option<Range<CellPosition>> {
+        self.selection_text(range).ok()?.content_bounds()
     }
 }
 
