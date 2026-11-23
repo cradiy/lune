@@ -50,6 +50,7 @@ pub struct ReflowRows<'a> {
     next: CellPosition,
     end: CellPosition,
     columns: usize,
+    empty: bool,
 }
 
 impl<'a> ReflowRows<'a> {
@@ -59,6 +60,7 @@ impl<'a> ReflowRows<'a> {
         debug_assert_eq!(self.next, row.end);
         Self {
             next: row.start,
+            empty: row.start == row.end,
             ..self.clone()
         }
     }
@@ -67,6 +69,20 @@ impl<'a> ReflowRows<'a> {
         view: ScreenView<'a>,
         rows: Range<usize>,
         columns: usize,
+    ) -> Result<Self, StorageError> {
+        let end = view
+            .row(rows.end - 1)
+            .expect("A logical line row exists")
+            .cells()
+            .len();
+        Self::with_end(view, rows, columns, end)
+    }
+
+    pub(crate) fn with_end(
+        view: ScreenView<'a>,
+        rows: Range<usize>,
+        columns: usize,
+        end: usize,
     ) -> Result<Self, StorageError> {
         if columns == 0 {
             return Err(StorageError::InvalidDimensions);
@@ -93,13 +109,10 @@ impl<'a> ReflowRows<'a> {
             },
             end: CellPosition {
                 row: last,
-                column: view
-                    .row(last)
-                    .expect("A logical line row exists")
-                    .cells()
-                    .len(),
+                column: end,
             },
             columns,
+            empty: rows.start == last && end == 0,
         })
     }
 }
@@ -289,7 +302,7 @@ impl<'a> Iterator for ReflowRows<'a> {
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        if self.next == self.end {
+        if self.next == self.end && !std::mem::take(&mut self.empty) {
             return None;
         }
         let start = self.next;
@@ -299,7 +312,11 @@ impl<'a> Iterator for ReflowRows<'a> {
                 .view
                 .row(self.next.row)
                 .expect("A logical line row exists");
-            let end = row.wrap_end().unwrap_or(row.cells().len());
+            let end = if self.next.row == self.end.row {
+                self.end.column
+            } else {
+                row.wrap_end().unwrap_or(row.cells().len())
+            };
             let mut boundary = self.next.column + (end - self.next.column).min(self.columns - used);
             // A continuation at the cut moves its complete wide unit to the next row.
             if boundary < end && row.cells()[boundary].is_continuation() {
@@ -345,7 +362,7 @@ impl<'a> Iterator for ReflowRows<'a> {
 
     #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
-        if self.next == self.end {
+        if self.next == self.end && !self.empty {
             (0, Some(0))
         } else {
             (1, None)

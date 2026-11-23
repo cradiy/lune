@@ -629,6 +629,35 @@ impl Row {
         &self.cells
     }
 
+    pub(crate) fn reflow_end(&self) -> usize {
+        if self
+            .cells
+            .last()
+            .is_some_and(|cell| cell.reflow_content() != 0)
+        {
+            return self.cells.len();
+        }
+        const CHUNK: usize = 16;
+        let (prefix, chunks) = self.cells.as_rchunks::<CHUNK>();
+        let (start, tail) = if let Some(index) = chunks.iter().rposition(|chunk| {
+            chunk
+                .iter()
+                .fold(0, |bits, cell| bits | cell.reflow_content())
+                != 0
+        }) {
+            (prefix.len() + index * CHUNK, chunks[index].as_slice())
+        } else {
+            (0, prefix)
+        };
+        let end = tail
+            .iter()
+            .rposition(|cell| cell.reflow_content() != 0)
+            .map_or(0, |column| start + column + 1);
+        self.sized_text_rows()
+            .last()
+            .map_or(end, |part| end.max(part.columns().end))
+    }
+
     /// Groups consecutive physical columns by style within the clamped range.
     #[inline]
     pub fn style_runs(&self, columns: Range<usize>) -> impl Iterator<Item = StyleRun> + '_ {

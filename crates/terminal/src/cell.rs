@@ -55,6 +55,11 @@ impl PartialEq for Cell {
 impl Eq for Cell {}
 
 impl Cell {
+    #[inline]
+    pub(crate) fn reflow_content(self) -> u32 {
+        self.style.0 | (!self.text & ERASED)
+    }
+
     pub(crate) fn without_row_metadata(self) -> Self {
         Self {
             text: self.text & !ROW_MASK,

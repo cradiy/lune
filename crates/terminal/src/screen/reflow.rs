@@ -23,6 +23,37 @@ struct Layout {
     anchor: Option<usize>,
 }
 
+#[derive(Clone, Copy)]
+struct PrimaryReflow<'a> {
+    view: ScreenView<'a>,
+    columns: usize,
+    required: [CellPosition; 2],
+}
+
+impl<'a> PrimaryReflow<'a> {
+    fn line(
+        self,
+        rows: Range<usize>,
+        images: &[GraphicsAnchor],
+    ) -> Result<ReflowRows<'a>, StorageError> {
+        let last = rows.end - 1;
+        let row = self.view.row(last).expect("A logical line row exists");
+        let mut end = row.reflow_end();
+        for point in self.required {
+            if point.row == last {
+                end = end.max(point.column);
+            }
+        }
+        let after = images.partition_point(|anchor| anchor.source.row <= last);
+        if let Some(anchor) = images[..after].last()
+            && anchor.source.row == last
+        {
+            end = end.max(anchor.source.column + 1);
+        }
+        ReflowRows::with_end(self.view, rows, self.columns, end.min(row.cells().len()))
+    }
+}
+
 enum Source<'a> {
     Primary(&'a mut RowHistory, &'a mut Grid),
     Alternate(&'a mut Grid),
@@ -135,20 +166,25 @@ fn clipped(mut cursor: Cursor, window: Range<usize>) -> Cursor {
 }
 
 fn layout<'a>(
-    view: ScreenView<'a>,
-    (columns, height): (usize, usize),
+    reflow: PrimaryReflow<'a>,
+    height: usize,
     pivot: Cursor,
     saved: Cursor,
     offset: usize,
     retained_rows: usize,
     image_anchors: &mut [GraphicsAnchor],
 ) -> Result<(Layout, Checkpoint<'a>), StorageError> {
+    let (view, columns) = (reflow.view, reflow.columns);
     let history = view.history_rows();
     let sources = [
         Some(position(pivot, history)),
         Some(position(saved, history)),
         (offset != 0).then_some(CellPosition {
             row: history - offset,
+            column: 0,
+        }),
+        Some(CellPosition {
+            row: history,
             column: 0,
         }),
     ];
@@ -164,8 +200,9 @@ fn layout<'a>(
             ReflowAffinity::After
         },
         ReflowAffinity::After,
+        ReflowAffinity::After,
     ];
-    let mut anchors = [None; 3];
+    let mut anchors = [None; 4];
     for (index, source) in sources.into_iter().enumerate() {
         if let Some(source) = source {
             anchors[index] = Some((normalize_position(view, source)?, index));
@@ -179,9 +216,10 @@ fn layout<'a>(
         )
     });
     let mut next_anchor = 0;
-    let mut mapped = [None; 3];
+    let mut mapped = [None; 4];
     let mut next_image = 0;
     let mut count = 0_usize;
+    let mut content_end = 0;
     let stride = retained_rows + height;
     let interval = stride.div_ceil(2);
     let mut checkpoint_at = 0;
@@ -189,8 +227,11 @@ fn layout<'a>(
     let mut slot = 0;
     let mut replay = None;
     for line in view.logical_lines() {
-        let mut rows = line.reflow(columns)?;
+        let mut rows = reflow.line(line.range(), image_anchors)?;
         while let Some(row) = rows.next() {
+            if row.used_columns() != 0 {
+                content_end = count + 1;
+            }
             if mapped[0].is_none() && count == checkpoint_at {
                 checkpoints[slot] = Some(Checkpoint {
                     index: count,
@@ -250,7 +291,12 @@ fn layout<'a>(
         columns,
     );
     let saved = placed(mapped[1].expect("The retained saved cursor maps"), columns);
-    let start = count.saturating_sub(height).min(cursor.row);
+    let live_top = mapped[3].expect("The primary live boundary maps").row;
+    let latest_start = count.saturating_sub(height).min(cursor.row);
+    let start = content_end
+        .saturating_sub(height)
+        .max(live_top.min(latest_start))
+        .min(cursor.row);
     let end = start + height;
     // Destinations are ordered by source, so only the tail can extend past the window.
     for anchor in image_anchors.iter_mut().rev() {
@@ -287,7 +333,9 @@ impl Screen {
     ///
     /// The primary window is the latest window containing its mapped cursor;
     /// while alternate storage is active, the primary save slot selects that
-    /// window. Rows beyond its bottom are cropped and missing rows are padded.
+    /// window. Unwritten default-style tails do not wrap. Blank rows below
+    /// content do not displace it. Rows beyond the bottom of the selected
+    /// window are cropped and missing rows are padded.
     /// Current and saved positions map or clamp into the new live dimensions.
     /// History retains the adjacent suffix within its row and byte budgets;
     /// an oversized row clears its preceding suffix. Expired viewport anchors
@@ -357,9 +405,17 @@ impl Screen {
             &self.inactive.graphics
         };
         let mut graphics_anchors = primary_graphics.reflow_anchors(view, primary.columns())?;
-        let (plan, checkpoint) = layout(
+        let reflow = PrimaryReflow {
             view,
-            (columns, rows),
+            columns,
+            required: [pivot, saved].map(|cursor| CellPosition {
+                row: view.history_rows() + cursor.row,
+                column: cursor.column + 1,
+            }),
+        };
+        let (plan, checkpoint) = layout(
+            reflow,
+            rows,
             pivot,
             saved,
             self.display_offset,
@@ -385,7 +441,7 @@ impl Screen {
         {
             let rows = match replay.take() {
                 Some(rows) => rows,
-                None => line.reflow(columns)?,
+                None => reflow.line(line.range(), &graphics_anchors)?,
             };
             for row in rows {
                 if index == plan.window.end {

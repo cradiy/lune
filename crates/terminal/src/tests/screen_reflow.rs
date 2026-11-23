@@ -501,6 +501,51 @@ fn screen_reflow_handles_active_alternate_origin_save_slots_and_shared_state() {
 }
 
 #[test]
+fn screen_reflow_keeps_short_output_visible_when_a_sparse_window_narrows() {
+    let mut screen = Screen::new(20, 6).unwrap();
+    screen
+        .set_history_limits(HistoryLimits {
+            max_rows: 8,
+            max_bytes: 4096,
+        })
+        .unwrap();
+    for (row, text) in ["header", "wrapped line", "prompt> "]
+        .into_iter()
+        .enumerate()
+    {
+        screen.set_cursor(row, 0);
+        screen
+            .write_ascii(text.as_bytes(), StyleId::default())
+            .unwrap();
+    }
+    screen.reflow(10, 6, StyleId::default()).unwrap();
+    assert!(screen.history().is_empty());
+    assert_eq!(
+        rows(&screen, ScreenBuffer::Primary),
+        [
+            "header    ",
+            "wrapped li",
+            "ne        ",
+            "prompt>   ",
+            "          ",
+            "          "
+        ]
+    );
+    assert_eq!(screen.cursor().row, 3);
+    assert_eq!(screen.cursor().column, 8);
+    screen.reflow(20, 6, StyleId::default()).unwrap();
+    assert_eq!(
+        rows(&screen, ScreenBuffer::Primary)[..3],
+        [
+            "header              ",
+            "wrapped line        ",
+            "prompt>             "
+        ]
+    );
+    assert_eq!(screen.cursor().row, 2);
+}
+
+#[test]
 fn screen_reflow_bounds_contiguous_history_crops_below_cursor_and_rejects_narrow_wide_units() {
     let mut screen = Screen::new(2, 4).unwrap();
     screen
