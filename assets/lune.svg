@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <title>Lune</title>
+  <defs>
+    <linearGradient id="case" x1="14" y1="8" x2="113" y2="123" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#374465"/>
+      <stop offset="0.55" stop-color="#232b47"/>
+      <stop offset="1" stop-color="#151b2e"/>
+    </linearGradient>
+    <linearGradient id="rim" x1="20" y1="10" x2="110" y2="118" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#7886b2"/>
+      <stop offset="1" stop-color="#3f496d"/>
+    </linearGradient>
+    <linearGradient id="moon" x1="33" y1="32" x2="62" y2="99" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#f4e5ff"/>
+      <stop offset="1" stop-color="#aeb6ff"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="11" width="112" height="112" rx="28" fill="#0c1020" opacity="0.26"/>
+  <rect x="9" y="8" width="110" height="110" rx="27" fill="url(#case)" stroke="url(#rim)" stroke-width="2"/>
+  <path d="M46.5 31.1a34 34 0 1 0 40.6 44a30 30 0 0 1-40.6-44Z" fill="url(#moon)"/>
+  <path d="m57 46 12 11-12 11m22-2h17" fill="none" stroke="#cce5ff" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

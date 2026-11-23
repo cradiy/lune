@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Lune
+GenericName=Terminal
+Comment=Wayland terminal emulator
+Exec=lune
+Icon=lune
+Terminal=false
+Categories=System;TerminalEmulator;
+Keywords=terminal;shell;command line;
