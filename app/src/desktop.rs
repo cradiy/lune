@@ -29,6 +29,7 @@ use winit::window::{Fullscreen, Theme, UserAttentionType, Window, WindowId};
 
 use crate::{GridGeometry, MAX_INPUT_BYTES, Session, SessionReady, WaitOutcome};
 
+use clipboard::ClipboardType;
 use font::{Font, FontMetrics};
 use input::Input;
 use paint::Painter;
@@ -546,7 +547,7 @@ impl Client {
             }
             (LogicalKey::Character(key), true, true, false) if key.eq_ignore_ascii_case("v") => {
                 if !event.repeat {
-                    self.paste();
+                    self.paste(ClipboardType::Regular);
                 }
                 return;
             }
@@ -642,15 +643,19 @@ impl Client {
             _ => return,
         };
         if state.is_pressed() {
-            if button == MouseButton::Left
-                && (!self.mouse_reporting() || self.modifiers.shift_key())
-            {
+            let mouse_reporting = self.mouse_reporting();
+            let local = !mouse_reporting || self.modifiers.shift_key();
+            if button == MouseButton::Left && local {
                 self.clear_selection();
                 self.selection_anchor = self
                     .pointer_pixel(false)
                     .and_then(|pixel| self.session.geometry().cell_at(pixel));
                 self.extend_selection();
-            } else if self.mouse_reporting() && self.pointer_pixel(false).is_some() {
+            } else if button == MouseButton::Middle && local {
+                if self.pointer_pixel(false).is_some() {
+                    self.paste(ClipboardType::Primary);
+                }
+            } else if mouse_reporting && self.pointer_pixel(false).is_some() {
                 self.pressed = Some(button);
                 self.mouse_event(MouseEvent::Press(button));
             }
@@ -753,11 +758,11 @@ impl Client {
         }
     }
 
-    fn paste(&mut self) {
+    fn paste(&mut self, clipboard: ClipboardType) {
         if self.paste_worker || self.inputs.len() >= INPUT_LIMIT {
             return;
         }
-        match clipboard::read(self.proxy.clone()) {
+        match clipboard::read(clipboard, self.proxy.clone()) {
             Ok(()) => {
                 self.follow_output();
                 self.push_input(Input::PendingPaste);

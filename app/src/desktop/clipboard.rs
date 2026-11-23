@@ -10,6 +10,8 @@ use crate::MAX_PASTE_BYTES;
 
 use super::{Event, PASTE_TIMEOUT};
 
+pub(super) use wl_clipboard_rs::paste::ClipboardType;
+
 pub(super) fn write(text: String, proxy: EventLoopProxy<Event>) -> io::Result<()> {
     thread::Builder::new()
         .name("lune-copy".into())
@@ -31,28 +33,27 @@ pub(super) fn write(text: String, proxy: EventLoopProxy<Event>) -> io::Result<()
     Ok(())
 }
 
-pub(super) fn read(proxy: EventLoopProxy<Event>) -> io::Result<()> {
+pub(super) fn read(clipboard: ClipboardType, proxy: EventLoopProxy<Event>) -> io::Result<()> {
     thread::Builder::new()
         .name("lune-paste".into())
         .spawn(move || {
-            let _ = proxy.send_event(Event::PasteReady(read_text()));
+            let _ = proxy.send_event(Event::PasteReady(read_text(clipboard)));
         })?;
     Ok(())
 }
 
-fn read_text() -> Result<String, String> {
+fn read_text(clipboard: ClipboardType) -> Result<String, String> {
     let deadline = Instant::now() + PASTE_TIMEOUT;
-    let mut reader = match paste::get_contents(
-        paste::ClipboardType::Regular,
-        paste::Seat::Unspecified,
-        paste::MimeType::Text,
-    ) {
-        Ok((pipe, _)) => pipe,
-        Err(paste::Error::ClipboardEmpty | paste::Error::NoMimeType | paste::Error::NoSeats) => {
-            return Ok(String::new());
-        }
-        Err(error) => return Err(error.to_string()),
-    };
+    let mut reader =
+        match paste::get_contents(clipboard, paste::Seat::Unspecified, paste::MimeType::Text) {
+            Ok((pipe, _)) => pipe,
+            Err(
+                paste::Error::ClipboardEmpty | paste::Error::NoMimeType | paste::Error::NoSeats,
+            ) => {
+                return Ok(String::new());
+            }
+            Err(error) => return Err(error.to_string()),
+        };
     let mut bytes = Vec::new();
     let mut chunk = [0; 16 * 1024];
     let mut descriptor = libc::pollfd {
