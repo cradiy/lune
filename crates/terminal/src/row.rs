@@ -452,6 +452,60 @@ impl Row {
         self.invalidate_revision();
     }
 
+    pub(crate) fn can_grow_sized_block(&self, added: usize, end: usize) -> bool {
+        end <= self.cells.len()
+            && self
+                .sized_text_at(added)
+                .is_none_or(|part| part.row_offset == 0)
+    }
+
+    pub(crate) fn grow_sized_block(
+        &mut self,
+        column: usize,
+        added: usize,
+        block: Arc<SizedBlock>,
+        insert: bool,
+    ) {
+        let end = column + block.columns;
+        let style = self.cells[column].style();
+        let wrapped = self.wrap_end() == Some(added);
+        if insert {
+            self.insert_cells(added, end - added, style)
+                .expect("The width fits");
+        }
+        self.clear_range(added..end, style).expect("The width fits");
+        self.replace_sized_block(column, block);
+        if wrapped && !insert {
+            self.set_wrap_end(Some(end));
+        }
+    }
+
+    pub(crate) fn remove_moved_sized_block(
+        &mut self,
+        column: usize,
+        block: &Arc<SizedBlock>,
+    ) -> bool {
+        let wrap = self.wrap_end();
+        let Some(sized) = &mut self.sized else {
+            return false;
+        };
+        let Ok(index) = sized
+            .parts
+            .binary_search_by_key(&column, |part| part.column)
+        else {
+            return false;
+        };
+        if !Arc::ptr_eq(&sized.parts[index].block, block) {
+            return false;
+        }
+        sized.parts.remove(index);
+        if wrap == Some(column + block.columns) {
+            self.set_wrap_end((column != 0).then_some(column));
+        }
+        self.invalidate_revision();
+        true
+    }
+
     fn copy_sized_partitions(
         &mut self,
         column: usize,

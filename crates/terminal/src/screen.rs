@@ -990,16 +990,38 @@ impl Screen {
         }
         let previous_columns = part.block.columns;
         let mut columns = part.block.columns_with_suffix(suffix);
-        if columns > previous_columns && (start < history || columns > self.grid.columns()) {
+        if columns > previous_columns
+            && columns > self.grid.columns()
+            && (start >= history
+                || !view
+                    .row(start)
+                    .unwrap()
+                    .can_grow_sized_block(column + previous_columns, column + columns))
+        {
             columns = previous_columns;
         }
         let Some(replacement) = part.block.append(suffix, columns)? else {
             return Ok(true);
         };
         if columns > previous_columns {
-            let style = view.row(start).unwrap().cells()[column].style();
+            let source = view.row(start).unwrap();
+            let style = source.cells()[column].style();
             let original = Arc::clone(&part.block);
-            self.grow_sized_text(start - history, column, style, original, replacement)?;
+            if start >= history {
+                self.grow_sized_text(start - history, column, style, original, replacement)?;
+            } else {
+                debug_assert_eq!(start + 1, history);
+                let added = column + previous_columns;
+                if source.can_grow_sized_block(added, column + columns) {
+                    self.history
+                        .grow_sized_block(start, column, added, &original, replacement);
+                } else if let Some(scrolled) =
+                    self.place_sized_text(self.cursor, replacement, style)?
+                {
+                    self.history
+                        .remove_moved_sized_block(column, &original, scrolled);
+                }
+            }
             return Ok(true);
         }
         let retained = history.saturating_sub(start).min(height);
@@ -1038,28 +1060,10 @@ impl Screen {
     ) -> Result<(), StorageError> {
         let added = column + original.columns;
         let end = column + replacement.columns;
-        let fits = end <= self.grid.columns()
-            && self
-                .grid
-                .row(row)
-                .unwrap()
-                .sized_text_at(added)
-                .is_none_or(|part| part.row_offset == 0);
+        let fits = self.grid.row(row).unwrap().can_grow_sized_block(added, end);
         if fits {
             let target = self.grid.row_mut(row).expect("The sized row is live");
-            let wrapped = target.wrap_end() == Some(added);
-            if self.insert_mode {
-                target
-                    .insert_cells(added, end - added, style)
-                    .expect("The width fits");
-            }
-            target
-                .clear_range(added..end, style)
-                .expect("The width fits");
-            target.replace_sized_block(column, Arc::clone(&replacement));
-            if wrapped && !self.insert_mode {
-                target.set_wrap_end(Some(end));
-            }
+            target.grow_sized_block(column, added, Arc::clone(&replacement), self.insert_mode);
             if self.cursor.row == row {
                 self.advance_sized(row, end, &replacement);
             }
@@ -1069,7 +1073,7 @@ impl Screen {
                 column,
                 wrap_pending: false,
             };
-            if self.place_sized_text(origin, replacement, style)? {
+            if self.place_sized_text(origin, replacement, style)?.is_some() {
                 original.erase();
             }
         }
@@ -1136,7 +1140,7 @@ impl Screen {
         mut candidate: Cursor,
         block: Arc<SizedBlock>,
         style: StyleId,
-    ) -> Result<bool, StorageError> {
+    ) -> Result<Option<usize>, StorageError> {
         let height = usize::from(block.size.scale);
         let columns = self.grid.columns();
         let placement_columns = block.placement_columns();
@@ -1146,14 +1150,14 @@ impl Screen {
             block.columns
         };
         if width > columns || height > self.grid.rows() || width == 0 {
-            return Ok(false);
+            return Ok(None);
         }
         if !self.auto_wrap && !candidate.wrap_pending {
             candidate.column = candidate.column.min(columns - width);
         }
         if self.grid.has_sized_text() {
             let Some(adjusted) = self.skip_sized_lower_rows(candidate, width) else {
-                return Ok(false);
+                return Ok(None);
             };
             candidate = adjusted;
         }
@@ -1181,7 +1185,7 @@ impl Screen {
         let in_region = region.contains(&candidate.row);
         let bottom = if in_region {
             if height > region.len() {
-                return Ok(false);
+                return Ok(None);
             }
             region.end
         } else {
@@ -1191,7 +1195,7 @@ impl Screen {
         if in_region {
             scroll += overflow;
         } else if overflow != 0 {
-            return Ok(false);
+            return Ok(None);
         }
         let row = candidate.row - overflow;
         let column = candidate.column;
@@ -1245,7 +1249,7 @@ impl Screen {
             self.grid.mark_sized_text(row);
         }
         self.advance_sized(row, column + block.columns, &block);
-        Ok(true)
+        Ok(Some(scroll))
     }
 
     /// Replaces a leading display unit and returns its resulting physical position.

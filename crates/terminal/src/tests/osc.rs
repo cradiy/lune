@@ -534,6 +534,76 @@ fn sized_text_combines_at_the_right_edge_without_auto_wrap() {
 }
 
 #[test]
+fn sized_text_widens_at_the_history_join() {
+    use crate::{HistoryLimits, UnicodeWriter};
+
+    for (start, in_place) in [(4, true), (5, false)] {
+        let mut processor = support::processor();
+        let mut screen = Screen::new(6, 3).unwrap();
+        let mut writer = UnicodeWriter::default();
+        let mut limits = HistoryLimits {
+            max_rows: 4,
+            max_bytes: 4096,
+        };
+        screen.set_history_limits(limits).unwrap();
+        let input = format!("\x1b[1;{}H\x1b]66;;❤\x07\x1b]66;w=2;ab\x07", start + 1);
+        processor
+            .advance(input.as_bytes(), &mut screen, &mut writer)
+            .unwrap();
+        screen.scroll_up(1, StyleId::default()).unwrap();
+        let bytes = screen.history().retained_bytes();
+        limits.max_bytes = bytes;
+        screen.set_history_limits(limits).unwrap();
+
+        processor
+            .advance("\x1b[1;1H\u{fe0f}".as_bytes(), &mut screen, &mut writer)
+            .unwrap();
+        if in_place {
+            let history = screen.history().row(0).unwrap();
+            assert_eq!(history.wrap_end(), Some(start + 1));
+            assert_eq!(history.sized_text_at(start).unwrap().text(), "❤");
+            assert_eq!(screen.history().retained_bytes(), bytes);
+
+            limits.max_bytes += 16;
+            screen.set_history_limits(limits).unwrap();
+            processor
+                .advance("\u{fe0f}".as_bytes(), &mut screen, &mut writer)
+                .unwrap();
+            let history = screen.history().row(0).unwrap();
+            let part = history.sized_text_at(start).unwrap();
+            assert_eq!(
+                (part.text(), part.columns()),
+                ("❤\u{fe0f}", start..start + 2)
+            );
+            assert_eq!(history.wrap_end(), Some(start + 2));
+            assert!(screen.history().retained_bytes() > bytes);
+            assert!(screen.history().retained_bytes() <= limits.max_bytes);
+            assert_eq!(screen.cursor().column, 0);
+            assert_eq!(
+                screen
+                    .grid()
+                    .row(0)
+                    .unwrap()
+                    .sized_text_at(0)
+                    .unwrap()
+                    .text(),
+                "ab"
+            );
+        } else {
+            let history = screen.history().row(0).unwrap();
+            assert_eq!(history.wrap_end(), Some(start));
+            assert!(history.sized_text_at(start).is_none());
+            assert!(screen.history().retained_bytes() < bytes);
+            let part = screen.grid().row(0).unwrap().sized_text_at(0).unwrap();
+            assert_eq!((part.text(), part.columns()), ("❤\u{fe0f}", 0..2));
+            assert_eq!(screen.cursor().column, 2);
+        }
+        assert_eq!(screen.cursor().row, 0);
+        assert_eq!(screen.history().len(), 1);
+    }
+}
+
+#[test]
 fn sized_text_survives_reflow_until_a_row_is_evicted() {
     use crate::{HistoryLimits, UnicodeWriter};
 

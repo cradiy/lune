@@ -119,6 +119,47 @@ impl RowHistory {
         self.revision = self.revision.wrapping_add(1);
     }
 
+    pub(crate) fn grow_sized_block(
+        &mut self,
+        index: usize,
+        column: usize,
+        added: usize,
+        previous: &SizedBlock,
+        replacement: Arc<SizedBlock>,
+    ) {
+        let projected = self.bytes - previous.retained_bytes() + replacement.retained_bytes();
+        if projected <= self.limits.max_bytes {
+            self.rows[index]
+                .row
+                .grow_sized_block(column, added, replacement, false);
+            self.reaccount(index);
+        }
+    }
+
+    pub(crate) fn remove_moved_sized_block(
+        &mut self,
+        column: usize,
+        block: &Arc<SizedBlock>,
+        scrolled: usize,
+    ) {
+        // Each scrolled line can append at most one newer retained row.
+        let first = self.rows.len().saturating_sub(scrolled + 1);
+        for index in (first..self.rows.len()).rev() {
+            if self.rows[index].row.remove_moved_sized_block(column, block) {
+                self.reaccount(index);
+                break;
+            }
+        }
+    }
+
+    fn reaccount(&mut self, index: usize) {
+        let entry = &mut self.rows[index];
+        let bytes = entry.row.retained_bytes();
+        self.bytes = self.bytes - entry.bytes + bytes;
+        entry.bytes = bytes;
+        self.revision = self.revision.wrapping_add(1);
+    }
+
     pub fn limits(&self) -> HistoryLimits {
         self.limits
     }
