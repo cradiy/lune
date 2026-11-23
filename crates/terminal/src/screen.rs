@@ -8,7 +8,7 @@ use lune_text::WidthPolicy;
 mod reflow;
 
 use crate::row::SizedRows;
-use crate::sizing::{SizedBlock, SizedBudget, joins_grapheme};
+use crate::sizing::{SizedBlock, SizedBudget, SizedWidth, joins_grapheme};
 use crate::{
     CellPosition, CellWidth, GraphicsPlacement, Grid, HistoryLimits, MAX_CELL_TEXT_BYTES,
     PixelSize, RowHistory, ScreenView, SizedTextRow, StorageError, StyleId, TextSize, Viewport,
@@ -970,9 +970,20 @@ impl Screen {
         }) {
             return Ok(false);
         }
-        let Some(replacement) = part.block.append(suffix)? else {
+        let previous_columns = part.block.columns;
+        let mut columns = part.block.columns_with_suffix(suffix);
+        if columns > previous_columns && (start < history || columns > self.grid.columns()) {
+            columns = previous_columns;
+        }
+        let Some(replacement) = part.block.append(suffix, columns)? else {
             return Ok(true);
         };
+        if columns > previous_columns {
+            let style = view.row(start).unwrap().cells()[column].style();
+            let original = Arc::clone(&part.block);
+            self.grow_sized_text(start - history, column, style, original, replacement)?;
+            return Ok(true);
+        }
         let retained = history.saturating_sub(start).min(height);
         let bytes = self.history.retained_bytes() - retained * part.retained_bytes()
             + retained * replacement.retained_bytes();
@@ -990,7 +1001,59 @@ impl Screen {
                     .replace_sized_block(column, Arc::clone(&replacement));
             }
         }
+        if columns < previous_columns && cursor_row == start && cursor_column > column + columns {
+            let end = cursor_column.saturating_sub(previous_columns - columns);
+            self.advance(self.cursor.row, end.max(column + columns));
+        }
         Ok(true)
+    }
+
+    fn grow_sized_text(
+        &mut self,
+        row: usize,
+        column: usize,
+        style: StyleId,
+        original: Arc<SizedBlock>,
+        replacement: Arc<SizedBlock>,
+    ) -> Result<(), StorageError> {
+        let added = column + original.columns;
+        let end = column + replacement.columns;
+        let fits = end <= self.grid.columns()
+            && self
+                .grid
+                .row(row)
+                .unwrap()
+                .sized_text_at(added)
+                .is_none_or(|part| part.row_offset == 0);
+        if fits {
+            let target = self.grid.row_mut(row).expect("The sized row is live");
+            let wrapped = target.wrap_end() == Some(added);
+            if self.insert_mode {
+                target
+                    .insert_cells(added, end - added, style)
+                    .expect("The width fits");
+            }
+            target
+                .clear_range(added..end, style)
+                .expect("The width fits");
+            target.replace_sized_block(column, replacement);
+            if wrapped && !self.insert_mode {
+                target.set_wrap_end(Some(end));
+            }
+            if self.cursor.row == row {
+                self.advance(row, end);
+            }
+        } else {
+            let origin = Cursor {
+                row,
+                column,
+                wrap_pending: false,
+            };
+            if self.place_sized_text(origin, replacement, style)? {
+                original.erase();
+            }
+        }
+        Ok(())
     }
 
     fn skip_sized_lower_rows(&self, mut candidate: Cursor, width: usize) -> Option<Cursor> {
@@ -1035,22 +1098,42 @@ impl Screen {
         &mut self,
         text: &str,
         size: TextSize,
-        width: usize,
+        width: SizedWidth,
         style: StyleId,
     ) -> Result<(), StorageError> {
-        let height = usize::from(size.scale);
-        let width = width * height;
-        let columns = self.grid.columns();
-        if width > columns || height > self.grid.rows() || width == 0 {
+        if width.columns(size) > self.grid.columns() || usize::from(size.scale) > self.grid.rows() {
             return Ok(());
         }
-        let mut candidate = self.cursor;
+        let budget = self.sized_budget.get_or_insert_with(Default::default);
+        let Some(block) = SizedBlock::new(size, width, text, budget)? else {
+            return Ok(());
+        };
+        self.place_sized_text(self.cursor, block, style).map(|_| ())
+    }
+
+    fn place_sized_text(
+        &mut self,
+        mut candidate: Cursor,
+        block: Arc<SizedBlock>,
+        style: StyleId,
+    ) -> Result<bool, StorageError> {
+        let height = usize::from(block.size.scale);
+        let columns = self.grid.columns();
+        let placement_columns = block.placement_columns();
+        let width = if placement_columns <= columns {
+            placement_columns
+        } else {
+            block.columns
+        };
+        if width > columns || height > self.grid.rows() || width == 0 {
+            return Ok(false);
+        }
         if !self.auto_wrap && !candidate.wrap_pending {
             candidate.column = candidate.column.min(columns - width);
         }
         if self.grid.has_sized_text() {
             let Some(adjusted) = self.skip_sized_lower_rows(candidate, width) else {
-                return Ok(());
+                return Ok(false);
             };
             candidate = adjusted;
         }
@@ -1078,7 +1161,7 @@ impl Screen {
         let in_region = region.contains(&candidate.row);
         let bottom = if in_region {
             if height > region.len() {
-                return Ok(());
+                return Ok(false);
             }
             region.end
         } else {
@@ -1088,7 +1171,7 @@ impl Screen {
         if in_region {
             scroll += overflow;
         } else if overflow != 0 {
-            return Ok(());
+            return Ok(false);
         }
         let row = candidate.row - overflow;
         let column = candidate.column;
@@ -1106,10 +1189,6 @@ impl Screen {
                 self.grid.row_mut(source)?.reserve_sized()?;
             }
         }
-        let budget = self.sized_budget.get_or_insert_with(Default::default);
-        let Some(block) = SizedBlock::new(size, width, text, budget)? else {
-            return Ok(());
-        };
         self.scroll_up(scroll, style)?;
         if let Some((previous, end)) = wrap {
             if !region.contains(&previous) {
@@ -1130,7 +1209,7 @@ impl Screen {
             }
             if self.insert_mode {
                 target
-                    .insert_cells(column, width, style)
+                    .insert_cells(column, block.columns, style)
                     .expect("The placement fits");
             }
             target.add_sized(
@@ -1145,8 +1224,8 @@ impl Screen {
         if height > 1 {
             self.grid.mark_sized_text(row);
         }
-        self.advance(row, column + width);
-        Ok(())
+        self.advance(row, column + block.columns);
+        Ok(true)
     }
 
     /// Replaces a leading display unit and returns its resulting physical position.

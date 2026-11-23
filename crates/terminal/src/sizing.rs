@@ -2,6 +2,7 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+use lune_text::WidthPolicy;
 use unicode_segmentation::{GraphemeCursor, GraphemeIncomplete};
 
 use crate::StorageError;
@@ -85,6 +86,7 @@ pub(crate) fn parse(bytes: &[u8]) -> Option<(TextSize, usize, &str)> {
 pub(crate) struct SizedBlock {
     pub(crate) size: TextSize,
     pub(crate) columns: usize,
+    natural_width: bool,
     text: String,
     erased: AtomicBool,
     budget: Arc<SizedBudget>,
@@ -93,23 +95,86 @@ pub(crate) struct SizedBlock {
 #[derive(Debug, Default)]
 pub(crate) struct SizedBudget(AtomicUsize);
 
+#[derive(Clone, Copy)]
+pub(crate) enum SizedWidth {
+    Explicit(usize),
+    Natural(usize),
+}
+
+impl SizedWidth {
+    pub(crate) fn columns(self, size: TextSize) -> usize {
+        let (Self::Explicit(width) | Self::Natural(width)) = self;
+        width * usize::from(size.scale)
+    }
+}
+
 impl SizedBlock {
     pub(crate) fn new(
         size: TextSize,
-        columns: usize,
+        width: SizedWidth,
         text: &str,
         budget: &Arc<SizedBudget>,
     ) -> Result<Option<Arc<Self>>, StorageError> {
-        Self::with_suffix(size, columns, text, "", budget)
+        Self::with_suffix(
+            size,
+            width.columns(size),
+            matches!(width, SizedWidth::Natural(_)),
+            text,
+            "",
+            budget,
+        )
     }
 
-    pub(crate) fn append(&self, suffix: &str) -> Result<Option<Arc<Self>>, StorageError> {
-        Self::with_suffix(self.size, self.columns, &self.text, suffix, &self.budget)
+    pub(crate) fn columns_with_suffix(&self, suffix: &str) -> usize {
+        let scale = usize::from(self.size.scale);
+        let Some(selector @ ('\u{fe0e}' | '\u{fe0f}')) = suffix.chars().next() else {
+            return self.columns;
+        };
+        if !self.natural_width
+            || (selector == '\u{fe0e}' && self.columns != scale * 2)
+            || (selector == '\u{fe0f}' && (scale != 1 || self.columns != 1))
+        {
+            return self.columns;
+        }
+        self.text
+            .chars()
+            .next_back()
+            .and_then(|base| variation_columns(base, selector))
+            .map_or(self.columns, |columns| columns * scale)
+    }
+
+    pub(crate) fn placement_columns(&self) -> usize {
+        let scale = usize::from(self.size.scale);
+        if self.natural_width && self.columns == scale && self.text.len() >= 4 {
+            let mut text = self.text.chars();
+            let base = text.next().unwrap();
+            if text.next() == Some('\u{fe0e}') && variation_columns(base, '\u{fe0e}') == Some(1) {
+                // The original wide emoji may have already wrapped before VS15 narrows it.
+                return 2 * scale;
+            }
+        }
+        self.columns
+    }
+
+    pub(crate) fn append(
+        &self,
+        suffix: &str,
+        columns: usize,
+    ) -> Result<Option<Arc<Self>>, StorageError> {
+        Self::with_suffix(
+            self.size,
+            columns,
+            self.natural_width,
+            &self.text,
+            suffix,
+            &self.budget,
+        )
     }
 
     fn with_suffix(
         size: TextSize,
         columns: usize,
+        natural_width: bool,
         text: &str,
         suffix: &str,
         budget: &Arc<SizedBudget>,
@@ -138,6 +203,7 @@ impl SizedBlock {
         Ok(Some(Arc::new(Self {
             size,
             columns,
+            natural_width,
             text: owned,
             erased: AtomicBool::new(false),
             budget: Arc::clone(budget),
@@ -154,6 +220,23 @@ impl SizedBlock {
 
     pub(crate) fn retained_bytes(&self) -> usize {
         size_of::<Self>() + self.text.capacity()
+    }
+}
+
+fn variation_columns(base: char, selector: char) -> Option<usize> {
+    let mut sequence = [0; 7];
+    let end = base.encode_utf8(&mut sequence).len();
+    let length = selector.encode_utf8(&mut sequence[end..]).len();
+    let variant = std::str::from_utf8(&sequence[..end + length]).unwrap();
+    let policy = WidthPolicy::Narrow;
+    match (
+        selector,
+        policy.columns(&variant[..end]),
+        policy.columns(variant),
+    ) {
+        ('\u{fe0e}', 2, 1) => Some(1),
+        ('\u{fe0f}', 1, 2) => Some(2),
+        _ => None,
     }
 }
 

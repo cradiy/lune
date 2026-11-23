@@ -417,6 +417,78 @@ fn sized_text_extends_from_later_utf8_and_osc_input() {
 }
 
 #[test]
+fn sized_text_variation_selectors_adjust_natural_widths_and_wrap() {
+    use crate::UnicodeWriter;
+
+    let mut processor = support::processor();
+    let mut screen = Screen::new(8, 6).unwrap();
+    let mut writer = UnicodeWriter::default();
+    let input =
+        "\x1b]66;;❤\x07\u{fe0f}\x1b]66;s=2;☕\x07\x1b]66;;\u{fe0e}\x07\x1b]66;w=2;☕\x07\u{fe0e}";
+    for bytes in input.as_bytes().chunks(2) {
+        processor.advance(bytes, &mut screen, &mut writer).unwrap();
+    }
+    let head = screen.grid().row(0).unwrap();
+    let tail = screen.grid().row(1).unwrap();
+    let emoji = head.sized_text_at(0).unwrap();
+    assert_eq!((emoji.text(), emoji.columns()), ("❤\u{fe0f}", 0..2));
+    let natural = head.sized_text_at(2).unwrap();
+    assert_eq!((natural.text(), natural.columns()), ("☕\u{fe0e}", 2..4));
+    assert!(natural.belongs_to(tail.sized_text_at(2).unwrap()));
+    assert!(tail.sized_text_at(4).is_none());
+    let explicit = head.sized_text_at(4).unwrap();
+    assert_eq!((explicit.text(), explicit.columns()), ("☕\u{fe0e}", 4..6));
+    assert_eq!(screen.cursor().column, 6);
+
+    processor
+        .advance(
+            "\x1b[4;8H\x1b]66;;❤\x07\u{fe0f}X".as_bytes(),
+            &mut screen,
+            &mut writer,
+        )
+        .unwrap();
+    assert_eq!((screen.cursor().row, screen.cursor().column), (4, 3));
+    assert_eq!(screen.grid().row(3).unwrap().wrap_end(), Some(7));
+    assert!(screen.grid().row(3).unwrap().sized_text_at(7).is_none());
+    let row = screen.grid().row(4).unwrap();
+    assert_eq!(row.sized_text_at(0).unwrap().columns(), 0..2);
+    assert_eq!(row.cells()[2].character(), Some('X'));
+
+    screen
+        .set_history_limits(crate::HistoryLimits {
+            max_rows: 4,
+            max_bytes: 4096,
+        })
+        .unwrap();
+    processor
+        .advance(
+            "\x1b[6;8H\x1b]66;;❤\x07\u{fe0f}\x1b[6;8H\x1b]66;;☕\x07\u{fe0e}Y".as_bytes(),
+            &mut screen,
+            &mut writer,
+        )
+        .unwrap();
+    assert_eq!(screen.history().len(), 2);
+    assert_eq!((screen.cursor().row, screen.cursor().column), (5, 2));
+    assert_eq!(screen.grid().row(4).unwrap().wrap_end(), Some(7));
+    let row = screen.grid().row(5).unwrap();
+    assert_eq!(row.sized_text_at(0).unwrap().columns(), 0..1);
+    assert_eq!(row.cells()[1].character(), Some('Y'));
+
+    processor
+        .advance(
+            "\x1b[5;8H\x1b]66;;☕\u{fe0e}\x07Z".as_bytes(),
+            &mut screen,
+            &mut writer,
+        )
+        .unwrap();
+    assert_eq!((screen.cursor().row, screen.cursor().column), (5, 2));
+    assert_eq!(screen.grid().row(4).unwrap().wrap_end(), Some(7));
+    let row = screen.grid().row(5).unwrap();
+    assert_eq!(row.sized_text_at(0).unwrap().columns(), 0..1);
+    assert_eq!(row.cells()[1].character(), Some('Z'));
+}
+
+#[test]
 fn sized_text_survives_reflow_until_a_row_is_evicted() {
     use crate::{HistoryLimits, UnicodeWriter};
 

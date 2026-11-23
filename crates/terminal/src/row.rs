@@ -444,7 +444,11 @@ impl Row {
         let index = parts
             .binary_search_by_key(&column, |part| part.column)
             .expect("The sized column exists");
-        parts[index].block = block;
+        let columns = block.columns;
+        let previous = std::mem::replace(&mut parts[index].block, block);
+        if columns < previous.columns && self.wrap_end() == Some(column + previous.columns) {
+            self.set_wrap_end(Some(column + columns));
+        }
         self.invalidate_revision();
     }
 

@@ -963,7 +963,12 @@ impl Processor {
                     if width != 0 {
                         if !payload.is_empty() {
                             screen
-                                .write_sized_text(payload, size, width, self.state.style)
+                                .write_sized_text(
+                                    payload,
+                                    size,
+                                    crate::sizing::SizedWidth::Explicit(width),
+                                    self.state.style,
+                                )
                                 .map_err(ProcessFailure::Screen)?;
                         }
                     } else {
@@ -980,7 +985,7 @@ impl Processor {
                                 screen.write_sized_text(
                                     unit,
                                     size,
-                                    width.clamp(1, 2),
+                                    crate::sizing::SizedWidth::Natural(width.clamp(1, 2)),
                                     self.state.style,
                                 )
                             })();
