@@ -4,9 +4,13 @@ use std::{
     num::NonZeroU64,
     ops::Range,
     slice,
-    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+    },
 };
 
+use crate::sizing::SizedBlock;
 use crate::{
     Cell, CellPosition, CellText, CellWidth, GRAPHICS_PLACEHOLDER, MAX_CELL_TEXT_BYTES,
     SizedTextRow, StorageError, StyleId,
@@ -432,6 +436,15 @@ impl Row {
             .parts;
         let index = parts.partition_point(|existing| existing.column < part.column);
         parts.insert(index, part);
+        self.invalidate_revision();
+    }
+
+    pub(crate) fn replace_sized_block(&mut self, column: usize, block: Arc<SizedBlock>) {
+        let parts = &mut self.sized.as_mut().expect("The sized row exists").parts;
+        let index = parts
+            .binary_search_by_key(&column, |part| part.column)
+            .expect("The sized column exists");
+        parts[index].block = block;
         self.invalidate_revision();
     }
 

@@ -2,11 +2,24 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+use unicode_segmentation::{GraphemeCursor, GraphemeIncomplete};
+
 use crate::StorageError;
 
 pub(crate) const MAX_SIZED_TEXT_BYTES: usize = 4096;
 pub(crate) const MAX_SIZING_METADATA_BYTES: usize = 128;
 const MAX_RETAINED_BYTES: usize = 8 << 20;
+
+pub(crate) fn joins_grapheme(text: &str, suffix: &str) -> bool {
+    let mut cursor = GraphemeCursor::new(text.len(), text.len() + suffix.len(), true);
+    loop {
+        match cursor.is_boundary(suffix, text.len()) {
+            Ok(boundary) => return !boundary,
+            Err(GraphemeIncomplete::PreContext(end)) => cursor.provide_context(&text[..end], 0),
+            Err(_) => unreachable!("The block and following text are available"),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TextSize {
@@ -87,11 +100,28 @@ impl SizedBlock {
         text: &str,
         budget: &Arc<SizedBudget>,
     ) -> Result<Option<Arc<Self>>, StorageError> {
-        if budget.0.load(Ordering::Relaxed) + size_of::<Self>() + text.len() > MAX_RETAINED_BYTES {
+        Self::with_suffix(size, columns, text, "", budget)
+    }
+
+    pub(crate) fn append(&self, suffix: &str) -> Result<Option<Arc<Self>>, StorageError> {
+        Self::with_suffix(self.size, self.columns, &self.text, suffix, &self.budget)
+    }
+
+    fn with_suffix(
+        size: TextSize,
+        columns: usize,
+        text: &str,
+        suffix: &str,
+        budget: &Arc<SizedBudget>,
+    ) -> Result<Option<Arc<Self>>, StorageError> {
+        let length = text.len().saturating_add(suffix.len());
+        if length > MAX_SIZED_TEXT_BYTES
+            || budget.0.load(Ordering::Relaxed) + size_of::<Self>() + length > MAX_RETAINED_BYTES
+        {
             return Ok(None);
         }
         let mut owned = String::new();
-        owned.try_reserve_exact(text.len())?;
+        owned.try_reserve_exact(length)?;
         let charge = size_of::<Self>() + owned.capacity();
         if budget
             .0
@@ -104,6 +134,7 @@ impl SizedBlock {
             return Ok(None);
         }
         owned.push_str(text);
+        owned.push_str(suffix);
         Ok(Some(Arc::new(Self {
             size,
             columns,
@@ -120,13 +151,17 @@ impl SizedBlock {
     pub(crate) fn erase(&self) {
         self.erased.store(true, Ordering::Relaxed);
     }
+
+    pub(crate) fn retained_bytes(&self) -> usize {
+        size_of::<Self>() + self.text.capacity()
+    }
 }
 
 impl Drop for SizedBlock {
     fn drop(&mut self) {
         self.budget
             .0
-            .fetch_sub(size_of::<Self>() + self.text.capacity(), Ordering::Relaxed);
+            .fetch_sub(self.retained_bytes(), Ordering::Relaxed);
     }
 }
 
@@ -156,6 +191,6 @@ impl SizedTextRow {
     }
 
     pub(crate) fn retained_bytes(&self) -> usize {
-        size_of::<SizedBlock>() + self.block.text.capacity()
+        self.block.retained_bytes()
     }
 }

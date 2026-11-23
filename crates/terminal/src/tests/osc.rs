@@ -381,8 +381,44 @@ fn sized_text_validates_metadata_and_honors_the_explicit_footprint() {
 }
 
 #[test]
+fn sized_text_extends_from_later_utf8_and_osc_input() {
+    use crate::UnicodeWriter;
+
+    let mut processor = support::processor();
+    let mut screen = Screen::new(12, 4).unwrap();
+    let mut writer = UnicodeWriter::default();
+    processor
+        .advance(b"\x1b]66;s=2;A\x07", &mut screen, &mut writer)
+        .unwrap();
+    let cursor = screen.cursor();
+    let revisions: [_; 2] = std::array::from_fn(|row| screen.grid().row(row).unwrap().revision());
+
+    let suffix = "\u{301}\x1b]66;;\u{323}\x1b\\";
+    for bytes in suffix.as_bytes().chunks(1) {
+        processor.advance(bytes, &mut screen, &mut writer).unwrap();
+    }
+    assert_eq!(screen.cursor(), cursor);
+    for (row, revision) in revisions.into_iter().enumerate() {
+        let row = screen.grid().row(row).unwrap();
+        assert_eq!(row.sized_text_at(0).unwrap().text(), "A\u{301}\u{323}");
+        assert_ne!(row.revision(), revision);
+    }
+
+    let input = "\x1b]66;s=2:w=1;🧑\x07\u{200d}💻β";
+    for bytes in input.as_bytes().chunks(2) {
+        processor.advance(bytes, &mut screen, &mut writer).unwrap();
+    }
+    let row = screen.grid().row(0).unwrap();
+    let emoji = row.sized_text_at(2).unwrap();
+    assert_eq!(emoji.text(), "🧑\u{200d}💻");
+    assert_eq!(emoji.columns(), 2..4);
+    assert_eq!(row.cells()[4].character(), Some('β'));
+    assert_eq!(screen.cursor().column, 5);
+}
+
+#[test]
 fn sized_text_survives_reflow_until_a_row_is_evicted() {
-    use crate::{HistoryLimits, StyleId};
+    use crate::{HistoryLimits, UnicodeWriter};
 
     let mut processor = support::processor();
     let mut screen = Screen::new(8, 4).unwrap();
@@ -394,12 +430,46 @@ fn sized_text_survives_reflow_until_a_row_is_evicted() {
         .unwrap();
     advance(&mut processor, &mut screen, b"\x1b]66;s=2;A\x07");
     screen.scroll_up(1, StyleId::default()).unwrap();
+    let bytes = screen.history().retained_bytes();
+    screen
+        .set_history_limits(HistoryLimits {
+            max_rows: 4,
+            max_bytes: bytes,
+        })
+        .unwrap();
+    let mut writer = UnicodeWriter::default();
+    processor
+        .advance("\u{301}".as_bytes(), &mut screen, &mut writer)
+        .unwrap();
+    assert_eq!(
+        screen
+            .history()
+            .row(0)
+            .unwrap()
+            .sized_text_at(0)
+            .unwrap()
+            .text(),
+        "A"
+    );
+    assert_eq!(screen.history().retained_bytes(), bytes);
+
+    screen
+        .set_history_limits(HistoryLimits {
+            max_rows: 4,
+            max_bytes: 4096,
+        })
+        .unwrap();
+    processor
+        .advance("\u{301}".as_bytes(), &mut screen, &mut writer)
+        .unwrap();
+    assert!(screen.history().retained_bytes() > bytes);
     screen.reflow(10, 4, StyleId::default()).unwrap();
 
     let view = screen.view();
     let head = view.row(0).unwrap().sized_text_at(0).unwrap();
     let tail = view.row(1).unwrap().sized_text_at(0).unwrap();
     assert!(head.belongs_to(tail));
+    assert_eq!(head.text(), "A\u{301}");
     assert_eq!((head.row_offset, tail.row_offset), (0, 1));
 
     screen.set_history_limits(HistoryLimits::default()).unwrap();

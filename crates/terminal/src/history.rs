@@ -1,6 +1,7 @@
-use std::collections::VecDeque;
+use std::{collections::VecDeque, sync::Arc};
 
 use crate::row::PreparedRow;
+use crate::sizing::SizedBlock;
 use crate::{Cell, CellWidth, Grid, Row, StorageError, StyleId};
 
 /// Maximum retained physical rows.
@@ -97,6 +98,25 @@ impl RowHistory {
 
     pub(crate) fn row_mut(&mut self, index: usize) -> Option<&mut Row> {
         self.rows.get_mut(index).map(|entry| &mut entry.row)
+    }
+
+    pub(crate) fn replace_sized_block(
+        &mut self,
+        index: usize,
+        column: usize,
+        block: Arc<SizedBlock>,
+    ) {
+        let entry = &mut self.rows[index];
+        let previous = entry
+            .row
+            .sized_text_at(column)
+            .expect("The sized column exists")
+            .retained_bytes();
+        let replacement = block.retained_bytes();
+        entry.row.replace_sized_block(column, block);
+        entry.bytes = entry.bytes - previous + replacement;
+        self.bytes = self.bytes - previous + replacement;
+        self.revision = self.revision.wrapping_add(1);
     }
 
     pub fn limits(&self) -> HistoryLimits {

@@ -969,10 +969,22 @@ impl Processor {
                     } else {
                         let policy = text.width_policy();
                         for unit in payload[offset..].graphemes(true) {
-                            let width = policy.columns(unit).clamp(1, 2);
-                            if let Err(error) =
-                                screen.write_sized_text(unit, size, width, self.state.style)
-                            {
+                            let width = policy.columns(unit);
+                            let result = (|| {
+                                if width == 0
+                                    && screen.has_sized_text_storage()
+                                    && screen.extend_sized_text(unit, policy)?
+                                {
+                                    return Ok(());
+                                }
+                                screen.write_sized_text(
+                                    unit,
+                                    size,
+                                    width.clamp(1, 2),
+                                    self.state.style,
+                                )
+                            })();
+                            if let Err(error) = result {
                                 self.pending[self.head] = Some(Pending::SizedText { offset });
                                 return Err(ProcessFailure::Screen(error));
                             }

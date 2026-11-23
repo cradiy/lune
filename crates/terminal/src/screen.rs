@@ -3,11 +3,12 @@ use std::{num::NonZeroU32, ops::Range, sync::Arc};
 use lune_kitty_graphics::{
     DeleteTarget, EvictionRanking, ImageChange, ImageStore, PlacementError, PlacementPosition,
 };
+use lune_text::WidthPolicy;
 
 mod reflow;
 
 use crate::row::SizedRows;
-use crate::sizing::{SizedBlock, SizedBudget};
+use crate::sizing::{SizedBlock, SizedBudget, joins_grapheme};
 use crate::{
     CellPosition, CellWidth, GraphicsPlacement, Grid, HistoryLimits, MAX_CELL_TEXT_BYTES,
     PixelSize, RowHistory, ScreenView, SizedTextRow, StorageError, StyleId, TextSize, Viewport,
@@ -918,6 +919,78 @@ impl Screen {
 
     pub(crate) fn has_sized_text(&self) -> bool {
         self.grid.has_sized_text()
+    }
+
+    #[inline]
+    pub(crate) fn has_sized_text_storage(&self) -> bool {
+        self.sized_budget.is_some()
+    }
+
+    #[cold]
+    pub(crate) fn extend_sized_text(
+        &mut self,
+        suffix: &str,
+        policy: WidthPolicy,
+    ) -> Result<bool, StorageError> {
+        let view = self.view();
+        let history = view.history_rows();
+        let cursor_row = history + self.cursor.row;
+        let cursor_column = self.cursor.column + usize::from(self.cursor.wrap_pending);
+        let (row, column) = if cursor_column != 0 {
+            (cursor_row, cursor_column - 1)
+        } else {
+            let Some(row) = cursor_row.checked_sub(1) else {
+                return Ok(false);
+            };
+            let Some(end) = view.row(row).and_then(crate::Row::wrap_end) else {
+                return Ok(false);
+            };
+            (row, end - 1)
+        };
+        let Some(part) = view.row(row).and_then(|row| row.sized_text_at(column)) else {
+            return Ok(false);
+        };
+        if policy.columns(suffix) != 0 && !joins_grapheme(part.text(), suffix) {
+            return Ok(false);
+        }
+        let column = part.column;
+        let height = usize::from(part.size().scale);
+        let Some(start) = row.checked_sub(part.row_offset) else {
+            return Ok(false);
+        };
+        let rows = start..start + height;
+        if !rows.clone().enumerate().all(|(offset, index)| {
+            view.row(index)
+                .and_then(|row| row.sized_text_at(column))
+                .is_some_and(|candidate| {
+                    candidate.row_offset == offset
+                        && candidate.column == column
+                        && candidate.belongs_to(part)
+                })
+        }) {
+            return Ok(false);
+        }
+        let Some(replacement) = part.block.append(suffix)? else {
+            return Ok(true);
+        };
+        let retained = history.saturating_sub(start).min(height);
+        let bytes = self.history.retained_bytes() - retained * part.retained_bytes()
+            + retained * replacement.retained_bytes();
+        if retained != 0 && bytes > self.history.limits().max_bytes {
+            return Ok(true);
+        }
+        for row in rows {
+            if row < history {
+                self.history
+                    .replace_sized_block(row, column, Arc::clone(&replacement));
+            } else {
+                self.grid
+                    .row_mut(row - history)
+                    .expect("The sized row is live")
+                    .replace_sized_block(column, Arc::clone(&replacement));
+            }
+        }
+        Ok(true)
     }
 
     fn skip_sized_lower_rows(&self, mut candidate: Cursor, width: usize) -> Option<Cursor> {

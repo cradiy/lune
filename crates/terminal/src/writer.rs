@@ -164,6 +164,12 @@ impl UnicodeWriter {
                 self.boundary();
                 return Ok(());
             }
+            if screen.has_sized_text_storage()
+                && self.grapheme.current().is_none()
+                && screen.extend_sized_text(text, self.grapheme.policy())?
+            {
+                return Ok(());
+            }
         }
         let position = &mut self.position;
         self.grapheme
