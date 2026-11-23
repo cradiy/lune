@@ -841,12 +841,16 @@ name = "lune"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "calloop",
+ "calloop-wayland-source",
  "cosmic-text",
  "guillotiere",
  "libc",
  "lune-pty",
  "lune-terminal",
  "pollster",
+ "wayland-client",
+ "wayland-protocols",
  "wgpu",
  "winit",
  "wl-clipboard-rs",

@@ -154,6 +154,7 @@ struct Client {
     proxy: EventLoopProxy<Event>,
     inputs: VecDeque<Input>,
     copy_pending: bool,
+    primary_selection: Option<clipboard::Primary>,
     paste_worker: bool,
     paste_deadline: Option<Instant>,
     font_size: f32,
@@ -223,6 +224,7 @@ impl Client {
             proxy,
             inputs: VecDeque::new(),
             copy_pending: false,
+            primary_selection: None,
             paste_worker: false,
             paste_deadline: None,
             font_size: FONT_SIZE,
@@ -662,6 +664,7 @@ impl Client {
         } else if button == MouseButton::Left && self.selection_anchor.is_some() {
             self.extend_selection();
             self.selection_anchor = None;
+            self.publish_primary_selection();
         } else if self.pressed == Some(button) {
             self.mouse_event(MouseEvent::Release(button));
             self.pressed = None;
@@ -744,17 +747,41 @@ impl Client {
         if self.copy_pending {
             return;
         }
-        if let Some(selection) = &self.selection
-            && let Ok(text) = self
-                .session
-                .screen()
-                .viewport()
-                .selection_text(selection.range.clone())
-        {
-            match clipboard::write(text.to_string(), self.proxy.clone()) {
+        if let Some(text) = self.selected_text() {
+            match clipboard::write(text, self.proxy.clone()) {
                 Ok(()) => self.copy_pending = true,
                 Err(error) => eprintln!("Lune clipboard: {error}"),
             }
+        }
+    }
+
+    fn selected_text(&self) -> Option<String> {
+        let selection = self.selection.as_ref()?;
+        let text = self
+            .session
+            .screen()
+            .viewport()
+            .selection_text(selection.range.clone())
+            .ok()?
+            .to_string();
+        (!text.is_empty()).then_some(text)
+    }
+
+    fn publish_primary_selection(&mut self) {
+        let Some(text) = self.selected_text() else {
+            return;
+        };
+        if self.primary_selection.is_none() {
+            self.primary_selection = match clipboard::Primary::new() {
+                Ok(primary) => Some(primary),
+                Err(error) => {
+                    eprintln!("Lune primary selection: {error}");
+                    return;
+                }
+            };
+        }
+        if let Some(primary) = &self.primary_selection {
+            primary.publish(text);
         }
     }
 
@@ -762,7 +789,11 @@ impl Client {
         if self.paste_worker || self.inputs.len() >= INPUT_LIMIT {
             return;
         }
-        match clipboard::read(clipboard, self.proxy.clone()) {
+        match clipboard::read(
+            clipboard,
+            self.primary_selection.as_ref(),
+            self.proxy.clone(),
+        ) {
             Ok(()) => {
                 self.follow_output();
                 self.push_input(Input::PendingPaste);

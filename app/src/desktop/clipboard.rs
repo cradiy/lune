@@ -1,5 +1,5 @@
 use std::io::{self, Read};
-use std::os::fd::{AsFd, AsRawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::thread;
 use std::time::Instant;
 
@@ -11,6 +11,9 @@ use crate::MAX_PASTE_BYTES;
 use super::{Event, PASTE_TIMEOUT};
 
 pub(super) use wl_clipboard_rs::paste::ClipboardType;
+
+mod primary;
+pub(super) use primary::Primary;
 
 pub(super) fn write(text: String, proxy: EventLoopProxy<Event>) -> io::Result<()> {
     thread::Builder::new()
@@ -33,17 +36,28 @@ pub(super) fn write(text: String, proxy: EventLoopProxy<Event>) -> io::Result<()
     Ok(())
 }
 
-pub(super) fn read(clipboard: ClipboardType, proxy: EventLoopProxy<Event>) -> io::Result<()> {
+pub(super) fn read(
+    clipboard: ClipboardType,
+    primary: Option<&Primary>,
+    proxy: EventLoopProxy<Event>,
+) -> io::Result<()> {
+    let publication = primary
+        .filter(|_| clipboard == ClipboardType::Primary)
+        .and_then(Primary::publication);
     thread::Builder::new()
         .name("lune-paste".into())
         .spawn(move || {
-            let _ = proxy.send_event(Event::PasteReady(read_text(clipboard)));
+            let deadline = Instant::now() + PASTE_TIMEOUT;
+            let result = match publication {
+                Some(publication) if !publication.wait(deadline) => Err("Paste timed out".into()),
+                _ => read_text(clipboard, deadline),
+            };
+            let _ = proxy.send_event(Event::PasteReady(result));
         })?;
     Ok(())
 }
 
-fn read_text(clipboard: ClipboardType) -> Result<String, String> {
-    let deadline = Instant::now() + PASTE_TIMEOUT;
+fn read_text(clipboard: ClipboardType, deadline: Instant) -> Result<String, String> {
     let mut reader =
         match paste::get_contents(clipboard, paste::Seat::Unspecified, paste::MimeType::Text) {
             Ok((pipe, _)) => pipe,
@@ -56,27 +70,9 @@ fn read_text(clipboard: ClipboardType) -> Result<String, String> {
         };
     let mut bytes = Vec::new();
     let mut chunk = [0; 16 * 1024];
-    let mut descriptor = libc::pollfd {
-        fd: reader.as_fd().as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
     loop {
-        let timeout = deadline.saturating_duration_since(Instant::now());
-        if timeout.is_zero() {
+        if !wait_fd(reader.as_fd(), libc::POLLIN, deadline).map_err(|error| error.to_string())? {
             return Err("Paste timed out".into());
-        }
-        // SAFETY: The reader owns the fd and the poll entry is initialized.
-        let ready = unsafe { libc::poll(&mut descriptor, 1, timeout.as_millis() as i32 + 1) };
-        if ready < 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(error.to_string());
-        }
-        if ready == 0 {
-            continue;
         }
         let count = reader.read(&mut chunk).map_err(|error| error.to_string())?;
         if count == 0 {
@@ -90,4 +86,27 @@ fn read_text(clipboard: ClipboardType) -> Result<String, String> {
     let mut text = String::from_utf8(bytes).map_err(|error| error.to_string())?;
     text.retain(|ch| !ch.is_control() || matches!(ch, '\n' | '\r' | '\t'));
     Ok(text)
+}
+
+fn wait_fd(fd: BorrowedFd<'_>, events: libc::c_short, deadline: Instant) -> io::Result<bool> {
+    let mut descriptor = libc::pollfd {
+        fd: fd.as_raw_fd(),
+        events,
+        revents: 0,
+    };
+    loop {
+        let timeout = deadline.saturating_duration_since(Instant::now());
+        if timeout.is_zero() {
+            return Ok(false);
+        }
+        // SAFETY: The descriptor is borrowed for the call and the poll entry is initialized.
+        let ready = unsafe { libc::poll(&mut descriptor, 1, timeout.as_millis() as i32 + 1) };
+        if ready >= 0 {
+            return Ok(ready > 0);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
 }
