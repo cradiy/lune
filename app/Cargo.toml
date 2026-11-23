@@ -5,7 +5,14 @@ edition = "2024"
 publish = false
 
 [features]
+default = ["desktop"]
+desktop = ["wgpu-renderer", "dep:cosmic-text", "dep:guillotiere", "dep:pollster", "dep:wl-clipboard-rs", "dep:winit"]
 wgpu-renderer = ["dep:bytemuck", "dep:wgpu"]
+
+[[bin]]
+name = "lune"
+path = "src/main.rs"
+required-features = ["desktop"]
 
 [dependencies]
 lune-terminal = { path = "../crates/terminal" }
@@ -14,7 +21,12 @@ lune-pty = { path = "../crates/pty" }
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
 bytemuck = { version = "1", optional = true }
+cosmic-text = { version = "0.19", optional = true }
+guillotiere = { version = "0.7", optional = true }
+pollster = { version = "0.4", optional = true }
 wgpu = { version = "30.0.1", default-features = false, features = ["std", "vulkan", "wgsl"], optional = true }
+wl-clipboard-rs = { version = "0.9.5", optional = true }
+winit = { version = "0.30.13", default-features = false, features = ["rwh_06", "wayland", "wayland-dlopen", "wayland-csd-adwaita"], optional = true }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 pollster = "0.4"

@@ -148,7 +148,7 @@ impl CellBackgroundRenderer {
     }
 }
 
-fn linear_colors() -> &'static [f32; 256] {
+pub(crate) fn linear_colors() -> &'static [f32; 256] {
     static LINEAR: OnceLock<[f32; 256]> = OnceLock::new();
     LINEAR.get_or_init(|| {
         std::array::from_fn(|channel| {

@@ -56,7 +56,7 @@ pub struct GraphicsLayout {
     pub offset: [f64; 2],
     pub size: [f64; 2],
     pub source_origin: [f64; 2],
-    pub source_per_pixel: f64,
+    pub source_per_pixel: [f64; 2],
     /// Inclusive texel centers at the top-left and bottom-right of the source region.
     pub sample_bounds: [[f64; 2]; 2],
 }
@@ -134,9 +134,10 @@ impl GraphicsPlacement {
     }
 
     pub fn layout(&self, cell: PixelSize) -> GraphicsLayout {
-        let (mut offset, mut size, scale) = self.uncropped_geometry(cell);
+        let (mut offset, mut size) = self.uncropped_geometry(cell);
         let mut source_origin = self.placement.source_origin.map(f64::from);
         let source_size = self.placement.source_size.map(f64::from);
+        let source_per_pixel = [source_size[0] / size[0], source_size[1] / size[1]];
         let mut sample_bounds = [
             source_origin.map(|start| start + 0.5),
             std::array::from_fn(|axis| source_origin[axis] + source_size[axis] - 0.5),
@@ -164,14 +165,15 @@ impl GraphicsPlacement {
             offset,
             size,
             source_origin,
-            source_per_pixel: scale.recip(),
+            source_per_pixel,
             sample_bounds,
         }
     }
 
-    fn uncropped_geometry(&self, cell: PixelSize) -> ([f64; 2], [f64; 2], f64) {
+    fn uncropped_geometry(&self, cell: PixelSize) -> ([f64; 2], [f64; 2]) {
+        let virtual_placement = self.is_virtual();
         let cells = self.placement.cells;
-        let cells = if self.is_virtual() && cells.contains(&0) {
+        let cells = if virtual_placement && cells.contains(&0) {
             self.virtual_cells(cell)
         } else {
             cells
@@ -184,6 +186,9 @@ impl GraphicsPlacement {
         let available_width = columns * cell[0] - x;
         let available_height = rows * cell[1] - y;
         let (scale, left, top) = match (columns > 0.0, rows > 0.0) {
+            (true, true) if !virtual_placement => {
+                return ([x, y], [available_width, available_height]);
+            }
             (true, true) => {
                 let scale = (available_width / width).min(available_height / height);
                 (
@@ -196,7 +201,7 @@ impl GraphicsPlacement {
             (false, true) => (available_height / height, 0.0, 0.0),
             (false, false) => (1.0, 0.0, 0.0),
         };
-        ([x + left, y + top], [width * scale, height * scale], scale)
+        ([x + left, y + top], [width * scale, height * scale])
     }
 
     fn cell_offset(&self, cell: [u32; 2]) -> [u32; 2] {
@@ -244,7 +249,7 @@ impl GraphicsPlacement {
     fn set_cell_size(&mut self, cell: PixelSize) {
         let cell_size = [cell.width.get(), cell.height.get()];
         if self.is_virtual() {
-            let (offset, size, _) = self.uncropped_geometry(cell);
+            let (offset, size) = self.uncropped_geometry(cell);
             let cell_size = cell_size.map(f64::from);
             self.virtual_start = std::array::from_fn(|axis| {
                 snap_integer_edge(offset[axis] / cell_size[axis]).floor() as u32
@@ -258,7 +263,7 @@ impl GraphicsPlacement {
         }
         self.span = self.uncropped_span(cell_size);
         if self.vertical_crop != UNCROPPED {
-            let (offset, size, _) = self.uncropped_geometry(cell);
+            let (offset, size) = self.uncropped_geometry(cell);
             let row_height = f64::from(cell_size[1]);
             let [top, bottom] = self.vertical_crop;
             let mut height = if bottom.is_finite() {
@@ -282,7 +287,7 @@ impl GraphicsPlacement {
         if retained.is_empty() {
             return false;
         }
-        let (offset, size, _) = self.uncropped_geometry(cell);
+        let (offset, size) = self.uncropped_geometry(cell);
         let anchor = if self.vertical_crop[0].is_finite() {
             self.vertical_crop[0]
         } else {

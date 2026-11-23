@@ -1,3 +1,5 @@
+#[cfg(all(target_os = "linux", feature = "desktop"))]
+mod desktop;
 #[cfg(target_os = "linux")]
 mod geometry;
 #[cfg(all(target_os = "linux", feature = "wgpu-renderer"))]
@@ -7,6 +9,8 @@ mod raster;
 #[cfg(target_os = "linux")]
 mod session;
 
+#[cfg(all(target_os = "linux", feature = "desktop"))]
+pub use desktop::run as run_desktop;
 #[cfg(target_os = "linux")]
 pub use geometry::{GridGeometry, PixelRect};
 #[cfg(all(target_os = "linux", feature = "wgpu-renderer"))]

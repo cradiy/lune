@@ -15,6 +15,8 @@ mod backgrounds;
 mod placeholders;
 mod textures;
 
+#[cfg(feature = "desktop")]
+pub(crate) use backgrounds::linear_colors;
 pub use backgrounds::{BackgroundPrepareError, CellBackgroundRenderer};
 use textures::{
     ImageTextures, PixelRegion, TextureBinding, TextureTiles, TileDamage, TileRegion, make_texture,
@@ -878,7 +880,7 @@ impl ImageRenderer {
     }
 }
 
-fn create_quad_pipeline(
+pub(crate) fn create_quad_pipeline(
     device: &Device,
     module: &wgpu::ShaderModule,
     format: TextureFormat,
@@ -917,7 +919,7 @@ fn create_quad_pipeline(
     })
 }
 
-fn write_instances<T: bytemuck::Pod>(
+pub(crate) fn write_instances<T: bytemuck::Pod>(
     device: &Device,
     queue: &Queue,
     buffer: &mut Option<Buffer>,
@@ -974,7 +976,7 @@ impl ImageQuad {
             quad.bounds[axis] =
                 [start, end].map(|pixel| direction * (pixel / screen[axis] * 2.0 - 1.0));
             quad.source[axis] = [start, end]
-                .map(|pixel| source_origin + (pixel - origin) * layout.source_per_pixel);
+                .map(|pixel| source_origin + (pixel - origin) * layout.source_per_pixel[axis]);
         }
         Some(quad)
     }

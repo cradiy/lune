@@ -1517,6 +1517,34 @@ fn kitty_images_compose_in_an_offscreen_wgpu_pass() {
         <[u8; 4]>::try_from(&mapped[start..start + 4]).unwrap()
     };
     {
+        let mut session = session_with_size(
+            concat!(
+                "\x1b_Ga=t,i=1,f=24,s=3,v=2,q=2;AP8A/wAA/wAAAP8A/wAA/wAA\x1b\\",
+                "\x1b_Ga=p,i=1,p=1,w=1,h=2,c=1,r=1,z=-1,C=1,q=2\x1b\\",
+                "\x1b[1;2H\x1b_Ga=p,i=1,p=2,x=1,w=2,h=2,c=1,r=1,z=-1,C=1,q=2\x1b\\",
+            )
+            .as_bytes(),
+            size,
+        );
+        session.pump().unwrap();
+        let mut renderer = crate::ImageRenderer::new(&device, format);
+        let frame = session.presentation_frame().unwrap();
+        assert_eq!(renderer.prepare(&device, &queue, &frame), 0);
+        let mapped = read_frame(&renderer);
+        for y in 0..2 {
+            assert_eq!(
+                std::array::from_fn::<_, 5, _>(|x| pixel(&mapped, x, y)),
+                [
+                    [0, 255, 0, 255],
+                    [0, 255, 0, 255],
+                    [255, 0, 0, 255],
+                    [255, 0, 0, 255],
+                    [0, 0, 0, 0],
+                ]
+            );
+        }
+    }
+    {
         let mut session = session_with_size(b"\x1b_Ga=T,i=1,s=1,v=1,C=1,q=2;/wAA/w==\x1b\\", size);
         session.pump().unwrap();
         let frame = session.presentation_frame().unwrap();
