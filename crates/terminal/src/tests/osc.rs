@@ -489,6 +489,51 @@ fn sized_text_variation_selectors_adjust_natural_widths_and_wrap() {
 }
 
 #[test]
+fn sized_text_combines_at_the_right_edge_without_auto_wrap() {
+    use crate::UnicodeWriter;
+
+    let mut processor = support::processor();
+    let mut screen = Screen::new(6, 4).unwrap();
+    let mut writer = UnicodeWriter::default();
+    let input =
+        "\x1b[?7l\x1b[1;5H\x1b]66;w=1;A\x07\x1b]66;w=1;e\x07\x1b[31m\u{301}\x1b]66;;\u{323}\x07";
+    for byte in input.as_bytes().chunks(1) {
+        processor.advance(byte, &mut screen, &mut writer).unwrap();
+    }
+    assert!(!screen.cursor().wrap_pending);
+    assert_eq!((screen.cursor().row, screen.cursor().column), (0, 5));
+    let row = screen.grid().row(0).unwrap();
+    assert_eq!(row.sized_text_at(4).unwrap().text(), "A");
+    assert_eq!(row.sized_text_at(5).unwrap().text(), "e\u{301}\u{323}");
+
+    processor
+        .advance("\x1b[1;6H\u{302}".as_bytes(), &mut screen, &mut writer)
+        .unwrap();
+    let row = screen.grid().row(0).unwrap();
+    assert_eq!(row.sized_text_at(4).unwrap().text(), "A\u{302}");
+    assert_eq!(row.sized_text_at(5).unwrap().text(), "e\u{301}\u{323}");
+
+    processor
+        .advance(
+            "\x1b[2;6H\x1b]66;;❤\x07\u{fe0f}\x1b[3;6H\x1b]66;;☕\x07\u{fe0e}\u{301}".as_bytes(),
+            &mut screen,
+            &mut writer,
+        )
+        .unwrap();
+    let grown = screen.grid().row(1).unwrap().sized_text_at(4).unwrap();
+    assert_eq!((grown.text(), grown.columns()), ("❤\u{fe0f}", 4..6));
+    let row = screen.grid().row(2).unwrap();
+    let shrunk = row.sized_text_at(4).unwrap();
+    assert_eq!(
+        (shrunk.text(), shrunk.columns()),
+        ("☕\u{fe0e}\u{301}", 4..5)
+    );
+    assert!(row.sized_text_at(5).is_none());
+    assert_eq!((screen.cursor().row, screen.cursor().column), (2, 5));
+    assert!(!screen.cursor().wrap_pending);
+}
+
+#[test]
 fn sized_text_survives_reflow_until_a_row_is_evicted() {
     use crate::{HistoryLimits, UnicodeWriter};
 

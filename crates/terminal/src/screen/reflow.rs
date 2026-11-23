@@ -541,6 +541,7 @@ impl Screen {
             self.cursor = alternate_cursor;
         }
         self.history.commit_reflow(history);
+        self.sized_right_edge = None;
         self.display_offset = offset.min(self.history.len());
         self.scroll_region = 0..rows;
         if let Some(tabs) = tabs {

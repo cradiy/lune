@@ -1,4 +1,8 @@
-use std::{num::NonZeroU32, ops::Range, sync::Arc};
+use std::{
+    num::NonZeroU32,
+    ops::Range,
+    sync::{Arc, Weak},
+};
 
 use lune_kitty_graphics::{
     DeleteTarget, EvictionRanking, ImageChange, ImageStore, PlacementError, PlacementPosition,
@@ -92,6 +96,8 @@ pub struct Screen {
     cursor_appearance: CursorAppearance,
     reverse_video: bool,
     sized_budget: Option<Arc<SizedBudget>>,
+    // The physical cursor stays in the last column with automatic wrapping off.
+    sized_right_edge: Option<Weak<SizedBlock>>,
 }
 
 #[derive(Debug)]
@@ -363,6 +369,7 @@ impl Screen {
             cursor_appearance: CursorAppearance::default(),
             reverse_video: false,
             sized_budget: None,
+            sized_right_edge: None,
         })
     }
 
@@ -524,6 +531,7 @@ impl Screen {
         if buffer == self.active_buffer {
             return;
         }
+        self.sized_right_edge = None;
         std::mem::swap(&mut self.grid, &mut self.inactive.grid);
         std::mem::swap(&mut self.graphics, &mut self.inactive.graphics);
         std::mem::swap(&mut self.saved_cursor, &mut self.inactive.saved_cursor);
@@ -584,6 +592,7 @@ impl Screen {
         self.clear_history();
         self.inactive.saved_cursor = SavedCursor::default();
         self.cursor = Cursor::default();
+        self.sized_right_edge = None;
         self.saved_cursor = SavedCursor::default();
         self.scroll_region = 0..self.grid.rows();
         self.reset_tab_stops();
@@ -599,7 +608,7 @@ impl Screen {
     /// save slot. Keeps physical cursor coordinates, both buffers, history,
     /// viewport, and tabs; cancels pending wrapping. This does not allocate.
     pub fn soft_reset(&mut self) {
-        self.cursor.wrap_pending = false;
+        self.cancel_pending_wrap();
         self.saved_cursor = SavedCursor::default();
         self.scroll_region = 0..self.grid.rows();
         self.auto_wrap = true;
@@ -614,6 +623,7 @@ impl Screen {
         self.disconnect_top(0);
         self.grid.fill_scalar('E', StyleId(0));
         self.cursor = Cursor::default();
+        self.sized_right_edge = None;
         self.origin_mode = false;
         self.scroll_region = 0..self.grid.rows();
         self.update_history_capture();
@@ -735,7 +745,7 @@ impl Screen {
             self.cursor.column = self
                 .tabs
                 .forward(self.cursor.column, count, self.grid.columns());
-            self.cursor.wrap_pending = false;
+            self.cancel_pending_wrap();
         }
     }
 
@@ -744,7 +754,7 @@ impl Screen {
     pub fn tab_backward(&mut self, count: usize) {
         if count != 0 {
             self.cursor.column = self.tabs.backward(self.cursor.column, count);
-            self.cursor.wrap_pending = false;
+            self.cancel_pending_wrap();
         }
     }
 
@@ -772,6 +782,7 @@ impl Screen {
     /// the physical right edge and may address wide-unit continuations.
     /// Coordinates through `usize::MAX` are accepted without allocating.
     pub fn set_cursor(&mut self, row: usize, column: usize) {
+        self.sized_right_edge = None;
         let (top, height) = if self.origin_mode {
             (self.scroll_region.start, self.scroll_region.len())
         } else {
@@ -800,7 +811,7 @@ impl Screen {
             self.scroll_region.start
         };
         self.cursor.row = self.cursor.row.saturating_sub(count).max(top);
-        self.cursor.wrap_pending = false;
+        self.cancel_pending_wrap();
     }
 
     /// Moves downward in physical rows, stopping at the scrolling region's bottom.
@@ -818,7 +829,7 @@ impl Screen {
             self.scroll_region.end - 1
         };
         self.cursor.row = self.cursor.row.saturating_add(count).min(bottom);
-        self.cursor.wrap_pending = false;
+        self.cancel_pending_wrap();
     }
 
     /// Moves left in physical columns, stopping at column zero. Wide-unit
@@ -830,7 +841,7 @@ impl Screen {
             return;
         }
         self.cursor.column = self.cursor.column.saturating_sub(count);
-        self.cursor.wrap_pending = false;
+        self.cancel_pending_wrap();
     }
 
     /// Moves right in physical columns, stopping at the last column. Other
@@ -845,7 +856,7 @@ impl Screen {
             .column
             .saturating_add(count)
             .min(self.grid.columns() - 1);
-        self.cursor.wrap_pending = false;
+        self.cancel_pending_wrap();
     }
 
     /// Writes a complete display unit, then advances by its supplied width.
@@ -935,7 +946,14 @@ impl Screen {
         let view = self.view();
         let history = view.history_rows();
         let cursor_row = history + self.cursor.row;
-        let cursor_column = self.cursor.column + usize::from(self.cursor.wrap_pending);
+        let past_edge = self.sized_right_edge.as_ref().is_some_and(|origin| {
+            self.cursor.column + 1 == self.grid.columns()
+                && view
+                    .row(cursor_row)
+                    .and_then(|row| row.sized_text_at(self.cursor.column))
+                    .is_some_and(|part| std::ptr::eq(origin.as_ptr(), Arc::as_ptr(&part.block)))
+        });
+        let cursor_column = self.cursor.column + usize::from(self.cursor.wrap_pending || past_edge);
         let (row, column) = if cursor_column != 0 {
             (cursor_row, cursor_column - 1)
         } else {
@@ -1003,7 +1021,9 @@ impl Screen {
         }
         if columns < previous_columns && cursor_row == start && cursor_column > column + columns {
             let end = cursor_column.saturating_sub(previous_columns - columns);
-            self.advance(self.cursor.row, end.max(column + columns));
+            self.advance_sized(self.cursor.row, end.max(column + columns), &replacement);
+        } else if past_edge {
+            self.sized_right_edge = Some(Arc::downgrade(&replacement));
         }
         Ok(true)
     }
@@ -1036,12 +1056,12 @@ impl Screen {
             target
                 .clear_range(added..end, style)
                 .expect("The width fits");
-            target.replace_sized_block(column, replacement);
+            target.replace_sized_block(column, Arc::clone(&replacement));
             if wrapped && !self.insert_mode {
                 target.set_wrap_end(Some(end));
             }
             if self.cursor.row == row {
-                self.advance(row, end);
+                self.advance_sized(row, end, &replacement);
             }
         } else {
             let origin = Cursor {
@@ -1224,7 +1244,7 @@ impl Screen {
         if height > 1 {
             self.grid.mark_sized_text(row);
         }
-        self.advance(row, column + block.columns);
+        self.advance_sized(row, column + block.columns, &block);
         Ok(true)
     }
 
@@ -1645,7 +1665,7 @@ impl Screen {
         self.grid
             .insert_cells(self.cursor.row, self.cursor.column, count, style)
             .expect("The cursor position is in bounds");
-        self.cursor.wrap_pending = false;
+        self.cancel_pending_wrap();
     }
 
     /// Deletes `count` columns at the cursor, shifting the suffix left and
@@ -1659,7 +1679,7 @@ impl Screen {
         self.grid
             .delete_cells(self.cursor.row, self.cursor.column, count, style)
             .expect("The cursor position is in bounds");
-        self.cursor.wrap_pending = false;
+        self.cancel_pending_wrap();
     }
 
     /// Erases `count` columns starting at the cursor, including complete wide
@@ -1680,7 +1700,7 @@ impl Screen {
                     style,
                 )
                 .expect("The cursor row and erasure range are in bounds");
-            self.cursor.wrap_pending = false;
+            self.cancel_pending_wrap();
         }
     }
 
@@ -1789,7 +1809,7 @@ impl Screen {
         self.grid
             .scroll_down(self.cursor.row..self.scroll_region.end, count, style)
             .expect("The cursor suffix is a valid row range");
-        self.cursor.wrap_pending = false;
+        self.cancel_pending_wrap();
     }
 
     /// Deletes rows at the cursor, shifting remaining rows up through the
@@ -1803,7 +1823,7 @@ impl Screen {
         self.grid
             .scroll_up(self.cursor.row..self.scroll_region.end, count, style)
             .expect("The cursor suffix is a valid row range");
-        self.cursor.wrap_pending = false;
+        self.cancel_pending_wrap();
     }
 
     /// Erases part or all of the physical cursor row using `style`. Cursor
@@ -1825,7 +1845,7 @@ impl Screen {
                 .clear_row(self.cursor.row, range, style)
                 .expect("The cursor row and erasure range are in bounds");
         }
-        self.cursor.wrap_pending = false;
+        self.cancel_pending_wrap();
     }
 
     /// Erases text in part or all of the physical display using `style`. The extent
@@ -1850,13 +1870,13 @@ impl Screen {
                 self.grid.clear(style);
             }
         }
-        self.cursor.wrap_pending = false;
+        self.cancel_pending_wrap();
     }
 
     /// Moves to column zero and cancels pending wrapping.
     pub fn carriage_return(&mut self) {
         self.cursor.column = 0;
-        self.cursor.wrap_pending = false;
+        self.cancel_pending_wrap();
     }
 
     /// Advances one row, scrolling at the region's bottom edge. Outside the
@@ -1880,7 +1900,7 @@ impl Screen {
             self.grid.set_wrap_end(self.cursor.row, None);
             self.cursor.row += 1;
         }
-        self.cursor.wrap_pending = false;
+        self.cancel_pending_wrap();
         Ok(())
     }
 
@@ -1898,13 +1918,13 @@ impl Screen {
         } else {
             self.cursor.row = self.cursor.row.saturating_sub(1);
         }
-        self.cursor.wrap_pending = false;
+        self.cancel_pending_wrap();
     }
 
     /// Moves one column left, stopping at column zero, and cancels pending wrapping.
     pub fn backspace(&mut self) {
         self.cursor.column = self.cursor.column.saturating_sub(1);
-        self.cursor.wrap_pending = false;
+        self.cancel_pending_wrap();
     }
 
     /// Preserves both upper-left grid intersections and clamps cursor coordinates.
@@ -1943,7 +1963,7 @@ impl Screen {
         }
         self.cursor.row = self.cursor.row.min(rows - 1);
         self.cursor.column = self.cursor.column.min(columns - 1);
-        self.cursor.wrap_pending = false;
+        self.cancel_pending_wrap();
         self.update_history_capture();
         Ok(())
     }
@@ -1955,5 +1975,16 @@ impl Screen {
             column: end.min(self.grid.columns() - 1),
             wrap_pending: end == self.grid.columns() && self.auto_wrap,
         };
+    }
+
+    #[inline]
+    fn cancel_pending_wrap(&mut self) {
+        self.cursor.wrap_pending = false;
+        self.sized_right_edge = None;
+    }
+
+    fn advance_sized(&mut self, row: usize, end: usize, block: &Arc<SizedBlock>) {
+        self.advance(row, end);
+        self.sized_right_edge = (end == self.grid.columns()).then(|| Arc::downgrade(block));
     }
 }
