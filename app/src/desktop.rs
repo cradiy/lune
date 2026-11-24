@@ -1,5 +1,6 @@
 mod clipboard;
 mod config;
+mod cursor;
 mod directory;
 mod font;
 mod input;
@@ -286,6 +287,9 @@ impl Client {
                     self.draw()?;
                 }
             }
+            WindowEvent::Occluded(true) => {
+                self.painter.reset_cursor_motion();
+            }
             WindowEvent::Occluded(false) => {
                 self.painter.invalidate_overlay();
                 self.window.request_redraw();
@@ -300,6 +304,9 @@ impl Client {
                 self.focused = focused;
                 self.push_input(Input::Focus(focused));
                 if !focused {
+                    if self.painter.reset_cursor_motion() {
+                        self.window.request_redraw();
+                    }
                     if let Some(button) = self.pressed.take() {
                         self.mouse_event(MouseEvent::Release(button));
                     }
@@ -580,6 +587,7 @@ impl Client {
                 self.selection.as_ref().map(|selection| &selection.range),
                 &self.preedit,
                 self.vi.as_ref(),
+                self.focused,
             )?;
         }
         Ok(())

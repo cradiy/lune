@@ -27,6 +27,37 @@ struct Quad {
     sprite: [u32; 2],
 }
 
+impl Quad {
+    fn new(
+        area: PixelSize,
+        rect: PixelRect,
+        color: Rgb,
+        alpha: f32,
+        uv: [f32; 4],
+        sprite: [u32; 2],
+    ) -> Self {
+        let scale_x = 2.0 / area.width.get() as f32;
+        let scale_y = 2.0 / area.height.get() as f32;
+        let lut = linear_colors();
+        Self {
+            rect: [
+                rect.origin.x as f32 * scale_x - 1.0,
+                1.0 - rect.origin.y as f32 * scale_y,
+                rect.size.width.get() as f32 * scale_x,
+                -(rect.size.height.get() as f32) * scale_y,
+            ],
+            uv,
+            color: [
+                lut[color.red as usize],
+                lut[color.green as usize],
+                lut[color.blue as usize],
+                alpha,
+            ],
+            sprite,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Sprite {
     allocation: Allocation,
@@ -109,6 +140,7 @@ pub(super) struct TextRenderer {
     image: Vec<u8>,
     instances: Vec<Quad>,
     buffer: Option<wgpu::Buffer>,
+    motion_buffer: Option<wgpu::Buffer>,
     area: PixelSize,
 }
 
@@ -155,6 +187,7 @@ impl TextRenderer {
             image: Vec::new(),
             instances: Vec::new(),
             buffer: None,
+            motion_buffer: None,
             area: metrics.cell,
         }
     }
@@ -446,14 +479,26 @@ impl TextRenderer {
         }
     }
 
-    pub(super) fn draw(&self, pass: &mut wgpu::RenderPass<'_>) {
+    pub(super) fn prepare_moving_cursor(&mut self, rect: PixelRect, color: Rgb) {
+        let quad = Quad::new(self.area, rect, color, 1.0, [0.0; 4], [0, 0]);
+        write_instances(&self.device, &self.queue, &mut self.motion_buffer, &[quad]);
+    }
+
+    pub(super) fn draw(&self, pass: &mut wgpu::RenderPass<'_>, moving: bool) {
+        if self.instances.is_empty() && !moving {
+            return;
+        }
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &self.bind_group, &[]);
         if let Some(buffer) = &self.buffer
             && !self.instances.is_empty()
         {
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &self.bind_group, &[]);
             pass.set_vertex_buffer(0, buffer.slice(..));
             pass.draw(0..4, 0..self.instances.len() as u32);
+        }
+        if moving && let Some(buffer) = &self.motion_buffer {
+            pass.set_vertex_buffer(0, buffer.slice(..));
+            pass.draw(0..4, 0..1);
         }
     }
 
@@ -787,25 +832,8 @@ impl TextRenderer {
     }
 
     fn quad(&mut self, rect: PixelRect, color: Rgb, alpha: f32, uv: [f32; 4], sprite: [u32; 2]) {
-        let scale_x = 2.0 / self.area.width.get() as f32;
-        let scale_y = 2.0 / self.area.height.get() as f32;
-        let lut = linear_colors();
-        self.instances.push(Quad {
-            rect: [
-                rect.origin.x as f32 * scale_x - 1.0,
-                1.0 - rect.origin.y as f32 * scale_y,
-                rect.size.width.get() as f32 * scale_x,
-                -(rect.size.height.get() as f32) * scale_y,
-            ],
-            uv,
-            color: [
-                lut[color.red as usize],
-                lut[color.green as usize],
-                lut[color.blue as usize],
-                alpha,
-            ],
-            sprite,
-        });
+        self.instances
+            .push(Quad::new(self.area, rect, color, alpha, uv, sprite));
     }
 }
 

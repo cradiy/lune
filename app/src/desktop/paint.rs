@@ -1,7 +1,8 @@
+use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use lune_terminal::{CellPosition, CursorAppearance, PaletteEntry};
+use lune_terminal::{CellPosition, CursorAppearance, PaletteEntry, PixelPosition, ScreenBuffer};
 use winit::dpi::PhysicalSize;
 use winit::window::Window;
 
@@ -12,6 +13,7 @@ use crate::{
 };
 
 use super::Result;
+use super::cursor::CursorMotion;
 use super::font::{Font, FontMetrics};
 use super::text::TextRenderer;
 use super::vi;
@@ -28,6 +30,8 @@ pub(super) struct Painter {
     images: ImageRenderer,
     text: TextRenderer,
     tracker: PresentationTracker,
+    cursor_motion: CursorMotion,
+    cursor_buffer: ScreenBuffer,
     retry: Option<Instant>,
     force_present: bool,
     dirty: bool,
@@ -87,6 +91,8 @@ impl Painter {
             images,
             text,
             tracker,
+            cursor_motion: CursorMotion::default(),
+            cursor_buffer: ScreenBuffer::Primary,
             retry: None,
             force_present: false,
             dirty: true,
@@ -104,6 +110,7 @@ impl Painter {
         self.config.width = size.width;
         self.config.height = size.height;
         self.surface.configure(&self.device, &self.config);
+        self.reset_cursor_motion();
         self.dirty = true;
     }
 
@@ -116,12 +123,22 @@ impl Painter {
     }
 
     pub(super) fn set_metrics(&mut self, metrics: FontMetrics) {
+        if self.text.metrics() != metrics {
+            self.reset_cursor_motion();
+        }
         self.text.set_metrics(metrics);
         self.dirty = true;
     }
 
     pub(super) fn invalidate_overlay(&mut self) {
         self.dirty = true;
+    }
+
+    pub(super) fn reset_cursor_motion(&mut self) -> bool {
+        let moving = self.cursor_motion.moving();
+        self.cursor_motion = CursorMotion::default();
+        self.dirty |= moving;
+        moving
     }
 
     pub(super) fn restart_blink(&mut self, now: Instant) -> bool {
@@ -155,6 +172,7 @@ impl Painter {
         selection: Option<&std::ops::Range<CellPosition>>,
         preedit: &str,
         vi: Option<&vi::Mode>,
+        focused: bool,
     ) -> Result<()> {
         let area = frame.geometry.text_area_pixels().unwrap();
         let (width, height) = (area.width.get(), area.height.get());
@@ -162,15 +180,52 @@ impl Painter {
             return Ok(());
         }
 
-        let update = self.tracker.prepare(frame, Instant::now())?;
+        let now = Instant::now();
+        let update = self.tracker.prepare(frame, now)?;
         let damage = update.damage();
         let rows_changed = match damage.rows {
             RowDamage::All => true,
             RowDamage::Rows(rows) => !rows.is_empty(),
         };
-        let text_changed = rows_changed || self.dirty || damage.cursor.is_some();
-        if !text_changed && !damage.graphics_changed && !self.force_present {
+        let cursor = if let Some(vi) = vi {
+            let rows = frame.viewport.range();
+            rows.contains(&vi.cursor.row).then(|| PresentedCursor {
+                position: CellPosition {
+                    row: vi.cursor.row - rows.start,
+                    column: vi.cursor.column,
+                },
+                appearance: CursorAppearance {
+                    blinking: false,
+                    ..CursorAppearance::default()
+                },
+                color: frame.palette.color(PaletteEntry::Cursor),
+            })
+        } else {
+            damage.displayed_cursor
+        };
+        let buffer = frame.graphics_buffer();
+        let mut motion = if self.cursor_buffer == buffer {
+            self.cursor_motion
+        } else {
+            CursorMotion::default()
+        };
+        let target =
+            if focused && vi.is_none() && preedit.is_empty() && frame.viewport.offset() == 0 {
+                cursor.and_then(|cursor| cursor_origin(frame, cursor.position))
+            } else {
+                None
+            };
+        let position = motion.advance(target, now);
+        let moving = position.is_some();
+        let text_changed = rows_changed
+            || self.dirty
+            || moving != self.cursor_motion.moving()
+            || (!moving && damage.cursor.is_some());
+        let prepare_layers = text_changed || damage.graphics_changed || self.force_present;
+        if !prepare_layers && !moving {
             update.commit();
+            self.cursor_motion = motion;
+            self.cursor_buffer = buffer;
             return Ok(());
         }
 
@@ -201,30 +256,33 @@ impl Painter {
         };
 
         if text_changed {
-            let cursor = if let Some(vi) = vi {
-                let rows = frame.viewport.range();
-                rows.contains(&vi.cursor.row).then(|| PresentedCursor {
-                    position: CellPosition {
-                        row: vi.cursor.row - rows.start,
-                        column: vi.cursor.column,
-                    },
-                    appearance: CursorAppearance {
-                        blinking: false,
-                        ..CursorAppearance::default()
-                    },
-                    color: frame.palette.color(PaletteEntry::Cursor),
-                })
-            } else {
-                damage.displayed_cursor
-            };
-            self.text.prepare(frame, cursor, selection, preedit, vi)?;
+            self.text
+                .prepare(frame, cursor.filter(|_| !moving), selection, preedit, vi)?;
         }
-        self.backgrounds
-            .prepare(&self.device, &self.queue, frame)
-            .map_err(|error| {
-                std::io::Error::other(format!("Failed to prepare terminal backgrounds: {error:?}"))
-            })?;
-        let failures = self.images.prepare(&self.device, &self.queue, frame);
+        let mut draw_moving_cursor = false;
+        if let Some(position) = position
+            && let Some(target) = target
+            && let Some(cursor) = cursor
+            && let Some(paint) = frame.cursor_paint(cursor, NonZeroU32::new(2).unwrap())?
+        {
+            let mut rect = paint.rect;
+            rect.origin.x = position.x + (rect.origin.x - target.x);
+            rect.origin.y = position.y + (rect.origin.y - target.y);
+            self.text.prepare_moving_cursor(rect, paint.color);
+            draw_moving_cursor = true;
+        }
+        let failures = if prepare_layers {
+            self.backgrounds
+                .prepare(&self.device, &self.queue, frame)
+                .map_err(|error| {
+                    std::io::Error::other(format!(
+                        "Failed to prepare terminal backgrounds: {error:?}"
+                    ))
+                })?;
+            Some(self.images.prepare(&self.device, &self.queue, frame))
+        } else {
+            None
+        };
 
         let view = texture
             .texture
@@ -259,24 +317,46 @@ impl Painter {
             pass.set_viewport(0.0, 0.0, width as f32, height as f32, 0.0, 1.0);
             pass.set_scissor_rect(0, 0, width, height);
             self.images
-                .draw_frame(&mut pass, &self.backgrounds, |pass| self.text.draw(pass));
+                .draw_frame(&mut pass, &self.backgrounds, |pass| {
+                    self.text.draw(pass, draw_moving_cursor)
+                });
         }
         self.queue.submit([encoder.finish()]);
         window.pre_present_notify();
         self.queue.present(texture);
         update.commit();
+        self.cursor_motion = motion;
+        self.cursor_buffer = buffer;
         self.force_present = false;
         self.dirty = false;
         if suboptimal {
             self.surface.configure(&self.device, &self.config);
         }
-        if failures != 0 {
-            if !self.graphics_prepare_failed {
-                log::warn!("Failed to prepare {failures} terminal graphics placements");
+        if let Some(failures) = failures {
+            if failures != 0 {
+                if !self.graphics_prepare_failed {
+                    log::warn!("Failed to prepare {failures} terminal graphics placements");
+                }
+                self.retry = Some(Instant::now() + Duration::from_millis(100));
             }
-            self.retry = Some(Instant::now() + Duration::from_millis(100));
+            self.graphics_prepare_failed = failures != 0;
         }
-        self.graphics_prepare_failed = failures != 0;
+        if moving {
+            window.request_redraw();
+        }
         Ok(())
     }
+}
+
+fn cursor_origin(frame: &PresentationFrame<'_>, position: CellPosition) -> Option<PixelPosition> {
+    let row = frame.viewport.row(position.row)?;
+    if row.sized_text_at(position.column).is_some() {
+        return None;
+    }
+    let cell = row.cells().get(position.column)?;
+    let leading = position.column - usize::from(cell.is_continuation());
+    frame
+        .geometry
+        .row_rect(position.row, leading..leading + 1)
+        .map(|rect| rect.origin)
 }
