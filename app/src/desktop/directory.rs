@@ -9,13 +9,58 @@ use winit::event_loop::EventLoopProxy;
 
 use super::Event;
 
-pub(super) fn open(uri: Option<String>, proxy: EventLoopProxy<Event>) -> io::Result<()> {
+pub(super) fn open(
+    uri: Option<String>,
+    fallback: Option<PathBuf>,
+    proxy: EventLoopProxy<Event>,
+) -> io::Result<()> {
     thread::Builder::new()
         .name("lune-open-directory".into())
         .spawn(move || {
-            let _ = proxy.send_event(Event::DirectoryOpened(open_directory(uri.as_deref())));
+            let _ = proxy.send_event(Event::DirectoryOpened(open_directory(
+                uri.as_deref(),
+                fallback,
+            )));
         })?;
     Ok(())
+}
+
+pub(super) fn working_directory(
+    uri: Option<&str>,
+    foreground_pgid: Option<u32>,
+    child_pid: u32,
+) -> Option<PathBuf> {
+    if let Some(uri) = uri {
+        let mut hostname = [0; 256];
+        if let Some(path) = local_path(uri, local_hostname(&mut hostname))
+            && path.is_dir()
+        {
+            return Some(path);
+        }
+    }
+    for pid in foreground_pgid
+        .into_iter()
+        .chain(std::iter::once(child_pid))
+    {
+        if let Some(path) = proc_cwd(pid)
+            && path.is_dir()
+        {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn proc_cwd(pid: u32) -> Option<PathBuf> {
+    if pid == 0 {
+        return None;
+    }
+    std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+}
+
+pub(super) fn is_valid_hyperlink(uri: &str) -> bool {
+    let mut hostname = [0; 256];
+    hyperlink_target(uri, local_hostname(&mut hostname)).is_some()
 }
 
 pub(super) fn open_hyperlink(uri: String, proxy: EventLoopProxy<Event>) -> io::Result<()> {
@@ -70,14 +115,17 @@ fn hyperlink_target(uri: &str, hostname: &[u8]) -> Option<OsString> {
     None
 }
 
-fn open_directory(uri: Option<&str>) -> io::Result<()> {
+fn open_directory(uri: Option<&str>, fallback: Option<PathBuf>) -> io::Result<()> {
     let path = match uri {
         Some(uri) => {
             let mut hostname = [0; 256];
             local_path(uri, local_hostname(&mut hostname))
                 .ok_or_else(|| io::Error::other("The shell did not report a local directory"))?
         }
-        None => std::env::current_dir()?,
+        None => match fallback {
+            Some(path) => path,
+            None => std::env::current_dir()?,
+        },
     };
     if !path.metadata()?.is_dir() {
         return Err(io::Error::other("The reported path is not a directory"));

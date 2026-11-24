@@ -13,8 +13,10 @@ use crate::{PixelRect, PresentationFrame, PresentationStyle, PresentedCursor};
 
 use super::font::{Font, FontMetrics};
 use super::ligature;
-use super::paint::Overlay;
+use super::paint::PaneOverlay;
+use super::split::{Axis, Divider};
 use super::tab_bar;
+use super::url::HoveredLink;
 
 const ATLAS_SIDE: i32 = 1024;
 const MAX_ATLAS_LAYERS: u32 = 32;
@@ -144,7 +146,6 @@ pub(super) struct TextRenderer {
     evicted: bool,
     image: Vec<u8>,
     instances: Vec<Quad>,
-    terminal_instances: u32,
     buffer: Option<wgpu::Buffer>,
     motion_buffer: Option<wgpu::Buffer>,
     area: PixelSize,
@@ -192,7 +193,6 @@ impl TextRenderer {
             evicted: false,
             image: Vec::new(),
             instances: Vec::new(),
-            terminal_instances: 0,
             buffer: None,
             motion_buffer: None,
             area: metrics.cell,
@@ -233,36 +233,37 @@ impl TextRenderer {
         self.sized_glyphs.clear();
     }
 
-    pub(super) fn prepare(
-        &mut self,
-        frame: &PresentationFrame<'_>,
-        cursor: Option<PresentedCursor>,
-        overlay: &Overlay<'_>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let Overlay {
-            selection,
-            hovered_hyperlink,
-            progress,
-            progress_phase,
-            background_opacity,
-            notice,
-            preedit,
-            vi,
-            tab_bar,
-            ..
-        } = overlay;
-        let selection = *selection;
-        let hovered_hyperlink = *hovered_hyperlink;
-        let progress = *progress;
-        let progress_phase = *progress_phase;
-        let background_opacity = *background_opacity;
-        let notice = *notice;
-        let preedit = *preedit;
-        let vi = *vi;
-        self.area = frame.geometry.text_area_pixels().unwrap();
+    pub(super) fn begin_frame(&mut self) {
         self.generation += 1;
         self.evicted = false;
         self.instances.clear();
+    }
+
+    pub(super) fn prepare_pane(
+        &mut self,
+        frame: &PresentationFrame<'_>,
+        cursor: Option<PresentedCursor>,
+        overlay: &PaneOverlay<'_>,
+    ) -> Result<Range<u32>, Box<dyn std::error::Error>> {
+        let PaneOverlay {
+            selection,
+            hovered_link,
+            progress,
+            progress_phase,
+            preedit,
+            vi,
+            zoomed,
+        } = *overlay;
+        let hovered_hyperlink = match hovered_link {
+            Some(HoveredLink::Explicit(id)) => Some(*id),
+            _ => None,
+        };
+        let detected_link = match hovered_link {
+            Some(HoveredLink::Detected(url)) => Some(url),
+            _ => None,
+        };
+        let instance_start = self.instances.len() as u32;
+        self.area = frame.geometry.text_area_pixels().unwrap();
         let columns = usize::from(frame.geometry.pty_size().columns);
         let ligatures = self.font.ligatures();
         let first_row = frame.viewport.range().start;
@@ -291,6 +292,8 @@ impl TextRenderer {
                 .unwrap_or(source.cells().len())
                 .min(columns);
             let selected = text_selection.and_then(|range| range.columns_on_row(first_row + row));
+            let detected_columns =
+                detected_link.and_then(|url| url.columns_on_row(first_row + row, visible_end));
             let cursor_column = cursor
                 .filter(|cursor| cursor.position.row == row && cursor.appearance.visible)
                 .map(|cursor| cursor.position.column);
@@ -436,6 +439,23 @@ impl TextRenderer {
                         }
                         self.row_decorations(frame, row, columns, decorated, alpha);
                     }
+                    if link == HyperlinkId(0)
+                        && decorated.style.underline == Underline::None
+                        && let Some(detected) = &detected_columns
+                    {
+                        let run_cols = run.columns();
+                        let start = run_cols.start.max(detected.start);
+                        let end = run_cols.end.min(detected.end);
+                        if start < end {
+                            let mut url_style = *style.style;
+                            url_style.underline = Underline::Single;
+                            let url_decorated = PresentationStyle {
+                                style: &url_style,
+                                ..style
+                            };
+                            self.row_decorations(frame, row, start..end, url_decorated, alpha);
+                        }
+                    }
                 }
             }
             for part in source.sized_text_rows() {
@@ -557,20 +577,82 @@ impl TextRenderer {
                     self.label(rect, text, frame, false);
                 }
             }
-        } else if !preedit.is_empty()
-            && let Some(cursor) = frame.viewport.cursor()
-            && let Some(rect) = frame.geometry.row_rect(cursor.row, cursor.column..columns)
-        {
-            self.label(rect, preedit, frame, false);
-        }
-        if let Some(notice) = notice
-            && let Some(rect) = frame.geometry.row_rect(0, 0..columns)
-        {
-            self.notice_banner(rect, notice, frame);
+        } else {
+            if zoomed {
+                let text = match columns {
+                    1 => "Z",
+                    2..=5 => "ZM",
+                    _ => " ZOOM ",
+                };
+                if columns >= text.len()
+                    && let Some(rect) = frame.geometry.row_rect(0, columns - text.len()..columns)
+                {
+                    self.label(rect, text, frame, false);
+                }
+            }
+            if !preedit.is_empty()
+                && let Some(cursor) = frame.viewport.cursor()
+                && let Some(rect) = frame.geometry.row_rect(cursor.row, cursor.column..columns)
+            {
+                self.label(rect, preedit, frame, false);
+            }
         }
         self.progress_bar(frame.palette, progress, progress_phase);
-        self.terminal_instances = self.instances.len() as u32;
-        self.tab_bar(tab_bar, progress_phase, background_opacity);
+        Ok(instance_start..self.instances.len() as u32)
+    }
+
+    pub(super) fn prepare_chrome(
+        &mut self,
+        area: PixelSize,
+        palette: &lune_terminal::Palette,
+        dividers: &[Divider],
+        focused_rect: Option<PixelRect>,
+        notice: Option<&str>,
+    ) -> Range<u32> {
+        let start = self.instances.len() as u32;
+        self.area = area;
+        if !dividers.is_empty() {
+            let bg = palette.color(PaletteEntry::Background);
+            let fg = palette.color(PaletteEntry::Foreground);
+            let base = mix_color(bg, fg, 60);
+            let accent = palette.color(PaletteEntry::Indexed(4));
+            for divider in dividers {
+                self.rect(divider.rect, base, 0.85);
+                if let Some(focused) = focused_rect
+                    && let Some(segment) = divider_focus_segment(*divider, focused)
+                {
+                    self.rect(segment, accent, 0.9);
+                }
+            }
+        }
+        if let Some(notice) = notice
+            && let Some(height) =
+                NonZeroU32::new(self.metrics.cell.height.get().min(area.height.get()))
+        {
+            let rect = PixelRect {
+                origin: PixelPosition { x: 0, y: 0 },
+                size: PixelSize {
+                    width: area.width,
+                    height,
+                },
+            };
+            self.notice_banner(rect, notice, palette);
+        }
+        start..self.instances.len() as u32
+    }
+
+    pub(super) fn prepare_tab_bar(
+        &mut self,
+        view: &tab_bar::View<'_>,
+        progress_phase: f32,
+        background_opacity: f32,
+    ) -> Range<u32> {
+        let start = self.instances.len() as u32;
+        self.tab_bar(view, progress_phase, background_opacity);
+        start..self.instances.len() as u32
+    }
+
+    pub(super) fn finish_frame(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         if std::mem::size_of_val(self.instances.as_slice()) as u64
             > self.device.limits().max_buffer_size
         {
@@ -716,12 +798,13 @@ impl TextRenderer {
             {
                 self.tab_label(title, label, color);
             }
-            if tab.progress != Progress::None
+            let tab_progress = tab.progress();
+            if tab_progress != Progress::None
                 && let Some(bar_h) = NonZeroU32::new(2.min(fill_rect.size.height.get()))
             {
                 let y = fill_rect.origin.y + fill_rect.size.height.get() - bar_h.get();
                 let total_w = fill_rect.size.width.get();
-                let (bar_color, start_x, seg_w) = match tab.progress {
+                let (bar_color, start_x, seg_w) = match tab_progress {
                     Progress::None => (color, 0, 0),
                     Progress::Normal(p) => (
                         view.palette.color(PaletteEntry::Indexed(6)),
@@ -806,16 +889,16 @@ impl TextRenderer {
         self.glyph(rect, text, TAB_LABEL_CACHE, color, 1.0);
     }
 
-    fn notice_banner(&mut self, mut rect: PixelRect, text: &str, frame: &PresentationFrame<'_>) {
-        let accent = frame.palette.color(PaletteEntry::Indexed(1));
-        let background = frame.palette.color(PaletteEntry::Background);
-        let foreground = frame.palette.color(PaletteEntry::Foreground);
+    fn notice_banner(&mut self, mut rect: PixelRect, text: &str, palette: &lune_terminal::Palette) {
+        let accent = palette.color(PaletteEntry::Indexed(1));
+        let background = palette.color(PaletteEntry::Background);
+        let foreground = palette.color(PaletteEntry::Foreground);
         let fill = mix_color(background, accent, 200);
         let text_color = [
             background,
             foreground,
-            frame.palette.color(PaletteEntry::Indexed(0)),
-            frame.palette.color(PaletteEntry::Indexed(15)),
+            palette.color(PaletteEntry::Indexed(0)),
+            palette.color(PaletteEntry::Indexed(15)),
         ]
         .into_iter()
         .max_by_key(|&color| luminance(color).abs_diff(luminance(fill)))
@@ -874,38 +957,31 @@ impl TextRenderer {
         }
     }
 
-    pub(super) fn prepare_moving_cursor(&mut self, rect: PixelRect, color: Rgb) {
-        let quad = Quad::new(self.area, rect, color, 1.0, [0.0; 4], [0, 0]);
+    pub(super) fn prepare_moving_cursor(&mut self, area: PixelSize, rect: PixelRect, color: Rgb) {
+        let quad = Quad::new(area, rect, color, 1.0, [0.0; 4], [0, 0]);
         write_instances(&self.device, &self.queue, &mut self.motion_buffer, &[quad]);
     }
 
-    pub(super) fn draw(&self, pass: &mut wgpu::RenderPass<'_>, moving: bool) {
-        if self.terminal_instances == 0 && !moving {
+    pub(super) fn draw_range(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        range: Range<u32>,
+        moving: bool,
+    ) {
+        if range.is_empty() && !moving {
             return;
         }
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bind_group, &[]);
         if let Some(buffer) = &self.buffer
-            && self.terminal_instances != 0
+            && !range.is_empty()
         {
             pass.set_vertex_buffer(0, buffer.slice(..));
-            pass.draw(0..4, 0..self.terminal_instances);
+            pass.draw(0..4, range);
         }
         if moving && let Some(buffer) = &self.motion_buffer {
             pass.set_vertex_buffer(0, buffer.slice(..));
             pass.draw(0..4, 0..1);
-        }
-    }
-
-    pub(super) fn draw_tab_bar(&self, pass: &mut wgpu::RenderPass<'_>) {
-        let count = self.instances.len() as u32;
-        if self.terminal_instances < count
-            && let Some(buffer) = &self.buffer
-        {
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &self.bind_group, &[]);
-            pass.set_vertex_buffer(0, buffer.slice(..));
-            pass.draw(0..4, self.terminal_instances..count);
         }
     }
 
@@ -1328,6 +1404,45 @@ fn aligned_offset(space: u32, alignment: u8) -> u32 {
         1 => space,
         2 => space / 2,
         _ => 0,
+    }
+}
+
+fn divider_focus_segment(divider: Divider, focused: PixelRect) -> Option<PixelRect> {
+    let dr = divider.rect;
+    let dx0 = dr.origin.x;
+    let dy0 = dr.origin.y;
+    let dx1 = dx0 + dr.size.width.get();
+    let dy1 = dy0 + dr.size.height.get();
+    let fx0 = focused.origin.x;
+    let fy0 = focused.origin.y;
+    let fx1 = fx0 + focused.size.width.get();
+    let fy1 = fy0 + focused.size.height.get();
+    match divider.axis {
+        Axis::Columns if dx1 == fx0 || fx1 == dx0 => {
+            let y0 = dy0.max(fy0);
+            let y1 = dy1.min(fy1);
+            let height = NonZeroU32::new(y1.saturating_sub(y0))?;
+            Some(PixelRect {
+                origin: PixelPosition { x: dx0, y: y0 },
+                size: PixelSize {
+                    width: dr.size.width,
+                    height,
+                },
+            })
+        }
+        Axis::Rows if dy1 == fy0 || fy1 == dy0 => {
+            let x0 = dx0.max(fx0);
+            let x1 = dx1.min(fx1);
+            let width = NonZeroU32::new(x1.saturating_sub(x0))?;
+            Some(PixelRect {
+                origin: PixelPosition { x: x0, y: dy0 },
+                size: PixelSize {
+                    width,
+                    height: dr.size.height,
+                },
+            })
+        }
+        _ => None,
     }
 }
 

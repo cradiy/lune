@@ -383,6 +383,16 @@ impl Session<Pty> {
     pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
         self.transport.try_wait()
     }
+
+    /// Returns the direct child process ID of this PTY session.
+    pub fn child_id(&self) -> u32 {
+        self.transport.child_id()
+    }
+
+    /// Returns the foreground process group ID attached to the PTY, if any.
+    pub fn foreground_process_group(&self) -> Option<u32> {
+        self.transport.foreground_process_group()
+    }
 }
 
 impl<T: AsFd> AsFd for Session<T> {

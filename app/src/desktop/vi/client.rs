@@ -3,9 +3,9 @@ use winit::event::KeyEvent;
 use winit::keyboard::{Key, NamedKey};
 
 use super::{Command, Mode, normalize};
-use crate::desktop::{Tab, selection::Selection, shortcuts};
+use crate::desktop::{selection::Selection, shortcuts, tab::Pane};
 
-impl Tab {
+impl Pane {
     pub(in crate::desktop) fn toggle_vi(&mut self) {
         if self.vi.is_some() {
             self.leave_vi();

@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::io;
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -12,9 +13,9 @@ use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, Ime, KeyEvent, MouseScrollDelta};
 use winit::event_loop::EventLoopProxy;
 use winit::keyboard::ModifiersState;
-use winit::window::{CursorIcon, UserAttentionType, Window};
+use winit::window::{UserAttentionType, Window};
 
-use crate::{GridGeometry, MAX_INPUT_BYTES, Session, SessionReady, WaitOutcome};
+use crate::{GridGeometry, MAX_INPUT_BYTES, PixelRect, Session, SessionReady, WaitOutcome};
 
 use super::clipboard::{self, ClipboardType};
 use super::config::{ClipboardPolicy, NotificationPolicy};
@@ -22,7 +23,9 @@ use super::directory;
 use super::input::{self, Input};
 use super::notify::Notifier;
 use super::readiness::{Readiness, Registration};
-use super::{Event, PASTE_TIMEOUT, Result, TabId, selection, vi};
+use super::split::{PaneRect, SplitLayout, SplitTree};
+use super::url::{self, DetectedUrl, HoveredLink};
+use super::{Event, PASTE_TIMEOUT, PaneId, Result, selection, vi};
 
 const INPUT_LIMIT: usize = 1024;
 
@@ -37,7 +40,100 @@ pub(super) struct DispatchContext<'a> {
 }
 
 pub(super) struct Tab {
-    pub(super) id: TabId,
+    pub(super) tree: SplitTree,
+    pub(super) panes: Vec<Pane>,
+    pub(super) focused: PaneId,
+    pub(super) zoomed: Option<PaneId>,
+    pub(super) layout: SplitLayout,
+}
+
+impl Tab {
+    pub(super) fn new(pane: Pane, area: PixelRect) -> Self {
+        let id = pane.id;
+        let layout = SplitLayout {
+            panes: vec![PaneRect { id, rect: area }],
+            dividers: Vec::new(),
+        };
+        Self {
+            tree: SplitTree::new(id),
+            panes: vec![pane],
+            focused: id,
+            zoomed: None,
+            layout,
+        }
+    }
+
+    pub(super) fn focused_pane(&self) -> &Pane {
+        self.panes
+            .iter()
+            .find(|pane| pane.id == self.focused)
+            .expect("focused pane must exist in tab")
+    }
+
+    pub(super) fn focused_pane_mut(&mut self) -> &mut Pane {
+        self.panes
+            .iter_mut()
+            .find(|pane| pane.id == self.focused)
+            .expect("focused pane must exist in tab")
+    }
+
+    pub(super) fn pane(&self, id: PaneId) -> Option<&Pane> {
+        self.panes.iter().find(|pane| pane.id == id)
+    }
+
+    pub(super) fn pane_mut(&mut self, id: PaneId) -> Option<&mut Pane> {
+        self.panes.iter_mut().find(|pane| pane.id == id)
+    }
+
+    pub(super) fn label(&self) -> &str {
+        self.focused_pane().label()
+    }
+
+    pub(super) fn progress(&self) -> Progress {
+        let focused = self.focused_pane().progress;
+        if focused != Progress::None {
+            return focused;
+        }
+        self.panes
+            .iter()
+            .map(|pane| pane.progress)
+            .find(|&progress| progress != Progress::None)
+            .unwrap_or(Progress::None)
+    }
+
+    pub(super) fn is_zoomed(&self) -> bool {
+        self.zoomed.is_some() && self.panes.len() > 1
+    }
+
+    pub(super) fn reflow(
+        &mut self,
+        area: PixelRect,
+        divider: u32,
+        cell: PixelSize,
+        tab_active: bool,
+    ) {
+        let zoomed = self.zoomed.filter(|_| self.panes.len() > 1);
+        self.layout = self.tree.layout(area, divider, zoomed);
+        for pane in &mut self.panes {
+            if let Some(rect) = self.layout.rect_of(pane.id) {
+                pane.origin = rect.origin;
+                if let Some(grid) = GridGeometry::fit(rect.size, cell) {
+                    pane.target_grid = grid;
+                }
+                pane.visible = tab_active;
+                pane.active = tab_active && pane.id == self.focused;
+            } else {
+                pane.visible = false;
+                pane.active = false;
+            }
+        }
+    }
+}
+
+pub(super) struct Pane {
+    pub(super) id: PaneId,
+    pub(super) origin: PixelPosition,
+    pub(super) target_grid: GridGeometry,
     pub(super) session: Session,
     pub(super) registration: Registration,
     window: Arc<Window>,
@@ -49,6 +145,7 @@ pub(super) struct Tab {
     inputs: VecDeque<Input>,
     paste_worker: bool,
     paste_deadline: Option<Instant>,
+    pub(super) visible: bool,
     pub(super) active: bool,
     pub(super) dirty: bool,
     pub(super) restart_blink: bool,
@@ -62,25 +159,29 @@ pub(super) struct Tab {
     selection_click: Option<selection::Click>,
     pub(super) selection_drag: Option<selection::Drag>,
     pub(super) selection: Option<selection::Selection>,
-    pub(super) hovered_hyperlink: Option<HyperlinkId>,
+    pub(super) hovered_link: Option<HoveredLink>,
     hyperlink_click: Option<HyperlinkId>,
     pub(super) vi: Option<vi::Mode>,
     pub(super) vi_search: Option<vi::Search>,
 }
 
-impl Tab {
+impl Pane {
     pub(super) fn spawn(
-        id: TabId,
+        id: PaneId,
         window: Arc<Window>,
         proxy: EventLoopProxy<Event>,
         grid: GridGeometry,
         palette: &Palette,
         scheme: ColorScheme,
+        cwd: Option<PathBuf>,
     ) -> Result<Self> {
         let shell = std::env::var_os("SHELL")
             .filter(|shell| !shell.is_empty())
             .unwrap_or_else(|| "/bin/sh".into());
         let mut command = Command::new(shell);
+        if let Some(dir) = cwd {
+            command.current_dir(dir);
+        }
         command
             .env("TERM", "xterm-256color")
             .env("COLORTERM", "truecolor")
@@ -99,6 +200,8 @@ impl Tab {
         })?;
         Ok(Self {
             id,
+            origin: PixelPosition { x: 0, y: 0 },
+            target_grid: grid,
             session,
             registration: Registration::default(),
             window,
@@ -110,6 +213,7 @@ impl Tab {
             inputs: VecDeque::new(),
             paste_worker: false,
             paste_deadline: None,
+            visible: false,
             active: false,
             dirty: true,
             restart_blink: false,
@@ -123,16 +227,24 @@ impl Tab {
             selection_click: None,
             selection_drag: None,
             selection: None,
-            hovered_hyperlink: None,
+            hovered_link: None,
             hyperlink_click: None,
             vi: None,
             vi_search: None,
         })
     }
 
+    pub(super) fn working_directory(&self) -> Option<PathBuf> {
+        directory::working_directory(
+            self.session.processor().working_directory_uri(),
+            self.session.foreground_process_group(),
+            self.session.child_id(),
+        )
+    }
+
     pub(super) fn invalidate_overlay(&mut self) {
         self.dirty = true;
-        if self.active {
+        if self.visible {
             self.window.request_redraw();
         }
     }
@@ -177,20 +289,24 @@ impl Tab {
         let ctrl_only = self.modifiers.control_key()
             && !self.modifiers.alt_key()
             && !self.modifiers.super_key();
-        let active_hover = self.active
+        let active_hover = self.visible
             && self.vi.is_none()
             && self.selection_drag.is_none()
             && (!self.mouse_reporting() || ctrl_only);
-        let next = active_hover.then(|| self.hyperlink_at_pointer()).flatten();
-        if self.hovered_hyperlink != next {
-            self.hovered_hyperlink = next;
-            if self.active {
-                self.window.set_cursor(if next.is_some() {
-                    CursorIcon::Pointer
-                } else {
-                    CursorIcon::Default
-                });
-            }
+        let next = if active_hover {
+            self.hyperlink_at_pointer()
+                .map(HoveredLink::Explicit)
+                .or_else(|| {
+                    ctrl_only
+                        .then(|| self.detected_url_at_pointer())
+                        .flatten()
+                        .map(HoveredLink::Detected)
+                })
+        } else {
+            None
+        };
+        if self.hovered_link != next {
+            self.hovered_link = next;
             self.invalidate_overlay();
         }
     }
@@ -202,6 +318,14 @@ impl Tab {
         let style_id = row.cells().get(cell.column)?.style();
         let link = self.session.processor().styles().get(style_id)?.hyperlink;
         (link != HyperlinkId(0)).then_some(link)
+    }
+
+    fn detected_url_at_pointer(&self) -> Option<DetectedUrl> {
+        let pixel = self.pointer_pixel(false)?;
+        let mut cell = self.session.geometry().cell_at(pixel)?;
+        let screen = self.session.screen();
+        cell.row += screen.viewport().range().start;
+        url::detect_at(screen.view(), cell)
     }
 
     pub(super) fn label(&self) -> &str {
@@ -266,7 +390,7 @@ impl Tab {
             return Ok(true);
         };
         let start = Instant::now();
-        for _ in 0..if self.active { 16 } else { 0 } {
+        for _ in 0..if self.visible { 16 } else { 0 } {
             if outcome != WaitOutcome::Pumped || start.elapsed() >= Duration::from_millis(2) {
                 break;
             }
@@ -373,7 +497,7 @@ impl Tab {
         self.refresh_vi();
         self.update_ime_area();
         self.update_hovered_hyperlink();
-        if self.active && self.session.presentation_frame().is_some() {
+        if self.visible && self.session.presentation_frame().is_some() {
             self.window.request_redraw();
         }
         Ok(true)
@@ -382,10 +506,9 @@ impl Tab {
     pub(super) fn service(
         &mut self,
         readiness: &Readiness,
-        grid: GridGeometry,
         now: Instant,
     ) -> Result<(bool, Option<Instant>)> {
-        self.resize(grid)?;
+        self.resize(self.target_grid)?;
         self.flush_input(now)?;
         let interests = self.session.interests();
         readiness.arm(self.id, &mut self.registration, interests)?;
@@ -425,6 +548,7 @@ impl Tab {
                     self.reset_vi_cursor(row);
                 }
                 self.update_ime_area();
+                self.update_hovered_hyperlink();
                 self.invalidate_overlay();
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
@@ -453,7 +577,10 @@ impl Tab {
         let Some(rect) = geometry.row_rect(row, column..column + 1) else {
             return;
         };
-        let origin = rect.origin;
+        let origin = PixelPosition {
+            x: self.origin.x + rect.origin.x,
+            y: self.origin.y + rect.origin.y,
+        };
         if self.ime_area != Some((origin, rect.size)) {
             self.window.set_ime_cursor_area(
                 PhysicalPosition::new(origin.x as i32, origin.y as i32),
@@ -588,7 +715,7 @@ impl Tab {
         self.session.follow_output();
         self.clear_selection();
         self.restart_blink = true;
-        if self.active && was_scrolled {
+        if self.visible && was_scrolled {
             self.window.request_redraw();
         }
     }
@@ -596,7 +723,8 @@ impl Tab {
     fn pointer_pixel(&self, clamp: bool) -> Option<PixelPosition> {
         let pointer = self.pointer?;
         let area = self.session.geometry().text_area_pixels()?;
-        let (x, y) = (pointer.x, pointer.y);
+        let x = pointer.x - f64::from(self.origin.x);
+        let y = pointer.y - f64::from(self.origin.y);
         if !clamp
             && (x < 0.0
                 || y < 0.0
@@ -606,8 +734,8 @@ impl Tab {
             return None;
         }
         Some(PixelPosition {
-            x: (x as u32).min(area.width.get() - 1),
-            y: (y as u32).min(area.height.get() - 1),
+            x: (x.max(0.0) as u32).min(area.width.get() - 1),
+            y: (y.max(0.0) as u32).min(area.height.get() - 1),
         })
     }
 
@@ -653,12 +781,15 @@ impl Tab {
             let ctrl_only = self.modifiers.control_key()
                 && !self.modifiers.alt_key()
                 && !self.modifiers.super_key();
-            if button == MouseButton::Left
-                && ctrl_only
-                && let Some(link_id) = self.hyperlink_at_pointer()
-            {
-                self.open_hyperlink(link_id, hyperlink_open_pending);
-                return;
+            if button == MouseButton::Left && ctrl_only {
+                if let Some(link_id) = self.hyperlink_at_pointer() {
+                    self.open_hyperlink(link_id, hyperlink_open_pending);
+                    return;
+                }
+                if let Some(detected) = self.detected_url_at_pointer() {
+                    self.open_uri(detected.uri, hyperlink_open_pending);
+                    return;
+                }
             }
             let mouse_reporting = self.mouse_reporting();
             let local = !mouse_reporting || self.modifiers.shift_key();
@@ -708,15 +839,19 @@ impl Tab {
     }
 
     fn open_hyperlink(&self, link_id: HyperlinkId, hyperlink_open_pending: &mut bool) {
+        if let Some(link) = self.session.processor().hyperlinks().get(link_id) {
+            self.open_uri(link.uri().to_owned(), hyperlink_open_pending);
+        }
+    }
+
+    fn open_uri(&self, uri: String, hyperlink_open_pending: &mut bool) {
         if *hyperlink_open_pending {
             return;
         }
-        if let Some(link) = self.session.processor().hyperlinks().get(link_id) {
-            match directory::open_hyperlink(link.uri().to_owned(), self.proxy.clone()) {
-                Ok(()) => *hyperlink_open_pending = true,
-                Err(error) => {
-                    log::warn!("Failed to start the hyperlink worker: {error}");
-                }
+        match directory::open_hyperlink(uri, self.proxy.clone()) {
+            Ok(()) => *hyperlink_open_pending = true,
+            Err(error) => {
+                log::warn!("Failed to start the hyperlink worker: {error}");
             }
         }
     }
@@ -830,6 +965,7 @@ impl Tab {
         let Some(drag) = &mut self.selection_drag else {
             return;
         };
+        let y = y - f64::from(self.origin.y);
         let screen = self.session.screen();
         let band = f64::from(self.session.geometry().cell_pixels().unwrap().height.get()) * 0.4;
         let rows = if let Some(area) = self.session.geometry().text_area_pixels()

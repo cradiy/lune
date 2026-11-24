@@ -7,7 +7,7 @@ use std::thread::{self, JoinHandle};
 use crate::{SessionInterests, SessionReady};
 use winit::event_loop::EventLoopProxy;
 
-use super::{Event, TabId};
+use super::{Event, PaneId};
 
 const STOP: u64 = 0;
 
@@ -48,7 +48,7 @@ impl Readiness {
 
     pub(super) fn arm(
         &self,
-        id: TabId,
+        id: PaneId,
         registration: &mut Registration,
         interests: SessionInterests<'_>,
     ) -> io::Result<()> {
@@ -85,8 +85,8 @@ impl Readiness {
         Ok(())
     }
 
-    pub(super) fn decode(token: u64) -> (TabId, u32) {
-        ((token >> 32) as TabId, token as u32)
+    pub(super) fn decode(token: u64) -> (PaneId, u32) {
+        ((token >> 32) as PaneId, token as u32)
     }
 }
 
@@ -108,7 +108,7 @@ impl Registration {
     }
 }
 
-fn token(id: TabId, sequence: u32) -> u64 {
+fn token(id: PaneId, sequence: u32) -> u64 {
     (u64::from(id) << 32) | u64::from(sequence)
 }
 

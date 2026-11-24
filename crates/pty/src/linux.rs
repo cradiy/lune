@@ -131,6 +131,12 @@ impl Pty {
         self.child.id()
     }
 
+    pub fn foreground_process_group(&self) -> Option<u32> {
+        // SAFETY: The master descriptor is open for the duration of the call.
+        let pgid = unsafe { libc::tcgetpgrp(self.master.as_raw_fd()) };
+        u32::try_from(pgid).ok().filter(|&pgid| pgid > 0)
+    }
+
     pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
         self.child.try_wait()
     }

@@ -9,7 +9,7 @@ use wl_clipboard_rs::{copy, paste};
 
 use crate::MAX_PASTE_BYTES;
 
-use super::{Event, PASTE_TIMEOUT, TabId};
+use super::{Event, PASTE_TIMEOUT, PaneId};
 
 pub(super) use wl_clipboard_rs::paste::ClipboardType;
 
@@ -40,7 +40,7 @@ pub(super) fn write(text: String, proxy: EventLoopProxy<Event>) -> io::Result<()
 pub(super) fn read(
     clipboard: ClipboardType,
     primary: Option<&Primary>,
-    tab: TabId,
+    pane: PaneId,
     proxy: EventLoopProxy<Event>,
 ) -> io::Result<()> {
     let publication = primary
@@ -54,7 +54,7 @@ pub(super) fn read(
                 Some(publication) if !publication.wait(deadline) => Err("Paste timed out".into()),
                 _ => read_text(clipboard, deadline, MAX_PASTE_BYTES, true),
             };
-            let _ = proxy.send_event(Event::PasteReady(tab, result));
+            let _ = proxy.send_event(Event::PasteReady(pane, result));
         })?;
     Ok(())
 }
@@ -62,7 +62,7 @@ pub(super) fn read(
 pub(super) fn read_osc52(
     clipboard: ClipboardType,
     primary: Option<&Primary>,
-    tab: TabId,
+    pane: PaneId,
     query: ClipboardQuery,
     proxy: EventLoopProxy<Event>,
 ) -> io::Result<()> {
@@ -79,7 +79,7 @@ pub(super) fn read_osc52(
                 }
                 _ => read_text(clipboard, deadline, MAX_CLIPBOARD_BYTES, false),
             };
-            let _ = proxy.send_event(Event::Osc52ReadReady(tab, query, result));
+            let _ = proxy.send_event(Event::Osc52ReadReady(pane, query, result));
         })?;
     Ok(())
 }

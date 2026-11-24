@@ -3,6 +3,7 @@ use winit::event::KeyEvent;
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 
+use super::split::{Axis, Direction as SplitDirection};
 use super::vi::{Command, Direction, Motion, VisualKind};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -22,6 +23,14 @@ pub(super) enum Action {
     CloseTab,
     NextTab,
     PreviousTab,
+    SelectTab(usize),
+    SelectLastTab,
+    MoveTabLeft,
+    MoveTabRight,
+    SplitPane(Axis),
+    FocusPane(SplitDirection),
+    ResizePane(SplitDirection),
+    TogglePaneZoom,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -89,10 +98,99 @@ use ModifiersState as Mods;
 use ShortcutKey::{Letter, Named, Symbol};
 
 const CTRL_SHIFT: Mods = Mods::CONTROL.union(Mods::SHIFT);
+const CTRL_ALT: Mods = Mods::CONTROL.union(Mods::ALT);
+const CTRL_ALT_SHIFT: Mods = CTRL_ALT.union(Mods::SHIFT);
 const WAYLAND_BINDINGS: &[Binding] = &[
     Binding::new(Action::Copy, CTRL_SHIFT, Letter("c")),
     Binding::new(Action::Paste, CTRL_SHIFT, Letter("v")),
     Binding::new(Action::OpenDirectory, CTRL_SHIFT, Letter("o")),
+    Binding::new(Action::SplitPane(Axis::Columns), CTRL_SHIFT, Letter("d")),
+    Binding::new(Action::SplitPane(Axis::Rows), CTRL_SHIFT, Letter("e")),
+    Binding::new(Action::TogglePaneZoom, CTRL_SHIFT, Letter("z")),
+    Binding::new(
+        Action::FocusPane(SplitDirection::Left),
+        CTRL_ALT,
+        Named(NamedKey::ArrowLeft),
+    ),
+    Binding::new(
+        Action::FocusPane(SplitDirection::Right),
+        CTRL_ALT,
+        Named(NamedKey::ArrowRight),
+    ),
+    Binding::new(
+        Action::FocusPane(SplitDirection::Up),
+        CTRL_ALT,
+        Named(NamedKey::ArrowUp),
+    ),
+    Binding::new(
+        Action::FocusPane(SplitDirection::Down),
+        CTRL_ALT,
+        Named(NamedKey::ArrowDown),
+    ),
+    Binding::new(
+        Action::FocusPane(SplitDirection::Left),
+        CTRL_ALT,
+        Letter("h"),
+    ),
+    Binding::new(
+        Action::FocusPane(SplitDirection::Right),
+        CTRL_ALT,
+        Letter("l"),
+    ),
+    Binding::new(Action::FocusPane(SplitDirection::Up), CTRL_ALT, Letter("k")),
+    Binding::new(
+        Action::FocusPane(SplitDirection::Down),
+        CTRL_ALT,
+        Letter("j"),
+    ),
+    Binding::new(
+        Action::ResizePane(SplitDirection::Left),
+        CTRL_ALT_SHIFT,
+        Named(NamedKey::ArrowLeft),
+    )
+    .repeating(),
+    Binding::new(
+        Action::ResizePane(SplitDirection::Right),
+        CTRL_ALT_SHIFT,
+        Named(NamedKey::ArrowRight),
+    )
+    .repeating(),
+    Binding::new(
+        Action::ResizePane(SplitDirection::Up),
+        CTRL_ALT_SHIFT,
+        Named(NamedKey::ArrowUp),
+    )
+    .repeating(),
+    Binding::new(
+        Action::ResizePane(SplitDirection::Down),
+        CTRL_ALT_SHIFT,
+        Named(NamedKey::ArrowDown),
+    )
+    .repeating(),
+    Binding::new(
+        Action::ResizePane(SplitDirection::Left),
+        CTRL_ALT_SHIFT,
+        Letter("h"),
+    )
+    .repeating(),
+    Binding::new(
+        Action::ResizePane(SplitDirection::Right),
+        CTRL_ALT_SHIFT,
+        Letter("l"),
+    )
+    .repeating(),
+    Binding::new(
+        Action::ResizePane(SplitDirection::Up),
+        CTRL_ALT_SHIFT,
+        Letter("k"),
+    )
+    .repeating(),
+    Binding::new(
+        Action::ResizePane(SplitDirection::Down),
+        CTRL_ALT_SHIFT,
+        Letter("j"),
+    )
+    .repeating(),
     Binding::new(Action::NewTab, CTRL_SHIFT, Letter("t")),
     Binding::new(Action::CloseTab, CTRL_SHIFT, Letter("w")),
     Binding::new(Action::PreviousTab, CTRL_SHIFT, Named(NamedKey::ArrowLeft)),
@@ -101,6 +199,17 @@ const WAYLAND_BINDINGS: &[Binding] = &[
     Binding::new(Action::NextTab, CTRL_SHIFT, Letter("l")),
     Binding::new(Action::NextTab, Mods::CONTROL, Named(NamedKey::Tab)),
     Binding::new(Action::PreviousTab, CTRL_SHIFT, Named(NamedKey::Tab)),
+    Binding::new(Action::SelectTab(0), Mods::ALT, Symbol("1")),
+    Binding::new(Action::SelectTab(1), Mods::ALT, Symbol("2")),
+    Binding::new(Action::SelectTab(2), Mods::ALT, Symbol("3")),
+    Binding::new(Action::SelectTab(3), Mods::ALT, Symbol("4")),
+    Binding::new(Action::SelectTab(4), Mods::ALT, Symbol("5")),
+    Binding::new(Action::SelectTab(5), Mods::ALT, Symbol("6")),
+    Binding::new(Action::SelectTab(6), Mods::ALT, Symbol("7")),
+    Binding::new(Action::SelectTab(7), Mods::ALT, Symbol("8")),
+    Binding::new(Action::SelectLastTab, Mods::ALT, Symbol("9")),
+    Binding::new(Action::MoveTabLeft, CTRL_SHIFT, Named(NamedKey::PageUp)),
+    Binding::new(Action::MoveTabRight, CTRL_SHIFT, Named(NamedKey::PageDown)),
     Binding::new(Action::ToggleVi, CTRL_SHIFT, ShortcutKey::Space),
     Binding::new(Action::PreviousPrompt, CTRL_SHIFT, Named(NamedKey::ArrowUp))
         .primary_screen()
