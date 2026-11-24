@@ -53,6 +53,7 @@ enum Event {
     CopyReady(std::result::Result<(), String>),
     PasteReady(std::result::Result<String, String>),
     DirectoryOpened(io::Result<()>),
+    SystemTheme(Theme),
 }
 
 pub fn run() -> Result<()> {
@@ -61,11 +62,25 @@ pub fn run() -> Result<()> {
         .with_wayland()
         .build()?;
     log::debug!("Wayland event loop ready");
+    let proxy = event_loop.create_proxy();
+    let theme_watch = if matches!(config.theme, theme::Preference::System) {
+        match theme::system::Watch::start(proxy.clone()) {
+            Ok(watch) => Some(watch),
+            Err(error) => {
+                log::warn!("Could not start the system theme watcher: {error}");
+                None
+            }
+        }
+    } else {
+        None
+    };
     let mut app = App {
-        proxy: event_loop.create_proxy(),
+        proxy,
         config,
         client: None,
         error: None,
+        system_theme: Theme::Dark,
+        _theme_watch: theme_watch,
     };
     event_loop.run_app(&mut app)?;
     app.error.map_or(Ok(()), Err)
@@ -76,6 +91,8 @@ struct App {
     config: Config,
     client: Option<Client>,
     error: Option<Box<dyn std::error::Error>>,
+    system_theme: Theme,
+    _theme_watch: Option<theme::system::Watch>,
 }
 
 impl App {
@@ -90,7 +107,12 @@ impl App {
 impl ApplicationHandler<Event> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.client.is_none() {
-            match Client::new(event_loop, self.proxy.clone(), &self.config) {
+            match Client::new(
+                event_loop,
+                self.proxy.clone(),
+                &self.config,
+                self.system_theme,
+            ) {
                 Ok(client) => self.client = Some(client),
                 Err(error) => self.report(event_loop, Err(error)),
             }
@@ -107,6 +129,12 @@ impl ApplicationHandler<Event> for App {
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: Event) {
+        if let Event::SystemTheme(theme) = event {
+            if self.system_theme == theme {
+                return;
+            }
+            self.system_theme = theme;
+        }
         let Some(client) = &mut self.client else {
             return;
         };
@@ -149,6 +177,10 @@ impl ApplicationHandler<Event> for App {
                 if let Err(error) = result {
                     log::warn!("Working directory open failed: {error}");
                 }
+                Ok(())
+            }
+            Event::SystemTheme(theme) => {
+                client.apply_system_theme(theme);
                 Ok(())
             }
         };
@@ -198,12 +230,15 @@ impl Client {
         event_loop: &ActiveEventLoop,
         proxy: EventLoopProxy<Event>,
         config: &Config,
+        system_theme: Theme,
     ) -> Result<Self> {
+        let selected_theme = config.theme.resolve(system_theme);
         let window = Arc::new(
             event_loop.create_window(
                 Window::default_attributes()
                     .with_title("Lune")
                     .with_name("lune", "")
+                    .with_theme(Some(selected_theme))
                     .with_inner_size(LogicalSize::new(960, 600))
                     .with_min_inner_size(LogicalSize::new(180, 100)),
             )?,
@@ -224,7 +259,7 @@ impl Client {
             .env("TERM", "xterm-256color")
             .env("COLORTERM", "truecolor")
             .env("TERM_PROGRAM", "Lune");
-        let (palette, scheme) = theme::palette(window.theme().unwrap_or(Theme::Dark));
+        let (palette, scheme) = config.theme.palette(selected_theme);
         let pty_size = geometry.pty_size();
         log::debug!(
             "Starting PTY session with {} columns and {} rows",
@@ -292,12 +327,6 @@ impl Client {
                 self.painter.reset_cursor_motion();
             }
             WindowEvent::Occluded(false) => {
-                self.painter.invalidate_overlay();
-                self.window.request_redraw();
-            }
-            WindowEvent::ThemeChanged(theme) => {
-                let (palette, scheme) = theme::palette(theme);
-                self.session.set_theme(&palette, Some(scheme));
                 self.painter.invalidate_overlay();
                 self.window.request_redraw();
             }
@@ -384,6 +413,14 @@ impl Client {
             _ => {}
         }
         Ok(())
+    }
+
+    fn apply_system_theme(&mut self, theme: Theme) {
+        self.window.set_theme(Some(theme));
+        let (palette, scheme) = theme::palette(theme);
+        self.session.set_theme(&palette, Some(scheme));
+        self.painter.invalidate_overlay();
+        self.window.request_redraw();
     }
 
     fn dispatch(&mut self, event_loop: &ActiveEventLoop, ready: SessionReady) -> Result<()> {

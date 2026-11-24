@@ -1,7 +1,9 @@
 use std::env;
 use std::fs;
 use std::io::ErrorKind;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+use super::theme::Preference;
 
 pub(super) const MIN_FONT_SIZE: f32 = 8.0;
 pub(super) const MAX_FONT_SIZE: f32 = 32.0;
@@ -10,6 +12,7 @@ pub(super) struct Config {
     pub(super) font_family: Option<String>,
     pub(super) font_size_points: f32,
     pub(super) font_ligatures: bool,
+    pub(super) theme: Preference,
 }
 
 impl Default for Config {
@@ -18,6 +21,7 @@ impl Default for Config {
             font_family: None,
             font_size_points: 15.0,
             font_ligatures: true,
+            theme: Preference::System,
         }
     }
 }
@@ -25,12 +29,13 @@ impl Default for Config {
 impl Config {
     pub(super) fn load() -> Self {
         let directory = absolute_env_path("XDG_CONFIG_HOME")
-            .or_else(|| absolute_env_path("HOME").map(|home| home.join(".config")));
-        let Some(path) = directory.map(|directory| directory.join("lune/lune.conf")) else {
+            .or_else(|| absolute_env_path("HOME").map(|home| home.join(".config")))
+            .map(|directory| directory.join("lune"));
+        let Some(directory) = directory else {
             return Self::default();
         };
-        match fs::read_to_string(path) {
-            Ok(text) => Self::parse(&text),
+        match fs::read_to_string(directory.join("lune.conf")) {
+            Ok(text) => Self::parse(&text, &directory),
             Err(error) if error.kind() == ErrorKind::NotFound => Self::default(),
             Err(error) => {
                 log::warn!("Could not read lune.conf: {error}");
@@ -39,21 +44,16 @@ impl Config {
         }
     }
 
-    fn parse(text: &str) -> Self {
+    fn parse(text: &str, directory: &Path) -> Self {
         let mut config = Self::default();
-        for (index, line) in text.lines().enumerate() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
+        parse_settings("lune.conf", text, |key, value| {
+            if key == "theme" {
+                config.theme = Preference::load(directory, value)?;
+                Ok(())
+            } else {
+                config.set(key, value)
             }
-            let result = line
-                .split_once('=')
-                .ok_or("expected key = value")
-                .and_then(|(key, value)| config.set(key.trim(), value.trim()));
-            if let Err(error) = result {
-                log::warn!("lune.conf line {}: {error}", index + 1);
-            }
-        }
+        });
         config
     }
 
@@ -83,6 +83,26 @@ impl Config {
     }
 }
 
+pub(super) fn parse_settings(
+    file: &str,
+    text: &str,
+    mut set: impl FnMut(&str, &str) -> Result<(), &'static str>,
+) {
+    for (index, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let result = line
+            .split_once('=')
+            .ok_or("expected key = value")
+            .and_then(|(key, value)| set(key.trim(), value.trim()));
+        if let Err(error) = result {
+            log::warn!("{file} line {}: {error}", index + 1);
+        }
+    }
+}
+
 fn absolute_env_path(name: &str) -> Option<PathBuf> {
     env::var_os(name)
         .map(PathBuf::from)
@@ -91,6 +111,8 @@ fn absolute_env_path(name: &str) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::Config;
 
     #[test]
@@ -98,6 +120,7 @@ mod tests {
         let config = Config::parse(
             "# Font settings\r\nfont-family = Fixture Mono\r\nfont-size=19.5\r\n\
              font-family=\r\nunknown-key=true\r\nfont-size=NaN\r\nfont-size=33\r\n",
+            Path::new(""),
         );
         assert_eq!(config.font_family.as_deref(), Some("Fixture Mono"));
         assert_eq!(config.font_size_points, 19.5);
