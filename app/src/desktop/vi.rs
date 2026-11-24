@@ -1,13 +1,10 @@
 mod client;
-mod search;
 
 use std::ops::Range;
 
 use lune_terminal::{CellPosition, Row, ScreenBuffer, ScreenView, Viewport};
 
 use super::selection::{cell_range, line_span};
-use search::Prompt;
-pub(super) use search::Search;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Command {
@@ -71,10 +68,8 @@ struct Visual {
 pub(super) struct Mode {
     pub(super) buffer: ScreenBuffer,
     pub(super) cursor: CellPosition,
-    pub(super) prompt: Option<Prompt>,
     visual: Option<Visual>,
     pending: Option<Pending>,
-    pub(super) search: Option<Search>,
     discarded_rows: u64,
     preferred_column: usize,
 }
@@ -98,8 +93,6 @@ impl Mode {
             cursor: normalize(view, cursor, columns),
             visual: None,
             pending: None,
-            prompt: None,
-            search: None,
             discarded_rows: view.discarded_history_rows(),
             preferred_column: cursor.column,
         }
@@ -290,27 +283,6 @@ impl Mode {
             }
         }
         scroll
-    }
-
-    pub(super) fn start_search(&mut self, direction: Direction) {
-        self.prompt = Some(Prompt::new(direction));
-    }
-
-    pub(super) fn confirm_search(&mut self, view: ScreenView<'_>, columns: usize) {
-        let Some(prompt) = self.prompt.take() else {
-            return;
-        };
-        if prompt.confirm(&mut self.search) {
-            self.repeat_search(view, columns, false);
-        }
-    }
-
-    pub(super) fn repeat_search(&mut self, view: ScreenView<'_>, columns: usize, reverse: bool) {
-        if let Some(search) = &self.search
-            && let Some(cursor) = search.find(view, columns, self.cursor, reverse)
-        {
-            self.set_cursor(cursor);
-        }
     }
 }
 
@@ -534,24 +506,5 @@ mod tests {
                 .to_string(),
             "abcdef界ij"
         );
-    }
-
-    #[test]
-    fn regex_search_crosses_soft_wraps_and_repeats_from_the_matching_cell() {
-        let screen = screen("abcdef界ij\r\nnext 界ij", 8, 4);
-        let mut vi = Mode::new(ScreenBuffer::Primary, screen.viewport(), 8);
-        vi.set_cursor(point(0, 0));
-        vi.start_search(Direction::Forward);
-        vi.prompt.as_mut().unwrap().push("f界i.");
-        vi.confirm_search(screen.view(), 8);
-        assert_eq!(vi.cursor, point(0, 5));
-        vi.start_search(Direction::Forward);
-        vi.prompt.as_mut().unwrap().push("界i.");
-        vi.confirm_search(screen.view(), 8);
-        assert_eq!(vi.cursor, point(0, 6));
-        vi.repeat_search(screen.view(), 8, false);
-        assert_eq!(vi.cursor, point(2, 5));
-        vi.repeat_search(screen.view(), 8, true);
-        assert_eq!(vi.cursor, point(0, 6));
     }
 }

@@ -4,21 +4,25 @@ use std::ops::Range;
 
 use guillotiere::{Allocation, AtlasAllocator, size2};
 use lune_terminal::{
-    CellText, Color, CursorShape, DisplayUnit, HyperlinkId, PaletteEntry, PixelPosition, PixelSize,
-    Progress, Rgb, SizedTextRow, Style, Underline,
+    CellPosition, CellText, Color, CursorShape, DisplayUnit, HyperlinkId, PaletteEntry,
+    PixelPosition, PixelSize, Progress, Rgb, SizedTextRow, Style, Underline,
 };
 
 use crate::gpu::{create_quad_pipeline, linear_colors, write_instances};
 use crate::{PixelRect, PresentationFrame, PresentationStyle, PresentedCursor};
 
+use super::box_drawing;
 use super::confirm;
 use super::font::{Font, FontMetrics};
+use super::ime::Preedit;
 use super::ligature;
 use super::paint::PaneOverlay;
 use super::scrollbar::ScrollbarView;
+use super::search::SearchBar;
 use super::split::{Axis, Divider};
 use super::tab_bar;
 use super::url::HoveredLink;
+use super::vi;
 
 const ATLAS_SIDE: i32 = 1024;
 const MAX_ATLAS_LAYERS: u32 = 32;
@@ -254,8 +258,10 @@ impl TextRenderer {
             progress_phase,
             preedit,
             vi,
+            search,
             zoomed,
             scrollbar,
+            dim_alpha,
         } = *overlay;
         let hovered_hyperlink = match hovered_link {
             Some(HoveredLink::Explicit(id)) => Some(*id),
@@ -270,6 +276,16 @@ impl TextRenderer {
         let columns = usize::from(frame.geometry.pty_size().columns);
         let ligatures = self.font.ligatures();
         let first_row = frame.viewport.range().start;
+        let search_highlight = frame.palette.color(PaletteEntry::Indexed(3));
+        let search_active_fg = [
+            frame.palette.color(PaletteEntry::Background),
+            frame.palette.color(PaletteEntry::Foreground),
+            frame.palette.color(PaletteEntry::Indexed(0)),
+            frame.palette.color(PaletteEntry::Indexed(15)),
+        ]
+        .into_iter()
+        .max_by_key(|&color| luminance(color).abs_diff(luminance(search_highlight)))
+        .unwrap();
         let text_selection =
             selection.and_then(|range| frame.viewport.source().selection_text(range.clone()).ok());
         let sized_cursor = cursor.and_then(|cursor| {
@@ -315,6 +331,23 @@ impl TextRenderer {
                 }
                 self.selection_background(frame, row, span);
             }
+            let mut active_search_span: Option<Range<usize>> = None;
+            if let Some(search) = search {
+                let chronological = first_row + row;
+                for (is_current, matched) in
+                    search.visible_matches(chronological..chronological + 1)
+                {
+                    if let Some(span) = matched.columns_on_row(chronological, columns)
+                        && let Some(rect) = frame.geometry.row_rect(row, span.clone())
+                    {
+                        let alpha = if is_current { 0.88 } else { 0.32 };
+                        self.rect(rect, search_highlight, alpha);
+                        if is_current {
+                            active_search_span = Some(span);
+                        }
+                    }
+                }
+            }
             if let Some(runs) = frame.row_runs(row, 0..columns) {
                 for run in runs {
                     let run = run?;
@@ -332,8 +365,13 @@ impl TextRenderer {
                         let unit_selected = selected
                             .as_ref()
                             .is_some_and(|span| span.contains(&unit.column));
+                        let in_active_match = active_search_span
+                            .as_ref()
+                            .is_some_and(|span| span.contains(&unit.column));
                         let color = if unit_selected {
                             frame.palette.graphics_color(251)
+                        } else if in_active_match {
+                            search_active_fg
                         } else {
                             style.foreground
                         };
@@ -544,7 +582,9 @@ impl TextRenderer {
                 }
             }
         }
+        let preedit_text = preedit.map_or("", Preedit::text);
         if let Some(cursor) = cursor
+            && preedit.is_none()
             && sized_cursor.is_none()
             && let Some(paint) = frame.cursor_paint(cursor, NonZeroU32::new(2).unwrap())?
         {
@@ -557,54 +597,427 @@ impl TextRenderer {
                 }
             }
         }
-        if let Some(vi) = vi {
-            if let Some(prompt) = &vi.prompt {
-                let text = if preedit.is_empty() {
-                    std::borrow::Cow::Borrowed(prompt.text())
-                } else {
-                    std::borrow::Cow::Owned(format!("{}{preedit}", prompt.text()))
-                };
-                if let Some(rect) = frame
-                    .geometry
-                    .row_rect(frame.viewport.rows() - 1, 0..columns)
-                {
-                    self.label(rect, &text, frame, true);
-                }
-            } else {
-                let text = match columns {
-                    1 => "V",
-                    2..=3 => "VI",
-                    _ => " VI ",
-                };
-                if let Some(rect) = frame.geometry.row_rect(0, columns - text.len()..columns) {
-                    self.label(rect, text, frame, false);
-                }
+        if vi.is_some() {
+            if search.is_none() {
+                self.mode_badge(frame.palette, "VI");
             }
         } else {
-            if zoomed {
-                let text = match columns {
-                    1 => "Z",
-                    2..=5 => "ZM",
-                    _ => " ZOOM ",
-                };
-                if columns >= text.len()
-                    && let Some(rect) = frame.geometry.row_rect(0, columns - text.len()..columns)
-                {
-                    self.label(rect, text, frame, false);
-                }
+            if zoomed && search.is_none() {
+                self.mode_badge(frame.palette, "ZOOM");
             }
-            if !preedit.is_empty()
+            if let Some(preedit) = preedit
+                && search.is_none()
                 && let Some(cursor) = frame.viewport.cursor()
-                && let Some(rect) = frame.geometry.row_rect(cursor.row, cursor.column..columns)
             {
-                self.label(rect, preedit, frame, false);
+                self.ime_preedit(
+                    frame,
+                    CellPosition {
+                        row: cursor.row,
+                        column: cursor.column,
+                    },
+                    preedit,
+                );
             }
+        }
+        if let Some(search) = search {
+            self.search_bar(frame.palette, search, preedit_text);
         }
         self.progress_bar(frame.palette, progress, progress_phase);
         if let Some(scrollbar) = scrollbar {
             self.scrollbar(frame.palette, scrollbar);
         }
+        if dim_alpha > 0.0 {
+            let veil = frame.palette.color(if frame.reverse_video {
+                PaletteEntry::Foreground
+            } else {
+                PaletteEntry::Background
+            });
+            self.rect(
+                PixelRect {
+                    origin: PixelPosition { x: 0, y: 0 },
+                    size: self.area,
+                },
+                veil,
+                dim_alpha,
+            );
+        }
         Ok(instance_start..self.instances.len() as u32)
+    }
+
+    fn ime_preedit(
+        &mut self,
+        frame: &PresentationFrame<'_>,
+        origin: CellPosition,
+        preedit: &Preedit,
+    ) {
+        let columns = usize::from(frame.geometry.pty_size().columns);
+        let rows = usize::from(frame.geometry.pty_size().rows);
+        let cells = preedit.layout_cells(origin, columns, rows);
+        if cells.is_empty() {
+            return;
+        }
+        let bg = frame.palette.color(if frame.reverse_video {
+            PaletteEntry::Foreground
+        } else {
+            PaletteEntry::Background
+        });
+        let cursor_color = frame.palette.color(PaletteEntry::Cursor);
+        let selected_fg = [
+            frame.palette.color(PaletteEntry::Background),
+            frame.palette.color(PaletteEntry::Foreground),
+            frame.palette.color(PaletteEntry::Indexed(0)),
+            frame.palette.color(PaletteEntry::Indexed(15)),
+        ]
+        .into_iter()
+        .max_by_key(|&color| luminance(color).abs_diff(luminance(cursor_color)))
+        .unwrap();
+        let thickness = ((self.metrics.size / 14.0).round().max(1.0) as u32)
+            .min(self.metrics.cell.height.get());
+        let underline_y = (self.metrics.baseline.max(0) as u32 + thickness)
+            .min(self.metrics.cell.height.get().saturating_sub(thickness));
+
+        for cell in &cells {
+            let Some(rect) = frame.geometry.row_rect(
+                cell.position.row,
+                cell.position.column..cell.position.column + cell.width,
+            ) else {
+                continue;
+            };
+            let (fill, fg) = if cell.selected {
+                (cursor_color, selected_fg)
+            } else {
+                (bg, cursor_color)
+            };
+            self.rect(rect, fill, 1.0);
+            if cell.text != " " {
+                let cache = usize::from(cell.width > 1) << 2;
+                self.glyph(rect, cell.text, cache, fg, 1.0);
+            }
+            self.rect(horizontal(rect, underline_y, thickness), fg, 1.0);
+        }
+
+        if let Some(caret) = preedit.cursor_cell(origin, columns, rows)
+            && let Some(mut rect) = frame
+                .geometry
+                .row_rect(caret.row, caret.column..caret.column + 1)
+        {
+            rect.size.width = NonZeroU32::new(2).unwrap().min(rect.size.width);
+            self.rect(rect, cursor_color, 1.0);
+        }
+    }
+
+    fn mode_badge(&mut self, palette: &lune_terminal::Palette, label: &str) {
+        let cell_h = self.metrics.cell.height.get();
+        let cell_w = self.metrics.cell.width.get();
+        let pad_x = (cell_w * 2 / 3).max(6);
+        let pad_y = (cell_h / 6).max(2);
+        let margin = (cell_w / 2).max(6);
+        let text_w = self.font.measure_text(self.metrics, label);
+        let box_w = text_w.saturating_add(pad_x * 2).min(ATLAS_SIDE as u32);
+        let box_h = cell_h.saturating_add(pad_y * 2);
+        if text_w == 0
+            || self.area.width.get() < box_w + margin * 2
+            || self.area.height.get() < box_h + margin
+        {
+            return;
+        }
+        let Some(width) = NonZeroU32::new(box_w) else {
+            return;
+        };
+        let Some(height) = NonZeroU32::new(box_h) else {
+            return;
+        };
+        let rect = PixelRect {
+            origin: PixelPosition {
+                x: self.area.width.get().saturating_sub(box_w + margin),
+                y: margin,
+            },
+            size: PixelSize { width, height },
+        };
+        let bg = palette.color(PaletteEntry::Background);
+        let fg = palette.color(PaletteEntry::Foreground);
+        let accent = palette.color(PaletteEntry::Indexed(4));
+        let fill = mix_color(bg, fg, 22);
+        let border = mix_color(bg, accent, 140);
+        let radius = (box_h / 4).clamp(4, 9);
+        self.rounded_rect(rect, radius, 0, fill, 0.94);
+        self.rounded_rect(rect, radius, 1, border, 0.9);
+        if let Some(label_w) = NonZeroU32::new(text_w.min(ATLAS_SIDE as u32)) {
+            self.glyph(
+                PixelRect {
+                    origin: PixelPosition {
+                        x: rect.origin.x + pad_x,
+                        y: rect.origin.y + pad_y,
+                    },
+                    size: PixelSize {
+                        width: label_w,
+                        height: self.metrics.cell.height,
+                    },
+                },
+                label,
+                LABEL_CACHE,
+                accent,
+                1.0,
+            );
+        }
+    }
+
+    fn search_bar(&mut self, palette: &lune_terminal::Palette, search: &SearchBar, preedit: &str) {
+        let cell_h = self.metrics.cell.height.get();
+        let cell_w = self.metrics.cell.width.get();
+        let pad_x = (cell_w / 2).max(4);
+        let pad_y = (cell_h / 5).max(3);
+        let margin = (cell_w / 2).max(6);
+        let box_h = cell_h.saturating_add(pad_y * 2);
+        if self.area.height.get() < box_h || self.area.width.get() < cell_w * 8 {
+            return;
+        }
+        let max_w = self
+            .area
+            .width
+            .get()
+            .saturating_sub(margin * 2)
+            .min(ATLAS_SIDE as u32);
+        let desired_w = (cell_w * 36).min(max_w);
+        let Some(box_w) = NonZeroU32::new(desired_w) else {
+            return;
+        };
+        let Some(box_h_nz) = NonZeroU32::new(box_h) else {
+            return;
+        };
+        let rect = PixelRect {
+            origin: PixelPosition {
+                x: self.area.width.get().saturating_sub(box_w.get() + margin),
+                y: margin.min(self.area.height.get().saturating_sub(box_h)),
+            },
+            size: PixelSize {
+                width: box_w,
+                height: box_h_nz,
+            },
+        };
+
+        let bg = palette.color(PaletteEntry::Background);
+        let fg = palette.color(PaletteEntry::Foreground);
+        let accent = if search.vi_mode && search.direction == vi::Direction::Backward {
+            palette.color(PaletteEntry::Indexed(3))
+        } else {
+            palette.color(PaletteEntry::Indexed(4))
+        };
+        let red = palette.color(PaletteEntry::Indexed(1));
+        let fill = mix_color(bg, fg, 22);
+        let border = if search.invalid_regex {
+            red
+        } else {
+            mix_color(bg, fg, 95)
+        };
+        let radius = (box_h / 4).clamp(4, 10);
+        self.rounded_rect(rect, radius, 0, fill, 0.96);
+        self.rounded_rect(rect, radius, 1, border, 0.95);
+
+        let text_y = rect.origin.y + pad_y;
+        let mut inner_left = rect.origin.x + pad_x;
+        let mut cursor_right = rect.origin.x + rect.size.width.get().saturating_sub(pad_x);
+        let badge_gap = (cell_w / 2).max(4);
+
+        if search.vi_mode {
+            let prefix = match search.direction {
+                vi::Direction::Forward => "/",
+                vi::Direction::Backward => "?",
+            };
+            let prefix_w = self.font.measure_text(self.metrics, prefix);
+            if let Some(width) =
+                NonZeroU32::new(prefix_w.min(cursor_right.saturating_sub(inner_left)))
+            {
+                self.glyph(
+                    PixelRect {
+                        origin: PixelPosition {
+                            x: inner_left,
+                            y: text_y,
+                        },
+                        size: PixelSize {
+                            width,
+                            height: self.metrics.cell.height,
+                        },
+                    },
+                    prefix,
+                    LABEL_CACHE,
+                    accent,
+                    1.0,
+                );
+                inner_left = inner_left.saturating_add(width.get() + badge_gap);
+            }
+        }
+
+        // Right-aligned toggles: `.*` (regex) and `Aa` (case-sensitive).
+        for (label, active) in [(".*", search.regex_mode), ("Aa", search.case_sensitive)] {
+            let w = self.font.measure_text(self.metrics, label);
+            if w == 0 || cursor_right < inner_left + w + badge_gap {
+                continue;
+            }
+            let x = cursor_right - w;
+            let color = if active {
+                accent
+            } else {
+                mix_color(bg, fg, 110)
+            };
+            if let Some(width) = NonZeroU32::new(w.min(ATLAS_SIDE as u32)) {
+                self.glyph(
+                    PixelRect {
+                        origin: PixelPosition { x, y: text_y },
+                        size: PixelSize {
+                            width,
+                            height: self.metrics.cell.height,
+                        },
+                    },
+                    label,
+                    LABEL_CACHE,
+                    color,
+                    1.0,
+                );
+            }
+            cursor_right = x.saturating_sub(badge_gap);
+        }
+
+        // Match count or `invalid` status.
+        let status = search.status_label();
+        if !status.is_empty() {
+            let w = self.font.measure_text(self.metrics, &status);
+            if w != 0 && cursor_right >= inner_left + w + badge_gap {
+                let x = cursor_right - w;
+                let color = if search.invalid_regex {
+                    red
+                } else if search.matches.is_empty() {
+                    mix_color(bg, fg, 110)
+                } else {
+                    mix_color(bg, fg, 185)
+                };
+                if let Some(width) = NonZeroU32::new(w.min(ATLAS_SIDE as u32)) {
+                    self.glyph(
+                        PixelRect {
+                            origin: PixelPosition { x, y: text_y },
+                            size: PixelSize {
+                                width,
+                                height: self.metrics.cell.height,
+                            },
+                        },
+                        &status,
+                        LABEL_CACHE,
+                        color,
+                        1.0,
+                    );
+                }
+                cursor_right = x.saturating_sub(badge_gap);
+            }
+        }
+
+        // Query + IME preedit (or placeholder when empty).
+        let query_avail = cursor_right.saturating_sub(inner_left);
+        if query_avail == 0 {
+            return;
+        }
+        let full_query = if preedit.is_empty() {
+            std::borrow::Cow::Borrowed(search.query.as_str())
+        } else {
+            std::borrow::Cow::Owned(format!("{}{preedit}", search.query))
+        };
+        if full_query.is_empty() {
+            let placeholder = if search.vi_mode {
+                match search.direction {
+                    vi::Direction::Forward => "Search forward",
+                    vi::Direction::Backward => "Search backward",
+                }
+            } else {
+                "Search"
+            };
+            let w = self
+                .font
+                .measure_text(self.metrics, placeholder)
+                .min(query_avail)
+                .min(ATLAS_SIDE as u32);
+            if let Some(width) = NonZeroU32::new(w) {
+                self.glyph(
+                    PixelRect {
+                        origin: PixelPosition {
+                            x: inner_left,
+                            y: text_y,
+                        },
+                        size: PixelSize {
+                            width,
+                            height: self.metrics.cell.height,
+                        },
+                    },
+                    placeholder,
+                    LABEL_CACHE,
+                    mix_color(bg, fg, 100),
+                    1.0,
+                );
+            }
+            if let Some(bar_w) = NonZeroU32::new(2.min(query_avail)) {
+                self.rect(
+                    PixelRect {
+                        origin: PixelPosition {
+                            x: inner_left,
+                            y: text_y,
+                        },
+                        size: PixelSize {
+                            width: bar_w,
+                            height: self.metrics.cell.height,
+                        },
+                    },
+                    accent,
+                    0.9,
+                );
+            }
+        } else {
+            // Keep the tail of long queries visible inside the input box.
+            let mut visible: &str = &full_query;
+            let mut measured = self.font.measure_text(self.metrics, visible);
+            while measured > query_avail.saturating_sub(2) {
+                let Some(next) = visible.char_indices().nth(1).map(|(idx, _)| idx) else {
+                    break;
+                };
+                visible = &visible[next..];
+                measured = self.font.measure_text(self.metrics, visible);
+            }
+            let draw_w = measured.min(query_avail).min(ATLAS_SIDE as u32);
+            if let Some(width) = NonZeroU32::new(draw_w) {
+                self.glyph(
+                    PixelRect {
+                        origin: PixelPosition {
+                            x: inner_left,
+                            y: text_y,
+                        },
+                        size: PixelSize {
+                            width,
+                            height: self.metrics.cell.height,
+                        },
+                    },
+                    visible,
+                    LABEL_CACHE,
+                    fg,
+                    1.0,
+                );
+            }
+            let caret_x = inner_left.saturating_add(draw_w);
+            if caret_x < cursor_right
+                && let Some(bar_w) = NonZeroU32::new(2.min(cursor_right - caret_x))
+            {
+                self.rect(
+                    PixelRect {
+                        origin: PixelPosition {
+                            x: caret_x,
+                            y: text_y,
+                        },
+                        size: PixelSize {
+                            width: bar_w,
+                            height: self.metrics.cell.height,
+                        },
+                    },
+                    accent,
+                    0.9,
+                );
+            }
+        }
     }
 
     fn scrollbar(&mut self, palette: &lune_terminal::Palette, view: ScrollbarView) {
@@ -1123,36 +1536,6 @@ impl TextRenderer {
         }
     }
 
-    fn label(
-        &mut self,
-        mut rect: PixelRect,
-        text: &str,
-        frame: &PresentationFrame<'_>,
-        fill: bool,
-    ) {
-        let width = self
-            .font
-            .measure_text(self.metrics, text)
-            .min(rect.size.width.get())
-            .min(ATLAS_SIDE as u32);
-        if let Some(width) = NonZeroU32::new(width) {
-            let row = rect;
-            rect.size.width = width;
-            self.rect(
-                if fill { row } else { rect },
-                frame.palette.graphics_color(250),
-                1.0,
-            );
-            self.glyph(
-                rect,
-                text,
-                LABEL_CACHE,
-                frame.palette.graphics_color(251),
-                1.0,
-            );
-        }
-    }
-
     pub(super) fn prepare_moving_cursor(&mut self, area: PixelSize, rect: PixelRect, color: Rgb) {
         let quad = Quad::new(area, rect, color, 1.0, [0.0; 4], [0, 0]);
         write_instances(&self.device, &self.queue, &mut self.motion_buffer, &[quad]);
@@ -1232,17 +1615,35 @@ impl TextRenderer {
                     _ => cache_index & 3,
                 }
             };
-            let Some(colored) = self.font.rasterize(
-                self.metrics,
-                text,
-                rendition,
-                width,
-                ligature_run,
-                &mut self.image,
-            ) else {
-                return false;
-            };
             let height = rect.size.height.get();
+            let procedural = if cache_index < LABEL_CACHE {
+                let mut chars = text.chars();
+                chars
+                    .next()
+                    .filter(|_| chars.next().is_none())
+                    .and_then(|ch| {
+                        box_drawing::rasterize(self.metrics, ch, width, height, &mut self.image)
+                    })
+            } else {
+                None
+            };
+            let colored = match procedural {
+                Some(true) => false,
+                Some(false) => return true,
+                None => {
+                    let Some(colored) = self.font.rasterize(
+                        self.metrics,
+                        text,
+                        rendition,
+                        width,
+                        ligature_run,
+                        &mut self.image,
+                    ) else {
+                        return false;
+                    };
+                    colored
+                }
+            };
             let Some(sprite) = self.upload_sprite(width, height, colored) else {
                 return false;
             };

@@ -1,3 +1,4 @@
+mod box_drawing;
 pub mod cli;
 mod clipboard;
 mod config;
@@ -5,13 +6,16 @@ mod confirm;
 mod cursor;
 mod directory;
 mod font;
+mod ime;
 mod input;
 mod ligature;
 mod notify;
 mod paint;
 mod readiness;
 mod scrollbar;
+mod search;
 mod selection;
+mod shell_integration;
 mod shortcuts;
 mod split;
 mod tab;
@@ -40,7 +44,7 @@ use winit::event::{Ime, KeyEvent, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::platform::wayland::{EventLoopBuilderExtWayland, WindowAttributesExtWayland};
-use winit::window::{CursorIcon, Fullscreen, Theme, Window, WindowId};
+use winit::window::{CursorIcon, Fullscreen, ImePurpose, Theme, Window, WindowId};
 
 use crate::{GridGeometry, PixelRect, SessionReady};
 
@@ -338,11 +342,13 @@ struct Client {
     custom_app_id: Option<String>,
     custom_config: Option<PathBuf>,
     keymap: Keymap,
+    unfocused_split_opacity: f32,
     window_padding: u32,
     history_limits: HistoryLimits,
     cursor_style: CursorShape,
     cursor_blink: bool,
     shell: Option<Vec<OsString>>,
+    shell_integration: bool,
     confirm_close: bool,
     confirm: Option<confirm::Dialog>,
 }
@@ -404,6 +410,7 @@ impl Client {
                 cursor_style: config.cursor_style,
                 cursor_blink: config.cursor_blink,
                 shell: config.shell.as_deref(),
+                shell_integration: config.shell_integration,
             },
             launch.working_directory,
             launch.command.as_deref(),
@@ -414,6 +421,7 @@ impl Client {
         pane.visible = true;
         pane.active = true;
         let tab = Tab::new(pane, content_area);
+        window.set_ime_purpose(ImePurpose::Terminal);
         window.set_ime_allowed(true);
         window.request_redraw();
         log::info!("Wayland terminal ready");
@@ -464,11 +472,13 @@ impl Client {
             custom_app_id,
             custom_config,
             keymap: Keymap::from_overrides(&config.keybinds),
+            unfocused_split_opacity: config.unfocused_split_opacity,
             window_padding: config.window_padding,
             history_limits,
             cursor_style: config.cursor_style,
             cursor_blink: config.cursor_blink,
             shell: config.shell.clone(),
+            shell_integration: config.shell_integration,
             confirm_close: config.confirm_close,
             confirm: None,
         })
@@ -482,6 +492,7 @@ impl Client {
             cursor_style: self.cursor_style,
             cursor_blink: self.cursor_blink,
             shell: self.shell.as_deref(),
+            shell_integration: self.shell_integration,
         }
     }
 
@@ -549,8 +560,14 @@ impl Client {
             }
             WindowEvent::Focused(focused) => {
                 self.focused = focused;
-                self.tabs[self.active].focused_pane_mut().focus(focused);
-                if !focused {
+                let pane = self.tabs[self.active].focused_pane_mut();
+                pane.focus(focused);
+                pane.invalidate_ime_area();
+                self.window
+                    .set_ime_allowed(focused && self.confirm.is_none() && pane.allows_ime());
+                if focused {
+                    pane.update_ime_area();
+                } else {
                     self.dragging_divider = None;
                     self.painter.reset_cursor_motion();
                     self.modifiers = ModifiersState::empty();
@@ -594,14 +611,15 @@ impl Client {
                 self.ime_enabled = true;
                 let pane = self.tabs[self.active].focused_pane_mut();
                 pane.ime_enabled = true;
-                pane.ime_area = None;
+                pane.invalidate_ime_area();
                 pane.update_ime_area();
             }
             WindowEvent::Ime(Ime::Disabled) => {
                 self.ime_enabled = false;
                 let pane = self.tabs[self.active].focused_pane_mut();
                 pane.ime_enabled = false;
-                pane.set_preedit(String::new());
+                pane.invalidate_ime_area();
+                pane.clear_preedit();
             }
             WindowEvent::Ime(ime) => {
                 if self.confirm.is_none() {
@@ -869,11 +887,29 @@ impl Client {
     }
 
     fn key(&mut self, event_loop: &ActiveEventLoop, event: &KeyEvent) {
-        let buffer = self.tabs[self.active]
-            .focused_pane()
-            .session
-            .screen()
-            .active_buffer();
+        let pane = self.tabs[self.active].focused_pane();
+        let buffer = pane.session.screen().active_buffer();
+        if pane.search.is_some() {
+            if let Some(binding) = self.keymap.binding(event, self.modifiers, buffer)
+                && let Some(action) = binding.action(event.repeat)
+            {
+                match action {
+                    Action::Search => {
+                        self.tabs[self.active].focused_pane_mut().close_search();
+                        return;
+                    }
+                    Action::Paste => {
+                        self.tabs[self.active]
+                            .focused_pane_mut()
+                            .paste(ClipboardType::Regular, self.primary_selection.as_ref());
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+            self.tabs[self.active].focused_pane_mut().search_key(event);
+            return;
+        }
         if let Some(binding) = self.keymap.binding(event, self.modifiers, buffer) {
             if let Some(action) = binding.action(event.repeat) {
                 let pass_through = (self.tabs.len() <= 1
@@ -913,6 +949,7 @@ impl Client {
                 }
             }
             Action::ToggleVi => self.tabs[self.active].focused_pane_mut().toggle_vi(),
+            Action::Search => self.tabs[self.active].focused_pane_mut().toggle_search(),
             Action::PreviousPrompt => self.tabs[self.active].focused_pane_mut().jump_prompt(false),
             Action::NextPrompt => self.tabs[self.active].focused_pane_mut().jump_prompt(true),
             Action::CopyLastOutput => self.tabs[self.active]
@@ -1201,7 +1238,7 @@ impl Client {
         }
         let pane = self.tabs[self.active].focused_pane_mut();
         pane.ime_enabled = self.ime_enabled;
-        pane.ime_area = None;
+        pane.invalidate_ime_area();
         pane.pointer = self.pointer;
         pane.set_ime_allowed();
         pane.update_ime_area();
@@ -1521,6 +1558,9 @@ impl Client {
         if old.background_opacity != new.background_opacity {
             self.painter.set_background_opacity(new.background_opacity);
         }
+        if old.unfocused_split_opacity != new.unfocused_split_opacity {
+            self.unfocused_split_opacity = new.unfocused_split_opacity;
+        }
         let mut layout_changed = false;
         if old.window_padding != new.window_padding {
             self.window_padding = new.window_padding;
@@ -1554,6 +1594,7 @@ impl Client {
             self.keymap = Keymap::from_overrides(&new.keybinds);
         }
         self.shell = new.shell.clone();
+        self.shell_integration = new.shell_integration;
         self.confirm_close = new.confirm_close;
         if !self.confirm_close {
             self.dismiss_confirm();
@@ -1737,6 +1778,7 @@ impl Client {
             tab_idx += 1;
         }
         let focused_pane = self.tabs[self.active].focused_pane_mut();
+        focused_pane.update_ime_area();
         let focused_id = focused_pane.id;
         let blink = std::mem::take(&mut focused_pane.restart_blink)
             && self.painter.restart_blink(focused_id, now);
@@ -1793,7 +1835,9 @@ impl Client {
             tab.reflow(content_area, divider, metrics.cell, index == self.active);
         }
         self.reflow_tab_bar();
-        self.tabs[self.active].focused_pane_mut().update_ime_area();
+        let pane = self.tabs[self.active].focused_pane_mut();
+        pane.invalidate_ime_area();
+        pane.update_ime_area();
         self.window.request_redraw();
     }
 
@@ -1827,6 +1871,8 @@ impl Client {
         let scale = self.window.scale_factor();
         let active_tab = &self.tabs[self.active];
         let zoomed = active_tab.is_zoomed();
+        let multi_pane = active_tab.layout.panes.len() > 1;
+        let unfocused_dim = (1.0 - self.unfocused_split_opacity).clamp(0.0, 0.85);
         let mut draw_panes = Vec::with_capacity(active_tab.layout.panes.len());
         let mut reverse_video = false;
         for layout_pane in &active_tab.layout.panes {
@@ -1837,12 +1883,17 @@ impl Client {
                 return Ok(());
             };
             let focused = self.focused && self.confirm.is_none() && pane.id == active_tab.focused;
-            if pane.vi.is_some() || !focused {
+            if pane.vi.is_some() || pane.search.is_some() || !focused {
                 frame.cursor_appearance.visible = false;
             }
             if pane.id == active_tab.focused {
                 reverse_video = frame.reverse_video;
             }
+            let dim_alpha = if multi_pane && pane.id != active_tab.focused {
+                unfocused_dim
+            } else {
+                0.0
+            };
             draw_panes.push(paint::PaneDraw {
                 id: pane.id,
                 rect: layout_pane.rect,
@@ -1850,15 +1901,17 @@ impl Client {
                 selection: pane.selection.as_ref().map(|selection| &selection.range),
                 hovered_link: pane.hovered_link.as_ref(),
                 progress: pane.progress,
-                preedit: if pane.id == active_tab.focused {
-                    &pane.preedit
+                preedit: if pane.id == active_tab.focused && !pane.preedit.is_empty() {
+                    Some(&pane.preedit)
                 } else {
-                    ""
+                    None
                 },
                 vi: pane.vi.as_ref(),
+                search: pane.search.as_ref(),
                 focused,
                 zoomed: zoomed && pane.id == active_tab.focused,
                 scrollbar: pane.scrollbar_view(scale),
+                dim_alpha,
             });
         }
         let focused_rect = (active_tab.layout.panes.len() > 1)

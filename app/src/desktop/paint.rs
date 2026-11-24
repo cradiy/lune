@@ -20,7 +20,9 @@ use crate::{
 use super::confirm;
 use super::cursor::CursorMotion;
 use super::font::{Font, FontMetrics};
+use super::ime::Preedit;
 use super::scrollbar::ScrollbarView;
+use super::search::SearchBar;
 use super::split::Divider;
 use super::text::TextRenderer;
 use super::url::HoveredLink;
@@ -34,10 +36,12 @@ pub(super) struct PaneOverlay<'a> {
     pub(super) hovered_link: Option<&'a HoveredLink>,
     pub(super) progress: Progress,
     pub(super) progress_phase: f32,
-    pub(super) preedit: &'a str,
+    pub(super) preedit: Option<&'a Preedit>,
     pub(super) vi: Option<&'a vi::Mode>,
+    pub(super) search: Option<&'a SearchBar>,
     pub(super) zoomed: bool,
     pub(super) scrollbar: Option<ScrollbarView>,
+    pub(super) dim_alpha: f32,
 }
 
 pub(super) struct PaneDraw<'a> {
@@ -47,11 +51,13 @@ pub(super) struct PaneDraw<'a> {
     pub(super) selection: Option<&'a Range<CellPosition>>,
     pub(super) hovered_link: Option<&'a HoveredLink>,
     pub(super) progress: Progress,
-    pub(super) preedit: &'a str,
+    pub(super) preedit: Option<&'a Preedit>,
     pub(super) vi: Option<&'a vi::Mode>,
+    pub(super) search: Option<&'a SearchBar>,
     pub(super) focused: bool,
     pub(super) zoomed: bool,
     pub(super) scrollbar: Option<ScrollbarView>,
+    pub(super) dim_alpha: f32,
 }
 
 pub(super) struct WindowChrome<'a> {
@@ -469,7 +475,8 @@ impl Painter {
             && let Some(pane) = focused_pane
             && pane.focused
             && pane.vi.is_none()
-            && pane.preedit.is_empty()
+            && pane.search.is_none()
+            && pane.preedit.is_none()
             && pane.frame.viewport.offset() == 0
         {
             focused_cursor.and_then(|cursor| cursor_origin(&pane.frame, cursor.position))
@@ -540,8 +547,10 @@ impl Painter {
                     progress_phase,
                     preedit: pane.preedit,
                     vi: pane.vi,
+                    search: pane.search,
                     zoomed: pane.zoomed,
                     scrollbar: pane.scrollbar,
+                    dim_alpha: pane.dim_alpha,
                 };
                 let range = self.text.prepare_pane(
                     &pane.frame,

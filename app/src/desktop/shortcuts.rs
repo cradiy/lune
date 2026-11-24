@@ -17,6 +17,7 @@ pub(super) enum Action {
     Zoom(Zoom),
     Scroll(Scroll),
     ToggleVi,
+    Search,
     PreviousPrompt,
     NextPrompt,
     CopyLastOutput,
@@ -301,6 +302,7 @@ const WAYLAND_BINDINGS: &[Binding] = &[
     Binding::new(Action::MoveTabLeft, CTRL_SHIFT, Named(NamedKey::PageUp)),
     Binding::new(Action::MoveTabRight, CTRL_SHIFT, Named(NamedKey::PageDown)),
     Binding::new(Action::ToggleVi, CTRL_SHIFT, ShortcutKey::Space),
+    Binding::new(Action::Search, CTRL_SHIFT, letter("f")),
     Binding::new(Action::PreviousPrompt, CTRL_SHIFT, Named(NamedKey::ArrowUp))
         .primary_screen()
         .repeating(),
@@ -533,6 +535,7 @@ fn parse_action(name: &str) -> Result<KeybindAction, &'static str> {
         "scroll_page_up" => Action::Scroll(Scroll::PageUp),
         "scroll_page_down" => Action::Scroll(Scroll::PageDown),
         "toggle_vi" => Action::ToggleVi,
+        "search" | "find" => Action::Search,
         "previous_prompt" => Action::PreviousPrompt,
         "next_prompt" => Action::NextPrompt,
         "copy_last_output" => Action::CopyLastOutput,

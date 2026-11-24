@@ -14,7 +14,7 @@ use lune_terminal::{
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, Ime, KeyEvent, MouseScrollDelta};
 use winit::event_loop::EventLoopProxy;
-use winit::keyboard::ModifiersState;
+use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{UserAttentionType, Window};
 
 use crate::{GridGeometry, MAX_INPUT_BYTES, PixelRect, Session, SessionReady, WaitOutcome};
@@ -22,10 +22,13 @@ use crate::{GridGeometry, MAX_INPUT_BYTES, PixelRect, Session, SessionReady, Wai
 use super::clipboard::{self, ClipboardType};
 use super::config::{ClipboardPolicy, NotificationPolicy};
 use super::directory;
+use super::ime;
 use super::input::{self, Input};
 use super::notify::Notifier;
 use super::readiness::{Readiness, Registration};
 use super::scrollbar::{ScrollbarMetrics, ScrollbarView};
+use super::search;
+use super::shell_integration;
 use super::split::{PaneRect, SplitLayout, SplitTree};
 use super::url::{self, DetectedUrl, HoveredLink};
 use super::{Event, PASTE_TIMEOUT, PaneId, Result, selection, vi};
@@ -154,8 +157,8 @@ pub(super) struct Pane {
     pub(super) restart_blink: bool,
     pub(super) modifiers: ModifiersState,
     pub(super) ime_enabled: bool,
-    pub(super) ime_area: Option<(PixelPosition, PixelSize)>,
-    pub(super) preedit: String,
+    ime_area: ime::ImeAreaCache,
+    pub(super) preedit: ime::Preedit,
     pub(super) pointer: Option<PhysicalPosition<f64>>,
     pub(super) pressed: Option<MouseButton>,
     wheel: f64,
@@ -167,7 +170,8 @@ pub(super) struct Pane {
     pub(super) hovered_link: Option<HoveredLink>,
     hyperlink_click: Option<HyperlinkId>,
     pub(super) vi: Option<vi::Mode>,
-    pub(super) vi_search: Option<vi::Search>,
+    pub(super) search: Option<search::SearchBar>,
+    pub(super) search_saved: Option<search::SavedSearch>,
 }
 
 pub(super) struct PaneConfig<'a> {
@@ -177,6 +181,7 @@ pub(super) struct PaneConfig<'a> {
     pub(super) cursor_style: CursorShape,
     pub(super) cursor_blink: bool,
     pub(super) shell: Option<&'a [OsString]>,
+    pub(super) shell_integration: bool,
 }
 
 impl Pane {
@@ -197,15 +202,13 @@ impl Pane {
             }
             _ => match config.shell {
                 Some([executable, args @ ..]) => {
-                    let mut command = Command::new(executable);
-                    command.args(args);
-                    command
+                    shell_integration::build_command(executable, args, config.shell_integration)
                 }
                 _ => {
                     let shell = std::env::var_os("SHELL")
                         .filter(|shell| !shell.is_empty())
                         .unwrap_or_else(|| "/bin/sh".into());
-                    Command::new(shell)
+                    shell_integration::build_command(&shell, &[], config.shell_integration)
                 }
             },
         };
@@ -247,8 +250,8 @@ impl Pane {
             restart_blink: false,
             modifiers: ModifiersState::empty(),
             ime_enabled: false,
-            ime_area: None,
-            preedit: String::new(),
+            ime_area: ime::ImeAreaCache::default(),
+            preedit: ime::Preedit::default(),
             pointer: None,
             pressed: None,
             wheel: 0.0,
@@ -260,7 +263,8 @@ impl Pane {
             hovered_link: None,
             hyperlink_click: None,
             vi: None,
-            vi_search: None,
+            search: None,
+            search_saved: None,
         })
     }
 
@@ -340,10 +344,18 @@ impl Pane {
         }
     }
 
-    pub(super) fn set_ime_allowed(&self) {
+    pub(super) fn allows_ime(&self) -> bool {
+        self.search.is_some() || self.vi.is_none()
+    }
+
+    pub(super) fn invalidate_ime_area(&mut self) {
+        self.ime_area.invalidate();
+    }
+
+    pub(super) fn set_ime_allowed(&mut self) {
         if self.active {
-            self.window
-                .set_ime_allowed(self.vi.as_ref().is_none_or(|vi| vi.prompt.is_some()));
+            self.ime_area.invalidate();
+            self.window.set_ime_allowed(self.allows_ime());
         }
     }
 
@@ -361,7 +373,7 @@ impl Pane {
             if let Some(vi) = &mut self.vi {
                 vi.cancel_pending();
             }
-            self.set_preedit(String::new());
+            self.clear_preedit();
         }
     }
 
@@ -445,22 +457,27 @@ impl Pane {
 
     pub(super) fn ime(&mut self, ime: Ime) {
         match ime {
-            Ime::Preedit(text, _) => {
-                if self.vi.is_none() && self.preedit.is_empty() && !text.is_empty() {
+            Ime::Preedit(text, cursor) => {
+                if self.vi.is_none()
+                    && self.search.is_none()
+                    && self.preedit.is_empty()
+                    && !text.is_empty()
+                {
                     self.follow_output();
                 }
-                if self.vi.as_ref().is_none_or(|vi| vi.prompt.is_some()) {
-                    self.set_preedit(text);
+                if self.allows_ime() {
+                    self.set_preedit(text, cursor);
+                    self.update_ime_area();
                 }
             }
             Ime::Commit(mut text) => {
-                self.set_preedit(String::new());
-                if let Some(vi) = &mut self.vi {
-                    if let Some(prompt) = &mut vi.prompt {
-                        prompt.push(&text);
-                        self.update_ime_area();
-                        self.redraw_vi();
-                    }
+                self.clear_preedit();
+                if self.search.is_some() {
+                    self.search_push(&text);
+                    self.update_ime_area();
+                    return;
+                }
+                if self.vi.is_some() {
                     return;
                 }
                 self.follow_output();
@@ -472,6 +489,7 @@ impl Pane {
                 if !text.is_empty() {
                     self.push_input(Input::Text(text));
                 }
+                self.update_ime_area();
             }
             _ => {}
         }
@@ -602,6 +620,7 @@ impl Pane {
             }
         }
         self.refresh_vi();
+        self.refresh_search();
         self.update_ime_area();
         self.update_hovered_hyperlink();
         if self.visible && self.session.presentation_frame().is_some() {
@@ -670,37 +689,99 @@ impl Pane {
             return;
         }
         let geometry = self.session.geometry();
+        let Some(cell) = geometry.cell_pixels() else {
+            return;
+        };
+        let columns = usize::from(geometry.pty_size().columns);
+        let rows = usize::from(geometry.pty_size().rows);
         let viewport = self.session.screen().viewport();
-        let (row, column) = if let Some(vi) = &self.vi {
-            if vi.prompt.is_none() {
+
+        let rect = if let Some(search) = &self.search {
+            let Some(area) = geometry.text_area_pixels() else {
                 return;
+            };
+            let cell_w = cell.width.get();
+            let cell_h = cell.height.get();
+            let pad_x = (cell_w / 2).max(4);
+            let pad_y = (cell_h / 5).max(3);
+            let margin = (cell_w / 2).max(6);
+            let box_h = cell_h.saturating_add(pad_y * 2);
+            let max_w = area.width.get().saturating_sub(margin * 2).min(1024);
+            let box_w = (cell_w * 36).min(max_w);
+            let box_x = area.width.get().saturating_sub(box_w + margin);
+            let text_y = margin.min(area.height.get().saturating_sub(box_h)) + pad_y;
+            let text_cols =
+                ime::display_width(&search.query) + ime::display_width(self.preedit.text());
+            let prefix_px = if search.vi_mode {
+                cell_w + (cell_w / 2).max(4)
+            } else {
+                0
+            };
+            let max_caret_x = box_x
+                .saturating_add(box_w)
+                .saturating_sub(pad_x.saturating_add(cell_w));
+            let caret_x = box_x
+                .saturating_add(pad_x)
+                .saturating_add(prefix_px)
+                .saturating_add((text_cols as u32).saturating_mul(cell_w))
+                .min(max_caret_x);
+            PixelRect {
+                origin: PixelPosition {
+                    x: self.origin.x.saturating_add(caret_x),
+                    y: self.origin.y.saturating_add(text_y),
+                },
+                size: cell,
             }
-            (viewport.rows() - 1, 0)
         } else if let Some(cursor) = viewport.cursor() {
-            (cursor.row, cursor.column)
+            let base = CellPosition {
+                row: cursor.row,
+                column: cursor.column,
+            };
+            let anchor = self
+                .preedit
+                .cursor_cell(base, columns, rows)
+                .unwrap_or(base);
+            let Some(cell_rect) = geometry.row_rect(anchor.row, anchor.column..anchor.column + 1)
+            else {
+                return;
+            };
+            PixelRect {
+                origin: PixelPosition {
+                    x: self.origin.x.saturating_add(cell_rect.origin.x),
+                    y: self.origin.y.saturating_add(cell_rect.origin.y),
+                },
+                size: cell_rect.size,
+            }
         } else {
             return;
         };
-        let Some(rect) = geometry.row_rect(row, column..column + 1) else {
+
+        let surface = self.window.inner_size();
+        let Some(clamped) =
+            ime::clamp_to_surface(rect.origin, rect.size, surface.width, surface.height)
+        else {
             return;
         };
-        let origin = PixelPosition {
-            x: self.origin.x + rect.origin.x,
-            y: self.origin.y + rect.origin.y,
-        };
-        if self.ime_area != Some((origin, rect.size)) {
+        let scale = self.window.scale_factor();
+        if self
+            .ime_area
+            .record_if_changed(clamped.origin, clamped.size, scale)
+        {
             self.window.set_ime_cursor_area(
-                PhysicalPosition::new(origin.x as i32, origin.y as i32),
-                PhysicalSize::new(rect.size.width.get(), rect.size.height.get()),
+                PhysicalPosition::new(clamped.origin.x as i32, clamped.origin.y as i32),
+                PhysicalSize::new(clamped.size.width.get(), clamped.size.height.get()),
             );
-            self.ime_area = Some((origin, rect.size));
         }
     }
 
-    pub(super) fn set_preedit(&mut self, mut text: String) {
-        text.truncate(text.floor_char_boundary(1024));
-        if self.preedit != text {
-            self.preedit = text;
+    pub(super) fn set_preedit(&mut self, text: String, cursor: Option<(usize, usize)>) {
+        if self.preedit.set(text, cursor) {
+            self.invalidate_overlay();
+        }
+    }
+
+    pub(super) fn clear_preedit(&mut self) {
+        if self.preedit.clear() {
             self.invalidate_overlay();
         }
     }
@@ -751,6 +832,15 @@ impl Pane {
                 .iter()
                 .position(|input| matches!(input, Input::PendingPaste))
         {
+            if self.search.is_some() {
+                self.inputs.remove(index);
+                match result {
+                    Ok(text) if !text.is_empty() => self.search_push(&text),
+                    Ok(_) => {}
+                    Err(error) => log::warn!("Clipboard paste failed: {error}"),
+                }
+                return;
+            }
             match result {
                 Ok(text) if !text.is_empty() => self.inputs[index] = Input::Paste(text),
                 Ok(_) => {
@@ -805,6 +895,7 @@ impl Pane {
 
     pub(super) fn key_release(&mut self, event: &KeyEvent) {
         if self.vi.is_none()
+            && self.search.is_none()
             && self
                 .session
                 .processor()
@@ -817,13 +908,281 @@ impl Pane {
         }
     }
 
+    pub(super) fn toggle_search(&mut self) {
+        if self.search.is_some() {
+            self.close_search();
+            return;
+        }
+        if self.vi.is_some() {
+            self.open_vi_search(vi::Direction::Forward);
+            return;
+        }
+        let columns = usize::from(self.session.geometry().pty_size().columns);
+        let screen = self.session.screen();
+        let buffer = screen.active_buffer();
+        let view = screen.view();
+        let viewport = screen.viewport().range();
+        let bar =
+            search::SearchBar::open(self.search_saved.take(), buffer, view, columns, viewport);
+        let target = bar.current_match();
+        self.search = Some(bar);
+        if let Some(pos) = target {
+            self.reveal_search_row(pos.row);
+        }
+        self.set_ime_allowed();
+        self.update_ime_area();
+        self.invalidate_overlay();
+    }
+
+    pub(super) fn open_vi_search(&mut self, direction: vi::Direction) {
+        let Some(vi) = &self.vi else {
+            return;
+        };
+        let bar =
+            search::SearchBar::open_vi(self.search_saved.as_ref(), direction, vi.cursor, vi.buffer);
+        self.search = Some(bar);
+        self.set_ime_allowed();
+        self.update_ime_area();
+        self.invalidate_overlay();
+    }
+
+    pub(super) fn close_search(&mut self) {
+        if let Some(bar) = self.search.take() {
+            if bar.vi_mode {
+                if let Some(origin) = bar.vi_origin
+                    && let Some(vi) = &mut self.vi
+                {
+                    vi.set_cursor(origin);
+                    self.reveal_vi_cursor();
+                    self.update_vi_selection();
+                }
+            } else {
+                let fallback = self.search_saved.take();
+                self.search_saved = Some(bar.into_saved(fallback));
+            }
+            self.clear_preedit();
+            self.set_ime_allowed();
+            self.update_ime_area();
+            self.invalidate_overlay();
+        }
+    }
+
+    fn confirm_vi_search(&mut self) {
+        let Some(bar) = self.search.take() else {
+            return;
+        };
+        let empty = bar.query.is_empty();
+        let invalid = bar.invalid_regex;
+        let matched = bar.current_match();
+        let origin = bar.vi_origin;
+        let fallback = self.search_saved.take();
+        if !invalid {
+            let saved = bar.into_saved(fallback);
+            let target = if empty {
+                let columns = usize::from(self.session.geometry().pty_size().columns);
+                let view = self.session.screen().view();
+                origin.and_then(|pos| saved.find_from(view, columns, pos, false))
+            } else {
+                matched
+            };
+            if let Some(pos) = target
+                && let Some(vi) = &mut self.vi
+            {
+                vi.set_cursor(pos);
+            }
+            self.search_saved = Some(saved);
+        } else {
+            self.search_saved = fallback;
+            if let Some(origin) = origin
+                && let Some(vi) = &mut self.vi
+            {
+                vi.set_cursor(origin);
+            }
+        }
+        self.clear_preedit();
+        self.set_ime_allowed();
+        if self.vi.is_some() {
+            self.reveal_vi_cursor();
+            self.update_vi_selection();
+        }
+        self.update_ime_area();
+        self.invalidate_overlay();
+    }
+
+    pub(super) fn search_key(&mut self, event: &KeyEvent) {
+        let ctrl = self.modifiers.control_key();
+        let alt = self.modifiers.alt_key();
+        let shift = self.modifiers.shift_key();
+        let super_key = self.modifiers.super_key();
+        let vi_mode = self.search.as_ref().is_some_and(|bar| bar.vi_mode);
+
+        let mut recompute = false;
+        let mut step: Option<bool> = None;
+
+        match &event.logical_key {
+            Key::Named(NamedKey::Escape) => {
+                self.close_search();
+                return;
+            }
+            Key::Named(NamedKey::Enter) if !ctrl && !alt && !super_key => {
+                if vi_mode && !shift {
+                    self.confirm_vi_search();
+                    return;
+                }
+                step = Some(!shift);
+            }
+            Key::Named(NamedKey::F3) if !ctrl && !alt && !super_key => {
+                step = Some(!shift);
+            }
+            Key::Named(NamedKey::ArrowDown) if !ctrl && !alt && !super_key => {
+                step = Some(true);
+            }
+            Key::Named(NamedKey::ArrowUp) if !ctrl && !alt && !super_key => {
+                step = Some(false);
+            }
+            Key::Named(NamedKey::Backspace) if !alt && !super_key => {
+                if let Some(bar) = &mut self.search {
+                    recompute = if ctrl {
+                        bar.delete_word()
+                    } else {
+                        bar.backspace()
+                    };
+                }
+            }
+            Key::Character(text) if alt && !ctrl && !super_key => {
+                if text.eq_ignore_ascii_case("c") {
+                    if let Some(bar) = &mut self.search {
+                        bar.toggle_case();
+                        recompute = true;
+                    }
+                } else if text.eq_ignore_ascii_case("r")
+                    && let Some(bar) = &mut self.search
+                {
+                    bar.toggle_regex();
+                    recompute = true;
+                }
+            }
+            Key::Character(text) if ctrl && !alt && !super_key => {
+                if text.eq_ignore_ascii_case("w") {
+                    if let Some(bar) = &mut self.search {
+                        recompute = bar.delete_word();
+                    }
+                } else if text.eq_ignore_ascii_case("u") {
+                    if let Some(bar) = &mut self.search {
+                        recompute = bar.clear();
+                    }
+                } else if text.eq_ignore_ascii_case("g") {
+                    step = Some(!shift);
+                }
+            }
+            Key::Named(NamedKey::Space) if !ctrl && !alt && !super_key => {
+                if let Some(bar) = &mut self.search {
+                    recompute = bar.push(" ");
+                }
+            }
+            Key::Character(text) if !ctrl && !alt && !super_key => {
+                if let Some(bar) = &mut self.search {
+                    recompute = bar.push(text);
+                }
+            }
+            _ => return,
+        }
+
+        if let Some(forward) = step {
+            let target = self.search.as_mut().and_then(|bar| bar.step(forward));
+            if let Some(pos) = target {
+                self.sync_search_target(Some(pos));
+            }
+            self.invalidate_overlay();
+        } else if recompute {
+            self.recompute_search(true);
+        }
+    }
+
+    fn search_push(&mut self, text: &str) {
+        let changed = self.search.as_mut().is_some_and(|bar| bar.push(text));
+        if changed {
+            self.recompute_search(true);
+        }
+    }
+
+    fn recompute_search(&mut self, reveal: bool) {
+        let columns = usize::from(self.session.geometry().pty_size().columns);
+        let (target, origin) = {
+            let screen = self.session.screen();
+            let view = screen.view();
+            let viewport = screen.viewport().range();
+            let Some(bar) = &mut self.search else {
+                return;
+            };
+            bar.recompute(view, columns, viewport);
+            (bar.current_match(), bar.vi_origin)
+        };
+        if reveal {
+            self.sync_search_target(target.or(origin));
+        }
+        self.update_ime_area();
+        self.invalidate_overlay();
+    }
+
+    fn sync_search_target(&mut self, target: Option<CellPosition>) {
+        if let Some(pos) = target {
+            if let Some(vi) = &mut self.vi {
+                vi.set_cursor(pos);
+                self.reveal_vi_cursor();
+                self.update_vi_selection();
+            } else {
+                self.reveal_search_row(pos.row);
+            }
+        }
+    }
+
+    fn refresh_search(&mut self) {
+        if self.search.is_none() {
+            return;
+        }
+        let columns = usize::from(self.session.geometry().pty_size().columns);
+        let screen = self.session.screen();
+        let buffer = screen.active_buffer();
+        let view = screen.view();
+        let viewport = screen.viewport().range();
+        if let Some(bar) = &mut self.search {
+            bar.refresh(buffer, view, columns, viewport);
+            self.dirty = true;
+        }
+    }
+
+    fn reveal_search_row(&mut self, row: usize) {
+        let screen = self.session.screen();
+        if screen.active_buffer() != ScreenBuffer::Primary {
+            return;
+        }
+        let viewport = screen.viewport();
+        let range = viewport.range();
+        if range.contains(&row) {
+            return;
+        }
+        let history = screen.view().history_rows();
+        let rows = viewport.rows();
+        let target_top = row.saturating_sub(rows / 2);
+        let desired_offset = history.saturating_sub(target_top);
+        let current_offset = screen.viewport_offset();
+        let delta = desired_offset as isize - current_offset as isize;
+        if delta != 0 {
+            self.scroll_history(delta);
+        }
+    }
+
     pub(super) fn follow_output(&mut self) {
         let was_scrolled = self.session.screen().viewport_offset() != 0;
         self.session.follow_output();
         self.clear_selection();
         self.restart_blink = true;
-        if self.visible && was_scrolled {
-            self.window.request_redraw();
+        if was_scrolled {
+            self.update_ime_area();
+            if self.visible {
+                self.window.request_redraw();
+            }
         }
     }
 

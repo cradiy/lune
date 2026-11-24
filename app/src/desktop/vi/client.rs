@@ -11,35 +11,36 @@ impl Pane {
             self.leave_vi();
             return;
         }
+        if self.search.is_some() {
+            self.close_search();
+        }
         if let Some(button) = self.pressed.take() {
             self.mouse_event(lune_terminal::MouseEvent::Release(button));
         }
         self.clear_selection();
         let screen = self.session.screen();
-        let mut vi = Mode::new(screen.active_buffer(), screen.viewport(), self.vi_columns());
-        vi.search = self.vi_search.take();
+        let vi = Mode::new(screen.active_buffer(), screen.viewport(), self.vi_columns());
         self.vi = Some(vi);
         log::debug!("Entered Vi mode");
         self.set_ime_allowed();
-        self.set_preedit(String::new());
+        self.clear_preedit();
         self.redraw_vi();
     }
 
     pub(in crate::desktop) fn leave_vi(&mut self) {
-        self.vi_search = self.vi.take().and_then(|vi| vi.search);
+        if self.search.is_some() {
+            self.close_search();
+        }
+        self.vi = None;
         log::debug!("Left Vi mode");
         self.set_ime_allowed();
-        self.set_preedit(String::new());
+        self.clear_preedit();
         self.follow_output();
         self.redraw_vi();
     }
 
     pub(in crate::desktop) fn vi_key(&mut self, event: &KeyEvent, copy_pending: &mut bool) {
         let vi = self.vi.as_ref().unwrap();
-        if vi.prompt.is_some() {
-            self.vi_search_key(event);
-            return;
-        }
         let command = match shortcuts::vi_binding(event, self.modifiers, vi.buffer) {
             Some(binding) => match binding.action(event.repeat) {
                 Some(command) => Some(command),
@@ -99,14 +100,17 @@ impl Pane {
                 0
             }
             Command::Search(direction) => {
-                vi.start_search(direction);
-                self.set_ime_allowed();
-                self.update_ime_area();
-                self.redraw_vi();
+                self.open_vi_search(direction);
                 return;
             }
             Command::RepeatSearch(reverse) => {
-                vi.repeat_search(viewport.source(), columns, reverse);
+                let cursor = vi.cursor;
+                if let Some(saved) = &self.search_saved
+                    && let Some(found) =
+                        saved.find_from(viewport.source(), columns, cursor, reverse)
+                {
+                    self.vi.as_mut().unwrap().set_cursor(found);
+                }
                 0
             }
             Command::TopPrefix | Command::InnerOrExit | Command::AroundOrExit => unreachable!(),
@@ -116,41 +120,6 @@ impl Pane {
         }
         self.reveal_vi_cursor();
         self.update_vi_selection();
-        self.redraw_vi();
-    }
-
-    fn vi_search_key(&mut self, event: &KeyEvent) {
-        let columns = self.vi_columns();
-        let vi = self.vi.as_mut().unwrap();
-        if matches!(
-            event.logical_key,
-            Key::Named(NamedKey::Enter | NamedKey::Escape)
-        ) {
-            if matches!(event.logical_key, Key::Named(NamedKey::Enter)) {
-                vi.confirm_search(self.session.screen().view(), columns);
-            } else {
-                vi.prompt = None;
-            }
-            self.set_ime_allowed();
-            self.set_preedit(String::new());
-            self.reveal_vi_cursor();
-            self.update_vi_selection();
-        } else {
-            let prompt = vi.prompt.as_mut().unwrap();
-            match &event.logical_key {
-                Key::Named(NamedKey::Backspace) => prompt.backspace(),
-                _ if self.modifiers.control_key()
-                    || self.modifiers.alt_key()
-                    || self.modifiers.super_key() =>
-                {
-                    return;
-                }
-                Key::Named(NamedKey::Space) => prompt.push(" "),
-                Key::Character(text) => prompt.push(text),
-                _ => return,
-            }
-            self.update_ime_area();
-        }
         self.redraw_vi();
     }
 
@@ -208,7 +177,7 @@ impl Pane {
         }
     }
 
-    fn reveal_vi_cursor(&mut self) {
+    pub(in crate::desktop) fn reveal_vi_cursor(&mut self) {
         let cursor = self.vi.as_ref().unwrap().cursor;
         let rows = self.session.screen().viewport().range();
         if cursor.row < rows.start {
@@ -220,7 +189,7 @@ impl Pane {
         }
     }
 
-    fn update_vi_selection(&mut self) {
+    pub(in crate::desktop) fn update_vi_selection(&mut self) {
         let view = self.session.screen().view();
         let range = self.vi.as_ref().unwrap().selection(view);
         match (&mut self.selection, range) {

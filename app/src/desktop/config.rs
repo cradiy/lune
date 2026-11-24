@@ -13,6 +13,8 @@ pub(super) mod watch;
 
 pub(super) const MIN_FONT_SIZE: f32 = 8.0;
 pub(super) const MAX_FONT_SIZE: f32 = 32.0;
+pub(super) const MIN_UNFOCUSED_SPLIT_OPACITY: f32 = 0.15;
+pub(super) const DEFAULT_UNFOCUSED_SPLIT_OPACITY: f32 = 0.75;
 pub(super) const MAX_WINDOW_PADDING: u32 = 64;
 pub(super) const DEFAULT_SCROLLBACK_LINES: usize = 10_000;
 pub(super) const MAX_SCROLLBACK_LINES: usize = 1_000_000;
@@ -81,12 +83,14 @@ pub(super) struct Config {
     pub(super) font_ligatures: bool,
     pub(super) theme: Preference,
     pub(super) background_opacity: f32,
+    pub(super) unfocused_split_opacity: f32,
     pub(super) window_padding: u32,
     pub(super) scrollback_lines: usize,
     pub(super) cursor_style: CursorShape,
     pub(super) cursor_blink: bool,
     pub(super) cursor_animation: bool,
     pub(super) shell: Option<Vec<OsString>>,
+    pub(super) shell_integration: bool,
     pub(super) confirm_close: bool,
     pub(super) clipboard_write: ClipboardPolicy,
     pub(super) clipboard_read: ClipboardPolicy,
@@ -102,12 +106,14 @@ impl Default for Config {
             font_ligatures: true,
             theme: Preference::System,
             background_opacity: 1.0,
+            unfocused_split_opacity: DEFAULT_UNFOCUSED_SPLIT_OPACITY,
             window_padding: 0,
             scrollback_lines: DEFAULT_SCROLLBACK_LINES,
             cursor_style: CursorShape::Block,
             cursor_blink: true,
             cursor_animation: true,
             shell: None,
+            shell_integration: true,
             confirm_close: true,
             clipboard_write: ClipboardPolicy::Allow,
             clipboard_read: ClipboardPolicy::Deny,
@@ -241,6 +247,15 @@ impl Config {
                     .filter(|value| value.is_finite() && (0.0..=1.0).contains(value))
                     .ok_or("background-opacity must be between 0.0 and 1.0")?;
             }
+            "unfocused-split-opacity" => {
+                self.unfocused_split_opacity = value
+                    .parse::<f32>()
+                    .ok()
+                    .filter(|value| {
+                        value.is_finite() && (MIN_UNFOCUSED_SPLIT_OPACITY..=1.0).contains(value)
+                    })
+                    .ok_or("unfocused-split-opacity must be between 0.15 and 1.0")?;
+            }
             "window-padding" => {
                 self.window_padding = value
                     .parse::<u32>()
@@ -270,6 +285,11 @@ impl Config {
             }
             "shell" => {
                 self.shell = Some(parse_command_words(value)?);
+            }
+            "shell-integration" => {
+                self.shell_integration = value
+                    .parse()
+                    .map_err(|_| "shell-integration must be true or false")?;
             }
             "confirm-close" => {
                 self.confirm_close = value
@@ -435,11 +455,13 @@ mod tests {
             "lune.conf",
             "# Font settings\r\nfont-family = Fixture Mono\r\nfont-size=19.5\r\n\
              background-opacity = 0.85\r\nbackground-opacity = 1.5\r\nbackground-opacity = NaN\r\n\
+             unfocused-split-opacity = 0.6\r\nunfocused-split-opacity = 0.05\r\n\
              window-padding = 12\r\nwindow-padding = 999\r\n\
              scrollback-lines = 50000\r\nscrollback-lines = -1\r\n\
              cursor-style = bar\r\ncursor-style = triangle\r\n\
              cursor-blink = false\r\ncursor-animation = false\r\n\
              shell = /usr/bin/zsh -l\r\nshell = \"unterminated\r\n\
+             shell-integration = false\r\nshell-integration = maybe\r\n\
              confirm-close = false\r\nconfirm-close = maybe\r\n\
              keybind = alt+v=split_right\r\nkeybind = bad\r\n\
              clipboard-write = deny\r\nclipboard-read = allow\r\nclipboard-read = invalid\r\n\
@@ -451,6 +473,7 @@ mod tests {
         assert_eq!(config.font_family.as_deref(), Some("Fixture Mono"));
         assert_eq!(config.font_size_points, 19.5);
         assert_eq!(config.background_opacity, 0.85);
+        assert_eq!(config.unfocused_split_opacity, 0.6);
         assert_eq!(config.window_padding, 12);
         assert_eq!(config.scrollback_lines, 50_000);
         assert_eq!(config.cursor_style, lune_terminal::CursorShape::Bar);
@@ -466,16 +489,17 @@ mod tests {
                 .as_slice()
             )
         );
+        assert!(!config.shell_integration);
         assert!(!config.confirm_close);
         assert_eq!(config.keybinds.len(), 1);
         assert_eq!(config.clipboard_write, super::ClipboardPolicy::Deny);
         assert_eq!(config.clipboard_read, super::ClipboardPolicy::Allow);
         assert_eq!(config.notifications, super::NotificationPolicy::Always);
-        assert_eq!(loaded.errors.len(), 14);
+        assert_eq!(loaded.errors.len(), 16);
         assert_eq!(
             format_errors(&loaded.errors).as_deref(),
             Some(
-                " Config error: lune.conf:5: background-opacity must be between 0.0 and 1.0 (+13 more) "
+                " Config error: lune.conf:5: background-opacity must be between 0.0 and 1.0 (+15 more) "
             )
         );
     }
