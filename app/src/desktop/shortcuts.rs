@@ -18,6 +18,7 @@ pub(super) enum Action {
     Scroll(Scroll),
     ToggleVi,
     Search,
+    Hints,
     PreviousPrompt,
     NextPrompt,
     CopyLastOutput,
@@ -303,6 +304,7 @@ const WAYLAND_BINDINGS: &[Binding] = &[
     Binding::new(Action::MoveTabRight, CTRL_SHIFT, Named(NamedKey::PageDown)),
     Binding::new(Action::ToggleVi, CTRL_SHIFT, ShortcutKey::Space),
     Binding::new(Action::Search, CTRL_SHIFT, letter("f")),
+    Binding::new(Action::Hints, CTRL_SHIFT, letter("s")),
     Binding::new(Action::PreviousPrompt, CTRL_SHIFT, Named(NamedKey::ArrowUp))
         .primary_screen()
         .repeating(),
@@ -390,6 +392,7 @@ const VI_BINDINGS: &[Binding<Command>] = &[
     Binding::vi(Command::TopPrefix, symbol("g")),
     Binding::vi(Command::Visual(VisualKind::Cell), symbol("v")),
     Binding::vi(Command::Visual(VisualKind::Line), symbol("V")),
+    Binding::vi_control("v", Command::Visual(VisualKind::Block)),
     Binding::vi(Command::Yank, symbol("y")),
     Binding::vi(Command::InnerOrExit, symbol("i")),
     Binding::vi(Command::AroundOrExit, symbol("a")),
@@ -536,6 +539,7 @@ fn parse_action(name: &str) -> Result<KeybindAction, &'static str> {
         "scroll_page_down" => Action::Scroll(Scroll::PageDown),
         "toggle_vi" => Action::ToggleVi,
         "search" | "find" => Action::Search,
+        "hints" | "quick_select" => Action::Hints,
         "previous_prompt" => Action::PreviousPrompt,
         "next_prompt" => Action::NextPrompt,
         "copy_last_output" => Action::CopyLastOutput,

@@ -14,11 +14,13 @@ use crate::{PixelRect, PresentationFrame, PresentationStyle, PresentedCursor};
 use super::box_drawing;
 use super::confirm;
 use super::font::{Font, FontMetrics};
+use super::hints::HintMode;
 use super::ime::Preedit;
 use super::ligature;
-use super::paint::PaneOverlay;
+use super::paint::{NoticeKind, NoticeView, PaneOverlay};
 use super::scrollbar::ScrollbarView;
 use super::search::SearchBar;
+use super::selection::SelectionKind;
 use super::split::{Axis, Divider};
 use super::tab_bar;
 use super::url::HoveredLink;
@@ -259,6 +261,7 @@ impl TextRenderer {
             preedit,
             vi,
             search,
+            hints,
             zoomed,
             scrollbar,
             dim_alpha,
@@ -286,8 +289,15 @@ impl TextRenderer {
         .into_iter()
         .max_by_key(|&color| luminance(color).abs_diff(luminance(search_highlight)))
         .unwrap();
-        let text_selection =
-            selection.and_then(|range| frame.viewport.source().selection_text(range.clone()).ok());
+        let text_selection = selection
+            .filter(|sel| sel.kind == SelectionKind::Stream)
+            .and_then(|sel| {
+                frame
+                    .viewport
+                    .source()
+                    .selection_text(sel.range.clone())
+                    .ok()
+            });
         let sized_cursor = cursor.and_then(|cursor| {
             let pos = cursor.position;
             frame
@@ -310,7 +320,8 @@ impl TextRenderer {
                 .wrap_end()
                 .unwrap_or(source.cells().len())
                 .min(columns);
-            let selected = text_selection.and_then(|range| range.columns_on_row(first_row + row));
+            let selected = selection
+                .and_then(|sel| sel.columns_on_row(frame.viewport.source(), first_row + row));
             let detected_columns =
                 detected_link.and_then(|url| url.columns_on_row(first_row + row, visible_end));
             let cursor_column = cursor
@@ -597,7 +608,9 @@ impl TextRenderer {
                 }
             }
         }
-        if vi.is_some() {
+        if let Some(hints) = hints {
+            self.hints_overlay(frame, hints);
+        } else if vi.is_some() {
             if search.is_none() {
                 self.mode_badge(frame.palette, "VI");
             }
@@ -706,6 +719,132 @@ impl TextRenderer {
         }
     }
 
+    fn hints_overlay(&mut self, frame: &PresentationFrame<'_>, hints: &HintMode) {
+        let visible = frame.viewport.range();
+        let columns = usize::from(frame.geometry.pty_size().columns);
+        let bg = frame.palette.color(PaletteEntry::Background);
+        let fg = frame.palette.color(PaletteEntry::Foreground);
+        let accent = frame.palette.color(PaletteEntry::Indexed(3));
+        let badge_fg = [
+            bg,
+            fg,
+            frame.palette.color(PaletteEntry::Indexed(0)),
+            frame.palette.color(PaletteEntry::Indexed(15)),
+        ]
+        .into_iter()
+        .max_by_key(|&color| luminance(color).abs_diff(luminance(accent)))
+        .unwrap();
+        let cell_h = self.metrics.cell.height.get();
+        let cell_w = self.metrics.cell.width.get();
+        let pad_x = (cell_w / 3).max(3);
+        let radius = (cell_h / 5).clamp(3, 6);
+        let underline_h = ((self.metrics.size / 14.0).round().max(1.0) as u32).min(cell_h);
+        let underline_y = (self.metrics.baseline.max(0) as u32 + underline_h)
+            .min(cell_h.saturating_sub(underline_h));
+
+        for hint in hints.active_hints() {
+            // Subtle span underline + tint across every visible row of the hint.
+            let first = hint.range.start.row.max(visible.start);
+            let last = hint.range.end.row.min(visible.end.saturating_sub(1));
+            for abs_row in first..=last {
+                if let Some(span) = hint.columns_on_row(abs_row, columns)
+                    && let Some(rect) = frame.geometry.row_rect(abs_row - visible.start, span)
+                {
+                    self.rect(rect, accent, 0.16);
+                    self.rect(horizontal(rect, underline_y, underline_h), accent, 0.75);
+                }
+            }
+
+            // High-contrast label pill anchored at the start of the hint span.
+            if !visible.contains(&hint.range.start.row) {
+                continue;
+            }
+            let local_row = hint.range.start.row - visible.start;
+            let Some(anchor) = frame.geometry.row_rect(
+                local_row,
+                hint.range.start.column..hint.range.start.column + 1,
+            ) else {
+                continue;
+            };
+            let display_label = hint.label.to_ascii_uppercase();
+            let text_w = self.font.measure_text(self.metrics, &display_label);
+            let pill_w = text_w.saturating_add(pad_x * 2).min(self.area.width.get());
+            let Some(width) = NonZeroU32::new(pill_w) else {
+                continue;
+            };
+            let x = anchor
+                .origin
+                .x
+                .min(self.area.width.get().saturating_sub(pill_w));
+            let pill = PixelRect {
+                origin: PixelPosition {
+                    x,
+                    y: anchor.origin.y,
+                },
+                size: PixelSize {
+                    width,
+                    height: self.metrics.cell.height,
+                },
+            };
+            self.rounded_rect(pill, radius, 0, accent, 0.96);
+
+            let typed_len = hints.typed.len().min(display_label.len());
+            let mut text_x = pill.origin.x + pad_x;
+            if typed_len > 0 {
+                let prefix = &display_label[..typed_len];
+                let pw = self.font.measure_text(self.metrics, prefix);
+                if let Some(w) = NonZeroU32::new(pw.min(ATLAS_SIDE as u32)) {
+                    self.glyph(
+                        PixelRect {
+                            origin: PixelPosition {
+                                x: text_x,
+                                y: pill.origin.y,
+                            },
+                            size: PixelSize {
+                                width: w,
+                                height: self.metrics.cell.height,
+                            },
+                        },
+                        prefix,
+                        LABEL_CACHE,
+                        mix_color(accent, badge_fg, 120),
+                        1.0,
+                    );
+                }
+                text_x = text_x.saturating_add(pw);
+            }
+            let rest = &display_label[typed_len..];
+            if !rest.is_empty() {
+                let rw = self.font.measure_text(self.metrics, rest);
+                if let Some(w) = NonZeroU32::new(rw.min(ATLAS_SIDE as u32)) {
+                    self.glyph(
+                        PixelRect {
+                            origin: PixelPosition {
+                                x: text_x,
+                                y: pill.origin.y,
+                            },
+                            size: PixelSize {
+                                width: w,
+                                height: self.metrics.cell.height,
+                            },
+                        },
+                        rest,
+                        LABEL_CACHE,
+                        badge_fg,
+                        1.0,
+                    );
+                }
+            }
+        }
+
+        if hints.typed.is_empty() {
+            self.mode_badge(frame.palette, "HINTS");
+        } else {
+            let label = format!("HINTS · {}", hints.typed.to_ascii_uppercase());
+            self.mode_badge(frame.palette, &label);
+        }
+    }
+
     fn mode_badge(&mut self, palette: &lune_terminal::Palette, label: &str) {
         let cell_h = self.metrics.cell.height.get();
         let cell_w = self.metrics.cell.width.get();
@@ -740,8 +879,7 @@ impl TextRenderer {
         let fill = mix_color(bg, fg, 22);
         let border = mix_color(bg, accent, 140);
         let radius = (box_h / 4).clamp(4, 9);
-        self.rounded_rect(rect, radius, 0, fill, 0.94);
-        self.rounded_rect(rect, radius, 1, border, 0.9);
+        self.floating_card(rect, radius, bg, fill, border, 0.94);
         if let Some(label_w) = NonZeroU32::new(text_w.min(ATLAS_SIDE as u32)) {
             self.glyph(
                 PixelRect {
@@ -811,8 +949,7 @@ impl TextRenderer {
             mix_color(bg, fg, 95)
         };
         let radius = (box_h / 4).clamp(4, 10);
-        self.rounded_rect(rect, radius, 0, fill, 0.96);
-        self.rounded_rect(rect, radius, 1, border, 0.95);
+        self.floating_card(rect, radius, bg, fill, border, 0.96);
 
         let text_y = rect.origin.y + pad_y;
         let mut inner_left = rect.origin.x + pad_x;
@@ -1039,7 +1176,7 @@ impl TextRenderer {
         palette: &lune_terminal::Palette,
         dividers: &[Divider],
         focused_rect: Option<PixelRect>,
-        notice: Option<&str>,
+        notice: Option<NoticeView<'_>>,
     ) -> Range<u32> {
         let start = self.instances.len() as u32;
         self.area = area;
@@ -1057,18 +1194,8 @@ impl TextRenderer {
                 }
             }
         }
-        if let Some(notice) = notice
-            && let Some(height) =
-                NonZeroU32::new(self.metrics.cell.height.get().min(area.height.get()))
-        {
-            let rect = PixelRect {
-                origin: PixelPosition { x: 0, y: 0 },
-                size: PixelSize {
-                    width: area.width,
-                    height,
-                },
-            };
-            self.notice_banner(rect, notice, palette);
+        if let Some(notice) = notice {
+            self.notice_toast(notice, palette);
         }
         start..self.instances.len() as u32
     }
@@ -1086,9 +1213,9 @@ impl TextRenderer {
         let bg = palette.color(PaletteEntry::Background);
         let fg = palette.color(PaletteEntry::Foreground);
         let backdrop_alpha = if background_opacity < 1.0 {
-            (background_opacity * 0.94).max(0.84)
+            (background_opacity * 0.68).max(0.58)
         } else {
-            0.94
+            0.58
         };
         self.rect(
             PixelRect {
@@ -1098,28 +1225,81 @@ impl TextRenderer {
             bg,
             backdrop_alpha,
         );
-        let Some(layout) = confirm::Layout::compute(area, self.metrics, scale) else {
+        let Some(layout) =
+            confirm::Layout::compute(area, self.metrics, scale, dialog.message_columns())
+        else {
             return start..self.instances.len() as u32;
         };
-        self.centered_text(layout.message_y, &dialog.message, fg);
 
         let green = palette.color(PaletteEntry::Indexed(2));
         let red = palette.color(PaletteEntry::Indexed(1));
         let amber = palette.color(PaletteEntry::Indexed(3));
-        let muted_border = mix_color(bg, fg, 115);
+        let accent = if dialog.target.is_paste() { amber } else { red };
+        let card_fill = mix_color(bg, fg, 22);
+        let card_border = mix_color(bg, accent, 150);
 
+        self.floating_card(
+            layout.card,
+            layout.card_radius,
+            bg,
+            card_fill,
+            card_border,
+            0.97,
+        );
+        self.rounded_rect(
+            layout.indicator,
+            layout.indicator.size.width.get() / 2,
+            0,
+            accent,
+            0.95,
+        );
+
+        let title = dialog.target.title();
+        let title_w = self
+            .font
+            .measure_text(self.metrics, title)
+            .min(layout.message_max_w)
+            .min(ATLAS_SIDE as u32);
+        if let Some(width) = NonZeroU32::new(title_w) {
+            self.glyph(
+                PixelRect {
+                    origin: layout.title_origin,
+                    size: PixelSize {
+                        width,
+                        height: self.metrics.cell.height,
+                    },
+                },
+                title,
+                LABEL_CACHE,
+                accent,
+                1.0,
+            );
+        }
+
+        self.clamped_text(
+            layout.message_origin,
+            layout.message_max_w,
+            &dialog.message,
+            fg,
+        );
+
+        let muted_border = mix_color(bg, fg, 90);
         for (button, rect, accel, rest, accel_color) in [
             (confirm::Button::Yes, layout.yes, "Y", "es", green),
             (confirm::Button::No, layout.no, "N", "o", red),
         ] {
             let active = dialog.selected == button || dialog.hovered == Some(button);
-            let fill = mix_color(bg, fg, if active { 18 } else { 8 });
-            let (border_color, border_alpha) = if active {
-                (amber, 0.95)
+            let fill = if active {
+                mix_color(card_fill, accent, 38)
             } else {
-                (muted_border, 0.8)
+                mix_color(bg, fg, 12)
             };
-            self.rounded_rect(rect, layout.radius, 0, fill, 0.55);
+            let (border_color, border_alpha) = if active {
+                (accent, 0.95)
+            } else {
+                (muted_border, 0.78)
+            };
+            self.rounded_rect(rect, layout.radius, 0, fill, 0.92);
             self.rounded_rect(
                 rect,
                 layout.radius,
@@ -1132,48 +1312,80 @@ impl TextRenderer {
         start..self.instances.len() as u32
     }
 
-    fn centered_text(&mut self, y: u32, text: &str, color: Rgb) {
-        let cell_h = self.metrics.cell.height;
-        let max_chunk_w = (ATLAS_SIDE as u32).saturating_sub(64);
-        let mut chunks: Vec<(&str, u32)> = Vec::new();
-        let mut start = 0;
-        while start < text.len() {
-            let mut end = start;
-            let mut width = 0;
-            for (offset, ch) in text[start..].char_indices() {
-                let next_end = start + offset + ch.len_utf8();
-                let next_w = self.font.measure_text(self.metrics, &text[start..next_end]);
-                if next_w > max_chunk_w && end > start {
-                    break;
-                }
-                end = next_end;
-                width = next_w;
-            }
-            if end == start {
+    fn floating_card(
+        &mut self,
+        rect: PixelRect,
+        radius: u32,
+        shadow: Rgb,
+        fill: Rgb,
+        border: Rgb,
+        alpha: f32,
+    ) {
+        if let (Some(w), Some(h)) = (
+            NonZeroU32::new(rect.size.width.get().saturating_add(2)),
+            NonZeroU32::new(rect.size.height.get().saturating_add(2)),
+        ) {
+            let halo = PixelRect {
+                origin: PixelPosition {
+                    x: rect.origin.x.saturating_sub(1),
+                    y: rect.origin.y.saturating_sub(1),
+                },
+                size: PixelSize {
+                    width: w,
+                    height: h,
+                },
+            };
+            self.rounded_rect(halo, radius.saturating_add(1), 0, shadow, 0.45);
+        }
+        self.rounded_rect(rect, radius, 0, fill, alpha);
+        self.rounded_rect(rect, radius, 1, border, 0.95);
+    }
+
+    fn truncate_to_width<'a>(
+        &mut self,
+        text: &'a str,
+        max_w: u32,
+    ) -> (std::borrow::Cow<'a, str>, u32) {
+        let measured = self.font.measure_text(self.metrics, text);
+        if measured <= max_w {
+            return (std::borrow::Cow::Borrowed(text), measured);
+        }
+        let ellipsis = "...";
+        let ellipsis_w = self.font.measure_text(self.metrics, ellipsis);
+        let budget = max_w.saturating_sub(ellipsis_w);
+        let mut end = 0;
+        for (idx, ch) in text.char_indices() {
+            let next = idx + ch.len_utf8();
+            if self.font.measure_text(self.metrics, &text[..next]) > budget {
                 break;
             }
-            chunks.push((&text[start..end], width));
-            start = end;
+            end = next;
         }
-        let total_w: u32 = chunks.iter().map(|(_, w)| *w).sum();
-        let mut x = self.area.width.get().saturating_sub(total_w) / 2;
-        for (chunk, chunk_w) in chunks {
-            let available = self.area.width.get().saturating_sub(x);
-            let draw_w = chunk_w.min(available).min(ATLAS_SIDE as u32);
-            if let Some(width) = NonZeroU32::new(draw_w) {
-                let rect = PixelRect {
-                    origin: PixelPosition { x, y },
+        let truncated = format!("{}{ellipsis}", text[..end].trim_end());
+        let width = self.font.measure_text(self.metrics, &truncated).min(max_w);
+        (std::borrow::Cow::Owned(truncated), width)
+    }
+
+    fn clamped_text(&mut self, origin: PixelPosition, max_w: u32, text: &str, color: Rgb) {
+        let limit = max_w.min(ATLAS_SIDE as u32);
+        if limit == 0 {
+            return;
+        }
+        let (display, text_w) = self.truncate_to_width(text, limit);
+        if let Some(width) = NonZeroU32::new(text_w.min(limit)) {
+            self.glyph(
+                PixelRect {
+                    origin,
                     size: PixelSize {
                         width,
-                        height: cell_h,
+                        height: self.metrics.cell.height,
                     },
-                };
-                self.glyph(rect, chunk, LABEL_CACHE, color, 1.0);
-            }
-            x = x.saturating_add(chunk_w);
-            if x >= self.area.width.get() {
-                break;
-            }
+                },
+                &display,
+                LABEL_CACHE,
+                color,
+                1.0,
+            );
         }
     }
 
@@ -1498,41 +1710,96 @@ impl TextRenderer {
         self.glyph(rect, text, TAB_LABEL_CACHE, color, 1.0);
     }
 
-    fn notice_banner(&mut self, mut rect: PixelRect, text: &str, palette: &lune_terminal::Palette) {
-        let accent = palette.color(PaletteEntry::Indexed(1));
-        let background = palette.color(PaletteEntry::Background);
-        let foreground = palette.color(PaletteEntry::Foreground);
-        let fill = mix_color(background, accent, 200);
-        let text_color = [
-            background,
-            foreground,
-            palette.color(PaletteEntry::Indexed(0)),
-            palette.color(PaletteEntry::Indexed(15)),
-        ]
-        .into_iter()
-        .max_by_key(|&color| luminance(color).abs_diff(luminance(fill)))
-        .unwrap();
-        self.rect(rect, fill, 0.96);
-        let stripe_width = NonZeroU32::new(3.min(rect.size.width.get())).unwrap();
-        self.rect(
-            PixelRect {
-                origin: rect.origin,
-                size: PixelSize {
-                    width: stripe_width,
-                    height: rect.size.height,
-                },
-            },
-            accent,
-            1.0,
-        );
-        let width = self
-            .font
-            .measure_text(self.metrics, text)
-            .min(rect.size.width.get())
+    fn notice_toast(&mut self, notice: NoticeView<'_>, palette: &lune_terminal::Palette) {
+        let text = notice.text.trim();
+        if text.is_empty() {
+            return;
+        }
+        let cell_h = self.metrics.cell.height.get();
+        let cell_w = self.metrics.cell.width.get();
+        let pad_x = cell_w.max(10);
+        let pad_y = (cell_h / 4).max(4);
+        let margin = (cell_h / 2).max(10);
+        let dot_w = (cell_w / 3).clamp(3, 5);
+        let dot_gap = (cell_w * 2 / 3).max(6);
+        let box_h = cell_h.saturating_add(pad_y * 2);
+        if self.area.height.get() < box_h + margin || self.area.width.get() < pad_x * 2 + dot_w {
+            return;
+        }
+
+        let max_box_w = self
+            .area
+            .width
+            .get()
+            .saturating_sub(margin * 2)
             .min(ATLAS_SIDE as u32);
-        if let Some(width) = NonZeroU32::new(width) {
-            rect.size.width = width;
-            self.glyph(rect, text, LABEL_CACHE, text_color, 1.0);
+        let chrome_w = pad_x * 2 + dot_w + dot_gap;
+        let max_text_w = max_box_w.saturating_sub(chrome_w);
+        if max_text_w == 0 {
+            return;
+        }
+
+        let (display, text_w) = self.truncate_to_width(text, max_text_w);
+
+        let box_w = text_w.saturating_add(chrome_w).min(max_box_w);
+        let Some(width) = NonZeroU32::new(box_w) else {
+            return;
+        };
+        let Some(height) = NonZeroU32::new(box_h) else {
+            return;
+        };
+        let rect = PixelRect {
+            origin: PixelPosition {
+                x: self.area.width.get().saturating_sub(box_w + margin),
+                y: margin,
+            },
+            size: PixelSize { width, height },
+        };
+
+        let bg = palette.color(PaletteEntry::Background);
+        let fg = palette.color(PaletteEntry::Foreground);
+        let accent = match notice.kind {
+            NoticeKind::Success => palette.color(PaletteEntry::Indexed(2)),
+            NoticeKind::Warning => palette.color(PaletteEntry::Indexed(3)),
+            NoticeKind::Error => palette.color(PaletteEntry::Indexed(1)),
+        };
+        let fill = mix_color(bg, fg, 22);
+        let border = mix_color(bg, accent, 155);
+        let radius = (box_h / 4).clamp(6, 10);
+        self.floating_card(rect, radius, bg, fill, border, 0.96);
+
+        let indicator_h = (cell_h * 2 / 3).max(6).min(cell_h);
+        if let (Some(iw), Some(ih)) = (NonZeroU32::new(dot_w), NonZeroU32::new(indicator_h)) {
+            let indicator = PixelRect {
+                origin: PixelPosition {
+                    x: rect.origin.x + pad_x,
+                    y: rect.origin.y + (box_h - indicator_h) / 2,
+                },
+                size: PixelSize {
+                    width: iw,
+                    height: ih,
+                },
+            };
+            self.rounded_rect(indicator, dot_w / 2, 0, accent, 0.95);
+        }
+
+        if let Some(tw) = NonZeroU32::new(text_w.min(ATLAS_SIDE as u32)) {
+            self.glyph(
+                PixelRect {
+                    origin: PixelPosition {
+                        x: rect.origin.x + pad_x + dot_w + dot_gap,
+                        y: rect.origin.y + pad_y,
+                    },
+                    size: PixelSize {
+                        width: tw,
+                        height: self.metrics.cell.height,
+                    },
+                },
+                &display,
+                LABEL_CACHE,
+                fg,
+                1.0,
+            );
         }
     }
 

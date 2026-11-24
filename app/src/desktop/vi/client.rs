@@ -14,6 +14,9 @@ impl Pane {
         if self.search.is_some() {
             self.close_search();
         }
+        if self.hints.is_some() {
+            self.close_hints();
+        }
         if let Some(button) = self.pressed.take() {
             self.mouse_event(lune_terminal::MouseEvent::Release(button));
         }
@@ -31,6 +34,9 @@ impl Pane {
         if self.search.is_some() {
             self.close_search();
         }
+        if self.hints.is_some() {
+            self.close_hints();
+        }
         self.vi = None;
         log::debug!("Left Vi mode");
         self.set_ime_allowed();
@@ -39,13 +45,14 @@ impl Pane {
         self.redraw_vi();
     }
 
-    pub(in crate::desktop) fn vi_key(&mut self, event: &KeyEvent, copy_pending: &mut bool) {
+    pub(in crate::desktop) fn vi_key(
+        &mut self,
+        event: &KeyEvent,
+        copy_pending: &mut bool,
+    ) -> Option<String> {
         let vi = self.vi.as_ref().unwrap();
         let command = match shortcuts::vi_binding(event, self.modifiers, vi.buffer) {
-            Some(binding) => match binding.action(event.repeat) {
-                Some(command) => Some(command),
-                None => return,
-            },
+            Some(binding) => Some(binding.action(event.repeat)?),
             None if matches!(
                 event.logical_key,
                 Key::Named(
@@ -58,22 +65,21 @@ impl Pane {
                 )
             ) =>
             {
-                return;
+                return None;
             }
             None => None,
         };
         let columns = self.vi_columns();
         let viewport = self.session.screen().viewport();
         let vi = self.vi.as_mut().unwrap();
-        let Some(command) = vi.resolve(command) else {
-            return;
-        };
+        let command = vi.resolve(command)?;
+        let mut copied_notice = None;
         let steps = match command {
             Command::Move(motion) => vi.move_cursor(motion, viewport, columns),
             Command::Scroll(steps) => {
                 self.scroll_history(steps);
                 self.redraw_vi();
-                return;
+                return None;
             }
             Command::Visual(kind) => {
                 vi.toggle_visual(kind);
@@ -85,15 +91,15 @@ impl Pane {
             }
             Command::Yank => {
                 if *copy_pending || self.selection.is_none() {
-                    return;
+                    return None;
                 }
-                self.copy(copy_pending);
+                copied_notice = self.copy(copy_pending);
                 self.vi.as_mut().unwrap().clear_visual();
                 0
             }
             Command::Exit => {
                 self.leave_vi();
-                return;
+                return None;
             }
             Command::Cancel => {
                 vi.clear_visual();
@@ -101,7 +107,7 @@ impl Pane {
             }
             Command::Search(direction) => {
                 self.open_vi_search(direction);
-                return;
+                return None;
             }
             Command::RepeatSearch(reverse) => {
                 let cursor = vi.cursor;
@@ -121,6 +127,7 @@ impl Pane {
         self.reveal_vi_cursor();
         self.update_vi_selection();
         self.redraw_vi();
+        copied_notice
     }
 
     pub(in crate::desktop) fn refresh_vi(&mut self) {
@@ -193,8 +200,10 @@ impl Pane {
         let view = self.session.screen().view();
         let range = self.vi.as_ref().unwrap().selection(view);
         match (&mut self.selection, range) {
-            (Some(selection), Some(range)) => selection.set_range(view, range),
-            (selection, Some(range)) => *selection = Some(Selection::new(view, range, None)),
+            (Some(selection), Some((range, kind))) => selection.set_range(view, range, kind),
+            (selection, Some((range, kind))) => {
+                *selection = Some(Selection::new(view, range, kind, None));
+            }
             (selection, None) => *selection = None,
         }
     }

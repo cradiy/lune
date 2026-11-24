@@ -4,7 +4,7 @@ use std::ops::Range;
 
 use lune_terminal::{CellPosition, Row, ScreenBuffer, ScreenView, Viewport};
 
-use super::selection::{cell_range, line_span};
+use super::selection::{SelectionKind, block_range, cell_range, line_span};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Command {
@@ -52,6 +52,7 @@ pub(super) enum Direction {
 pub(super) enum VisualKind {
     Cell,
     Line,
+    Block,
 }
 
 #[derive(Clone, Copy)]
@@ -143,15 +144,25 @@ impl Mode {
         };
     }
 
-    pub(super) fn selection(&self, view: ScreenView<'_>) -> Option<Range<CellPosition>> {
+    pub(super) fn selection(
+        &self,
+        view: ScreenView<'_>,
+    ) -> Option<(Range<CellPosition>, SelectionKind)> {
         let visual = self.visual.as_ref()?;
         match visual.kind {
-            VisualKind::Cell => cell_range(view, visual.anchor, self.cursor),
+            VisualKind::Cell => Some((
+                cell_range(view, visual.anchor, self.cursor)?,
+                SelectionKind::Stream,
+            )),
             VisualKind::Line => {
                 let start = line_span(view, visual.anchor.row.min(self.cursor.row))?;
                 let end = line_span(view, visual.anchor.row.max(self.cursor.row))?;
-                Some(start.start..end.end)
+                Some((start.start..end.end, SelectionKind::Stream))
             }
+            VisualKind::Block => Some((
+                block_range(view, visual.anchor, self.cursor)?,
+                SelectionKind::Block,
+            )),
         }
     }
 
@@ -501,7 +512,7 @@ mod tests {
         vi.toggle_visual(VisualKind::Cell);
         vi.select_word(view, 8, false);
         assert_eq!(
-            view.selection_text(vi.selection(view).unwrap())
+            view.selection_text(vi.selection(view).unwrap().0)
                 .unwrap()
                 .to_string(),
             "abcdef界ij"

@@ -2,14 +2,22 @@ use std::collections::VecDeque;
 use std::ops::Range;
 use std::time::{Duration, Instant};
 
-use lune_terminal::{CellPosition, Row, RowRevision, ScreenView};
+use lune_terminal::{CellPosition, CellText, Row, RowRevision, ScreenView};
 
 const MULTI_CLICK_INTERVAL: Duration = Duration::from_millis(500);
 const EDGE_SCROLL_DELAY: Duration = Duration::from_millis(120);
 const EDGE_SCROLL_INTERVAL: Duration = Duration::from_millis(40);
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum SelectionKind {
+    #[default]
+    Stream,
+    Block,
+}
+
 pub(super) struct Selection {
     pub(super) range: Range<CellPosition>,
+    pub(super) kind: SelectionKind,
     pub(super) anchor: Option<Anchor>,
     rows: VecDeque<RowRevision>,
     discarded_rows: u64,
@@ -19,18 +27,26 @@ impl Selection {
     pub(super) fn new(
         view: ScreenView<'_>,
         range: Range<CellPosition>,
+        kind: SelectionKind,
         anchor: Option<Anchor>,
     ) -> Self {
         let rows = row_revisions(view, range.start.row..range.end.row + 1).collect();
         Self {
             range,
+            kind,
             anchor,
             rows,
             discarded_rows: view.discarded_history_rows(),
         }
     }
 
-    pub(super) fn set_range(&mut self, view: ScreenView<'_>, range: Range<CellPosition>) {
+    pub(super) fn set_range(
+        &mut self,
+        view: ScreenView<'_>,
+        range: Range<CellPosition>,
+        kind: SelectionKind,
+    ) {
+        self.kind = kind;
         let old = self.range.start.row..self.range.end.row + 1;
         let new = range.start.row..range.end.row + 1;
         self.range = range;
@@ -49,6 +65,27 @@ impl Selection {
             }
             self.rows.extend(row_revisions(view, shared.end..new.end));
         }
+    }
+
+    pub(super) fn columns_on_row(&self, view: ScreenView<'_>, row: usize) -> Option<Range<usize>> {
+        match self.kind {
+            SelectionKind::Stream => view
+                .selection_text(self.range.clone())
+                .ok()?
+                .columns_on_row(row),
+            SelectionKind::Block => block_columns_on_row(view, &self.range, row),
+        }
+    }
+
+    pub(super) fn extract_text(&self, view: ScreenView<'_>, linewise: bool) -> Option<String> {
+        let mut text = match self.kind {
+            SelectionKind::Stream => view.selection_text(self.range.clone()).ok()?.to_string(),
+            SelectionKind::Block => extract_block_text(view, &self.range),
+        };
+        if linewise && self.kind == SelectionKind::Stream {
+            text.push('\n');
+        }
+        (!text.is_empty()).then_some(text)
     }
 
     pub(super) fn refresh(&mut self, view: ScreenView<'_>) -> bool {
@@ -95,21 +132,31 @@ pub(super) struct Click {
     position: CellPosition,
     time: Instant,
     shift: bool,
+    block: bool,
     unit: Unit,
 }
 
 impl Click {
-    pub(super) fn new(position: CellPosition, time: Instant, shift: bool) -> Self {
+    pub(super) fn new(position: CellPosition, time: Instant, shift: bool, block: bool) -> Self {
         Self {
             position,
             time,
             shift,
+            block,
             unit: Unit::Cell,
         }
     }
 
-    pub(super) fn next(self, position: CellPosition, time: Instant, shift: bool) -> Option<Self> {
-        (self.position == position
+    pub(super) fn next(
+        self,
+        position: CellPosition,
+        time: Instant,
+        shift: bool,
+        block: bool,
+    ) -> Option<Self> {
+        (!block
+            && !self.block
+            && self.position == position
             && self.shift == shift
             && time.duration_since(self.time) <= MULTI_CLICK_INTERVAL)
             .then_some(Self {
@@ -125,12 +172,20 @@ impl Click {
 
     pub(super) fn drag(&self, view: ScreenView<'_>) -> Drag {
         let position = self.position;
-        let anchor = (self.unit != Unit::Cell && cell_range(view, position, position).is_some())
-            .then(|| self.unit.span(view, position))
-            .flatten();
+        let kind = if self.block {
+            SelectionKind::Block
+        } else {
+            SelectionKind::Stream
+        };
+        let anchor = (kind == SelectionKind::Stream
+            && self.unit != Unit::Cell
+            && cell_range(view, position, position).is_some())
+        .then(|| self.unit.span(view, position))
+        .flatten();
         Anchor {
             position,
             unit: self.unit,
+            kind,
             span: anchor,
         }
         .drag(self.shift || self.unit != Unit::Cell)
@@ -141,6 +196,7 @@ impl Click {
 pub(super) struct Anchor {
     position: CellPosition,
     unit: Unit,
+    pub(super) kind: SelectionKind,
     span: Option<Range<CellPosition>>,
 }
 
@@ -224,6 +280,9 @@ impl Drag {
 
     pub(super) fn range(&self, view: ScreenView<'_>) -> Option<Range<CellPosition>> {
         let focus = self.focus?;
+        if self.anchor.kind == SelectionKind::Block {
+            return block_range(view, self.anchor.position, focus);
+        }
         let Some(anchor) = &self.anchor.span else {
             return cell_range(view, self.anchor.position, focus);
         };
@@ -233,6 +292,87 @@ impl Drag {
         let focus = self.anchor.unit.span(view, focus)?;
         view.selection_bounds(anchor.start.min(focus.start)..anchor.end.max(focus.end))
     }
+}
+
+pub(super) fn block_range(
+    view: ScreenView<'_>,
+    anchor: CellPosition,
+    focus: CellPosition,
+) -> Option<Range<CellPosition>> {
+    if view.rows() == 0 {
+        return None;
+    }
+    let top = anchor.row.min(focus.row).min(view.rows() - 1);
+    let bottom = anchor.row.max(focus.row).min(view.rows() - 1);
+    let left = anchor.column.min(focus.column);
+    let right = anchor.column.max(focus.column).saturating_add(1);
+    let range = CellPosition {
+        row: top,
+        column: left,
+    }..CellPosition {
+        row: bottom,
+        column: right,
+    };
+    (top..=bottom)
+        .any(|row| block_columns_on_row(view, &range, row).is_some())
+        .then_some(range)
+}
+
+pub(super) fn block_columns_on_row(
+    view: ScreenView<'_>,
+    range: &Range<CellPosition>,
+    row_index: usize,
+) -> Option<Range<usize>> {
+    if row_index < range.start.row || row_index > range.end.row {
+        return None;
+    }
+    let row = view.row(row_index)?;
+    let cells = row.cells();
+    let limit = row.wrap_end().unwrap_or(cells.len());
+    if limit == 0 || range.start.column >= limit {
+        return None;
+    }
+    let mut start = range.start.column.min(limit - 1);
+    if cells[start].is_continuation() && start > 0 {
+        start -= 1;
+    }
+    let mut end = range.end.column.min(limit);
+    if end < limit && cells[end].is_continuation() {
+        end += 1;
+    }
+    (start < end).then_some(start..end)
+}
+
+fn extract_block_text(view: ScreenView<'_>, range: &Range<CellPosition>) -> String {
+    let mut out = String::new();
+    for (idx, row_index) in (range.start.row..=range.end.row).enumerate() {
+        if idx > 0 {
+            out.push('\n');
+        }
+        let Some(cols) = block_columns_on_row(view, range, row_index) else {
+            continue;
+        };
+        let Some(row) = view.row(row_index) else {
+            continue;
+        };
+        let cells = row.cells();
+        let trimmed_end = cells[cols.start..cols.end]
+            .iter()
+            .rposition(|cell| !cell.is_erased())
+            .map_or(cols.start, |last| cols.start + last + 1);
+        for unit in row.display_units(cols.start..trimmed_end) {
+            if unit.cell.is_erased() {
+                out.push(' ');
+            } else {
+                match unit.text {
+                    CellText::Scalar(ch) => out.push(ch),
+                    CellText::Extended(cluster) => out.push_str(cluster),
+                    CellText::Continuation => {}
+                }
+            }
+        }
+    }
+    out
 }
 
 impl Unit {
@@ -411,7 +551,7 @@ fn sized_line(view: ScreenView<'_>, position: CellPosition) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Click, MULTI_CLICK_INTERVAL, Selection, cell_range};
+    use super::{Click, MULTI_CLICK_INTERVAL, Selection, SelectionKind, cell_range};
     use lune_terminal::{
         CellPosition, HistoryLimits, MAX_STYLES, Processor, Screen, StyleId, UnicodeWriter,
     };
@@ -449,7 +589,9 @@ mod tests {
                 column: 10,
             };
             let now = std::time::Instant::now();
-            let word = Click::new(left, now, false).next(left, now, false).unwrap();
+            let word = Click::new(left, now, false, false)
+                .next(left, now, false, false)
+                .unwrap();
             let view = screen.view();
             let selected = cell_range(view, left, right).unwrap();
             assert_eq!(cell_range(view, right, left), Some(selected.clone()));
@@ -486,7 +628,7 @@ mod tests {
         };
         let origin = point(1, 1);
         let now = std::time::Instant::now();
-        let single = Click::new(origin, now, false);
+        let single = Click::new(origin, now, false, false);
         let mut drag = single.drag(view);
         assert!(!drag.move_to(origin));
         assert!(drag.range(view).is_none());
@@ -499,27 +641,27 @@ mod tests {
             "界"
         );
 
-        let word = single.next(origin, now, false).unwrap();
+        let word = single.next(origin, now, false, false).unwrap();
         assert_eq!(text(&word, origin).as_deref(), Some("abcdef界ij"));
         assert_eq!(text(&word, point(0, 0)).as_deref(), Some("! abcdef界ij"));
 
-        let line = word.next(origin, now, false).unwrap();
+        let line = word.next(origin, now, false, false).unwrap();
         assert_eq!(text(&line, origin).as_deref(), Some("! abcdef界ij xyz"));
         assert_eq!(
             text(&line, point(2, 1)).as_deref(),
             Some("! abcdef界ij xyz\nend")
         );
         let later = now + MULTI_CLICK_INTERVAL * 2;
-        assert!(line.next(origin, later, false).is_none());
-        let new = Click::new(origin, later, false);
+        assert!(line.next(origin, later, false, false).is_none());
+        let new = Click::new(origin, later, false, false);
         assert_eq!(text(&new, origin), None);
 
         let blank = point(2, 7);
-        assert!(new.next(blank, later, false).is_none());
-        let third = Click::new(blank, later, false)
-            .next(blank, later, false)
+        assert!(new.next(blank, later, false, false).is_none());
+        let third = Click::new(blank, later, false, false)
+            .next(blank, later, false, false)
             .unwrap()
-            .next(blank, later, false)
+            .next(blank, later, false, false)
             .unwrap();
         assert_eq!(text(&third, blank), None);
     }
@@ -541,13 +683,18 @@ mod tests {
             .unwrap();
         let point = |row, column| CellPosition { row, column };
         let view = screen.view();
-        let click = Click::new(point(1, 0), std::time::Instant::now(), false);
+        let click = Click::new(point(1, 0), std::time::Instant::now(), false, false);
         let mut drag = click.drag(view);
         drag.move_to(point(2, 0));
         let original = drag.range(view).unwrap();
-        let mut selection = Selection::new(view, original.clone(), Some(drag.anchor.clone()));
+        let mut selection = Selection::new(
+            view,
+            original.clone(),
+            SelectionKind::Stream,
+            Some(drag.anchor.clone()),
+        );
         for range in [point(0, 0)..point(3, 1), point(4, 0)..point(5, 1), original] {
-            selection.set_range(view, range);
+            selection.set_range(view, range, SelectionKind::Stream);
             assert!(selection.refresh(view));
         }
 
@@ -576,5 +723,34 @@ mod tests {
             .unwrap();
         assert!(!selection.refresh(screen.view()));
         assert!(drag.rebase(1).is_none());
+    }
+
+    #[test]
+    fn rectangular_block_selection_slices_columns_and_wide_cells() {
+        let (palette, _) = super::super::theme::palette(winit::window::Theme::Dark);
+        let mut processor = Processor::new(MAX_STYLES, palette).unwrap();
+        let mut screen = Screen::new(12, 4).unwrap();
+        processor
+            .advance(
+                "01 abc 99\r\n02 中文 88\r\n03 xy\r\n".as_bytes(),
+                &mut screen,
+                &mut UnicodeWriter::default(),
+            )
+            .unwrap();
+        let view = screen.view();
+        let now = std::time::Instant::now();
+        // Drag from bottom-right (row 2, col 5) to top-left (row 0, col 3) with block=true.
+        let click = Click::new(CellPosition { row: 2, column: 5 }, now, false, true);
+        let mut drag = click.drag(view);
+        drag.move_to(CellPosition { row: 0, column: 3 });
+        let range = drag.range(view).unwrap();
+        let selection = Selection::new(view, range, SelectionKind::Block, Some(drag.anchor));
+        assert_eq!(selection.columns_on_row(view, 0), Some(3..6));
+        assert_eq!(selection.columns_on_row(view, 1), Some(3..7));
+        assert_eq!(selection.columns_on_row(view, 2), Some(3..6));
+        assert_eq!(
+            selection.extract_text(view, false).as_deref(),
+            Some("abc\n中文\nxy")
+        );
     }
 }

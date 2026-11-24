@@ -6,6 +6,7 @@ mod confirm;
 mod cursor;
 mod directory;
 mod font;
+mod hints;
 mod ime;
 mod input;
 mod ligature;
@@ -55,7 +56,7 @@ use config::{
 };
 use font::{Font, physical_font_size};
 use notify::Notifier;
-use paint::Painter;
+use paint::{NoticeKind, NoticeView, Painter};
 use readiness::Readiness;
 use shortcuts::{Action, Keymap, Scroll, Zoom};
 use split::{Axis, Direction as SplitDirection, Divider, SplitTree};
@@ -66,12 +67,15 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 pub(super) type PaneId = u32;
 
 const PASTE_TIMEOUT: Duration = Duration::from_secs(2);
-const NOTICE_DURATION: Duration = Duration::from_secs(6);
+const TOAST_SUCCESS_DURATION: Duration = Duration::from_millis(1800);
+const TOAST_WARNING_DURATION: Duration = Duration::from_millis(2500);
+const TOAST_ERROR_DURATION: Duration = Duration::from_secs(6);
 const SPLIT_RESIZE_STEP: f32 = 0.05;
 const MIN_SPLIT_COLUMNS: u16 = 4;
 const MIN_SPLIT_ROWS: u16 = 2;
 
 struct Notice {
+    kind: NoticeKind,
     text: String,
     expires: Instant,
 }
@@ -259,8 +263,13 @@ impl ApplicationHandler<Event> for App {
             Event::PtyReady(token) => client.pty_ready(event_loop, token),
             Event::PtyError(error) => Err(error.into()),
             Event::PasteReady(id, result) => {
-                if let Some(pane) = client.pane_mut(id) {
-                    pane.finish_paste(result);
+                let confirm_paste = client.confirm_paste;
+                let pending_confirm = client
+                    .pane_mut(id)
+                    .and_then(|pane| pane.finish_paste(result, confirm_paste));
+                if let Some(text) = pending_confirm {
+                    let message = confirm::format_paste(&text);
+                    client.open_confirm(confirm::ConfirmTarget::Paste { pane: id, text }, message);
                 }
                 Ok(())
             }
@@ -350,6 +359,8 @@ struct Client {
     shell: Option<Vec<OsString>>,
     shell_integration: bool,
     confirm_close: bool,
+    confirm_paste: bool,
+    copy_on_select: bool,
     confirm: Option<confirm::Dialog>,
 }
 
@@ -456,8 +467,9 @@ impl Client {
             notifications_policy: config.notifications,
             notifier,
             notice: startup_notice.map(|text| Notice {
+                kind: NoticeKind::Error,
                 text,
-                expires: Instant::now() + NOTICE_DURATION,
+                expires: Instant::now() + TOAST_ERROR_DURATION,
             }),
             font_size_points: config.font_size_points,
             base_font_size_points: config.font_size_points,
@@ -480,6 +492,8 @@ impl Client {
             shell: config.shell.clone(),
             shell_integration: config.shell_integration,
             confirm_close: config.confirm_close,
+            confirm_paste: config.confirm_paste,
+            copy_on_select: config.copy_on_select,
             confirm: None,
         })
     }
@@ -752,13 +766,13 @@ impl Client {
                     self.dragging_divider = Some(divider);
                     self.update_cursor_icon();
                 } else if state.is_pressed() {
-                    if let Some(point) = self.pointer
+                    let copied_notice = if let Some(point) = self.pointer
                         && let Some(target_id) = self.tabs[self.active].layout.pane_at(point)
                     {
                         if target_id != self.tabs[self.active].focused {
                             self.focus_pane(target_id);
                         }
-                        if let Some(pane) = self.tabs[self.active].pane_mut(target_id) {
+                        self.tabs[self.active].pane_mut(target_id).and_then(|pane| {
                             pane.pointer = Some(point);
                             pane.modifiers = self.modifiers;
                             pane.button(
@@ -766,15 +780,22 @@ impl Client {
                                 button,
                                 &mut self.primary_selection,
                                 &mut self.hyperlink_open_pending,
-                            );
-                        }
+                                &mut self.copy_pending,
+                                self.copy_on_select,
+                            )
+                        })
                     } else {
                         self.tabs[self.active].focused_pane_mut().button(
                             state,
                             button,
                             &mut self.primary_selection,
                             &mut self.hyperlink_open_pending,
-                        );
+                            &mut self.copy_pending,
+                            self.copy_on_select,
+                        )
+                    };
+                    if let Some(text) = copied_notice {
+                        self.show_notice(NoticeKind::Success, text);
                     }
                     self.update_cursor_icon();
                 } else {
@@ -788,13 +809,19 @@ impl Client {
                         })
                         .map(|pane| pane.id)
                         .unwrap_or(self.tabs[self.active].focused);
-                    if let Some(pane) = self.tabs[self.active].pane_mut(target_id) {
-                        pane.button(
-                            state,
-                            button,
-                            &mut self.primary_selection,
-                            &mut self.hyperlink_open_pending,
-                        );
+                    let copied_notice =
+                        self.tabs[self.active].pane_mut(target_id).and_then(|pane| {
+                            pane.button(
+                                state,
+                                button,
+                                &mut self.primary_selection,
+                                &mut self.hyperlink_open_pending,
+                                &mut self.copy_pending,
+                                self.copy_on_select,
+                            )
+                        });
+                    if let Some(text) = copied_notice {
+                        self.show_notice(NoticeKind::Success, text);
                     }
                     self.update_cursor_icon();
                 }
@@ -889,6 +916,24 @@ impl Client {
     fn key(&mut self, event_loop: &ActiveEventLoop, event: &KeyEvent) {
         let pane = self.tabs[self.active].focused_pane();
         let buffer = pane.session.screen().active_buffer();
+        if pane.hints.is_some() {
+            if let Some(binding) = self.keymap.binding(event, self.modifiers, buffer)
+                && let Some(Action::Hints) = binding.action(event.repeat)
+            {
+                self.tabs[self.active].focused_pane_mut().close_hints();
+                return;
+            }
+            let notice = self.tabs[self.active].focused_pane_mut().hints_key(
+                event,
+                &mut self.copy_pending,
+                &mut self.primary_selection,
+                &mut self.hyperlink_open_pending,
+            );
+            if let Some(text) = notice {
+                self.show_notice(NoticeKind::Success, text);
+            }
+            return;
+        }
         if pane.search.is_some() {
             if let Some(binding) = self.keymap.binding(event, self.modifiers, buffer)
                 && let Some(action) = binding.action(event.repeat)
@@ -923,25 +968,34 @@ impl Client {
                     || (self.tabs[self.active].panes.len() <= 1
                         && matches!(action, Action::FocusPane(_) | Action::ResizePane(_)));
                 if pass_through {
-                    self.tabs[self.active]
+                    if let Some(text) = self.tabs[self.active]
                         .focused_pane_mut()
-                        .key(event, &mut self.copy_pending);
+                        .key(event, &mut self.copy_pending)
+                    {
+                        self.show_notice(NoticeKind::Success, text);
+                    }
                 } else {
                     self.run_shortcut(event_loop, action);
                 }
             }
-        } else {
-            self.tabs[self.active]
-                .focused_pane_mut()
-                .key(event, &mut self.copy_pending);
+        } else if let Some(text) = self.tabs[self.active]
+            .focused_pane_mut()
+            .key(event, &mut self.copy_pending)
+        {
+            self.show_notice(NoticeKind::Success, text);
         }
     }
 
     fn run_shortcut(&mut self, event_loop: &ActiveEventLoop, action: Action) {
         match action {
-            Action::Copy => self.tabs[self.active]
-                .focused_pane()
-                .copy(&mut self.copy_pending),
+            Action::Copy => {
+                if let Some(text) = self.tabs[self.active]
+                    .focused_pane()
+                    .copy(&mut self.copy_pending)
+                {
+                    self.show_notice(NoticeKind::Success, text);
+                }
+            }
             Action::Paste => {
                 let pane = self.tabs[self.active].focused_pane_mut();
                 if pane.vi.is_none() {
@@ -950,11 +1004,21 @@ impl Client {
             }
             Action::ToggleVi => self.tabs[self.active].focused_pane_mut().toggle_vi(),
             Action::Search => self.tabs[self.active].focused_pane_mut().toggle_search(),
+            Action::Hints => {
+                if !self.tabs[self.active].focused_pane_mut().toggle_hints() {
+                    self.show_notice(NoticeKind::Warning, "No hints found in view".into());
+                }
+            }
             Action::PreviousPrompt => self.tabs[self.active].focused_pane_mut().jump_prompt(false),
             Action::NextPrompt => self.tabs[self.active].focused_pane_mut().jump_prompt(true),
-            Action::CopyLastOutput => self.tabs[self.active]
-                .focused_pane()
-                .copy_last_output(&mut self.copy_pending),
+            Action::CopyLastOutput => {
+                if let Some(text) = self.tabs[self.active]
+                    .focused_pane()
+                    .copy_last_output(&mut self.copy_pending)
+                {
+                    self.show_notice(NoticeKind::Success, text);
+                }
+            }
             Action::ReloadConfig => {
                 let _ = self.proxy.send_event(Event::ConfigReload(true));
             }
@@ -1371,21 +1435,31 @@ impl Client {
     }
 
     fn confirm_layout(&self) -> Option<confirm::Layout> {
+        let dialog = self.confirm.as_ref()?;
         let size = self.painter.size();
         let area = PixelSize {
             width: NonZeroU32::new(size.width)?,
             height: NonZeroU32::new(size.height)?,
         };
-        confirm::Layout::compute(area, self.painter.metrics(), self.window.scale_factor())
+        confirm::Layout::compute(
+            area,
+            self.painter.metrics(),
+            self.window.scale_factor(),
+            dialog.message_columns(),
+        )
     }
 
-    fn open_confirm(&mut self, target: confirm::CloseTarget, message: String) {
+    fn open_confirm(&mut self, target: confirm::ConfirmTarget, message: String) {
         self.dragging_divider = None;
-        let mut dialog = confirm::Dialog::new(target, message);
-        if let Some(point) = self.pointer {
-            dialog.hovered = self.confirm_layout().and_then(|layout| layout.hit(point));
-        }
+        let dialog = confirm::Dialog::new(target, message);
         self.confirm = Some(dialog);
+        if let Some(point) = self.pointer {
+            let hovered = self.confirm_layout().and_then(|layout| layout.hit(point));
+            if let Some(dialog) = &mut self.confirm {
+                dialog.hovered = hovered;
+            }
+        }
+        self.window.set_ime_allowed(false);
         self.painter.reset_cursor_motion();
         self.painter.invalidate_overlay();
         self.update_cursor_icon();
@@ -1394,31 +1468,47 @@ impl Client {
 
     fn dismiss_confirm(&mut self) {
         if self.confirm.take().is_some() {
+            let pane = self.tabs[self.active].focused_pane_mut();
+            pane.invalidate_ime_area();
+            self.window
+                .set_ime_allowed(self.focused && pane.allows_ime());
+            pane.update_ime_area();
             self.painter.invalidate_overlay();
             self.update_cursor_icon();
             self.window.request_redraw();
         }
     }
 
-    fn execute_confirm(&mut self, event_loop: &ActiveEventLoop, target: confirm::CloseTarget) {
+    fn execute_confirm(&mut self, event_loop: &ActiveEventLoop, target: confirm::ConfirmTarget) {
         self.painter.invalidate_overlay();
         self.update_cursor_icon();
         match target {
-            confirm::CloseTarget::Window => {
+            confirm::ConfirmTarget::CloseWindow => {
                 log::debug!("Terminal window closed");
                 event_loop.exit();
             }
-            confirm::CloseTarget::Tab(index) => {
+            confirm::ConfirmTarget::CloseTab(index) => {
                 if index < self.tabs.len() {
                     self.close_tab(event_loop, index);
                 }
             }
-            confirm::CloseTarget::Pane(pane_id) => {
+            confirm::ConfirmTarget::ClosePane(pane_id) => {
                 if let Some(tab_index) =
                     self.tabs.iter().position(|tab| tab.pane(pane_id).is_some())
                 {
                     self.close_pane(event_loop, tab_index, pane_id);
                 }
+            }
+            confirm::ConfirmTarget::Paste { pane, text } => {
+                if let Some(pane) = self.pane_mut(pane) {
+                    pane.commit_paste(text);
+                }
+                let focused_pane = self.tabs[self.active].focused_pane_mut();
+                focused_pane.invalidate_ime_area();
+                self.window
+                    .set_ime_allowed(self.focused && focused_pane.allows_ime());
+                focused_pane.update_ime_area();
+                self.window.request_redraw();
             }
         }
     }
@@ -1437,14 +1527,14 @@ impl Client {
                 self.dismiss_confirm();
             }
             Key::Named(NamedKey::Enter | NamedKey::Space) => {
-                if let Some(dialog) = self.confirm.take() {
-                    match dialog.selected {
-                        confirm::Button::Yes => self.execute_confirm(event_loop, dialog.target),
-                        confirm::Button::No => {
-                            self.painter.invalidate_overlay();
-                            self.update_cursor_icon();
-                            self.window.request_redraw();
+                if let Some(selected) = self.confirm.as_ref().map(|dialog| dialog.selected) {
+                    match selected {
+                        confirm::Button::Yes => {
+                            if let Some(dialog) = self.confirm.take() {
+                                self.execute_confirm(event_loop, dialog.target);
+                            }
                         }
+                        confirm::Button::No => self.dismiss_confirm(),
                     }
                 }
             }
@@ -1483,7 +1573,7 @@ impl Client {
             return true;
         }
         let message = confirm::format_running("window", &processes, total_panes);
-        self.open_confirm(confirm::CloseTarget::Window, message);
+        self.open_confirm(confirm::ConfirmTarget::CloseWindow, message);
         false
     }
 
@@ -1505,7 +1595,7 @@ impl Client {
             return;
         };
         let message = confirm::format_running("pane", &[process], 1);
-        self.open_confirm(confirm::CloseTarget::Pane(pane_id), message);
+        self.open_confirm(confirm::ConfirmTarget::ClosePane(pane_id), message);
     }
 
     fn request_close_tab(&mut self, event_loop: &ActiveEventLoop, index: usize) {
@@ -1524,23 +1614,33 @@ impl Client {
             return;
         }
         let message = confirm::format_running("tab", &processes, tab.panes.len());
-        self.open_confirm(confirm::CloseTarget::Tab(index), message);
+        self.open_confirm(confirm::ConfirmTarget::CloseTab(index), message);
+    }
+
+    fn show_notice(&mut self, kind: NoticeKind, text: String) {
+        let duration = match kind {
+            NoticeKind::Success => TOAST_SUCCESS_DURATION,
+            NoticeKind::Warning => TOAST_WARNING_DURATION,
+            NoticeKind::Error => TOAST_ERROR_DURATION,
+        };
+        self.notice = Some(Notice {
+            kind,
+            text,
+            expires: Instant::now() + duration,
+        });
+        self.painter.invalidate_overlay();
+        self.window.request_redraw();
     }
 
     fn set_notice(&mut self, text: Option<String>) {
-        let changed = match text {
-            Some(text) => {
-                self.notice = Some(Notice {
-                    text,
-                    expires: Instant::now() + NOTICE_DURATION,
-                });
-                true
+        match text {
+            Some(text) => self.show_notice(NoticeKind::Error, text),
+            None => {
+                if self.notice.take().is_some() {
+                    self.painter.invalidate_overlay();
+                    self.window.request_redraw();
+                }
             }
-            None => self.notice.take().is_some(),
-        };
-        if changed {
-            self.painter.invalidate_overlay();
-            self.window.request_redraw();
         }
     }
 
@@ -1596,7 +1696,14 @@ impl Client {
         self.shell = new.shell.clone();
         self.shell_integration = new.shell_integration;
         self.confirm_close = new.confirm_close;
-        if !self.confirm_close {
+        self.confirm_paste = new.confirm_paste;
+        self.copy_on_select = new.copy_on_select;
+        if !self.confirm_close
+            && !matches!(
+                self.confirm.as_ref().map(|dialog| &dialog.target),
+                Some(confirm::ConfirmTarget::Paste { .. })
+            )
+        {
             self.dismiss_confirm();
         }
         if old.font_size_points != new.font_size_points {
@@ -1883,7 +1990,7 @@ impl Client {
                 return Ok(());
             };
             let focused = self.focused && self.confirm.is_none() && pane.id == active_tab.focused;
-            if pane.vi.is_some() || pane.search.is_some() || !focused {
+            if pane.vi.is_some() || pane.search.is_some() || pane.hints.is_some() || !focused {
                 frame.cursor_appearance.visible = false;
             }
             if pane.id == active_tab.focused {
@@ -1898,7 +2005,7 @@ impl Client {
                 id: pane.id,
                 rect: layout_pane.rect,
                 frame,
-                selection: pane.selection.as_ref().map(|selection| &selection.range),
+                selection: pane.selection.as_ref(),
                 hovered_link: pane.hovered_link.as_ref(),
                 progress: pane.progress,
                 preedit: if pane.id == active_tab.focused && !pane.preedit.is_empty() {
@@ -1908,6 +2015,7 @@ impl Client {
                 },
                 vi: pane.vi.as_ref(),
                 search: pane.search.as_ref(),
+                hints: pane.hints.as_ref(),
                 focused,
                 zoomed: zoomed && pane.id == active_tab.focused,
                 scrollbar: pane.scrollbar_view(scale),
@@ -1925,7 +2033,10 @@ impl Client {
                 reverse_video,
                 dividers: &active_tab.layout.dividers,
                 focused_rect,
-                notice: self.notice.as_ref().map(|notice| notice.text.as_str()),
+                notice: self.notice.as_ref().map(|notice| NoticeView {
+                    kind: notice.kind,
+                    text: notice.text.as_str(),
+                }),
                 confirm: self.confirm.as_ref(),
                 scale,
                 tab_bar: tab_bar::View {

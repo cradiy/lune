@@ -92,6 +92,8 @@ pub(super) struct Config {
     pub(super) shell: Option<Vec<OsString>>,
     pub(super) shell_integration: bool,
     pub(super) confirm_close: bool,
+    pub(super) confirm_paste: bool,
+    pub(super) copy_on_select: bool,
     pub(super) clipboard_write: ClipboardPolicy,
     pub(super) clipboard_read: ClipboardPolicy,
     pub(super) notifications: NotificationPolicy,
@@ -115,6 +117,8 @@ impl Default for Config {
             shell: None,
             shell_integration: true,
             confirm_close: true,
+            confirm_paste: true,
+            copy_on_select: false,
             clipboard_write: ClipboardPolicy::Allow,
             clipboard_read: ClipboardPolicy::Deny,
             notifications: NotificationPolicy::Unfocused,
@@ -296,6 +300,16 @@ impl Config {
                     .parse()
                     .map_err(|_| "confirm-close must be true or false")?;
             }
+            "confirm-paste" => {
+                self.confirm_paste = value
+                    .parse()
+                    .map_err(|_| "confirm-paste must be true or false")?;
+            }
+            "copy-on-select" => {
+                self.copy_on_select = value
+                    .parse()
+                    .map_err(|_| "copy-on-select must be true or false")?;
+            }
             "keybind" => {
                 self.keybinds.push(shortcuts::parse_keybind(value)?);
             }
@@ -408,9 +422,9 @@ pub(super) fn format_errors(errors: &[String]) -> Option<String> {
     let first = errors.first()?;
     let extra = errors.len() - 1;
     Some(if extra == 0 {
-        format!(" Config error: {first} ")
+        format!("Config error: {first}")
     } else {
-        format!(" Config error: {first} (+{extra} more) ")
+        format!("Config error: {first} (+{extra} more)")
     })
 }
 
@@ -463,6 +477,8 @@ mod tests {
              shell = /usr/bin/zsh -l\r\nshell = \"unterminated\r\n\
              shell-integration = false\r\nshell-integration = maybe\r\n\
              confirm-close = false\r\nconfirm-close = maybe\r\n\
+             confirm-paste = false\r\nconfirm-paste = nope\r\n\
+             copy-on-select = true\r\ncopy-on-select = nope\r\n\
              keybind = alt+v=split_right\r\nkeybind = bad\r\n\
              clipboard-write = deny\r\nclipboard-read = allow\r\nclipboard-read = invalid\r\n\
              notifications = always\r\nnotifications = bad\r\n\
@@ -491,15 +507,17 @@ mod tests {
         );
         assert!(!config.shell_integration);
         assert!(!config.confirm_close);
+        assert!(!config.confirm_paste);
+        assert!(config.copy_on_select);
         assert_eq!(config.keybinds.len(), 1);
         assert_eq!(config.clipboard_write, super::ClipboardPolicy::Deny);
         assert_eq!(config.clipboard_read, super::ClipboardPolicy::Allow);
         assert_eq!(config.notifications, super::NotificationPolicy::Always);
-        assert_eq!(loaded.errors.len(), 16);
+        assert_eq!(loaded.errors.len(), 18);
         assert_eq!(
             format_errors(&loaded.errors).as_deref(),
             Some(
-                " Config error: lune.conf:5: background-opacity must be between 0.0 and 1.0 (+15 more) "
+                "Config error: lune.conf:5: background-opacity must be between 0.0 and 1.0 (+17 more)"
             )
         );
     }

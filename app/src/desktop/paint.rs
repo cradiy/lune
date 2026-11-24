@@ -20,9 +20,11 @@ use crate::{
 use super::confirm;
 use super::cursor::CursorMotion;
 use super::font::{Font, FontMetrics};
+use super::hints::HintMode;
 use super::ime::Preedit;
 use super::scrollbar::ScrollbarView;
 use super::search::SearchBar;
+use super::selection::Selection;
 use super::split::Divider;
 use super::text::TextRenderer;
 use super::url::HoveredLink;
@@ -32,13 +34,14 @@ const RETRY_DELAY: Duration = Duration::from_millis(16);
 const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(530);
 
 pub(super) struct PaneOverlay<'a> {
-    pub(super) selection: Option<&'a Range<CellPosition>>,
+    pub(super) selection: Option<&'a Selection>,
     pub(super) hovered_link: Option<&'a HoveredLink>,
     pub(super) progress: Progress,
     pub(super) progress_phase: f32,
     pub(super) preedit: Option<&'a Preedit>,
     pub(super) vi: Option<&'a vi::Mode>,
     pub(super) search: Option<&'a SearchBar>,
+    pub(super) hints: Option<&'a HintMode>,
     pub(super) zoomed: bool,
     pub(super) scrollbar: Option<ScrollbarView>,
     pub(super) dim_alpha: f32,
@@ -48,16 +51,30 @@ pub(super) struct PaneDraw<'a> {
     pub(super) id: PaneId,
     pub(super) rect: PixelRect,
     pub(super) frame: PresentationFrame<'a>,
-    pub(super) selection: Option<&'a Range<CellPosition>>,
+    pub(super) selection: Option<&'a Selection>,
     pub(super) hovered_link: Option<&'a HoveredLink>,
     pub(super) progress: Progress,
     pub(super) preedit: Option<&'a Preedit>,
     pub(super) vi: Option<&'a vi::Mode>,
     pub(super) search: Option<&'a SearchBar>,
+    pub(super) hints: Option<&'a HintMode>,
     pub(super) focused: bool,
     pub(super) zoomed: bool,
     pub(super) scrollbar: Option<ScrollbarView>,
     pub(super) dim_alpha: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum NoticeKind {
+    Success,
+    Warning,
+    Error,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct NoticeView<'a> {
+    pub(super) kind: NoticeKind,
+    pub(super) text: &'a str,
 }
 
 pub(super) struct WindowChrome<'a> {
@@ -65,7 +82,7 @@ pub(super) struct WindowChrome<'a> {
     pub(super) reverse_video: bool,
     pub(super) dividers: &'a [Divider],
     pub(super) focused_rect: Option<PixelRect>,
-    pub(super) notice: Option<&'a str>,
+    pub(super) notice: Option<NoticeView<'a>>,
     pub(super) confirm: Option<&'a confirm::Dialog>,
     pub(super) scale: f64,
     pub(super) tab_bar: tab_bar::View<'a>,
@@ -476,6 +493,7 @@ impl Painter {
             && pane.focused
             && pane.vi.is_none()
             && pane.search.is_none()
+            && pane.hints.is_none()
             && pane.preedit.is_none()
             && pane.frame.viewport.offset() == 0
         {
@@ -548,6 +566,7 @@ impl Painter {
                     preedit: pane.preedit,
                     vi: pane.vi,
                     search: pane.search,
+                    hints: pane.hints,
                     zoomed: pane.zoomed,
                     scrollbar: pane.scrollbar,
                     dim_alpha: pane.dim_alpha,

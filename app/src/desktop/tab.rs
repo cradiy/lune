@@ -21,7 +21,9 @@ use crate::{GridGeometry, MAX_INPUT_BYTES, PixelRect, Session, SessionReady, Wai
 
 use super::clipboard::{self, ClipboardType};
 use super::config::{ClipboardPolicy, NotificationPolicy};
+use super::confirm;
 use super::directory;
+use super::hints::{self, HintKind, HintMode, HintResolution};
 use super::ime;
 use super::input::{self, Input};
 use super::notify::Notifier;
@@ -172,6 +174,7 @@ pub(super) struct Pane {
     pub(super) vi: Option<vi::Mode>,
     pub(super) search: Option<search::SearchBar>,
     pub(super) search_saved: Option<search::SavedSearch>,
+    pub(super) hints: Option<HintMode>,
 }
 
 pub(super) struct PaneConfig<'a> {
@@ -265,6 +268,7 @@ impl Pane {
             vi: None,
             search: None,
             search_saved: None,
+            hints: None,
         })
     }
 
@@ -345,7 +349,7 @@ impl Pane {
     }
 
     pub(super) fn allows_ime(&self) -> bool {
-        self.search.is_some() || self.vi.is_none()
+        self.search.is_some() || (self.vi.is_none() && self.hints.is_none())
     }
 
     pub(super) fn invalidate_ime_area(&mut self) {
@@ -373,6 +377,7 @@ impl Pane {
             if let Some(vi) = &mut self.vi {
                 vi.cancel_pending();
             }
+            self.close_hints();
             self.clear_preedit();
         }
     }
@@ -824,7 +829,11 @@ impl Pane {
         Ok(())
     }
 
-    pub(super) fn finish_paste(&mut self, result: std::result::Result<String, String>) {
+    pub(super) fn finish_paste(
+        &mut self,
+        result: std::result::Result<String, String>,
+        confirm_paste: bool,
+    ) -> Option<String> {
         self.paste_worker = false;
         if self.paste_deadline.take().is_some()
             && let Some(index) = self
@@ -839,10 +848,17 @@ impl Pane {
                     Ok(_) => {}
                     Err(error) => log::warn!("Clipboard paste failed: {error}"),
                 }
-                return;
+                return None;
             }
             match result {
-                Ok(text) if !text.is_empty() => self.inputs[index] = Input::Paste(text),
+                Ok(text) if !text.is_empty() => {
+                    let bracketed = self.session.processor().input_modes().bracketed_paste;
+                    if confirm_paste && !bracketed && confirm::needs_paste_confirm(&text) {
+                        self.inputs.remove(index);
+                        return Some(text);
+                    }
+                    self.inputs[index] = Input::Paste(text);
+                }
                 Ok(_) => {
                     self.inputs.remove(index);
                 }
@@ -852,6 +868,15 @@ impl Pane {
                 }
             }
         }
+        None
+    }
+
+    pub(super) fn commit_paste(&mut self, text: String) {
+        if text.is_empty() || self.inputs.len() >= INPUT_LIMIT {
+            return;
+        }
+        self.follow_output();
+        self.push_input(Input::Paste(text));
     }
 
     pub(super) fn finish_osc52_read(
@@ -876,9 +901,9 @@ impl Pane {
         }
     }
 
-    pub(super) fn key(&mut self, event: &KeyEvent, copy_pending: &mut bool) {
+    pub(super) fn key(&mut self, event: &KeyEvent, copy_pending: &mut bool) -> Option<String> {
         if self.vi.is_some() {
-            self.vi_key(event, copy_pending);
+            self.vi_key(event, copy_pending)
         } else {
             let kitty = !self
                 .session
@@ -890,12 +915,14 @@ impl Pane {
                 self.follow_output();
                 self.push_input(input);
             }
+            None
         }
     }
 
     pub(super) fn key_release(&mut self, event: &KeyEvent) {
         if self.vi.is_none()
             && self.search.is_none()
+            && self.hints.is_none()
             && self
                 .session
                 .processor()
@@ -906,6 +933,114 @@ impl Pane {
         {
             self.push_input(input);
         }
+    }
+
+    pub(super) fn toggle_hints(&mut self) -> bool {
+        if self.hints.is_some() {
+            self.close_hints();
+            return true;
+        }
+        if self.search.is_some() {
+            self.close_search();
+        }
+        let columns = usize::from(self.session.geometry().pty_size().columns);
+        let viewport = self.session.screen().viewport();
+        let processor = self.session.processor();
+        let Some(mode) = hints::HintMode::scan(
+            viewport,
+            processor.styles(),
+            processor.hyperlinks(),
+            columns,
+        ) else {
+            return false;
+        };
+        self.hints = Some(mode);
+        self.clear_preedit();
+        self.set_ime_allowed();
+        self.invalidate_overlay();
+        true
+    }
+
+    pub(super) fn close_hints(&mut self) {
+        if self.hints.take().is_some() {
+            self.set_ime_allowed();
+            self.update_ime_area();
+            self.invalidate_overlay();
+        }
+    }
+
+    pub(super) fn hints_key(
+        &mut self,
+        event: &KeyEvent,
+        copy_pending: &mut bool,
+        primary: &mut Option<clipboard::Primary>,
+        hyperlink_open_pending: &mut bool,
+    ) -> Option<String> {
+        let ctrl = self.modifiers.control_key();
+        let alt = self.modifiers.alt_key();
+        let super_key = self.modifiers.super_key();
+        let shift = self.modifiers.shift_key();
+
+        match &event.logical_key {
+            Key::Named(NamedKey::Escape) => {
+                self.close_hints();
+                return None;
+            }
+            Key::Named(NamedKey::Backspace) if !ctrl && !alt && !super_key => {
+                if let Some(hints) = &mut self.hints
+                    && hints.backspace()
+                {
+                    self.invalidate_overlay();
+                }
+                return None;
+            }
+            Key::Character(text) if !ctrl && !alt && !super_key => {
+                let mut chars = text.chars();
+                let ch = chars.next()?;
+                if chars.next().is_some() || !ch.is_ascii_alphabetic() {
+                    return None;
+                }
+                let resolution = self.hints.as_mut()?.push(ch, shift);
+                match resolution {
+                    HintResolution::Pending => {
+                        self.invalidate_overlay();
+                    }
+                    HintResolution::NoMatch => {
+                        self.close_hints();
+                    }
+                    HintResolution::Matched {
+                        kind,
+                        text,
+                        open_or_insert,
+                    } => {
+                        self.close_hints();
+                        if open_or_insert {
+                            if kind == HintKind::Url {
+                                self.open_uri(text, hyperlink_open_pending);
+                                return None;
+                            }
+                            self.follow_output();
+                            self.push_input(Input::Paste(text));
+                            return None;
+                        }
+                        publish_primary_text(text.clone(), primary);
+                        if !*copy_pending {
+                            match clipboard::write(text.clone(), self.proxy.clone()) {
+                                Ok(()) => *copy_pending = true,
+                                Err(error) => {
+                                    log::warn!(
+                                        "Failed to start the hint clipboard copy worker: {error}"
+                                    );
+                                }
+                            }
+                        }
+                        return Some(format_copied_preview(&text));
+                    }
+                }
+            }
+            _ => {}
+        }
+        None
     }
 
     pub(super) fn toggle_search(&mut self) {
@@ -1231,14 +1366,16 @@ impl Pane {
         button: winit::event::MouseButton,
         primary: &mut Option<clipboard::Primary>,
         hyperlink_open_pending: &mut bool,
-    ) {
+        copy_pending: &mut bool,
+        copy_on_select: bool,
+    ) -> Option<String> {
         if !state.is_pressed()
             && button == winit::event::MouseButton::Left
             && self.scrollbar_drag.take().is_some()
         {
             self.update_scrollbar_hover();
             self.invalidate_overlay();
-            return;
+            return None;
         }
         if state.is_pressed()
             && button == winit::event::MouseButton::Left
@@ -1262,11 +1399,11 @@ impl Pane {
                 self.scrollbar_drag = Some(grab);
                 self.scrollbar_hovered = true;
                 self.invalidate_overlay();
-                return;
+                return None;
             }
         }
         if self.vi.is_some() {
-            return;
+            return None;
         }
         let button = match button {
             winit::event::MouseButton::Left => MouseButton::Left,
@@ -1274,7 +1411,7 @@ impl Pane {
             winit::event::MouseButton::Middle => MouseButton::Middle,
             winit::event::MouseButton::Back => MouseButton::Button8,
             winit::event::MouseButton::Forward => MouseButton::Button9,
-            _ => return,
+            _ => return None,
         };
         if state.is_pressed() {
             let ctrl_only = self.modifiers.control_key()
@@ -1283,11 +1420,11 @@ impl Pane {
             if button == MouseButton::Left && ctrl_only {
                 if let Some(link_id) = self.hyperlink_at_pointer() {
                     self.open_hyperlink(link_id, hyperlink_open_pending);
-                    return;
+                    return None;
                 }
                 if let Some(detected) = self.detected_url_at_pointer() {
                     self.open_uri(detected.uri, hyperlink_open_pending);
-                    return;
+                    return None;
                 }
             }
             let mouse_reporting = self.mouse_reporting();
@@ -1313,6 +1450,7 @@ impl Pane {
                 self.pressed = Some(button);
                 self.mouse_event(MouseEvent::Press(button));
             }
+            None
         } else if button == MouseButton::Left && self.selection_drag.is_some() {
             self.extend_selection();
             let moved = self
@@ -1321,6 +1459,7 @@ impl Pane {
                 .is_some_and(selection::Drag::moved);
             self.selection_drag = None;
             let clicked_link = self.hyperlink_click.take();
+            let mut copied_notice = None;
             if !moved
                 && self.selection.is_none()
                 && let Some(link_id) = clicked_link
@@ -1329,11 +1468,18 @@ impl Pane {
                 self.open_hyperlink(link_id, hyperlink_open_pending);
             } else {
                 self.publish_primary_selection(primary);
+                if copy_on_select && self.selection.is_some() {
+                    copied_notice = self.copy(copy_pending);
+                }
             }
             self.update_hovered_hyperlink();
+            copied_notice
         } else if self.pressed == Some(button) {
             self.mouse_event(MouseEvent::Release(button));
             self.pressed = None;
+            None
+        } else {
+            None
         }
     }
 
@@ -1395,6 +1541,7 @@ impl Pane {
 
     pub(super) fn scroll_history(&mut self, steps: isize) {
         if self.session.scroll_history(steps) {
+            self.close_hints();
             self.selection_click = None;
             self.selection_drag = None;
             self.hyperlink_click = None;
@@ -1440,24 +1587,27 @@ impl Pane {
         }
     }
 
-    pub(super) fn copy_last_output(&self, copy_pending: &mut bool) {
+    pub(super) fn copy_last_output(&self, copy_pending: &mut bool) -> Option<String> {
         if *copy_pending {
-            return;
+            return None;
         }
         let view = self.session.screen().view();
-        let Some(range) = view.last_command_output() else {
-            return;
-        };
-        let Ok(text) = view.selection_text(range) else {
-            return;
-        };
+        let range = view.last_command_output()?;
+        let text = view.selection_text(range).ok()?;
         let text = text.to_string();
         if text.is_empty() {
-            return;
+            return None;
         }
+        let notice = format_copied_summary(&text);
         match clipboard::write(text, self.proxy.clone()) {
-            Ok(()) => *copy_pending = true,
-            Err(error) => log::warn!("Failed to start the clipboard copy worker: {error}"),
+            Ok(()) => {
+                *copy_pending = true;
+                Some(notice)
+            }
+            Err(error) => {
+                log::warn!("Failed to start the clipboard copy worker: {error}");
+                None
+            }
         }
     }
 
@@ -1510,6 +1660,7 @@ impl Pane {
     fn start_selection(&mut self) {
         let previous = self.selection_click.take();
         let shift = self.modifiers.shift_key();
+        let block = self.modifiers.alt_key();
         let Some(position) = self.selection_position(false) else {
             if !shift {
                 self.clear_selection();
@@ -1517,10 +1668,11 @@ impl Pane {
             return;
         };
         let now = Instant::now();
-        let next = previous.and_then(|click| click.next(position, now, shift));
+        let next = previous.and_then(|click| click.next(position, now, shift, block));
         let repeated = next.is_some();
-        let click = next.unwrap_or_else(|| selection::Click::new(position, now, shift));
+        let click = next.unwrap_or_else(|| selection::Click::new(position, now, shift, block));
         if shift
+            && !block
             && !repeated
             && let Some(anchor) = self
                 .selection
@@ -1551,16 +1703,23 @@ impl Pane {
             self.hyperlink_click = None;
         }
         let view = self.session.screen().view();
+        let kind = drag.anchor.kind;
         let range = drag.range(view);
-        if self.selection.as_ref().map(|selection| &selection.range) == range.as_ref() {
+        if self
+            .selection
+            .as_ref()
+            .map(|selection| (&selection.range, selection.kind))
+            == range.as_ref().map(|range| (range, kind))
+        {
             return;
         }
         match (&mut self.selection, range) {
-            (Some(selection), Some(range)) => selection.set_range(view, range),
+            (Some(selection), Some(range)) => selection.set_range(view, range, kind),
             (selection, Some(range)) => {
                 *selection = Some(selection::Selection::new(
                     view,
                     range,
+                    kind,
                     Some(drag.anchor.clone()),
                 ));
             }
@@ -1577,31 +1736,28 @@ impl Pane {
         }
     }
 
-    pub(super) fn copy(&self, copy_pending: &mut bool) {
+    pub(super) fn copy(&self, copy_pending: &mut bool) -> Option<String> {
         if *copy_pending {
-            return;
+            return None;
         }
-        if let Some(text) = self.selected_text() {
-            match clipboard::write(text, self.proxy.clone()) {
-                Ok(()) => *copy_pending = true,
-                Err(error) => log::warn!("Failed to start the clipboard copy worker: {error}"),
+        let text = self.selected_text()?;
+        let notice = format_copied_summary(&text);
+        match clipboard::write(text, self.proxy.clone()) {
+            Ok(()) => {
+                *copy_pending = true;
+                Some(notice)
+            }
+            Err(error) => {
+                log::warn!("Failed to start the clipboard copy worker: {error}");
+                None
             }
         }
     }
 
     fn selected_text(&self) -> Option<String> {
         let selection = self.selection.as_ref()?;
-        let mut text = self
-            .session
-            .screen()
-            .view()
-            .selection_text(selection.range.clone())
-            .ok()?
-            .to_string();
-        if self.vi.as_ref().is_some_and(vi::Mode::linewise) {
-            text.push('\n');
-        }
-        (!text.is_empty()).then_some(text)
+        let linewise = self.vi.as_ref().is_some_and(vi::Mode::linewise);
+        selection.extract_text(self.session.screen().view(), linewise)
     }
 
     fn publish_primary_selection(&self, primary: &mut Option<clipboard::Primary>) {
@@ -1623,6 +1779,30 @@ impl Pane {
             }
             Err(error) => log::warn!("Failed to start the clipboard paste worker: {error}"),
         }
+    }
+}
+
+fn format_copied_summary(text: &str) -> String {
+    let lines = text.lines().count();
+    if lines > 1 {
+        format!("Copied {lines} lines")
+    } else {
+        format_copied_preview(text)
+    }
+}
+
+fn format_copied_preview(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return "Copied".to_owned();
+    }
+    const LIMIT: usize = 36;
+    let mut chars = trimmed.chars();
+    let preview: String = chars.by_ref().take(LIMIT).collect();
+    if chars.next().is_some() {
+        format!("Copied: {preview}...")
+    } else {
+        format!("Copied: {preview}")
     }
 }
 
