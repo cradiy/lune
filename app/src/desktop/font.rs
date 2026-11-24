@@ -1,8 +1,8 @@
 use std::num::NonZeroU32;
 
 use cosmic_text::{
-    Attrs, Buffer, Family, FontSystem, Metrics, Shaping, Style, SwashCache, SwashContent,
-    SwashImage, Weight,
+    Attrs, Buffer, Family, FeatureTag, FontFeatures, FontSystem, Metrics, Shaping, Style,
+    SwashCache, SwashContent, SwashImage, Weight,
 };
 use lune_terminal::PixelSize;
 
@@ -21,12 +21,13 @@ pub(super) struct FontMetrics {
 pub(super) struct Font {
     system: FontSystem,
     family: Option<String>,
+    ligatures: bool,
     buffer: Buffer,
     swash: SwashCache,
 }
 
 impl Font {
-    pub(super) fn new(family: Option<&str>) -> Self {
+    pub(super) fn new(family: Option<&str>, ligatures: bool) -> Self {
         let mut system = FontSystem::new();
         let database = system.db();
         if database
@@ -63,15 +64,20 @@ impl Font {
         Self {
             system,
             family,
+            ligatures,
             buffer: Buffer::new_empty(Metrics::new(16.0, 21.0)),
             swash: SwashCache::new(),
         }
     }
 
+    pub(super) fn ligatures(&self) -> bool {
+        self.ligatures
+    }
+
     pub(super) fn measure(&mut self, size: f32) -> FontMetrics {
         let fallback_height = (size * 1.30).ceil();
         self.buffer.set_metrics(Metrics::new(size, fallback_height));
-        self.shape("M", 0);
+        self.shape("M", 0, false);
         let (width, height, baseline) = self.buffer.layout_runs().next().map_or_else(
             || ((size * 0.6).ceil(), fallback_height, size * 0.95),
             |run| {
@@ -102,8 +108,8 @@ impl Font {
         }
     }
 
-    fn shape(&mut self, text: &str, rendition: usize) {
-        let attrs = Attrs::new()
+    fn shape(&mut self, text: &str, rendition: usize, ligature_run: bool) {
+        let mut attrs = Attrs::new()
             .family(
                 self.family
                     .as_deref()
@@ -119,6 +125,18 @@ impl Font {
             } else {
                 Style::Italic
             });
+        if ligature_run || (!self.ligatures && text.chars().nth(1).is_some()) {
+            let mut features = FontFeatures::new();
+            let enabled = u32::from(self.ligatures);
+            features
+                .set(FeatureTag::STANDARD_LIGATURES, enabled)
+                .set(FeatureTag::CONTEXTUAL_LIGATURES, enabled)
+                .set(FeatureTag::CONTEXTUAL_ALTERNATES, enabled);
+            if ligature_run {
+                features.disable(FeatureTag::KERNING);
+            }
+            attrs = attrs.font_features(features);
+        }
         self.buffer.set_text(text, &attrs, Shaping::Advanced, None);
         self.buffer.shape_until_scroll(&mut self.system, false);
     }
@@ -126,7 +144,7 @@ impl Font {
     pub(super) fn measure_text(&mut self, metrics: FontMetrics, text: &str) -> u32 {
         self.buffer
             .set_metrics(Metrics::new(metrics.size, metrics.cell.height.get() as f32));
-        self.shape(text, 0);
+        self.shape(text, 0, false);
         self.buffer
             .layout_runs()
             .next()
@@ -139,12 +157,13 @@ impl Font {
         text: &str,
         rendition: usize,
         width: u32,
+        ligature_run: bool,
         pixels: &mut Vec<u8>,
     ) -> Option<bool> {
         let height = metrics.cell.height.get();
         self.buffer
             .set_metrics(Metrics::new(metrics.size, height as f32));
-        self.shape(text, rendition);
+        self.shape(text, rendition, ligature_run);
         let run = self.buffer.layout_runs().next()?;
         let offset = ((width as f32 - run.line_w) * 0.5).max(0.0).floor();
         pixels.clear();
@@ -186,7 +205,7 @@ impl Font {
         let height = metrics.cell.height.get();
         self.buffer
             .set_metrics(Metrics::new(metrics.size, height as f32));
-        self.shape(text, rendition);
+        self.shape(text, rendition, false);
         let run = self.buffer.layout_runs().next()?;
         let glyph = run.glyphs.first()?;
         let offset = ((metrics.cell.width.get() as f32 - run.line_w) * 0.5)

@@ -4,6 +4,7 @@ mod cursor;
 mod directory;
 mod font;
 mod input;
+mod ligature;
 mod paint;
 mod readiness;
 mod selection;
@@ -210,7 +211,7 @@ impl Client {
         let scale = window.scale_factor();
         let painter = pollster::block_on(Painter::new(
             window.clone(),
-            Font::new(config.font_family.as_deref()),
+            Font::new(config.font_family.as_deref(), config.font_ligatures),
             physical_font_size(config.font_size_points, scale),
         ))?;
         let geometry = geometry(window.inner_size(), painter.metrics())

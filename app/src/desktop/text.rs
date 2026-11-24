@@ -12,11 +12,13 @@ use crate::gpu::{create_quad_pipeline, linear_colors, write_instances};
 use crate::{PixelRect, PresentationFrame, PresentationStyle, PresentedCursor};
 
 use super::font::{Font, FontMetrics};
+use super::ligature;
 
 const ATLAS_SIDE: i32 = 1024;
 const MAX_ATLAS_LAYERS: u32 = 32;
 const LABEL_CACHE: usize = 8;
 const ICON_CACHE: usize = 9;
+const LIGATURE_CACHE: usize = ICON_CACHE + 4;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -131,7 +133,7 @@ pub(super) struct TextRenderer {
     atlas: wgpu::Texture,
     bind_group: wgpu::BindGroup,
     layers: Vec<AtlasAllocator>,
-    glyphs: [HashMap<Box<str>, Sprite>; ICON_CACHE + 4],
+    glyphs: [HashMap<Box<str>, Sprite>; LIGATURE_CACHE + 4],
     sized_glyphs: HashMap<SizedRaster, HashMap<Box<str>, Sprite>>,
     font: Font,
     metrics: FontMetrics,
@@ -227,6 +229,7 @@ impl TextRenderer {
         self.evicted = false;
         self.instances.clear();
         let columns = usize::from(frame.geometry.pty_size().columns);
+        let ligatures = self.font.ligatures();
         let first_row = frame.viewport.range().start;
         let text_selection =
             selection.and_then(|range| frame.viewport.source().selection_text(range.clone()).ok());
@@ -240,10 +243,17 @@ impl TextRenderer {
         });
         for (row, source) in frame.viewport.iter_rows().enumerate() {
             let mut sized = source.sized_text_rows().peekable();
+            let visible_end = source
+                .wrap_end()
+                .unwrap_or(source.cells().len())
+                .min(columns);
             let selected = text_selection.and_then(|range| range.columns_on_row(first_row + row));
             let cursor_column = cursor
                 .filter(|cursor| cursor.position.row == row && cursor.appearance.visible)
                 .map(|cursor| cursor.position.column);
+            let block_cursor = cursor
+                .filter(|cursor| cursor.appearance.shape == CursorShape::Block)
+                .and(cursor_column);
             if let Some(mut span) = selected.clone() {
                 for part in source.sized_text_rows() {
                     if part.column >= span.end {
@@ -264,7 +274,9 @@ impl TextRenderer {
                         continue;
                     }
                     let alpha = if style.style.faint { 0.6 } else { 1.0 };
-                    for unit in run.units() {
+                    let span = run.columns();
+                    let mut units = run.units();
+                    while let Some(unit) = units.next() {
                         if unit.cell.is_erased() || unit.text == CellText::Scalar(' ') {
                             continue;
                         }
@@ -276,14 +288,55 @@ impl TextRenderer {
                         } else {
                             style.foreground
                         };
+                        if ligatures
+                            && let CellText::Scalar(character) = unit.text
+                            && ligature::can_start(character)
+                        {
+                            let start = unit.column;
+                            let mut end = span.end.min(visible_end);
+                            if let Some(selection) = &selected
+                                && start < selection.end
+                            {
+                                end = end.min(if unit_selected {
+                                    selection.end
+                                } else {
+                                    selection.start
+                                });
+                            }
+                            if let Some(column) = block_cursor.filter(|&column| column >= start) {
+                                end = end.min(column);
+                            }
+                            let previous = (start > span.start).then(|| source.cells()[start - 1]);
+                            if let Some(cells) = source.cells().get(start..end)
+                                && let Some(candidate) = ligature::prefix(cells, previous)
+                            {
+                                let text = candidate.text();
+                                if let Some(rect) =
+                                    frame.geometry.row_rect(row, start..start + text.len())
+                                    && rect.size.width.get() <= ATLAS_SIDE as u32
+                                {
+                                    let rendition = usize::from(style.style.bold)
+                                        | (usize::from(style.style.italic) << 1);
+                                    if self.glyph(
+                                        rect,
+                                        text,
+                                        LIGATURE_CACHE + rendition,
+                                        color,
+                                        alpha,
+                                    ) {
+                                        units.nth(text.len() - 2);
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
                         if let Some(rect) = frame
                             .geometry
                             .row_rect(row, unit.column..unit.column + unit.cell.width())
                         {
                             if let Some(icon) = icon_character(unit) {
                                 let next = unit.column + 1;
-                                let can_extend = next < columns
-                                    && next < source.wrap_end().unwrap_or(source.cells().len())
+                                let can_extend = next < visible_end
                                     && cursor_column != Some(unit.column)
                                     && cursor_column != Some(next)
                                     && source.sized_text_at(next).is_none()
@@ -522,7 +575,14 @@ impl TextRenderer {
         self.glyph(rect, text, cache, color, alpha);
     }
 
-    fn glyph(&mut self, rect: PixelRect, text: &str, cache_index: usize, color: Rgb, alpha: f32) {
+    fn glyph(
+        &mut self,
+        rect: PixelRect,
+        text: &str,
+        cache_index: usize,
+        color: Rgb,
+        alpha: f32,
+    ) -> bool {
         let width = rect.size.width.get();
         let cache = &mut self.glyphs[cache_index];
         if cache_index == LABEL_CACHE
@@ -537,15 +597,25 @@ impl TextRenderer {
             sprite.generation = self.generation;
             *sprite
         } else {
-            let Some(colored) =
-                self.font
-                    .rasterize(self.metrics, text, cache_index & 3, width, &mut self.image)
-            else {
-                return;
+            let ligature_run = cache_index >= LIGATURE_CACHE;
+            let rendition = if ligature_run {
+                cache_index - LIGATURE_CACHE
+            } else {
+                cache_index & 3
+            };
+            let Some(colored) = self.font.rasterize(
+                self.metrics,
+                text,
+                rendition,
+                width,
+                ligature_run,
+                &mut self.image,
+            ) else {
+                return false;
             };
             let height = rect.size.height.get();
             let Some(sprite) = self.upload_sprite(width, height, colored) else {
-                return;
+                return false;
             };
             self.glyphs[cache_index].insert(text.into(), sprite);
             sprite
@@ -563,6 +633,7 @@ impl TextRenderer {
             ],
             [if sprite.colored { 2 } else { 1 }, sprite.layer as u32],
         );
+        true
     }
 
     fn icon(
@@ -663,7 +734,7 @@ impl TextRenderer {
             };
             let Some(colored) =
                 self.font
-                    .rasterize(metrics, text, rendition, key.width, &mut self.image)
+                    .rasterize(metrics, text, rendition, key.width, false, &mut self.image)
             else {
                 return;
             };

@@ -9,6 +9,7 @@ pub(super) const MAX_FONT_SIZE: f32 = 32.0;
 pub(super) struct Config {
     pub(super) font_family: Option<String>,
     pub(super) font_size_points: f32,
+    pub(super) font_ligatures: bool,
 }
 
 impl Default for Config {
@@ -16,6 +17,7 @@ impl Default for Config {
         Self {
             font_family: None,
             font_size_points: 15.0,
+            font_ligatures: true,
         }
     }
 }
@@ -69,6 +71,11 @@ impl Config {
                     .ok()
                     .filter(|value| (MIN_FONT_SIZE..=MAX_FONT_SIZE).contains(value))
                     .ok_or("font-size must be between 8 and 32 points")?;
+            }
+            "font-ligatures" => {
+                self.font_ligatures = value
+                    .parse()
+                    .map_err(|_| "font-ligatures must be true or false")?;
             }
             _ => return Err("unknown setting"),
         }
