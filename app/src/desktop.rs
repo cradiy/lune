@@ -1,9 +1,11 @@
 mod clipboard;
+mod directory;
 mod font;
 mod input;
 mod paint;
 mod readiness;
 mod selection;
+mod shortcuts;
 mod text;
 mod theme;
 
@@ -15,14 +17,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use lune_terminal::{
-    CellPosition, HistoryLimits, Modifiers, MouseButton, MouseEvent, MouseTracking, PixelPosition,
-    PixelSize, ScreenBuffer,
+    CellPosition, HistoryLimits, MouseButton, MouseEvent, MouseTracking, PixelPosition, PixelSize,
+    ScreenBuffer,
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, Ime, KeyEvent, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
-use winit::keyboard::{Key as LogicalKey, ModifiersState, NamedKey};
+use winit::keyboard::ModifiersState;
 use winit::platform::wayland::{EventLoopBuilderExtWayland, WindowAttributesExtWayland};
 use winit::window::{Fullscreen, Theme, UserAttentionType, Window, WindowId};
 
@@ -33,6 +35,7 @@ use font::{Font, FontMetrics};
 use input::Input;
 use paint::Painter;
 use readiness::Readiness;
+use shortcuts::{Action, Scroll, Zoom};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -45,6 +48,7 @@ enum Event {
     PtyError(io::Error),
     CopyReady(std::result::Result<(), String>),
     PasteReady(std::result::Result<String, String>),
+    DirectoryOpened(io::Result<()>),
 }
 
 pub fn run() -> Result<()> {
@@ -132,6 +136,13 @@ impl ApplicationHandler<Event> for App {
                 }
                 Ok(())
             }
+            Event::DirectoryOpened(result) => {
+                client.directory_open_pending = false;
+                if let Err(error) = result {
+                    eprintln!("Lune directory: {error}");
+                }
+                Ok(())
+            }
         };
         self.report(event_loop, result);
     }
@@ -152,6 +163,7 @@ struct Client {
     proxy: EventLoopProxy<Event>,
     inputs: VecDeque<Input>,
     copy_pending: bool,
+    directory_open_pending: bool,
     primary_selection: Option<clipboard::Primary>,
     paste_worker: bool,
     paste_deadline: Option<Instant>,
@@ -216,6 +228,7 @@ impl Client {
             proxy,
             inputs: VecDeque::new(),
             copy_pending: false,
+            directory_open_pending: false,
             primary_selection: None,
             paste_worker: false,
             paste_deadline: None,
@@ -543,83 +556,64 @@ impl Client {
         self.inputs.push_back(input);
     }
 
-    fn modifiers(&self) -> Modifiers {
-        Modifiers {
-            shift: self.modifiers.shift_key(),
-            alt: self.modifiers.alt_key(),
-            control: self.modifiers.control_key(),
+    fn key(&mut self, event: &KeyEvent) {
+        if let Some(binding) =
+            shortcuts::binding(event, self.modifiers, self.session.screen().active_buffer())
+        {
+            if let Some(action) = binding.action(event.repeat) {
+                self.run_shortcut(action);
+            }
+            return;
+        }
+        if let Some(input) = input::key(event, self.modifiers) {
+            self.follow_output();
+            self.push_input(input);
         }
     }
 
-    fn key(&mut self, event: &KeyEvent) {
-        if self.modifiers.super_key() {
-            return;
-        }
-        let modifiers = self.modifiers();
-        match (
-            &event.logical_key,
-            modifiers.control,
-            modifiers.shift,
-            modifiers.alt,
-        ) {
-            (LogicalKey::Character(key), true, true, false) if key.eq_ignore_ascii_case("c") => {
-                if !event.repeat {
-                    self.copy();
+    fn run_shortcut(&mut self, action: Action) {
+        match action {
+            Action::Copy => self.copy(),
+            Action::Paste => self.paste(ClipboardType::Regular),
+            Action::OpenDirectory => {
+                if !self.directory_open_pending {
+                    let uri = self
+                        .session
+                        .processor()
+                        .working_directory_uri()
+                        .map(str::to_owned);
+                    match directory::open(uri, self.proxy.clone()) {
+                        Ok(()) => self.directory_open_pending = true,
+                        Err(error) => eprintln!("Lune directory: {error}"),
+                    }
                 }
-                return;
             }
-            (LogicalKey::Character(key), true, true, false) if key.eq_ignore_ascii_case("v") => {
-                if !event.repeat {
-                    self.paste(ClipboardType::Regular);
-                }
-                return;
-            }
-            (LogicalKey::Character(key), true, _, false)
-                if matches!(key.as_str(), "=" | "+" | "-" | "0") =>
-            {
-                self.font_size = match key.as_str() {
-                    "-" => (self.font_size - 1.0).max(8.0),
-                    "0" => FONT_SIZE,
-                    _ => (self.font_size + 1.0).min(32.0),
+            Action::Zoom(zoom) => {
+                self.font_size = match zoom {
+                    Zoom::In => (self.font_size + 1.0).min(32.0),
+                    Zoom::Out => (self.font_size - 1.0).max(8.0),
+                    Zoom::Reset => FONT_SIZE,
                 };
                 self.resize_pending = true;
-                return;
             }
-            (LogicalKey::Named(NamedKey::F11), false, false, false) => {
-                if !event.repeat {
-                    self.window.set_fullscreen(
-                        self.window
-                            .fullscreen()
-                            .is_none()
-                            .then_some(Fullscreen::Borderless(None)),
-                    );
-                }
-                return;
+            Action::ToggleFullscreen => {
+                self.window.set_fullscreen(
+                    self.window
+                        .fullscreen()
+                        .is_none()
+                        .then_some(Fullscreen::Borderless(None)),
+                );
             }
-            (
-                LogicalKey::Named(
-                    key @ (NamedKey::Home | NamedKey::End | NamedKey::PageUp | NamedKey::PageDown),
-                ),
-                false,
-                true,
-                false,
-            ) if self.session.screen().active_buffer() == ScreenBuffer::Primary => {
+            Action::Scroll(scroll) => {
                 let page = (self.session.geometry().pty_size().rows as isize - 1).max(1);
-                let steps = match key {
-                    NamedKey::Home => isize::MAX,
-                    NamedKey::End => isize::MIN,
-                    NamedKey::PageUp => page,
-                    NamedKey::PageDown => -page,
-                    _ => unreachable!(),
+                let steps = match scroll {
+                    Scroll::Oldest => isize::MAX,
+                    Scroll::Live => isize::MIN,
+                    Scroll::PageUp => page,
+                    Scroll::PageDown => -page,
                 };
                 self.scroll_history(steps);
-                return;
             }
-            _ => {}
-        }
-        if let Some(input) = input::key(event, modifiers) {
-            self.follow_output();
-            self.push_input(input);
         }
     }
 
@@ -656,7 +650,11 @@ impl Client {
         }
         let clamp = self.pressed.is_some() || matches!(event, MouseEvent::Release(_));
         if let Some(pixel) = self.pointer_pixel(clamp) {
-            self.push_input(Input::Mouse(event, pixel, self.modifiers()));
+            self.push_input(Input::Mouse(
+                event,
+                pixel,
+                input::terminal_modifiers(self.modifiers),
+            ));
         }
     }
 

@@ -2,7 +2,7 @@ use std::io;
 
 use lune_terminal::{Key, Modifiers, MouseEvent, PixelPosition};
 use winit::event::KeyEvent;
-use winit::keyboard::{Key as LogicalKey, KeyCode, NamedKey, PhysicalKey};
+use winit::keyboard::{Key as LogicalKey, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 
 use crate::Session;
 
@@ -39,7 +39,19 @@ impl Input {
     }
 }
 
-pub(super) fn key(event: &KeyEvent, modifiers: Modifiers) -> Option<Input> {
+pub(super) fn terminal_modifiers(state: ModifiersState) -> Modifiers {
+    Modifiers {
+        shift: state.shift_key(),
+        alt: state.alt_key(),
+        control: state.control_key(),
+    }
+}
+
+pub(super) fn key(event: &KeyEvent, state: ModifiersState) -> Option<Input> {
+    if state.super_key() {
+        return None;
+    }
+    let modifiers = terminal_modifiers(state);
     if event.logical_key == LogicalKey::Named(NamedKey::Space) {
         return Some(Input::Character(' ', modifiers, event.repeat));
     }
