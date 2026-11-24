@@ -35,7 +35,11 @@ pub(super) struct Painter {
 }
 
 impl Painter {
-    pub(super) async fn new(window: Arc<Window>, mut font: Font, font_size: f32) -> Result<Self> {
+    pub(super) async fn new(
+        window: Arc<Window>,
+        mut font: Font,
+        physical_font_size: f32,
+    ) -> Result<Self> {
         let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
         descriptor.backends = wgpu::Backends::VULKAN;
         let instance = wgpu::Instance::new(descriptor);
@@ -65,7 +69,7 @@ impl Painter {
         surface.configure(&device, &config);
         let backgrounds = CellBackgroundRenderer::new(&device, config.format);
         let images = ImageRenderer::new(&device, config.format);
-        let metrics = font.measure(font_size);
+        let metrics = font.measure(physical_font_size);
         let text = TextRenderer::new(&device, &queue, config.format, font, metrics);
         log::debug!(
             "Vulkan renderer ready with surface format {:?}",

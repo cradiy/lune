@@ -15,6 +15,8 @@ use super::font::{Font, FontMetrics};
 
 const ATLAS_SIDE: i32 = 1024;
 const MAX_ATLAS_LAYERS: u32 = 32;
+const LABEL_CACHE: usize = 8;
+const ICON_CACHE: usize = 9;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -98,7 +100,7 @@ pub(super) struct TextRenderer {
     atlas: wgpu::Texture,
     bind_group: wgpu::BindGroup,
     layers: Vec<AtlasAllocator>,
-    glyphs: [HashMap<Box<str>, Sprite>; 9],
+    glyphs: [HashMap<Box<str>, Sprite>; ICON_CACHE + 4],
     sized_glyphs: HashMap<SizedRaster, HashMap<Box<str>, Sprite>>,
     font: Font,
     metrics: FontMetrics,
@@ -206,6 +208,9 @@ impl TextRenderer {
         for (row, source) in frame.viewport.iter_rows().enumerate() {
             let mut sized = source.sized_text_rows().peekable();
             let selected = text_selection.and_then(|range| range.columns_on_row(first_row + row));
+            let cursor_column = cursor
+                .filter(|cursor| cursor.position.row == row && cursor.appearance.visible)
+                .map(|cursor| cursor.position.column);
             if let Some(mut span) = selected.clone() {
                 for part in source.sized_text_rows() {
                     if part.column >= span.end {
@@ -230,10 +235,10 @@ impl TextRenderer {
                         if unit.cell.is_erased() || unit.text == CellText::Scalar(' ') {
                             continue;
                         }
-                        let color = if selected
+                        let unit_selected = selected
                             .as_ref()
-                            .is_some_and(|span| span.contains(&unit.column))
-                        {
+                            .is_some_and(|span| span.contains(&unit.column));
+                        let color = if unit_selected {
                             frame.palette.graphics_color(251)
                         } else {
                             style.foreground
@@ -242,7 +247,27 @@ impl TextRenderer {
                             .geometry
                             .row_rect(row, unit.column..unit.column + unit.cell.width())
                         {
-                            self.unit(rect, unit, style.style, color, alpha);
+                            if let Some(icon) = icon_character(unit) {
+                                let next = unit.column + 1;
+                                let can_extend = next < columns
+                                    && next < source.wrap_end().unwrap_or(source.cells().len())
+                                    && cursor_column != Some(unit.column)
+                                    && cursor_column != Some(next)
+                                    && source.sized_text_at(next).is_none()
+                                    && selected.as_ref().is_some_and(|span| span.contains(&next))
+                                        == unit_selected
+                                    && source.cells().get(next).is_some_and(|cell| {
+                                        (cell.is_erased()
+                                            || (cell.character() == Some(' ')
+                                                && !cell.has_extended_text()))
+                                            && frame.resolve_style(cell.style()).is_some_and(
+                                                |next| next.background == style.background,
+                                            )
+                                    });
+                                self.icon(rect, icon, style.style, color, alpha, can_extend);
+                            } else {
+                                self.unit(rect, unit, style.style, color, alpha);
+                            }
                         }
                     }
                     if style.style.strikethrough || style.style.underline != Underline::None {
@@ -344,7 +369,11 @@ impl TextRenderer {
         {
             self.rect(paint.rect, paint.color, 1.0);
             if let Some(glyph) = paint.glyph {
-                self.unit(paint.rect, glyph.unit, glyph.style, glyph.color, 1.0);
+                if let Some(icon) = icon_character(glyph.unit) {
+                    self.icon(paint.rect, icon, glyph.style, glyph.color, 1.0, false);
+                } else {
+                    self.unit(paint.rect, glyph.unit, glyph.style, glyph.color, 1.0);
+                }
             }
         }
         if let Some(vi) = vi {
@@ -407,7 +436,13 @@ impl TextRenderer {
                 frame.palette.graphics_color(250),
                 1.0,
             );
-            self.glyph(rect, text, 8, frame.palette.graphics_color(251), 1.0);
+            self.glyph(
+                rect,
+                text,
+                LABEL_CACHE,
+                frame.palette.graphics_color(251),
+                1.0,
+            );
         }
     }
 
@@ -445,7 +480,7 @@ impl TextRenderer {
     fn glyph(&mut self, rect: PixelRect, text: &str, cache_index: usize, color: Rgb, alpha: f32) {
         let width = rect.size.width.get();
         let cache = &mut self.glyphs[cache_index];
-        if cache_index == 8
+        if cache_index == LABEL_CACHE
             && cache
                 .get(text)
                 .is_some_and(|sprite| sprite.allocation.rectangle.width() != width as i32)
@@ -480,6 +515,64 @@ impl TextRenderer {
                 corner.y as f32,
                 width as f32,
                 rect.size.height.get() as f32,
+            ],
+            [if sprite.colored { 2 } else { 1 }, sprite.layer as u32],
+        );
+    }
+
+    fn icon(
+        &mut self,
+        mut rect: PixelRect,
+        icon: char,
+        style: &Style,
+        color: Rgb,
+        alpha: f32,
+        can_extend: bool,
+    ) {
+        let mut bytes = [0; 4];
+        let text = icon.encode_utf8(&mut bytes);
+        let rendition = usize::from(style.bold) | (usize::from(style.italic) << 1);
+        let cache = ICON_CACHE + rendition;
+        let height = rect.size.height.get();
+        let sprite = if let Some(sprite) = self.glyphs[cache].get_mut(text as &str) {
+            sprite.generation = self.generation;
+            *sprite
+        } else {
+            let Some((width, colored)) = self.font.rasterize_icon(
+                self.metrics,
+                text,
+                rendition,
+                ATLAS_SIDE as u32,
+                &mut self.image,
+            ) else {
+                self.glyph(rect, text, rendition, color, alpha);
+                return;
+            };
+            let Some(sprite) = self.upload_sprite(width, height, colored) else {
+                return;
+            };
+            self.glyphs[cache].insert(Box::<str>::from(text as &str), sprite);
+            sprite
+        };
+        let native = sprite.allocation.rectangle;
+        let width = native.width() as u32;
+        let available = rect.size.width.get() * if can_extend { 2 } else { 1 };
+        let draw_width = width.min(available);
+        let scale = draw_width as f32 / width as f32;
+        let draw_height = (height as f32 * scale).round().max(1.0) as u32;
+        let top = (self.metrics.baseline as f32 * (1.0 - scale)).round() as u32;
+        rect.origin.y += top.min(height - draw_height);
+        rect.size.width = NonZeroU32::new(draw_width).unwrap();
+        rect.size.height = NonZeroU32::new(draw_height).unwrap();
+        self.quad(
+            rect,
+            color,
+            alpha,
+            [
+                native.min.x as f32,
+                native.min.y as f32,
+                width as f32,
+                height as f32,
             ],
             [if sprite.colored { 2 } else { 1 }, sprite.layer as u32],
         );
@@ -714,6 +807,17 @@ impl TextRenderer {
             sprite,
         });
     }
+}
+
+fn icon_character(unit: DisplayUnit<'_>) -> Option<char> {
+    let CellText::Scalar(character) = unit.text else {
+        return None;
+    };
+    // Powerline separators follow the edges of their own cell.
+    (unit.cell.width() == 1
+        && matches!(character, '\u{e000}'..='\u{f8ff}' | '\u{f0000}'..='\u{ffffd}' | '\u{100000}'..='\u{10fffd}')
+        && !matches!(character, '\u{e0a0}'..='\u{e0d7}'))
+        .then_some(character)
 }
 
 fn aligned_offset(space: u32, alignment: u8) -> u32 {

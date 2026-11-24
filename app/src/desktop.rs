@@ -1,4 +1,5 @@
 mod clipboard;
+mod config;
 mod directory;
 mod font;
 mod input;
@@ -32,7 +33,8 @@ use winit::window::{Fullscreen, Theme, UserAttentionType, Window, WindowId};
 use crate::{GridGeometry, MAX_INPUT_BYTES, Session, SessionReady, WaitOutcome};
 
 use clipboard::ClipboardType;
-use font::{Font, FontMetrics};
+use config::{Config, MAX_FONT_SIZE, MIN_FONT_SIZE};
+use font::{Font, FontMetrics, physical_font_size};
 use input::Input;
 use paint::Painter;
 use readiness::Readiness;
@@ -40,7 +42,6 @@ use shortcuts::{Action, Scroll, Zoom};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-const FONT_SIZE: f32 = 15.0;
 const INPUT_LIMIT: usize = 1024;
 const PASTE_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -53,12 +54,14 @@ enum Event {
 }
 
 pub fn run() -> Result<()> {
+    let config = Config::load();
     let event_loop = EventLoop::<Event>::with_user_event()
         .with_wayland()
         .build()?;
     log::debug!("Wayland event loop ready");
     let mut app = App {
         proxy: event_loop.create_proxy(),
+        config,
         client: None,
         error: None,
     };
@@ -68,6 +71,7 @@ pub fn run() -> Result<()> {
 
 struct App {
     proxy: EventLoopProxy<Event>,
+    config: Config,
     client: Option<Client>,
     error: Option<Box<dyn std::error::Error>>,
 }
@@ -84,7 +88,7 @@ impl App {
 impl ApplicationHandler<Event> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.client.is_none() {
-            match Client::new(event_loop, self.proxy.clone()) {
+            match Client::new(event_loop, self.proxy.clone(), &self.config) {
                 Ok(client) => self.client = Some(client),
                 Err(error) => self.report(event_loop, Err(error)),
             }
@@ -169,7 +173,8 @@ struct Client {
     primary_selection: Option<clipboard::Primary>,
     paste_worker: bool,
     paste_deadline: Option<Instant>,
-    font_size: f32,
+    font_size_points: f32,
+    base_font_size_points: f32,
     resize_pending: bool,
     modifiers: ModifiersState,
     focused: bool,
@@ -187,7 +192,11 @@ struct Client {
 }
 
 impl Client {
-    fn new(event_loop: &ActiveEventLoop, proxy: EventLoopProxy<Event>) -> Result<Self> {
+    fn new(
+        event_loop: &ActiveEventLoop,
+        proxy: EventLoopProxy<Event>,
+        config: &Config,
+    ) -> Result<Self> {
         let window = Arc::new(
             event_loop.create_window(
                 Window::default_attributes()
@@ -200,8 +209,8 @@ impl Client {
         let scale = window.scale_factor();
         let painter = pollster::block_on(Painter::new(
             window.clone(),
-            Font::new(),
-            FONT_SIZE * scale as f32,
+            Font::new(config.font_family.as_deref()),
+            physical_font_size(config.font_size_points, scale),
         ))?;
         let geometry = geometry(window.inner_size(), painter.metrics())
             .ok_or_else(|| io::Error::other("The terminal grid does not fit the Wayland window"))?;
@@ -243,7 +252,8 @@ impl Client {
             primary_selection: None,
             paste_worker: false,
             paste_deadline: None,
-            font_size: FONT_SIZE,
+            font_size_points: config.font_size_points,
+            base_font_size_points: config.font_size_points,
             resize_pending: false,
             modifiers: ModifiersState::empty(),
             focused: false,
@@ -510,7 +520,7 @@ impl Client {
             return Ok(());
         }
         let scale = self.window.scale_factor();
-        let physical_font = (self.font_size * scale as f32).clamp(8.0, 128.0);
+        let physical_font = physical_font_size(self.font_size_points, scale);
         let metrics = self.painter.metrics();
         let metrics = if metrics.size == physical_font {
             metrics
@@ -670,10 +680,10 @@ impl Client {
                 }
             }
             Action::Zoom(zoom) => {
-                self.font_size = match zoom {
-                    Zoom::In => (self.font_size + 1.0).min(32.0),
-                    Zoom::Out => (self.font_size - 1.0).max(8.0),
-                    Zoom::Reset => FONT_SIZE,
+                self.font_size_points = match zoom {
+                    Zoom::In => (self.font_size_points + 1.0).min(MAX_FONT_SIZE),
+                    Zoom::Out => (self.font_size_points - 1.0).max(MIN_FONT_SIZE),
+                    Zoom::Reset => self.base_font_size_points,
                 };
                 self.resize_pending = true;
             }
