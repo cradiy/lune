@@ -37,6 +37,25 @@ pub(crate) struct SizedRows {
     visible: AtomicUsize,
 }
 
+/// Semantic shell zone recorded via OSC 133 prompt markers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PromptZone {
+    #[default]
+    None,
+    Prompt,
+    Input,
+    Output,
+}
+
+/// Per-row OSC 133 semantic prompt metadata retained across scrolling and reflow.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SemanticRow {
+    pub zone: PromptZone,
+    pub prompt_start: bool,
+    pub output_start: bool,
+    pub exit_code: Option<u8>,
+}
+
 /// An owned display row with read-only cell and text access.
 /// Grid mutations preserve its width and wide-cell pairs.
 #[derive(Debug)]
@@ -44,6 +63,7 @@ pub struct Row {
     cells: Vec<Cell>,
     extended: Vec<ExtendedText>,
     sized: Option<Box<SizedRows>>,
+    semantic: SemanticRow,
     revision: AtomicU64,
 }
 
@@ -131,6 +151,11 @@ impl PreparedRow {
         source: &Row,
         range: Range<usize>,
     ) -> Result<(), StorageError> {
+        if column == 0 && range.start == 0 {
+            self.row.semantic = source.semantic;
+        } else if self.row.semantic.zone == PromptZone::None {
+            self.row.semantic.zone = source.semantic.zone;
+        }
         self.row.copy_cells(column, source, range.clone());
         self.row
             .copy_sized_partitions(column, source, range.clone(), true)?;
@@ -203,6 +228,11 @@ impl Row {
                 .last()
                 .is_none_or(|entry| entry.column < column)
         );
+        if column == 0 && range.start == 0 {
+            self.semantic = source.semantic;
+        } else if self.semantic.zone == PromptZone::None {
+            self.semantic.zone = source.semantic.zone;
+        }
         self.copy_cells(column, source, range.clone());
         self.copy_sized_partitions(column, source, range.clone(), false)?;
         let entries = source.extended_range(range.clone());
@@ -362,8 +392,20 @@ impl Row {
             cells,
             extended: Vec::new(),
             sized: None,
+            semantic: SemanticRow::default(),
             revision: AtomicU64::new(0),
         })
+    }
+
+    /// Semantic OSC 133 prompt metadata for this physical row.
+    #[inline]
+    pub fn semantic(&self) -> SemanticRow {
+        self.semantic
+    }
+
+    #[inline]
+    pub(crate) fn semantic_mut(&mut self) -> &mut SemanticRow {
+        &mut self.semantic
     }
 
     /// Returns the current row revision. Moving the row preserves this key.
@@ -621,7 +663,7 @@ impl Row {
     }
 
     #[inline]
-    fn invalidate_revision(&mut self) {
+    pub(crate) fn invalidate_revision(&mut self) {
         *self.revision.get_mut() = 0;
     }
 
@@ -1121,6 +1163,7 @@ impl Row {
     pub(crate) fn clear(&mut self, style: StyleId) {
         self.erase_sized();
         self.extended.clear();
+        self.semantic = SemanticRow::default();
         self.cells.fill(Cell::blank(style));
         self.invalidate_revision();
     }
@@ -1128,6 +1171,7 @@ impl Row {
     pub(crate) fn fill_scalar(&mut self, character: char, style: StyleId) {
         self.erase_sized();
         self.extended.clear();
+        self.semantic = SemanticRow::default();
         self.cells
             .fill(Cell::scalar(character, CellWidth::Single, style));
         self.invalidate_revision();
@@ -1139,6 +1183,7 @@ impl Row {
         debug_assert_eq!(bytes.len(), self.cells.len());
         self.erase_sized();
         self.extended.clear();
+        self.semantic = SemanticRow::default();
         for (cell, &byte) in self.cells.iter_mut().zip(bytes) {
             *cell = Cell::scalar(char::from(byte), CellWidth::Single, style);
         }

@@ -6,7 +6,9 @@ use crate::charsets::Charsets;
 use crate::dcs::{Dcs, DcsOutcome};
 use crate::graphics::Graphics;
 use crate::input::KittyKeyboardStack;
-use crate::osc::{ClipboardQuery, ClipboardWrite, Osc, Outcome};
+use crate::osc::{
+    ClipboardQuery, ClipboardWrite, DesktopNotification, Osc, Outcome, Progress, SemanticPrompt,
+};
 use crate::rendition_stack::RenditionStack;
 use crate::reply::{
     self, ColorReport, ModeReport, Reply, Report, ResizeReport, SizeReport, StatusReport,
@@ -98,6 +100,8 @@ pub struct TerminalNotifications<'a> {
     pub palette: Option<&'a Palette>,
     pub clipboard_write: Option<ClipboardWrite<'a>>,
     pub clipboard_query: Option<ClipboardQuery>,
+    pub progress: Option<Progress>,
+    pub desktop_notification: Option<DesktopNotification<'a>>,
     pub bell: bool,
 }
 
@@ -114,6 +118,7 @@ enum Pending {
     Rendition(Style),
     PopRendition,
     Hyperlink,
+    SemanticPrompt(SemanticPrompt),
     SyncTextStyle,
     Reply(Report),
     HostNotice(HostNotice),
@@ -375,6 +380,11 @@ impl Processor {
         self.state.osc.take_working_directory_change()
     }
 
+    /// Current task progress reported by `OSC 9;4`.
+    pub fn progress(&self) -> Progress {
+        self.state.osc.progress()
+    }
+
     /// Acknowledges and borrows the latest terminal notifications as one batch.
     pub fn take_notifications(&mut self) -> TerminalNotifications<'_> {
         let osc = &mut self.state.osc;
@@ -383,6 +393,8 @@ impl Processor {
         let palette_changed = osc.take_palette_change();
         let clipboard_targets = osc.take_clipboard_write();
         let clipboard_query = osc.take_clipboard_query();
+        let progress = osc.take_progress_change();
+        let notify_ready = osc.take_notification_ready();
         let working_directory = if directory_changed {
             osc.working_directory_uri()
                 .map_or(WorkingDirectoryChange::Cleared, WorkingDirectoryChange::Set)
@@ -398,6 +410,8 @@ impl Processor {
                 text: osc.clipboard_text(),
             }),
             clipboard_query,
+            progress,
+            desktop_notification: notify_ready.then(|| osc.desktop_notification()),
             bell: std::mem::take(&mut self.bell_pending),
         }
     }
@@ -880,6 +894,10 @@ impl Processor {
                             pending[*end] = Some(Pending::Hyperlink);
                             *end += 1;
                         }
+                        Outcome::SemanticPrompt(event) => {
+                            pending[*end] = Some(Pending::SemanticPrompt(event));
+                            *end += 1;
+                        }
                     }
                 }
                 Event::Dcs(event) => {
@@ -1128,6 +1146,10 @@ impl Processor {
                         .map_err(ProcessFailure::Style)?;
                     self.state.active_hyperlink = link;
                     self.state.text_style = text_style;
+                }
+                Pending::SemanticPrompt(event) => {
+                    text.boundary();
+                    screen.mark_semantic_prompt(event);
                 }
                 Pending::SyncTextStyle => {
                     self.state.text_style = sync_text_style(

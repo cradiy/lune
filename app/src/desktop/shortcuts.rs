@@ -14,6 +14,9 @@ pub(super) enum Action {
     Zoom(Zoom),
     Scroll(Scroll),
     ToggleVi,
+    PreviousPrompt,
+    NextPrompt,
+    CopyLastOutput,
     NewTab,
     CloseTab,
     NextTab,
@@ -98,6 +101,13 @@ const WAYLAND_BINDINGS: &[Binding] = &[
     Binding::new(Action::NextTab, Mods::CONTROL, Named(NamedKey::Tab)),
     Binding::new(Action::PreviousTab, CTRL_SHIFT, Named(NamedKey::Tab)),
     Binding::new(Action::ToggleVi, CTRL_SHIFT, ShortcutKey::Space),
+    Binding::new(Action::PreviousPrompt, CTRL_SHIFT, Named(NamedKey::ArrowUp))
+        .primary_screen()
+        .repeating(),
+    Binding::new(Action::NextPrompt, CTRL_SHIFT, Named(NamedKey::ArrowDown))
+        .primary_screen()
+        .repeating(),
+    Binding::new(Action::CopyLastOutput, CTRL_SHIFT, Letter("g")).primary_screen(),
     Binding::new(
         Action::ToggleFullscreen,
         Mods::empty(),

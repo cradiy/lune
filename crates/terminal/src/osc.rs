@@ -14,9 +14,56 @@ pub(crate) const MAX_SAVED_TITLES: usize = 10;
 pub const MAX_WORKING_DIRECTORY_URI_BYTES: usize = MAX_TITLE_BYTES;
 /// Maximum decoded UTF-8 byte length of an OSC 52 clipboard payload.
 pub const MAX_CLIPBOARD_BYTES: usize = 128 * 1024;
+/// Maximum UTF-8 byte length of an OSC 99 notification identifier.
+pub const MAX_NOTIFICATION_ID_BYTES: usize = 128;
+/// Maximum UTF-8 byte length of a desktop notification title.
+pub const MAX_NOTIFICATION_TITLE_BYTES: usize = 256;
+/// Maximum UTF-8 byte length of a desktop notification body.
+pub const MAX_NOTIFICATION_BODY_BYTES: usize = 1024;
+const MAX_OSC99_META_BYTES: usize = 256;
+const MAX_OSC99_PAYLOAD_BYTES: usize = MAX_NOTIFICATION_BODY_BYTES.div_ceil(3) * 4;
+const MAX_OSC133_BYTES: usize = 128;
 const MAX_COLOR_BYTES: usize = 18;
 /// Maximum number of indexed operations in one OSC 4/104 command.
 pub const MAX_OSC_PALETTE_ENTRIES: usize = 256;
+
+/// Semantic prompt boundary markers reported via `OSC 133`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SemanticPrompt {
+    PromptStart,
+    InputStart,
+    OutputStart,
+    CommandEnd(Option<u8>),
+}
+
+/// Task progress reported via `OSC 9;4`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Progress {
+    #[default]
+    None,
+    Normal(u8),
+    Error(u8),
+    Indeterminate,
+    Paused(u8),
+}
+
+/// Urgency level for desktop notifications (`OSC 9` / `OSC 99` / `OSC 777`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum NotificationUrgency {
+    Low,
+    #[default]
+    Normal,
+    Critical,
+}
+
+/// A completed desktop notification emitted by the terminal stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DesktopNotification<'a> {
+    pub id: Option<&'a str>,
+    pub title: &'a str,
+    pub body: &'a str,
+    pub urgency: NotificationUrgency,
+}
 
 /// Target selections requested by an OSC 52 clipboard command.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -221,6 +268,13 @@ enum Phase {
     WorkingDirectory,
     HyperlinkParams,
     HyperlinkUri,
+    Osc9,
+    Osc99Meta,
+    Osc99Payload,
+    Osc777Verb,
+    Osc777Title,
+    Osc777Body,
+    Osc133,
     ClipboardTargets,
     ClipboardData,
     SizedText,
@@ -238,6 +292,7 @@ pub(crate) enum Outcome {
     Replies,
     SizedText,
     Hyperlink,
+    SemanticPrompt(SemanticPrompt),
 }
 
 #[derive(Clone, Copy)]
@@ -283,6 +338,30 @@ pub(crate) struct Osc {
     hyperlink_params_len: usize,
     hyperlink_uri: [u8; MAX_HYPERLINK_URI_BYTES],
     hyperlink_uri_len: usize,
+    progress: Progress,
+    progress_changed: bool,
+    notify_stage: [u8; MAX_OSC99_PAYLOAD_BYTES],
+    notify_stage_len: usize,
+    osc99_meta: [u8; MAX_OSC99_META_BYTES],
+    osc99_meta_len: usize,
+    notify_title_stage: [u8; MAX_NOTIFICATION_TITLE_BYTES],
+    notify_title_stage_len: usize,
+    notify_body_stage: [u8; MAX_NOTIFICATION_BODY_BYTES],
+    notify_body_stage_len: usize,
+    osc99_id: [u8; MAX_NOTIFICATION_ID_BYTES],
+    osc99_id_len: usize,
+    osc99_urgency: NotificationUrgency,
+    osc99_in_progress: bool,
+    notify_id: [u8; MAX_NOTIFICATION_ID_BYTES],
+    notify_id_len: usize,
+    notify_title: [u8; MAX_NOTIFICATION_TITLE_BYTES],
+    notify_title_len: usize,
+    notify_body: [u8; MAX_NOTIFICATION_BODY_BYTES],
+    notify_body_len: usize,
+    notify_urgency: NotificationUrgency,
+    notify_ready: bool,
+    osc133: [u8; MAX_OSC133_BYTES],
+    osc133_len: usize,
 }
 
 impl Osc {
@@ -319,6 +398,30 @@ impl Osc {
             hyperlink_params_len: 0,
             hyperlink_uri: [0; MAX_HYPERLINK_URI_BYTES],
             hyperlink_uri_len: 0,
+            progress: Progress::None,
+            progress_changed: false,
+            notify_stage: [0; MAX_OSC99_PAYLOAD_BYTES],
+            notify_stage_len: 0,
+            osc99_meta: [0; MAX_OSC99_META_BYTES],
+            osc99_meta_len: 0,
+            notify_title_stage: [0; MAX_NOTIFICATION_TITLE_BYTES],
+            notify_title_stage_len: 0,
+            notify_body_stage: [0; MAX_NOTIFICATION_BODY_BYTES],
+            notify_body_stage_len: 0,
+            osc99_id: [0; MAX_NOTIFICATION_ID_BYTES],
+            osc99_id_len: 0,
+            osc99_urgency: NotificationUrgency::Normal,
+            osc99_in_progress: false,
+            notify_id: [0; MAX_NOTIFICATION_ID_BYTES],
+            notify_id_len: 0,
+            notify_title: [0; MAX_NOTIFICATION_TITLE_BYTES],
+            notify_title_len: 0,
+            notify_body: [0; MAX_NOTIFICATION_BODY_BYTES],
+            notify_body_len: 0,
+            notify_urgency: NotificationUrgency::Normal,
+            notify_ready: false,
+            osc133: [0; MAX_OSC133_BYTES],
+            osc133_len: 0,
         }
     }
 
@@ -427,6 +530,35 @@ impl Osc {
         self.clipboard_query.take()
     }
 
+    pub(crate) fn progress(&self) -> Progress {
+        self.progress
+    }
+
+    pub(crate) fn take_progress_change(&mut self) -> Option<Progress> {
+        std::mem::take(&mut self.progress_changed).then_some(self.progress)
+    }
+
+    pub(crate) fn take_notification_ready(&mut self) -> bool {
+        std::mem::take(&mut self.notify_ready)
+    }
+
+    pub(crate) fn desktop_notification(&self) -> DesktopNotification<'_> {
+        let id = (self.notify_id_len != 0).then(|| {
+            std::str::from_utf8(&self.notify_id[..self.notify_id_len])
+                .expect("Committed notification IDs are valid UTF-8")
+        });
+        let title = std::str::from_utf8(&self.notify_title[..self.notify_title_len])
+            .expect("Committed notification titles are valid UTF-8");
+        let body = std::str::from_utf8(&self.notify_body[..self.notify_body_len])
+            .expect("Committed notification bodies are valid UTF-8");
+        DesktopNotification {
+            id,
+            title,
+            body,
+            urgency: self.notify_urgency,
+        }
+    }
+
     pub(crate) fn reset(&mut self) {
         self.directory_changed |= self.directory_length != 0;
         self.directory_length = 0;
@@ -444,6 +576,17 @@ impl Osc {
         self.clipboard_query = None;
         self.hyperlink_params_len = 0;
         self.hyperlink_uri_len = 0;
+        self.progress_changed |= self.progress != Progress::None;
+        self.progress = Progress::None;
+        self.notify_stage_len = 0;
+        self.osc99_meta_len = 0;
+        self.notify_title_stage_len = 0;
+        self.notify_body_stage_len = 0;
+        self.osc99_id_len = 0;
+        self.osc99_urgency = NotificationUrgency::Normal;
+        self.osc99_in_progress = false;
+        self.notify_ready = false;
+        self.osc133_len = 0;
     }
 
     #[inline]
@@ -455,6 +598,13 @@ impl Osc {
                 | Phase::WorkingDirectory
                 | Phase::HyperlinkParams
                 | Phase::HyperlinkUri
+                | Phase::Osc9
+                | Phase::Osc99Meta
+                | Phase::Osc99Payload
+                | Phase::Osc777Verb
+                | Phase::Osc777Title
+                | Phase::Osc777Body
+                | Phase::Osc133
                 | Phase::ClipboardTargets
                 | Phase::ClipboardData
                 | Phase::SizedText
@@ -475,6 +625,14 @@ impl Osc {
             self.append_clipboard_data(bytes);
         } else if matches!(self.phase, Phase::HyperlinkUri) {
             self.append_hyperlink_uri(bytes);
+        } else if matches!(self.phase, Phase::Osc9) {
+            self.append_osc9(bytes);
+        } else if matches!(self.phase, Phase::Osc99Payload) {
+            self.append_osc99_payload(bytes);
+        } else if matches!(self.phase, Phase::Osc777Body) {
+            self.append_osc777_body(bytes);
+        } else if matches!(self.phase, Phase::Osc133) {
+            self.append_osc133(bytes);
         } else if matches!(self.phase, Phase::Selector { .. }) {
             self.command_data(bytes);
         } else {
@@ -496,6 +654,25 @@ impl Osc {
                     self.hyperlink_params_len = 0;
                     self.hyperlink_uri_len = 0;
                     self.phase = Phase::HyperlinkParams;
+                }
+                b';' if value == 9 => {
+                    self.notify_stage_len = 0;
+                    self.phase = Phase::Osc9;
+                }
+                b';' if value == 99 => {
+                    self.osc99_meta_len = 0;
+                    self.notify_stage_len = 0;
+                    self.phase = Phase::Osc99Meta;
+                }
+                b';' if value == 777 => {
+                    self.notify_stage_len = 0;
+                    self.notify_title_stage_len = 0;
+                    self.notify_body_stage_len = 0;
+                    self.phase = Phase::Osc777Verb;
+                }
+                b';' if value == 133 => {
+                    self.osc133_len = 0;
+                    self.phase = Phase::Osc133;
                 }
                 b';' if value == 52 => {
                     self.clipboard_targets = ClipboardTargets::default();
@@ -539,9 +716,61 @@ impl Osc {
             self.append_clipboard_data(bytes);
         } else if matches!(self.phase, Phase::HyperlinkUri) {
             self.append_hyperlink_uri(bytes);
+        } else if matches!(self.phase, Phase::Osc9) {
+            self.append_osc9(bytes);
+        } else if matches!(self.phase, Phase::Osc99Payload) {
+            self.append_osc99_payload(bytes);
+        } else if matches!(self.phase, Phase::Osc777Body) {
+            self.append_osc777_body(bytes);
+        } else if matches!(self.phase, Phase::Osc133) {
+            self.append_osc133(bytes);
         } else {
             self.batch_data(bytes);
         }
+    }
+
+    #[cold]
+    fn append_osc133(&mut self, bytes: &[u8]) {
+        if bytes.len() > MAX_OSC133_BYTES - self.osc133_len {
+            self.phase = Phase::Discard;
+            return;
+        }
+        let end = self.osc133_len + bytes.len();
+        self.osc133[self.osc133_len..end].copy_from_slice(bytes);
+        self.osc133_len = end;
+    }
+
+    #[cold]
+    fn append_osc9(&mut self, bytes: &[u8]) {
+        if bytes.len() > MAX_NOTIFICATION_BODY_BYTES - self.notify_stage_len {
+            self.phase = Phase::Discard;
+            return;
+        }
+        let end = self.notify_stage_len + bytes.len();
+        self.notify_stage[self.notify_stage_len..end].copy_from_slice(bytes);
+        self.notify_stage_len = end;
+    }
+
+    #[cold]
+    fn append_osc99_payload(&mut self, bytes: &[u8]) {
+        if bytes.len() > MAX_OSC99_PAYLOAD_BYTES - self.notify_stage_len {
+            self.phase = Phase::Discard;
+            return;
+        }
+        let end = self.notify_stage_len + bytes.len();
+        self.notify_stage[self.notify_stage_len..end].copy_from_slice(bytes);
+        self.notify_stage_len = end;
+    }
+
+    #[cold]
+    fn append_osc777_body(&mut self, bytes: &[u8]) {
+        if bytes.len() > MAX_NOTIFICATION_BODY_BYTES - self.notify_body_stage_len {
+            self.phase = Phase::Discard;
+            return;
+        }
+        let end = self.notify_body_stage_len + bytes.len();
+        self.notify_body_stage[self.notify_body_stage_len..end].copy_from_slice(bytes);
+        self.notify_body_stage_len = end;
     }
 
     #[cold]
@@ -657,6 +886,10 @@ impl Osc {
                     }
                     Phase::WorkingDirectory => self.commit_directory(candidate),
                     Phase::HyperlinkUri if self.hyperlink().is_some() => Outcome::Hyperlink,
+                    Phase::Osc9 => self.commit_osc9(),
+                    Phase::Osc99Payload => self.commit_osc99(),
+                    Phase::Osc777Body => self.commit_osc777(),
+                    Phase::Osc133 => self.commit_osc133(),
                     Phase::ClipboardData => self.commit_clipboard(terminator),
                     Phase::SizedText if self.sized_text().is_some() => Outcome::SizedText,
                     Phase::Color(selector) if self.operation_count == 0 => {
@@ -719,6 +952,205 @@ impl Osc {
                 self.hyperlink_params_len = 0;
                 self.hyperlink_uri_len = 0;
             }
+        }
+        Outcome::Done
+    }
+
+    #[cold]
+    fn commit_osc133(&mut self) -> Outcome {
+        let bytes = &self.osc133[..self.osc133_len];
+        let (kind, rest) = match bytes.iter().position(|&byte| byte == b';') {
+            Some(separator) => (&bytes[..separator], Some(&bytes[separator + 1..])),
+            None => (bytes, None),
+        };
+        let event = match kind {
+            b"A" => SemanticPrompt::PromptStart,
+            b"B" => SemanticPrompt::InputStart,
+            b"C" => SemanticPrompt::OutputStart,
+            b"D" => {
+                let exit_code = rest.and_then(|rest| {
+                    let first = rest.split(|&b| b == b';').next().unwrap_or_default();
+                    if let Some(code) = parse_decimal_u16(first) {
+                        return u8::try_from(code).ok();
+                    }
+                    rest.split(|&b| b == b';').find_map(|field| {
+                        let digits = field.strip_prefix(b"err=")?;
+                        u8::try_from(parse_decimal_u16(digits)?).ok()
+                    })
+                });
+                SemanticPrompt::CommandEnd(exit_code)
+            }
+            _ => return Outcome::Ignored,
+        };
+        Outcome::SemanticPrompt(event)
+    }
+
+    #[cold]
+    fn commit_osc9(&mut self) -> Outcome {
+        let bytes = &self.notify_stage[..self.notify_stage_len];
+        if bytes == b"4" || bytes.starts_with(b"4;") {
+            let rest = bytes.strip_prefix(b"4;").unwrap_or_default();
+            let Some(progress) = parse_progress(rest) else {
+                return Outcome::Ignored;
+            };
+            if self.progress != progress {
+                self.progress = progress;
+                self.progress_changed = true;
+            }
+            return Outcome::Done;
+        }
+        if bytes.is_empty() || std::str::from_utf8(bytes).is_err() {
+            return Outcome::Ignored;
+        }
+        self.notify_id_len = 0;
+        self.notify_title_len = 0;
+        self.notify_body[..bytes.len()].copy_from_slice(bytes);
+        self.notify_body_len = bytes.len();
+        self.notify_urgency = NotificationUrgency::Normal;
+        self.notify_ready = true;
+        Outcome::Done
+    }
+
+    #[cold]
+    fn commit_osc777(&mut self) -> Outcome {
+        let title = &self.notify_title_stage[..self.notify_title_stage_len];
+        let body = &self.notify_body_stage[..self.notify_body_stage_len];
+        if (title.is_empty() && body.is_empty())
+            || std::str::from_utf8(title).is_err()
+            || std::str::from_utf8(body).is_err()
+        {
+            return Outcome::Ignored;
+        }
+        self.notify_id_len = 0;
+        self.notify_title[..title.len()].copy_from_slice(title);
+        self.notify_title_len = title.len();
+        self.notify_body[..body.len()].copy_from_slice(body);
+        self.notify_body_len = body.len();
+        self.notify_urgency = NotificationUrgency::Normal;
+        self.notify_ready = true;
+        Outcome::Done
+    }
+
+    #[cold]
+    fn commit_osc99(&mut self) -> Outcome {
+        let Ok(meta) = std::str::from_utf8(&self.osc99_meta[..self.osc99_meta_len]) else {
+            return Outcome::Ignored;
+        };
+        let mut id: Option<&str> = None;
+        let mut done = true;
+        let mut part = "title";
+        let mut encoded = false;
+        let mut urgency: Option<NotificationUrgency> = None;
+        for entry in meta.split(':').filter(|entry| !entry.is_empty()) {
+            let Some((key, value)) = entry.split_once('=') else {
+                return Outcome::Ignored;
+            };
+            match key {
+                "i" => {
+                    if value.len() > MAX_NOTIFICATION_ID_BYTES
+                        || !value.bytes().all(|b| {
+                            b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'+')
+                        })
+                    {
+                        return Outcome::Ignored;
+                    }
+                    id = Some(value);
+                }
+                "d" => match value {
+                    "0" => done = false,
+                    "1" => done = true,
+                    _ => return Outcome::Ignored,
+                },
+                "p" => part = value,
+                "e" => match value {
+                    "0" => encoded = false,
+                    "1" => encoded = true,
+                    _ => return Outcome::Ignored,
+                },
+                "u" => {
+                    urgency = Some(match value {
+                        "0" => NotificationUrgency::Low,
+                        "1" => NotificationUrgency::Normal,
+                        "2" => NotificationUrgency::Critical,
+                        _ => return Outcome::Ignored,
+                    });
+                }
+                _ => {}
+            }
+        }
+        if part == "close" {
+            self.osc99_in_progress = false;
+            return Outcome::Done;
+        }
+        if !matches!(part, "title" | "body") {
+            return Outcome::Done;
+        }
+
+        let raw = &self.notify_stage[..self.notify_stage_len];
+        let mut decoded = [0u8; MAX_NOTIFICATION_BODY_BYTES];
+        let payload = if encoded {
+            let Some(len) = decode_base64_slice(raw, &mut decoded) else {
+                return Outcome::Ignored;
+            };
+            &decoded[..len]
+        } else {
+            if raw.len() > MAX_NOTIFICATION_BODY_BYTES {
+                return Outcome::Ignored;
+            }
+            raw
+        };
+        if std::str::from_utf8(payload).is_err() {
+            return Outcome::Ignored;
+        }
+
+        let incoming_id = id.unwrap_or_default().as_bytes();
+        let same_stream =
+            self.osc99_in_progress && incoming_id == &self.osc99_id[..self.osc99_id_len];
+        if !same_stream {
+            self.osc99_id[..incoming_id.len()].copy_from_slice(incoming_id);
+            self.osc99_id_len = incoming_id.len();
+            self.notify_title_stage_len = 0;
+            self.notify_body_stage_len = 0;
+            self.osc99_urgency = NotificationUrgency::Normal;
+            self.osc99_in_progress = true;
+        }
+        if let Some(urgency) = urgency {
+            self.osc99_urgency = urgency;
+        }
+        if part == "title" {
+            if payload.len() > MAX_NOTIFICATION_TITLE_BYTES - self.notify_title_stage_len {
+                self.osc99_in_progress = false;
+                return Outcome::Ignored;
+            }
+            let end = self.notify_title_stage_len + payload.len();
+            self.notify_title_stage[self.notify_title_stage_len..end].copy_from_slice(payload);
+            self.notify_title_stage_len = end;
+        } else {
+            if payload.len() > MAX_NOTIFICATION_BODY_BYTES - self.notify_body_stage_len {
+                self.osc99_in_progress = false;
+                return Outcome::Ignored;
+            }
+            let end = self.notify_body_stage_len + payload.len();
+            self.notify_body_stage[self.notify_body_stage_len..end].copy_from_slice(payload);
+            self.notify_body_stage_len = end;
+        }
+
+        if done {
+            self.osc99_in_progress = false;
+            let title = &self.notify_title_stage[..self.notify_title_stage_len];
+            let body = &self.notify_body_stage[..self.notify_body_stage_len];
+            if title.is_empty() && body.is_empty() {
+                return Outcome::Done;
+            }
+            self.notify_id[..self.osc99_id_len]
+                .copy_from_slice(&self.osc99_id[..self.osc99_id_len]);
+            self.notify_id_len = self.osc99_id_len;
+            self.notify_title[..title.len()].copy_from_slice(title);
+            self.notify_title_len = title.len();
+            self.notify_body[..body.len()].copy_from_slice(body);
+            self.notify_body_len = body.len();
+            self.notify_urgency = self.osc99_urgency;
+            self.notify_ready = true;
         }
         Outcome::Done
     }
@@ -798,6 +1230,82 @@ impl Osc {
                     let end = self.hyperlink_params_len + bytes.len();
                     self.hyperlink_params[self.hyperlink_params_len..end].copy_from_slice(bytes);
                     self.hyperlink_params_len = end;
+                    return;
+                }
+                Phase::Osc99Meta => {
+                    if let Some(separator) = bytes.iter().position(|&byte| byte == b';') {
+                        let prefix = &bytes[..separator];
+                        if prefix.len() > MAX_OSC99_META_BYTES - self.osc99_meta_len {
+                            self.phase = Phase::Discard;
+                            return;
+                        }
+                        let end = self.osc99_meta_len + prefix.len();
+                        self.osc99_meta[self.osc99_meta_len..end].copy_from_slice(prefix);
+                        self.osc99_meta_len = end;
+                        self.phase = Phase::Osc99Payload;
+                        self.append_osc99_payload(&bytes[separator + 1..]);
+                        return;
+                    }
+                    if bytes.len() > MAX_OSC99_META_BYTES - self.osc99_meta_len {
+                        self.phase = Phase::Discard;
+                        return;
+                    }
+                    let end = self.osc99_meta_len + bytes.len();
+                    self.osc99_meta[self.osc99_meta_len..end].copy_from_slice(bytes);
+                    self.osc99_meta_len = end;
+                    return;
+                }
+                Phase::Osc777Verb => {
+                    if let Some(separator) = bytes.iter().position(|&byte| byte == b';') {
+                        let prefix = &bytes[..separator];
+                        if prefix.len() > 6 - self.notify_stage_len {
+                            self.phase = Phase::Discard;
+                            return;
+                        }
+                        let end = self.notify_stage_len + prefix.len();
+                        self.notify_stage[self.notify_stage_len..end].copy_from_slice(prefix);
+                        self.notify_stage_len = end;
+                        if &self.notify_stage[..self.notify_stage_len] != b"notify" {
+                            self.phase = Phase::Discard;
+                            return;
+                        }
+                        self.phase = Phase::Osc777Title;
+                        bytes = &bytes[separator + 1..];
+                        continue;
+                    }
+                    if bytes.len() > 6 - self.notify_stage_len {
+                        self.phase = Phase::Discard;
+                        return;
+                    }
+                    let end = self.notify_stage_len + bytes.len();
+                    self.notify_stage[self.notify_stage_len..end].copy_from_slice(bytes);
+                    self.notify_stage_len = end;
+                    return;
+                }
+                Phase::Osc777Title => {
+                    if let Some(separator) = bytes.iter().position(|&byte| byte == b';') {
+                        let prefix = &bytes[..separator];
+                        if prefix.len() > MAX_NOTIFICATION_TITLE_BYTES - self.notify_title_stage_len
+                        {
+                            self.phase = Phase::Discard;
+                            return;
+                        }
+                        let end = self.notify_title_stage_len + prefix.len();
+                        self.notify_title_stage[self.notify_title_stage_len..end]
+                            .copy_from_slice(prefix);
+                        self.notify_title_stage_len = end;
+                        self.phase = Phase::Osc777Body;
+                        self.append_osc777_body(&bytes[separator + 1..]);
+                        return;
+                    }
+                    if bytes.len() > MAX_NOTIFICATION_TITLE_BYTES - self.notify_title_stage_len {
+                        self.phase = Phase::Discard;
+                        return;
+                    }
+                    let end = self.notify_title_stage_len + bytes.len();
+                    self.notify_title_stage[self.notify_title_stage_len..end]
+                        .copy_from_slice(bytes);
+                    self.notify_title_stage_len = end;
                     return;
                 }
                 Phase::ClipboardTargets => {
@@ -1143,4 +1651,112 @@ fn hex_value(bytes: &[u8]) -> Option<u16> {
         value = (value << 4) | u16::from(digit);
     }
     Some(value)
+}
+
+fn parse_progress(bytes: &[u8]) -> Option<Progress> {
+    let (state_bytes, value_bytes) = match bytes.iter().position(|&b| b == b';') {
+        Some(separator) => (&bytes[..separator], Some(&bytes[separator + 1..])),
+        None => (bytes, None),
+    };
+    let state = parse_decimal_u16(state_bytes)?;
+    let value = match value_bytes {
+        None | Some([]) => 0u8,
+        Some(digits) => parse_decimal_u16(digits)?.min(100) as u8,
+    };
+    match state {
+        0 => Some(Progress::None),
+        1 => Some(Progress::Normal(value)),
+        2 => Some(Progress::Error(value)),
+        3 => Some(Progress::Indeterminate),
+        4 => Some(Progress::Paused(value)),
+        _ => None,
+    }
+}
+
+fn parse_decimal_u16(bytes: &[u8]) -> Option<u16> {
+    if bytes.is_empty() || bytes.len() > 5 {
+        return None;
+    }
+    let mut value = 0u16;
+    for &byte in bytes {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        value = value.checked_mul(10)?.checked_add(u16::from(byte - b'0'))?;
+    }
+    Some(value)
+}
+
+fn decode_base64_slice(input: &[u8], out: &mut [u8]) -> Option<usize> {
+    let mut quantum = [0u8; 4];
+    let mut qlen = 0usize;
+    let mut pad_seen = false;
+    let mut out_len = 0usize;
+
+    let mut push_slice = |bytes: &[u8]| -> Option<()> {
+        if bytes.len() > out.len() - out_len {
+            return None;
+        }
+        out[out_len..out_len + bytes.len()].copy_from_slice(bytes);
+        out_len += bytes.len();
+        Some(())
+    };
+
+    for &byte in input {
+        if matches!(byte, b'\r' | b'\n' | b' ') {
+            continue;
+        }
+        if byte == b'=' {
+            if qlen < 2 {
+                return None;
+            }
+            pad_seen = true;
+            quantum[qlen] = b'=';
+            qlen += 1;
+            if qlen == 4 {
+                if quantum[2] == b'=' {
+                    if quantum[3] != b'=' {
+                        return None;
+                    }
+                    push_slice(&[(quantum[0] << 2) | (quantum[1] >> 4)])?;
+                } else {
+                    push_slice(&[
+                        (quantum[0] << 2) | (quantum[1] >> 4),
+                        (quantum[1] << 4) | (quantum[2] >> 2),
+                    ])?;
+                }
+                qlen = 0;
+            }
+            continue;
+        }
+        if pad_seen {
+            return None;
+        }
+        quantum[qlen] = base64_value(byte)?;
+        qlen += 1;
+        if qlen == 4 {
+            push_slice(&[
+                (quantum[0] << 2) | (quantum[1] >> 4),
+                (quantum[1] << 4) | (quantum[2] >> 2),
+                (quantum[2] << 6) | quantum[3],
+            ])?;
+            qlen = 0;
+        }
+    }
+    match qlen {
+        0 => Some(out_len),
+        1 => None,
+        2 if !pad_seen => {
+            push_slice(&[(quantum[0] << 2) | (quantum[1] >> 4)])?;
+            Some(out_len)
+        }
+        3 if !pad_seen => {
+            push_slice(&[
+                (quantum[0] << 2) | (quantum[1] >> 4),
+                (quantum[1] << 4) | (quantum[2] >> 2),
+            ])?;
+            Some(out_len)
+        }
+        _ => None,
+    }
 }

@@ -5,7 +5,7 @@ use std::ops::Range;
 use guillotiere::{Allocation, AtlasAllocator, size2};
 use lune_terminal::{
     CellText, Color, CursorShape, DisplayUnit, HyperlinkId, PaletteEntry, PixelPosition, PixelSize,
-    Rgb, SizedTextRow, Style, Underline,
+    Progress, Rgb, SizedTextRow, Style, Underline,
 };
 
 use crate::gpu::{create_quad_pipeline, linear_colors, write_instances};
@@ -230,6 +230,8 @@ impl TextRenderer {
         let Overlay {
             selection,
             hovered_hyperlink,
+            progress,
+            progress_phase,
             preedit,
             vi,
             tab_bar,
@@ -237,6 +239,8 @@ impl TextRenderer {
         } = overlay;
         let selection = *selection;
         let hovered_hyperlink = *hovered_hyperlink;
+        let progress = *progress;
+        let progress_phase = *progress_phase;
         let preedit = *preedit;
         let vi = *vi;
         self.area = frame.geometry.text_area_pixels().unwrap();
@@ -257,6 +261,14 @@ impl TextRenderer {
                 .map(|part| (cursor, part))
         });
         for (row, source) in frame.viewport.iter_rows().enumerate() {
+            let semantic = source.semantic();
+            if semantic.prompt_start
+                && semantic.exit_code.is_some_and(|code| code != 0)
+                && let Some(mut rect) = frame.geometry.row_rect(row, 0..1)
+            {
+                rect.size.width = NonZeroU32::new(2.min(rect.size.width.get())).unwrap();
+                self.rect(rect, frame.palette.color(PaletteEntry::Indexed(1)), 0.9);
+            }
             let mut sized = source.sized_text_rows().peekable();
             let visible_end = source
                 .wrap_end()
@@ -535,8 +547,9 @@ impl TextRenderer {
         {
             self.label(rect, preedit, frame, false);
         }
+        self.progress_bar(frame.palette, progress, progress_phase);
         self.terminal_instances = self.instances.len() as u32;
-        self.tab_bar(tab_bar);
+        self.tab_bar(tab_bar, progress_phase);
         if std::mem::size_of_val(self.instances.as_slice()) as u64
             > self.device.limits().max_buffer_size
         {
@@ -548,7 +561,99 @@ impl TextRenderer {
         Ok(())
     }
 
-    fn tab_bar(&mut self, view: &tab_bar::View<'_>) {
+    fn progress_bar(&mut self, palette: &lune_terminal::Palette, progress: Progress, phase: f32) {
+        if progress == Progress::None {
+            return;
+        }
+        let width = self.area.width.get();
+        let height = 3.min(self.area.height.get());
+        let Some(bar_height) = NonZeroU32::new(height) else {
+            return;
+        };
+        let track = PixelRect {
+            origin: PixelPosition { x: 0, y: 0 },
+            size: PixelSize {
+                width: self.area.width,
+                height: bar_height,
+            },
+        };
+        let (color, fill_rect) = match progress {
+            Progress::None => return,
+            Progress::Normal(percent) => {
+                let fill = ((u64::from(width) * u64::from(percent)) / 100) as u32;
+                let fill = if percent == 0 {
+                    0
+                } else {
+                    fill.max(2).min(width)
+                };
+                (
+                    palette.color(PaletteEntry::Indexed(4)),
+                    NonZeroU32::new(fill).map(|w| PixelRect {
+                        origin: PixelPosition { x: 0, y: 0 },
+                        size: PixelSize {
+                            width: w,
+                            height: bar_height,
+                        },
+                    }),
+                )
+            }
+            Progress::Error(percent) => {
+                let pct = if percent == 0 { 100 } else { percent };
+                let fill = ((u64::from(width) * u64::from(pct)) / 100).max(2) as u32;
+                (
+                    palette.color(PaletteEntry::Indexed(1)),
+                    NonZeroU32::new(fill.min(width)).map(|w| PixelRect {
+                        origin: PixelPosition { x: 0, y: 0 },
+                        size: PixelSize {
+                            width: w,
+                            height: bar_height,
+                        },
+                    }),
+                )
+            }
+            Progress::Paused(percent) => {
+                let fill = ((u64::from(width) * u64::from(percent)) / 100) as u32;
+                let fill = if percent == 0 {
+                    0
+                } else {
+                    fill.max(2).min(width)
+                };
+                (
+                    palette.color(PaletteEntry::Indexed(3)),
+                    NonZeroU32::new(fill).map(|w| PixelRect {
+                        origin: PixelPosition { x: 0, y: 0 },
+                        size: PixelSize {
+                            width: w,
+                            height: bar_height,
+                        },
+                    }),
+                )
+            }
+            Progress::Indeterminate => {
+                let seg = ((width as f32 * 0.28).round() as u32).clamp(12.min(width), width);
+                let travel = (width + seg) as f32;
+                let pos = (phase * travel) as i32 - seg as i32;
+                let start = pos.max(0) as u32;
+                let end = (pos + seg as i32).clamp(0, width as i32) as u32;
+                (
+                    palette.color(PaletteEntry::Indexed(6)),
+                    NonZeroU32::new(end.saturating_sub(start)).map(|w| PixelRect {
+                        origin: PixelPosition { x: start, y: 0 },
+                        size: PixelSize {
+                            width: w,
+                            height: bar_height,
+                        },
+                    }),
+                )
+            }
+        };
+        self.rect(track, color, 0.2);
+        if let Some(fill) = fill_rect {
+            self.rect(fill, color, 0.95);
+        }
+    }
+
+    fn tab_bar(&mut self, view: &tab_bar::View<'_>, progress_phase: f32) {
         let layout = view.layout;
         let Some(area) = layout.area() else {
             return;
@@ -581,6 +686,52 @@ impl TextRenderer {
                 && let Some(label) = tab.label().get(..title_end)
             {
                 self.tab_label(title, label, color);
+            }
+            if tab.progress != Progress::None
+                && let Some(bar_h) = NonZeroU32::new(2.min(fill_rect.size.height.get()))
+            {
+                let y = fill_rect.origin.y + fill_rect.size.height.get() - bar_h.get();
+                let total_w = fill_rect.size.width.get();
+                let (bar_color, start_x, seg_w) = match tab.progress {
+                    Progress::None => (color, 0, 0),
+                    Progress::Normal(p) => (
+                        view.palette.color(PaletteEntry::Indexed(6)),
+                        0,
+                        ((u64::from(total_w) * u64::from(p)) / 100) as u32,
+                    ),
+                    Progress::Error(p) => (
+                        view.palette.color(PaletteEntry::Indexed(1)),
+                        0,
+                        ((u64::from(total_w) * u64::from(if p == 0 { 100 } else { p })) / 100)
+                            as u32,
+                    ),
+                    Progress::Paused(p) => (
+                        view.palette.color(PaletteEntry::Indexed(3)),
+                        0,
+                        ((u64::from(total_w) * u64::from(p)) / 100) as u32,
+                    ),
+                    Progress::Indeterminate => {
+                        let seg = ((total_w as f32 * 0.35).round() as u32).max(2).min(total_w);
+                        let x = ((total_w - seg) as f32 * progress_phase).round() as u32;
+                        (view.palette.color(PaletteEntry::Indexed(6)), x, seg)
+                    }
+                };
+                if let Some(w) = NonZeroU32::new(seg_w.min(total_w.saturating_sub(start_x))) {
+                    self.rect(
+                        PixelRect {
+                            origin: PixelPosition {
+                                x: fill_rect.origin.x + start_x,
+                                y,
+                            },
+                            size: PixelSize {
+                                width: w,
+                                height: bar_h,
+                            },
+                        },
+                        bar_color,
+                        0.95,
+                    );
+                }
             }
         }
         self.area = terminal_area;

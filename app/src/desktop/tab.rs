@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use lune_terminal::{
     CellPosition, ClipboardQuery, ColorScheme, HistoryLimits, HyperlinkId, MouseButton, MouseEvent,
-    MouseTracking, Palette, PixelPosition, PixelSize, ScreenBuffer,
+    MouseTracking, Palette, PixelPosition, PixelSize, Progress, ScreenBuffer,
 };
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, Ime, KeyEvent, MouseScrollDelta};
@@ -17,13 +17,24 @@ use winit::window::{CursorIcon, UserAttentionType, Window};
 use crate::{GridGeometry, MAX_INPUT_BYTES, Session, SessionReady, WaitOutcome};
 
 use super::clipboard::{self, ClipboardType};
-use super::config::ClipboardPolicy;
+use super::config::{ClipboardPolicy, NotificationPolicy};
 use super::directory;
 use super::input::{self, Input};
+use super::notify::Notifier;
 use super::readiness::{Readiness, Registration};
 use super::{Event, PASTE_TIMEOUT, Result, TabId, selection, vi};
 
 const INPUT_LIMIT: usize = 1024;
+
+pub(super) struct DispatchContext<'a> {
+    pub(super) focused: bool,
+    pub(super) copy_pending: &'a mut bool,
+    pub(super) primary: &'a mut Option<clipboard::Primary>,
+    pub(super) clipboard_write: ClipboardPolicy,
+    pub(super) clipboard_read: ClipboardPolicy,
+    pub(super) notifications_policy: NotificationPolicy,
+    pub(super) notifier: Option<&'a Notifier>,
+}
 
 pub(super) struct Tab {
     pub(super) id: TabId,
@@ -33,6 +44,8 @@ pub(super) struct Tab {
     proxy: EventLoopProxy<Event>,
     pub(super) title: String,
     pub(super) title_changed: bool,
+    pub(super) progress: Progress,
+    pub(super) progress_changed: bool,
     inputs: VecDeque<Input>,
     paste_worker: bool,
     paste_deadline: Option<Instant>,
@@ -92,6 +105,8 @@ impl Tab {
             proxy,
             title: String::new(),
             title_changed: false,
+            progress: Progress::None,
+            progress_changed: false,
             inputs: VecDeque::new(),
             paste_worker: false,
             paste_deadline: None,
@@ -234,11 +249,7 @@ impl Tab {
     pub(super) fn dispatch(
         &mut self,
         ready: SessionReady,
-        focused: bool,
-        copy_pending: &mut bool,
-        primary: &mut Option<clipboard::Primary>,
-        clipboard_write: ClipboardPolicy,
-        clipboard_read: ClipboardPolicy,
+        ctx: DispatchContext<'_>,
     ) -> Result<bool> {
         let selection_source = (self.selection.is_some()
             || self.selection_click.is_some()
@@ -278,37 +289,58 @@ impl Tab {
                 .extend(title.chars().filter(|ch| !ch.is_control()).take(128));
             self.title_changed = true;
         }
-        if notifications.bell && !focused {
+        if notifications.bell && !ctx.focused {
             self.window
                 .request_user_attention(Some(UserAttentionType::Informational));
         }
+        if let Some(progress) = notifications.progress
+            && self.progress != progress
+        {
+            self.progress = progress;
+            self.progress_changed = true;
+            self.dirty = true;
+        }
+        if let Some(desktop_note) = notifications.desktop_notification {
+            let allowed = match ctx.notifications_policy {
+                NotificationPolicy::Always => true,
+                NotificationPolicy::Unfocused => !ctx.focused,
+                NotificationPolicy::Deny => false,
+            };
+            if allowed && let Some(notifier) = ctx.notifier {
+                notifier.send(desktop_note);
+            }
+        }
         if let Some(write) = notifications.clipboard_write
-            && clipboard_write == ClipboardPolicy::Allow
+            && ctx.clipboard_write == ClipboardPolicy::Allow
         {
             let text = write.text.to_owned();
-            if write.targets.clipboard && !*copy_pending {
+            if write.targets.clipboard && !*ctx.copy_pending {
                 match clipboard::write(text.clone(), self.proxy.clone()) {
-                    Ok(()) => *copy_pending = true,
+                    Ok(()) => *ctx.copy_pending = true,
                     Err(error) => {
                         log::warn!("Failed to start the OSC 52 copy worker: {error}");
                     }
                 }
             }
             if write.targets.primary {
-                publish_primary_text(text, primary);
+                publish_primary_text(text, ctx.primary);
             }
         }
         if let Some(query) = notifications.clipboard_query
-            && clipboard_read == ClipboardPolicy::Allow
+            && ctx.clipboard_read == ClipboardPolicy::Allow
         {
             let kind = if query.targets.clipboard {
                 ClipboardType::Regular
             } else {
                 ClipboardType::Primary
             };
-            if let Err(error) =
-                clipboard::read_osc52(kind, primary.as_ref(), self.id, query, self.proxy.clone())
-            {
+            if let Err(error) = clipboard::read_osc52(
+                kind,
+                ctx.primary.as_ref(),
+                self.id,
+                query,
+                self.proxy.clone(),
+            ) {
                 log::warn!("Failed to start the OSC 52 read worker: {error}");
             }
         }
@@ -735,6 +767,62 @@ impl Tab {
             self.scroll_vi_cursor();
             self.update_hovered_hyperlink();
             self.window.request_redraw();
+        }
+    }
+
+    pub(super) fn jump_prompt(&mut self, forward: bool) {
+        let screen = self.session.screen();
+        if screen.active_buffer() != ScreenBuffer::Primary {
+            return;
+        }
+        let view = screen.view();
+        let history = view.history_rows();
+        let viewport = screen.viewport();
+        let current_offset = screen.viewport_offset();
+        let target = if forward {
+            if current_offset == 0 {
+                return;
+            }
+            view.next_prompt(viewport.range().start)
+        } else {
+            let anchor = if current_offset == 0 {
+                history + screen.cursor().row
+            } else {
+                viewport.range().start
+            };
+            view.previous_prompt(anchor)
+        };
+        match target {
+            Some(row) => {
+                let desired_offset = history.saturating_sub(row);
+                let delta = desired_offset as isize - current_offset as isize;
+                if delta != 0 {
+                    self.scroll_history(delta);
+                }
+            }
+            None if forward => self.follow_output(),
+            None => {}
+        }
+    }
+
+    pub(super) fn copy_last_output(&self, copy_pending: &mut bool) {
+        if *copy_pending {
+            return;
+        }
+        let view = self.session.screen().view();
+        let Some(range) = view.last_command_output() else {
+            return;
+        };
+        let Ok(text) = view.selection_text(range) else {
+            return;
+        };
+        let text = text.to_string();
+        if text.is_empty() {
+            return;
+        }
+        match clipboard::write(text, self.proxy.clone()) {
+            Ok(()) => *copy_pending = true,
+            Err(error) => log::warn!("Failed to start the clipboard copy worker: {error}"),
         }
     }
 

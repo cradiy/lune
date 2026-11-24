@@ -15,6 +15,14 @@ pub(super) enum ClipboardPolicy {
     Deny,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum NotificationPolicy {
+    #[default]
+    Unfocused,
+    Always,
+    Deny,
+}
+
 pub(super) struct Config {
     pub(super) font_family: Option<String>,
     pub(super) font_size_points: f32,
@@ -22,6 +30,7 @@ pub(super) struct Config {
     pub(super) theme: Preference,
     pub(super) clipboard_write: ClipboardPolicy,
     pub(super) clipboard_read: ClipboardPolicy,
+    pub(super) notifications: NotificationPolicy,
 }
 
 impl Default for Config {
@@ -33,6 +42,7 @@ impl Default for Config {
             theme: Preference::System,
             clipboard_write: ClipboardPolicy::Allow,
             clipboard_read: ClipboardPolicy::Deny,
+            notifications: NotificationPolicy::Unfocused,
         }
     }
 }
@@ -94,9 +104,24 @@ impl Config {
             "clipboard-read" => {
                 self.clipboard_read = parse_clipboard_policy(value)?;
             }
+            "notifications" => {
+                self.notifications = parse_notification_policy(value)?;
+            }
             _ => return Err("unknown setting"),
         }
         Ok(())
+    }
+}
+
+fn parse_notification_policy(value: &str) -> Result<NotificationPolicy, &'static str> {
+    if value.eq_ignore_ascii_case("unfocused") {
+        Ok(NotificationPolicy::Unfocused)
+    } else if value.eq_ignore_ascii_case("always") {
+        Ok(NotificationPolicy::Always)
+    } else if value.eq_ignore_ascii_case("deny") {
+        Ok(NotificationPolicy::Deny)
+    } else {
+        Err("notifications must be unfocused, always, or deny")
     }
 }
 
@@ -147,6 +172,7 @@ mod tests {
         let config = Config::parse(
             "# Font settings\r\nfont-family = Fixture Mono\r\nfont-size=19.5\r\n\
              clipboard-write = deny\r\nclipboard-read = allow\r\nclipboard-read = invalid\r\n\
+             notifications = always\r\nnotifications = bad\r\n\
              font-family=\r\nunknown-key=true\r\nfont-size=NaN\r\nfont-size=33\r\n",
             Path::new(""),
         );
@@ -154,5 +180,6 @@ mod tests {
         assert_eq!(config.font_size_points, 19.5);
         assert_eq!(config.clipboard_write, super::ClipboardPolicy::Deny);
         assert_eq!(config.clipboard_read, super::ClipboardPolicy::Allow);
+        assert_eq!(config.notifications, super::NotificationPolicy::Always);
     }
 }

@@ -2914,3 +2914,27 @@ fn processor_retries_style_and_text_allocations_without_replaying_accepted_input
     });
     assert_eq!(stats.attempts, 0);
 }
+
+#[test]
+fn osc_progress_notifications_and_semantic_prompts_make_no_allocation_requests() {
+    let mut screen = Screen::new(16, 4).unwrap();
+    let mut processor = support::processor();
+    let mut writer = UnicodeWriter::default();
+    let wire = b"\x1b]9;4;1;42\x07\x1b]9;4;3\x07\x1b]9;4;0\x07\
+        \x1b]9;build done\x07\
+        \x1b]777;notify;Lune;tests ok\x07\
+        \x1b]99;i=job1:d=0:p=title:e=1:u=2;QnVpbGQ=\x1b\\\
+        \x1b]99;i=job1:d=1:p=body:e=1;RG9uZQ==\x1b\\\
+        \x1b]133;A\x07$ \x1b]133;B\x07ok\r\n\x1b]133;C\x07out\r\n\x1b]133;D;2\x07";
+    let ((), stats) = allocator::measure(Some(0), || {
+        for chunk in [1, 7, wire.len()] {
+            for bytes in wire.chunks(chunk) {
+                processor.advance(bytes, &mut screen, &mut writer).unwrap();
+            }
+            let notes = processor.take_notifications();
+            assert!(notes.progress.is_some());
+            assert!(notes.desktop_notification.is_some());
+        }
+    });
+    assert_eq!(stats.attempts, 0);
+}

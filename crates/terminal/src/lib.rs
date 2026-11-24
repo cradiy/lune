@@ -64,8 +64,10 @@ pub use mouse::{
     MouseButton, MouseEvent, MouseFormat, MouseSequence, MouseTracking, PixelPosition,
 };
 pub use osc::{
-    ClipboardQuery, ClipboardTargets, ClipboardWrite, MAX_CLIPBOARD_BYTES, MAX_OSC_PALETTE_ENTRIES,
-    MAX_TITLE_BYTES, MAX_WORKING_DIRECTORY_URI_BYTES,
+    ClipboardQuery, ClipboardTargets, ClipboardWrite, DesktopNotification, MAX_CLIPBOARD_BYTES,
+    MAX_NOTIFICATION_BODY_BYTES, MAX_NOTIFICATION_ID_BYTES, MAX_NOTIFICATION_TITLE_BYTES,
+    MAX_OSC_PALETTE_ENTRIES, MAX_TITLE_BYTES, MAX_WORKING_DIRECTORY_URI_BYTES, NotificationUrgency,
+    Progress, SemanticPrompt,
 };
 pub use palette::{GraphicsColors, Palette, PaletteEntry, Rgb};
 pub use paste::Paste;
@@ -74,7 +76,7 @@ pub use processor::{
 };
 pub use reflow::{ReflowAffinity, ReflowAnchor, ReflowRow, ReflowRows};
 pub use reply::{ColorScheme, PixelSize};
-pub use row::{DisplayUnit, DisplayUnits, Row, RowRevision, StyleRun};
+pub use row::{DisplayUnit, DisplayUnits, PromptZone, Row, RowRevision, SemanticRow, StyleRun};
 pub use screen::{Cursor, CursorAppearance, CursorShape, EraseMode, Screen, ScreenBuffer};
 pub use sizing::{SizedTextRow, TextSize};
 pub use style::{Color, Style, Underline};

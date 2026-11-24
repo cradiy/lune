@@ -1708,6 +1708,59 @@ impl Screen {
         }
     }
 
+    /// Records an OSC 133 semantic prompt boundary on the active screen row.
+    pub fn mark_semantic_prompt(&mut self, event: crate::SemanticPrompt) {
+        use crate::{PromptZone, SemanticPrompt};
+        match event {
+            SemanticPrompt::PromptStart => {
+                if let Ok(row) = self.grid.row_mut(self.cursor.row) {
+                    let semantic = row.semantic_mut();
+                    semantic.zone = PromptZone::Prompt;
+                    semantic.prompt_start = true;
+                    semantic.exit_code = None;
+                    row.invalidate_revision();
+                }
+            }
+            SemanticPrompt::InputStart => {
+                if let Ok(row) = self.grid.row_mut(self.cursor.row) {
+                    row.semantic_mut().zone = PromptZone::Input;
+                }
+            }
+            SemanticPrompt::OutputStart => {
+                if let Ok(row) = self.grid.row_mut(self.cursor.row) {
+                    let semantic = row.semantic_mut();
+                    semantic.zone = PromptZone::Output;
+                    semantic.output_start = true;
+                }
+            }
+            SemanticPrompt::CommandEnd(code) => {
+                let Some(code) = code else {
+                    return;
+                };
+                for index in (0..=self.cursor.row).rev() {
+                    if let Ok(row) = self.grid.row_mut(index)
+                        && row.semantic().prompt_start
+                    {
+                        row.semantic_mut().exit_code = Some(code);
+                        row.invalidate_revision();
+                        return;
+                    }
+                }
+                if self.active_buffer() == ScreenBuffer::Primary {
+                    for index in (0..self.history.len()).rev() {
+                        if let Some(row) = self.history.row_mut(index)
+                            && row.semantic().prompt_start
+                        {
+                            row.semantic_mut().exit_code = Some(code);
+                            row.invalidate_revision();
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Scrolls the entire active region upward, discarding rows at its top and
     /// filling exposed bottom rows using `style`. Counts are clamped to the
     /// region's height; zero preserves all state. The cursor position, pending

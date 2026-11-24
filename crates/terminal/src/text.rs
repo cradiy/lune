@@ -136,6 +136,46 @@ impl<'a> ScreenView<'a> {
     pub fn selection_bounds(&self, range: Range<CellPosition>) -> Option<Range<CellPosition>> {
         self.selection_text(range).ok()?.content_bounds()
     }
+
+    /// Finds the nearest earlier row marked with `OSC 133;A`.
+    pub fn previous_prompt(&self, before_row: usize) -> Option<usize> {
+        let limit = before_row.min(self.rows());
+        (0..limit)
+            .rev()
+            .find(|&row| self.row(row).is_some_and(|row| row.semantic().prompt_start))
+    }
+
+    /// Finds the nearest later row marked with `OSC 133;A`.
+    pub fn next_prompt(&self, after_row: usize) -> Option<usize> {
+        let start = after_row.saturating_add(1);
+        (start..self.rows())
+            .find(|&row| self.row(row).is_some_and(|row| row.semantic().prompt_start))
+    }
+
+    /// Returns the cell range of the most recent command's output (`OSC 133;C`..next `133;A`).
+    pub fn last_command_output(&self) -> Option<Range<CellPosition>> {
+        let total = self.rows();
+        let start_row = (0..total)
+            .rev()
+            .find(|&row| self.row(row).is_some_and(|row| row.semantic().output_start))?;
+        let end_exclusive = ((start_row + 1)..total)
+            .find(|&row| self.row(row).is_some_and(|row| row.semantic().prompt_start))
+            .unwrap_or(total);
+        if end_exclusive <= start_row {
+            return None;
+        }
+        let end_row = end_exclusive - 1;
+        let end_col = self.row(end_row)?.cells().len();
+        self.selection_bounds(
+            CellPosition {
+                row: start_row,
+                column: 0,
+            }..CellPosition {
+                row: end_row,
+                column: end_col,
+            },
+        )
+    }
 }
 
 /// A validated, read-only text range borrowed from grid or screen rows.

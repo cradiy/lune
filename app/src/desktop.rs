@@ -5,6 +5,7 @@ mod directory;
 mod font;
 mod input;
 mod ligature;
+mod notify;
 mod paint;
 mod readiness;
 mod selection;
@@ -32,8 +33,9 @@ use winit::window::{Fullscreen, Theme, Window, WindowId};
 use crate::{GridGeometry, SessionReady};
 
 use clipboard::ClipboardType;
-use config::{ClipboardPolicy, Config, MAX_FONT_SIZE, MIN_FONT_SIZE};
+use config::{ClipboardPolicy, Config, MAX_FONT_SIZE, MIN_FONT_SIZE, NotificationPolicy};
 use font::{Font, FontMetrics, physical_font_size};
+use notify::Notifier;
 use paint::Painter;
 use readiness::Readiness;
 use shortcuts::{Action, Scroll, Zoom};
@@ -208,6 +210,8 @@ struct Client {
     primary_selection: Option<clipboard::Primary>,
     clipboard_write: ClipboardPolicy,
     clipboard_read: ClipboardPolicy,
+    notifications_policy: NotificationPolicy,
+    notifier: Option<Notifier>,
     font_size_points: f32,
     base_font_size_points: f32,
     resize_pending: bool,
@@ -252,6 +256,16 @@ impl Client {
         window.set_ime_allowed(true);
         window.request_redraw();
         log::info!("Wayland terminal ready");
+        let notifier = match config.notifications {
+            NotificationPolicy::Deny => None,
+            _ => match Notifier::start() {
+                Ok(notifier) => Some(notifier),
+                Err(error) => {
+                    log::warn!("Could not start desktop notifications: {error}");
+                    None
+                }
+            },
+        };
         Ok(Self {
             window,
             painter,
@@ -270,6 +284,8 @@ impl Client {
             primary_selection: None,
             clipboard_write: config.clipboard_write,
             clipboard_read: config.clipboard_read,
+            notifications_policy: config.notifications,
+            notifier,
             font_size_points: config.font_size_points,
             base_font_size_points: config.font_size_points,
             resize_pending: false,
@@ -403,6 +419,9 @@ impl Client {
                 }
             }
             Action::ToggleVi => tab.toggle_vi(),
+            Action::PreviousPrompt => tab.jump_prompt(false),
+            Action::NextPrompt => tab.jump_prompt(true),
+            Action::CopyLastOutput => tab.copy_last_output(&mut self.copy_pending),
             Action::OpenDirectory => {
                 if !self.directory_open_pending {
                     let uri = tab.session.processor().working_directory_uri();
@@ -561,11 +580,15 @@ impl Client {
     ) -> Result<bool> {
         let running = match self.tabs[index].dispatch(
             ready,
-            self.focused && index == self.active,
-            &mut self.copy_pending,
-            &mut self.primary_selection,
-            self.clipboard_write,
-            self.clipboard_read,
+            tab::DispatchContext {
+                focused: self.focused && index == self.active,
+                copy_pending: &mut self.copy_pending,
+                primary: &mut self.primary_selection,
+                clipboard_write: self.clipboard_write,
+                clipboard_read: self.clipboard_read,
+                notifications_policy: self.notifications_policy,
+                notifier: self.notifier.as_ref(),
+            },
         ) {
             Ok(running) => running,
             Err(error) => {
@@ -575,12 +598,20 @@ impl Client {
         };
         if !running {
             self.close_tab(event_loop, index);
-        } else if std::mem::take(&mut self.tabs[index].title_changed) {
-            if index == self.active {
-                self.update_window_title();
+        } else {
+            let title_changed = std::mem::take(&mut self.tabs[index].title_changed);
+            let progress_changed = std::mem::take(&mut self.tabs[index].progress_changed);
+            if title_changed {
+                if index == self.active {
+                    self.update_window_title();
+                }
+                if self.bar.height != 0 {
+                    self.reflow_tab_bar();
+                }
             }
-            if self.bar.height != 0 {
-                self.reflow_tab_bar();
+            if (title_changed && self.bar.height != 0)
+                || (progress_changed && (index == self.active || self.bar.height != 0))
+            {
                 self.painter.invalidate_overlay();
                 self.window.request_redraw();
             }
@@ -705,6 +736,8 @@ impl Client {
                 paint::Overlay {
                     selection: tab.selection.as_ref().map(|selection| &selection.range),
                     hovered_hyperlink: tab.hovered_hyperlink,
+                    progress: tab.progress,
+                    progress_phase: 0.0,
                     preedit: &tab.preedit,
                     vi: tab.vi.as_ref(),
                     focused: self.focused,

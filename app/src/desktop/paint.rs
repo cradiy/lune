@@ -4,7 +4,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use lune_terminal::{
-    CellPosition, CursorAppearance, HyperlinkId, PaletteEntry, PixelPosition, ScreenBuffer,
+    CellPosition, CursorAppearance, HyperlinkId, PaletteEntry, PixelPosition, Progress,
+    ScreenBuffer,
 };
 use winit::dpi::PhysicalSize;
 use winit::window::Window;
@@ -27,6 +28,8 @@ const RETRY_DELAY: Duration = Duration::from_millis(16);
 pub(super) struct Overlay<'a> {
     pub(super) selection: Option<&'a Range<CellPosition>>,
     pub(super) hovered_hyperlink: Option<HyperlinkId>,
+    pub(super) progress: Progress,
+    pub(super) progress_phase: f32,
     pub(super) preedit: &'a str,
     pub(super) vi: Option<&'a vi::Mode>,
     pub(super) focused: bool,
@@ -45,6 +48,7 @@ pub(super) struct Painter {
     tracker: PresentationTracker,
     cursor_motion: CursorMotion,
     cursor_buffer: ScreenBuffer,
+    progress_animation: Option<Instant>,
     retry: Option<Instant>,
     force_present: bool,
     dirty: bool,
@@ -106,6 +110,7 @@ impl Painter {
             tracker,
             cursor_motion: CursorMotion::default(),
             cursor_buffer: ScreenBuffer::Primary,
+            progress_animation: None,
             retry: None,
             force_present: false,
             dirty: true,
@@ -174,9 +179,13 @@ impl Painter {
     }
 
     pub(super) fn deadline(&self) -> Option<Instant> {
+        let progress_deadline = self
+            .progress_animation
+            .map(|_| Instant::now() + RETRY_DELAY);
         self.retry
             .into_iter()
             .chain(self.tracker.cursor_deadline())
+            .chain(progress_deadline)
             .min()
     }
 
@@ -187,16 +196,25 @@ impl Painter {
             self.force_present = true;
         }
         let cursor_changed = self.tracker.tick_cursor(now).is_some();
-        self.dirty |= cursor_changed;
-        retry || cursor_changed
+        let progress_changed = self.progress_animation.is_some();
+        self.dirty |= cursor_changed || progress_changed;
+        retry || cursor_changed || progress_changed
     }
 
     pub(super) fn draw(
         &mut self,
         window: &Arc<Window>,
         frame: &PresentationFrame<'_>,
-        overlay: Overlay<'_>,
+        mut overlay: Overlay<'_>,
     ) -> Result<()> {
+        let now = Instant::now();
+        if overlay.progress == Progress::Indeterminate {
+            let start = *self.progress_animation.get_or_insert(now);
+            overlay.progress_phase = (now.duration_since(start).as_secs_f32() * 0.75).fract();
+        } else {
+            self.progress_animation = None;
+            overlay.progress_phase = 0.0;
+        }
         let Overlay {
             preedit,
             vi,
@@ -210,7 +228,6 @@ impl Painter {
             return Ok(());
         }
 
-        let now = Instant::now();
         let update = self.tracker.prepare(frame, now)?;
         let damage = update.damage();
         let rows_changed = match damage.rows {
@@ -384,7 +401,7 @@ impl Painter {
             }
             self.graphics_prepare_failed = failures != 0;
         }
-        if moving {
+        if moving || self.progress_animation.is_some() {
             window.request_redraw();
         }
         Ok(())

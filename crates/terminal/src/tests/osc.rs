@@ -857,3 +857,140 @@ fn osc8_hyperlinks_survive_sgr_reset_reflow_and_reclaim_on_collection() {
     assert!(processor.hyperlinks().get(link_id).is_none());
     assert!(processor.hyperlinks().is_empty());
 }
+
+#[test]
+fn osc9_progress_and_notifications_parse_across_splits_and_reset() {
+    use crate::{DesktopNotification, NotificationUrgency, Progress};
+
+    let wire =
+        b"\x1b]9;4;1;42\x07\x1b]9;4;2;150\x1b\\\x1b]9;4;3\x07\x1b]9;4;4;80\x07\x1b]9;4;0\x07";
+    for split in 0..=wire.len() {
+        let mut processor = support::processor();
+        let mut screen = Screen::new(8, 4).unwrap();
+        advance(&mut processor, &mut screen, &wire[..split]);
+        advance(&mut processor, &mut screen, &wire[split..]);
+        assert_eq!(processor.progress(), Progress::None);
+        assert_eq!(processor.ignored_sequences(), 0);
+    }
+
+    let mut processor = support::processor();
+    let mut screen = Screen::new(8, 4).unwrap();
+    advance(&mut processor, &mut screen, b"\x1b]9;4;1;65\x07");
+    assert_eq!(processor.progress(), Progress::Normal(65));
+    assert_eq!(
+        processor.take_notifications().progress,
+        Some(Progress::Normal(65))
+    );
+    advance(&mut processor, &mut screen, b"\x1b]9;4;2;120\x1b\\");
+    assert_eq!(
+        processor.take_notifications().progress,
+        Some(Progress::Error(100))
+    );
+    advance(&mut processor, &mut screen, b"\x1b]9;4;3\x07");
+    assert_eq!(
+        processor.take_notifications().progress,
+        Some(Progress::Indeterminate)
+    );
+    advance(&mut processor, &mut screen, b"\x1b]9;4;4;30\x07");
+    assert_eq!(
+        processor.take_notifications().progress,
+        Some(Progress::Paused(30))
+    );
+    advance(&mut processor, &mut screen, b"\x1bc");
+    assert_eq!(processor.progress(), Progress::None);
+    assert_eq!(
+        processor.take_notifications().progress,
+        Some(Progress::None)
+    );
+
+    // OSC 9 simple notification, OSC 777 notify, and OSC 99 chunked + base64 notification.
+    advance(&mut processor, &mut screen, b"\x1b]9;Build done\x07");
+    assert_eq!(
+        processor.take_notifications().desktop_notification,
+        Some(DesktopNotification {
+            id: None,
+            title: "",
+            body: "Build done",
+            urgency: NotificationUrgency::Normal,
+        })
+    );
+    advance(
+        &mut processor,
+        &mut screen,
+        b"\x1b]777;notify;Cargo;All tests passed\x1b\\",
+    );
+    assert_eq!(
+        processor.take_notifications().desktop_notification,
+        Some(DesktopNotification {
+            id: None,
+            title: "Cargo",
+            body: "All tests passed",
+            urgency: NotificationUrgency::Normal,
+        })
+    );
+    let osc99 = b"\x1b]99;i=job1:d=0:p=title:u=2;Deploy\x1b\\\x1b]99;i=job1:d=1:p=body:e=1;T0sg5a6M5oiQ\x1b\\";
+    for split in 0..=osc99.len() {
+        let mut p = support::processor();
+        let mut s = Screen::new(8, 4).unwrap();
+        advance(&mut p, &mut s, &osc99[..split]);
+        advance(&mut p, &mut s, &osc99[split..]);
+        assert_eq!(
+            p.take_notifications().desktop_notification,
+            Some(DesktopNotification {
+                id: Some("job1"),
+                title: "Deploy",
+                body: "OK 完成",
+                urgency: NotificationUrgency::Critical,
+            })
+        );
+        assert_eq!(p.ignored_sequences(), 0);
+    }
+}
+
+#[test]
+fn osc133_tracks_prompts_exit_codes_across_history_and_reflow() {
+    use crate::{HistoryLimits, UnicodeWriter};
+
+    let wire = concat!(
+        "\x1b]133;A;aid=1\x07$ \x1b]133;B\x07ls\r\n",
+        "\x1b]133;C\x07alpha\r\nbeta\r\n\x1b]133;D;0\x07",
+        "\x1b]133;A\x07$ \x1b]133;B\x07false\r\n",
+        "\x1b]133;C\x07err1\r\nerr2\r\nerr3\r\n\x1b]133;D;1\x07",
+        "\x1b]133;A\x07$ \x1b]133;B\x07"
+    );
+    let mut processor = support::processor();
+    let mut screen = Screen::new(10, 4).unwrap();
+    screen
+        .set_history_limits(HistoryLimits {
+            max_rows: 32,
+            max_bytes: 64 * 1024,
+        })
+        .unwrap();
+    let mut writer = UnicodeWriter::default();
+    for chunk in wire.as_bytes().chunks(5) {
+        processor.advance(chunk, &mut screen, &mut writer).unwrap();
+    }
+    let view = screen.view();
+    assert_eq!(view.previous_prompt(view.rows()), Some(7));
+    assert_eq!(view.previous_prompt(7), Some(3));
+    assert_eq!(view.previous_prompt(3), Some(0));
+    assert_eq!(view.previous_prompt(0), None);
+    assert_eq!(view.next_prompt(0), Some(3));
+    assert_eq!(view.next_prompt(3), Some(7));
+    assert_eq!(view.next_prompt(7), None);
+
+    assert_eq!(view.row(0).unwrap().semantic().exit_code, Some(0));
+    assert_eq!(view.row(3).unwrap().semantic().exit_code, Some(1));
+    assert_eq!(view.row(7).unwrap().semantic().exit_code, None);
+
+    let output_range = view.last_command_output().unwrap();
+    let output_text = view.selection_text(output_range).unwrap().to_string();
+    assert_eq!(output_text, "err1\nerr2\nerr3");
+
+    // Reflow preserves prompt starts and exit codes.
+    screen.reflow(8, 4, StyleId(0)).unwrap();
+    let view = screen.view();
+    let last_prompt = view.previous_prompt(view.rows()).unwrap();
+    let prev_prompt = view.previous_prompt(last_prompt).unwrap();
+    assert_eq!(view.row(prev_prompt).unwrap().semantic().exit_code, Some(1));
+}
