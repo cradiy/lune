@@ -23,6 +23,7 @@ use super::cursor::CursorMotion;
 use super::font::{Font, FontConfig, FontMetrics};
 use super::hints::HintMode;
 use super::ime::Preedit;
+use super::palette::CommandPalette;
 use super::scrollbar::ScrollbarView;
 use super::search::SearchBar;
 use super::selection::Selection;
@@ -85,6 +86,7 @@ pub(super) struct WindowChrome<'a> {
     pub(super) focused_rect: Option<PixelRect>,
     pub(super) notice: Option<NoticeView<'a>>,
     pub(super) confirm: Option<&'a confirm::Dialog>,
+    pub(super) command_palette: Option<&'a CommandPalette>,
     pub(super) scale: f64,
     pub(super) tab_bar: tab_bar::View<'a>,
 }
@@ -660,6 +662,19 @@ impl Painter {
                     PixelSize { width, height },
                     chrome.palette,
                     dialog,
+                    chrome.scale,
+                    background_opacity,
+                );
+            } else if let Some(cmd_palette) = chrome.command_palette
+                && let (Some(width), Some(height)) = (
+                    NonZeroU32::new(self.config.width),
+                    NonZeroU32::new(self.config.height),
+                )
+            {
+                self.modal_range = self.text.prepare_command_palette(
+                    PixelSize { width, height },
+                    chrome.palette,
+                    cmd_palette,
                     chrome.scale,
                     background_opacity,
                 );

@@ -19,6 +19,8 @@ pub(super) enum Action {
     ToggleVi,
     Search,
     Hints,
+    CommandPalette,
+    ToggleMode,
     PreviousPrompt,
     NextPrompt,
     CopyLastOutput,
@@ -175,6 +177,66 @@ impl Keymap {
             screen,
         )
     }
+
+    pub(super) fn shortcut_label(&self, action: Action) -> Option<String> {
+        let binding = self.bindings.iter().find(|b| b.action == action)?;
+        Some(format_binding(binding.modifiers, &binding.key))
+    }
+}
+
+fn format_binding(modifiers: ModifiersState, key: &ShortcutKey) -> String {
+    let mut parts = Vec::new();
+    if modifiers.control_key() {
+        parts.push("Ctrl");
+    }
+    if modifiers.alt_key() {
+        parts.push("Alt");
+    }
+    if modifiers.shift_key() {
+        parts.push("Shift");
+    }
+    if modifiers.super_key() {
+        parts.push("Super");
+    }
+    let key_str: Cow<'static, str> = match key {
+        ShortcutKey::Letter(ch) => Cow::Owned(ch.to_ascii_uppercase()),
+        ShortcutKey::Symbol(sym) => sym.clone(),
+        ShortcutKey::Space => Cow::Borrowed("Space"),
+        ShortcutKey::Named(named) => Cow::Borrowed(match named {
+            NamedKey::Enter => "Enter",
+            NamedKey::Tab => "Tab",
+            NamedKey::Escape => "Esc",
+            NamedKey::Backspace => "Backspace",
+            NamedKey::Delete => "Del",
+            NamedKey::Insert => "Ins",
+            NamedKey::Home => "Home",
+            NamedKey::End => "End",
+            NamedKey::PageUp => "PgUp",
+            NamedKey::PageDown => "PgDn",
+            NamedKey::ArrowUp => "Up",
+            NamedKey::ArrowDown => "Down",
+            NamedKey::ArrowLeft => "Left",
+            NamedKey::ArrowRight => "Right",
+            NamedKey::F1 => "F1",
+            NamedKey::F2 => "F2",
+            NamedKey::F3 => "F3",
+            NamedKey::F4 => "F4",
+            NamedKey::F5 => "F5",
+            NamedKey::F6 => "F6",
+            NamedKey::F7 => "F7",
+            NamedKey::F8 => "F8",
+            NamedKey::F9 => "F9",
+            NamedKey::F10 => "F10",
+            NamedKey::F11 => "F11",
+            NamedKey::F12 => "F12",
+            _ => "Key",
+        }),
+    };
+    if parts.is_empty() {
+        key_str.into_owned()
+    } else {
+        format!("{}+{key_str}", parts.join("+"))
+    }
 }
 
 use ModifiersState as Mods;
@@ -305,6 +367,8 @@ const WAYLAND_BINDINGS: &[Binding] = &[
     Binding::new(Action::ToggleVi, CTRL_SHIFT, ShortcutKey::Space),
     Binding::new(Action::Search, CTRL_SHIFT, letter("f")),
     Binding::new(Action::Hints, CTRL_SHIFT, letter("s")),
+    Binding::new(Action::CommandPalette, CTRL_SHIFT, letter("p")),
+    Binding::new(Action::ToggleMode, CTRL_SHIFT, letter("m")),
     Binding::new(Action::PreviousPrompt, CTRL_SHIFT, Named(NamedKey::ArrowUp))
         .primary_screen()
         .repeating(),
@@ -540,6 +604,8 @@ fn parse_action(name: &str) -> Result<KeybindAction, &'static str> {
         "toggle_vi" => Action::ToggleVi,
         "search" | "find" => Action::Search,
         "hints" | "quick_select" => Action::Hints,
+        "command_palette" | "palette" => Action::CommandPalette,
+        "toggle_mode" => Action::ToggleMode,
         "previous_prompt" => Action::PreviousPrompt,
         "next_prompt" => Action::NextPrompt,
         "copy_last_output" => Action::CopyLastOutput,

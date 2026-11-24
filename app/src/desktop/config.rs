@@ -12,6 +12,7 @@ use super::bg_image::{
 };
 use super::contrast::{MAX_CONTRAST, MIN_CONTRAST};
 use super::font::{FontConfig, FontFeature, MetricAdjustment};
+use super::scrollbar::ScrollbarPolicy;
 use super::shortcuts::{self, Keybind};
 use super::theme::Preference;
 
@@ -68,6 +69,32 @@ impl ConfigSource {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum TerminalMode {
+    #[default]
+    Classic,
+    Modern,
+}
+
+impl TerminalMode {
+    pub(super) fn parse(value: &str) -> Result<Self, &'static str> {
+        if value.eq_ignore_ascii_case("classic") || value.eq_ignore_ascii_case("traditional") {
+            Ok(Self::Classic)
+        } else if value.eq_ignore_ascii_case("modern") {
+            Ok(Self::Modern)
+        } else {
+            Err("mode must be classic or modern")
+        }
+    }
+
+    pub(super) const fn toggle(self) -> Self {
+        match self {
+            Self::Classic => Self::Modern,
+            Self::Modern => Self::Classic,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) enum ClipboardPolicy {
     #[default]
     Allow,
@@ -84,6 +111,8 @@ pub(super) enum NotificationPolicy {
 
 #[derive(PartialEq)]
 pub(super) struct Config {
+    pub(super) mode: TerminalMode,
+    pub(super) scrollbar: ScrollbarPolicy,
     pub(super) font_family: Option<String>,
     pub(super) font_family_bold: Option<String>,
     pub(super) font_family_italic: Option<String>,
@@ -122,6 +151,8 @@ pub(super) struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            mode: TerminalMode::Classic,
+            scrollbar: ScrollbarPolicy::Auto,
             font_family: None,
             font_family_bold: None,
             font_family_italic: None,
@@ -285,6 +316,12 @@ impl Config {
 
     fn set(&mut self, key: &str, value: &str) -> Result<(), &'static str> {
         match key {
+            "mode" => {
+                self.mode = TerminalMode::parse(value)?;
+            }
+            "scrollbar" => {
+                self.scrollbar = ScrollbarPolicy::parse(value)?;
+            }
             "font-family" => {
                 self.font_family = parse_font_family(value)?;
             }
@@ -626,6 +663,8 @@ mod tests {
         let loaded = Config::parse(
             "lune.conf",
             "# Font settings\r\nfont-family = Fixture Mono\r\nfont-size=19.5\r\n\
+             mode = modern\r\nmode = futuristic\r\n\
+             scrollbar = always\r\nscrollbar = maybe\r\n\
              font-family-bold = Fixture Bold\r\nfont-family-italic = Fixture Italic\r\n\
              font-family-bold-italic = Fixture Bold Italic\r\n\
              font-feature = ss01, -calt, cv02=2\r\nfont-feature = bad\r\n\
@@ -656,6 +695,8 @@ mod tests {
             Path::new(""),
         );
         let config = loaded.config;
+        assert_eq!(config.mode, super::TerminalMode::Modern);
+        assert_eq!(config.scrollbar, super::ScrollbarPolicy::Always);
         assert_eq!(config.font_family.as_deref(), Some("Fixture Mono"));
         assert_eq!(config.font_family_bold.as_deref(), Some("Fixture Bold"));
         assert_eq!(config.font_family_italic.as_deref(), Some("Fixture Italic"));
@@ -711,12 +752,10 @@ mod tests {
         assert_eq!(config.clipboard_write, super::ClipboardPolicy::Deny);
         assert_eq!(config.clipboard_read, super::ClipboardPolicy::Allow);
         assert_eq!(config.notifications, super::NotificationPolicy::Always);
-        assert_eq!(loaded.errors.len(), 28);
+        assert_eq!(loaded.errors.len(), 30);
         assert_eq!(
             format_errors(&loaded.errors).as_deref(),
-            Some(
-                "Config error: lune.conf:8: font-feature tag must be 4 printable ASCII characters (+27 more)"
-            )
+            Some("Config error: lune.conf:5: mode must be classic or modern (+29 more)")
         );
     }
 }

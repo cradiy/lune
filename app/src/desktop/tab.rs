@@ -28,7 +28,7 @@ use super::ime;
 use super::input::{self, Input};
 use super::notify::Notifier;
 use super::readiness::{Readiness, Registration};
-use super::scrollbar::{ScrollbarMetrics, ScrollbarView};
+use super::scrollbar::{ScrollbarMetrics, ScrollbarPolicy, ScrollbarView};
 use super::search;
 use super::shell_integration;
 use super::split::{PaneRect, SplitLayout, SplitTree};
@@ -310,22 +310,35 @@ impl Pane {
             return None;
         }
         let history_rows = screen.history().len();
-        let offset = screen.viewport_offset();
-        if history_rows == 0 || (offset == 0 && self.scrollbar_drag.is_none()) {
+        if history_rows == 0 {
             return None;
         }
+        let offset = screen.viewport_offset();
         let area = self.session.geometry().text_area_pixels()?;
         ScrollbarMetrics::compute(area, history_rows, screen.viewport().rows(), offset, scale)
     }
 
-    pub(super) fn scrollbar_view(&self, scale: f64) -> Option<ScrollbarView> {
-        self.scrollbar_metrics(scale)
-            .map(|metrics| metrics.view(self.scrollbar_hovered || self.scrollbar_drag.is_some()))
+    pub(super) fn scrollbar_view(
+        &self,
+        scale: f64,
+        policy: ScrollbarPolicy,
+    ) -> Option<ScrollbarView> {
+        if policy == ScrollbarPolicy::Never {
+            return None;
+        }
+        let metrics = self.scrollbar_metrics(scale)?;
+        let highlighted = self.scrollbar_hovered || self.scrollbar_drag.is_some();
+        let offset = self.session.screen().viewport_offset();
+        let visible = match policy {
+            ScrollbarPolicy::Always => true,
+            ScrollbarPolicy::Auto => offset > 0 || highlighted,
+            ScrollbarPolicy::Never => false,
+        };
+        visible.then(|| metrics.view(highlighted))
     }
 
-    pub(super) fn update_scrollbar_hover(&mut self) {
-        let hovered = self
-            .visible
+    pub(super) fn update_scrollbar_hover(&mut self, policy: ScrollbarPolicy) {
+        let hovered = (policy != ScrollbarPolicy::Never && self.visible)
             .then(|| {
                 let pos = self.pointer?;
                 let metrics = self.scrollbar_metrics(self.window.scale_factor())?;
@@ -382,7 +395,11 @@ impl Pane {
         }
     }
 
-    pub(super) fn pointer_moved(&mut self, position: PhysicalPosition<f64>) {
+    pub(super) fn pointer_moved(
+        &mut self,
+        position: PhysicalPosition<f64>,
+        scrollbar_policy: ScrollbarPolicy,
+    ) {
         let moved = self.pointer.replace(position) != Some(position);
         if let Some(grab_offset_y) = self.scrollbar_drag {
             if let Some(metrics) = self.scrollbar_metrics(self.window.scale_factor()) {
@@ -403,7 +420,7 @@ impl Pane {
         } else {
             self.mouse_event(MouseEvent::Motion(self.pressed));
         }
-        self.update_scrollbar_hover();
+        self.update_scrollbar_hover(scrollbar_policy);
         self.update_hovered_hyperlink();
     }
 
@@ -1360,6 +1377,7 @@ impl Pane {
             && self.session.processor().input_modes().mouse_tracking != MouseTracking::Disabled
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn button(
         &mut self,
         state: ElementState,
@@ -1368,17 +1386,19 @@ impl Pane {
         hyperlink_open_pending: &mut bool,
         copy_pending: &mut bool,
         copy_on_select: bool,
+        scrollbar_policy: ScrollbarPolicy,
     ) -> Option<String> {
         if !state.is_pressed()
             && button == winit::event::MouseButton::Left
             && self.scrollbar_drag.take().is_some()
         {
-            self.update_scrollbar_hover();
+            self.update_scrollbar_hover(scrollbar_policy);
             self.invalidate_overlay();
             return None;
         }
         if state.is_pressed()
             && button == winit::event::MouseButton::Left
+            && scrollbar_policy != ScrollbarPolicy::Never
             && let Some(pos) = self.pointer
             && let Some(metrics) = self.scrollbar_metrics(self.window.scale_factor())
         {
@@ -1546,9 +1566,22 @@ impl Pane {
             self.selection_drag = None;
             self.hyperlink_click = None;
             self.scroll_vi_cursor();
-            self.update_scrollbar_hover();
             self.update_hovered_hyperlink();
             self.invalidate_overlay();
+        }
+    }
+
+    pub(super) fn jump_to_row(&mut self, row: usize) {
+        let screen = self.session.screen();
+        if screen.active_buffer() != ScreenBuffer::Primary {
+            return;
+        }
+        let history = screen.view().history_rows();
+        let desired_offset = history.saturating_sub(row);
+        let current_offset = screen.viewport_offset();
+        let delta = desired_offset as isize - current_offset as isize;
+        if delta != 0 {
+            self.scroll_history(delta);
         }
     }
 

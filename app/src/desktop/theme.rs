@@ -8,14 +8,14 @@ use super::config::parse_settings;
 
 pub(super) mod system;
 
-#[derive(PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(super) enum Preference {
     System,
     Fixed(Theme),
     Custom(Theme, Box<Colors>),
 }
 
-#[derive(Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub(super) struct Colors {
     ansi: [Option<u32>; 16],
     foreground: Option<u32>,
@@ -26,6 +26,37 @@ pub(super) struct Colors {
 }
 
 impl Preference {
+    pub(super) fn list_available(directory: Option<&Path>) -> Vec<String> {
+        let mut names = vec!["system".to_owned(), "dark".to_owned(), "light".to_owned()];
+        let Some(directory) = directory else {
+            return names;
+        };
+        let Ok(entries) = fs::read_dir(directory.join("themes")) else {
+            return names;
+        };
+        let mut custom = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("conf") {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if !stem.is_empty()
+                && !matches!(stem, "system" | "dark" | "light")
+                && stem
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+            {
+                custom.push(stem.to_owned());
+            }
+        }
+        custom.sort();
+        names.extend(custom);
+        names
+    }
+
     pub(super) fn load(
         directory: &Path,
         name: &str,

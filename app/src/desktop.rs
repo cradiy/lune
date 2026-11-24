@@ -14,6 +14,7 @@ mod input;
 mod ligature;
 mod notify;
 mod paint;
+mod palette;
 mod readiness;
 mod scrollbar;
 mod search;
@@ -55,11 +56,14 @@ use cli::LaunchOptions;
 use clipboard::ClipboardType;
 use config::{
     ClipboardPolicy, Config, ConfigSource, MAX_FONT_SIZE, MIN_FONT_SIZE, NotificationPolicy,
+    TerminalMode,
 };
 use font::{Font, physical_font_size};
 use notify::Notifier;
 use paint::{NoticeKind, NoticeView, Painter, PainterOptions};
+use palette::{CommandPalette, PaletteAction, PaletteContext};
 use readiness::Readiness;
+use scrollbar::ScrollbarPolicy;
 use shortcuts::{Action, Keymap, Scroll, Zoom};
 use split::{Axis, Direction as SplitDirection, Divider, SplitTree};
 use tab::{Pane, PaneConfig, Tab};
@@ -329,6 +333,9 @@ struct Client {
     next_pane: PaneId,
     palette: Palette,
     scheme: ColorScheme,
+    theme_preference: theme::Preference,
+    system_theme: Theme,
+    config_dir: Option<PathBuf>,
     bar: tab_bar::Layout,
     content_area: PixelRect,
     copy_pending: bool,
@@ -360,10 +367,13 @@ struct Client {
     cursor_blink: bool,
     shell: Option<Vec<OsString>>,
     shell_integration: bool,
+    mode: TerminalMode,
+    scrollbar: ScrollbarPolicy,
     confirm_close: bool,
     confirm_paste: bool,
     copy_on_select: bool,
     confirm: Option<confirm::Dialog>,
+    command_palette: Option<CommandPalette>,
 }
 
 impl Client {
@@ -459,6 +469,10 @@ impl Client {
                 }
             },
         };
+        let config_dir = custom_config
+            .as_deref()
+            .and_then(|path| path.parent().map(PathBuf::from))
+            .or_else(Config::directory);
         Ok(Self {
             window,
             painter,
@@ -469,6 +483,9 @@ impl Client {
             next_pane: 2,
             palette,
             scheme,
+            theme_preference: config.theme.clone(),
+            system_theme,
+            config_dir,
             bar,
             content_area,
             copy_pending: false,
@@ -512,10 +529,13 @@ impl Client {
             cursor_blink: config.cursor_blink,
             shell: config.shell.clone(),
             shell_integration: config.shell_integration,
+            mode: config.mode,
+            scrollbar: config.scrollbar,
             confirm_close: config.confirm_close,
             confirm_paste: config.confirm_paste,
             copy_on_select: config.copy_on_select,
             confirm: None,
+            command_palette: None,
         })
     }
 
@@ -634,6 +654,12 @@ impl Client {
                     }
                     return Ok(());
                 }
+                if self.command_palette.is_some() {
+                    if event.state.is_pressed() {
+                        self.handle_palette_key(event_loop, &event);
+                    }
+                    return Ok(());
+                }
                 if event.state.is_pressed() {
                     self.key(event_loop, &event);
                 } else {
@@ -657,7 +683,29 @@ impl Client {
                 pane.clear_preedit();
             }
             WindowEvent::Ime(ime) => {
-                if self.confirm.is_none() {
+                if self.confirm.is_some() {
+                    return Ok(());
+                }
+                if let Some(cmd_palette) = &mut self.command_palette {
+                    match ime {
+                        Ime::Preedit(text, _) => {
+                            if cmd_palette.preedit != text {
+                                cmd_palette.preedit = text;
+                                self.painter.invalidate_overlay();
+                                self.window.request_redraw();
+                            }
+                        }
+                        Ime::Commit(text) => {
+                            cmd_palette.preedit.clear();
+                            if cmd_palette.push_text(&text) {
+                                self.sync_palette_theme_preview();
+                            }
+                            self.painter.invalidate_overlay();
+                            self.window.request_redraw();
+                        }
+                        _ => {}
+                    }
+                } else {
                     self.tabs[self.active].focused_pane_mut().ime(ime);
                 }
             }
@@ -677,6 +725,20 @@ impl Client {
                     self.update_cursor_icon();
                     return Ok(());
                 }
+                if self.command_palette.is_some() {
+                    let hovered = self
+                        .palette_layout()
+                        .and_then(|(layout, shown)| layout.hit_row(position, shown));
+                    if let Some(cmd_palette) = &mut self.command_palette
+                        && cmd_palette.hovered != hovered
+                    {
+                        cmd_palette.hovered = hovered;
+                        self.painter.invalidate_overlay();
+                        self.window.request_redraw();
+                    }
+                    self.update_cursor_icon();
+                    return Ok(());
+                }
                 if let Some(divider) = self.dragging_divider {
                     let ratio = divider.ratio_for(position);
                     if self.tabs[self.active].tree.set_ratio(divider.path, ratio) {
@@ -687,6 +749,7 @@ impl Client {
                     self.update_cursor_icon();
                     return Ok(());
                 }
+                let scrollbar = self.scrollbar;
                 let tab = &mut self.tabs[self.active];
                 let captured = tab
                     .panes
@@ -699,7 +762,7 @@ impl Client {
                     .map(|pane| pane.id);
                 if let Some(id) = captured {
                     if let Some(pane) = tab.pane_mut(id) {
-                        pane.pointer_moved(position);
+                        pane.pointer_moved(position, scrollbar);
                     }
                 } else {
                     let hovered_id = (!self.bar.contains(position))
@@ -708,10 +771,10 @@ impl Client {
                     for pane in &mut tab.panes {
                         if Some(pane.id) == hovered_id {
                             pane.modifiers = self.modifiers;
-                            pane.pointer_moved(position);
+                            pane.pointer_moved(position, scrollbar);
                         } else if pane.pointer.is_some() {
                             pane.pointer = None;
-                            pane.update_scrollbar_hover();
+                            pane.update_scrollbar_hover(scrollbar);
                             pane.update_hovered_hyperlink();
                         }
                     }
@@ -726,6 +789,13 @@ impl Client {
                     self.painter.invalidate_overlay();
                     self.window.request_redraw();
                 }
+                if let Some(cmd_palette) = &mut self.command_palette
+                    && cmd_palette.hovered.take().is_some()
+                {
+                    self.painter.invalidate_overlay();
+                    self.window.request_redraw();
+                }
+                let scrollbar = self.scrollbar;
                 for pane in &mut self.tabs[self.active].panes {
                     if pane.pressed.is_none()
                         && pane.selection_drag.is_none()
@@ -733,7 +803,7 @@ impl Client {
                     {
                         pane.pointer = None;
                     }
-                    pane.update_scrollbar_hover();
+                    pane.update_scrollbar_hover(scrollbar);
                     pane.update_hovered_hyperlink();
                 }
                 self.update_cursor_icon();
@@ -753,6 +823,29 @@ impl Client {
                                 }
                             }
                             confirm::Button::No => self.dismiss_confirm(),
+                        }
+                    }
+                    return Ok(());
+                }
+                if self.command_palette.is_some() {
+                    if state.is_pressed()
+                        && button == winit::event::MouseButton::Left
+                        && let Some(point) = self.pointer
+                    {
+                        if let Some((layout, shown)) = self.palette_layout() {
+                            if let Some(row) = layout.hit_row(point, shown) {
+                                let action = self.command_palette.as_mut().and_then(|palette| {
+                                    palette.select_visible(row);
+                                    palette.entry_at_visible(row).map(|e| e.action.clone())
+                                });
+                                if let Some(action) = action {
+                                    self.execute_palette_action(event_loop, action);
+                                }
+                            } else if !layout.contains_card(point) {
+                                self.close_palette(true);
+                            }
+                        } else {
+                            self.close_palette(true);
                         }
                     }
                     return Ok(());
@@ -803,6 +896,7 @@ impl Client {
                                 &mut self.hyperlink_open_pending,
                                 &mut self.copy_pending,
                                 self.copy_on_select,
+                                self.scrollbar,
                             )
                         })
                     } else {
@@ -813,6 +907,7 @@ impl Client {
                             &mut self.hyperlink_open_pending,
                             &mut self.copy_pending,
                             self.copy_on_select,
+                            self.scrollbar,
                         )
                     };
                     if let Some(text) = copied_notice {
@@ -839,6 +934,7 @@ impl Client {
                                 &mut self.hyperlink_open_pending,
                                 &mut self.copy_pending,
                                 self.copy_on_select,
+                                self.scrollbar,
                             )
                         });
                     if let Some(text) = copied_notice {
@@ -849,6 +945,24 @@ impl Client {
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 if self.confirm.is_some() {
+                    return Ok(());
+                }
+                if let Some(cmd_palette) = &mut self.command_palette {
+                    let y = match delta {
+                        winit::event::MouseScrollDelta::LineDelta(_, y) => f64::from(y),
+                        winit::event::MouseScrollDelta::PixelDelta(pos) => pos.y / 20.0,
+                    };
+                    let step = if y > 0.0 {
+                        -1
+                    } else if y < 0.0 {
+                        1
+                    } else {
+                        0
+                    };
+                    if step != 0 && cmd_palette.scroll_list(step) {
+                        self.painter.invalidate_overlay();
+                        self.window.request_redraw();
+                    }
                     return Ok(());
                 }
                 if self.pointer.is_some_and(|point| self.bar.contains(point)) {
@@ -889,6 +1003,12 @@ impl Client {
     fn update_cursor_icon(&mut self) {
         let next = if let Some(dialog) = &self.confirm {
             if dialog.hovered.is_some() {
+                CursorIcon::Pointer
+            } else {
+                CursorIcon::Default
+            }
+        } else if let Some(cmd_palette) = &self.command_palette {
+            if cmd_palette.hovered.is_some() {
                 CursorIcon::Pointer
             } else {
                 CursorIcon::Default
@@ -1030,6 +1150,8 @@ impl Client {
                     self.show_notice(NoticeKind::Warning, "No hints found in view".into());
                 }
             }
+            Action::CommandPalette => self.open_palette(),
+            Action::ToggleMode => self.set_mode(self.mode.toggle()),
             Action::PreviousPrompt => self.tabs[self.active].focused_pane_mut().jump_prompt(false),
             Action::NextPrompt => self.tabs[self.active].focused_pane_mut().jump_prompt(true),
             Action::CopyLastOutput => {
@@ -1444,8 +1566,15 @@ impl Client {
     }
 
     fn apply_system_theme(&mut self, theme: Theme) {
-        self.window.set_theme(Some(theme));
-        (self.palette, self.scheme) = theme::palette(theme);
+        self.system_theme = theme;
+        self.apply_theme_preference(self.theme_preference.clone());
+    }
+
+    fn apply_theme_preference(&mut self, preference: theme::Preference) {
+        let selected = preference.resolve(self.system_theme);
+        self.window.set_theme(Some(selected));
+        (self.palette, self.scheme) = preference.palette(selected);
+        self.theme_preference = preference;
         for tab in &mut self.tabs {
             for pane in &mut tab.panes {
                 pane.session.set_theme(&self.palette, Some(self.scheme));
@@ -1453,6 +1582,314 @@ impl Client {
         }
         self.painter.invalidate_overlay();
         self.window.request_redraw();
+    }
+
+    fn set_mode(&mut self, mode: TerminalMode) {
+        if self.mode == mode {
+            return;
+        }
+        self.mode = mode;
+        let label = match mode {
+            TerminalMode::Classic => "Mode: Classic",
+            TerminalMode::Modern => "Mode: Modern",
+        };
+        self.show_notice(NoticeKind::Success, label.into());
+    }
+
+    fn palette_layout(&self) -> Option<(palette::Layout, usize)> {
+        let cmd_palette = self.command_palette.as_ref()?;
+        let size = self.painter.size();
+        let area = PixelSize {
+            width: NonZeroU32::new(size.width)?,
+            height: NonZeroU32::new(size.height)?,
+        };
+        let shown = cmd_palette.match_count().min(palette::MAX_VISIBLE_ROWS);
+        let layout = palette::Layout::compute(
+            area,
+            self.painter.metrics(),
+            self.window.scale_factor(),
+            cmd_palette.match_count(),
+        )?;
+        Some((layout, shown))
+    }
+
+    fn open_palette(&mut self) {
+        if self.command_palette.is_some() {
+            self.close_palette(true);
+            return;
+        }
+        self.dragging_divider = None;
+        let tab = &self.tabs[self.active];
+        let pane = tab.focused_pane();
+        let ctx = PaletteContext {
+            keymap: &self.keymap,
+            mode: self.mode,
+            scrollbar: self.scrollbar,
+            copy_on_select: self.copy_on_select,
+            multi_tab: self.tabs.len() > 1,
+            multi_pane: tab.panes.len() > 1,
+            primary_screen: pane.session.screen().active_buffer()
+                == lune_terminal::ScreenBuffer::Primary,
+        };
+        self.command_palette = Some(CommandPalette::new(&ctx));
+        self.window.set_ime_allowed(self.focused);
+        self.painter.reset_cursor_motion();
+        self.painter.invalidate_overlay();
+        self.update_cursor_icon();
+        self.window.request_redraw();
+    }
+
+    fn close_palette(&mut self, restore_theme: bool) {
+        if let Some(cmd_palette) = self.command_palette.take() {
+            if restore_theme && let Some(saved) = cmd_palette.theme_restore {
+                self.apply_theme_preference(saved);
+            }
+            let pane = self.tabs[self.active].focused_pane_mut();
+            pane.invalidate_ime_area();
+            self.window
+                .set_ime_allowed(self.focused && pane.allows_ime());
+            pane.update_ime_area();
+            self.painter.invalidate_overlay();
+            self.update_cursor_icon();
+            self.window.request_redraw();
+        }
+    }
+
+    fn sync_palette_theme_preview(&mut self) {
+        let preview_name = self
+            .command_palette
+            .as_ref()
+            .filter(|palette| palette.in_theme_menu())
+            .and_then(|palette| palette.selected_entry())
+            .and_then(|entry| match &entry.action {
+                PaletteAction::ApplyTheme(name) => Some(name.clone()),
+                _ => None,
+            });
+        let Some(name) = preview_name else {
+            return;
+        };
+        let dir = self
+            .config_dir
+            .as_deref()
+            .unwrap_or(std::path::Path::new(""));
+        let mut errors = Vec::new();
+        if let Ok(pref) = theme::Preference::load(dir, &name, &mut errors) {
+            self.apply_theme_preference(pref);
+        }
+    }
+
+    fn handle_palette_key(&mut self, event_loop: &ActiveEventLoop, event: &KeyEvent) {
+        let ctrl = self.modifiers.control_key();
+        let alt = self.modifiers.alt_key();
+        let shift = self.modifiers.shift_key();
+        let super_key = self.modifiers.super_key();
+
+        if let Some(binding) =
+            self.keymap
+                .binding(event, self.modifiers, lune_terminal::ScreenBuffer::Primary)
+            && let Some(Action::CommandPalette) = binding.action(event.repeat)
+        {
+            self.close_palette(true);
+            return;
+        }
+
+        let mut changed = false;
+        match &event.logical_key {
+            Key::Named(NamedKey::Escape) => {
+                let popped = self
+                    .command_palette
+                    .as_mut()
+                    .is_some_and(CommandPalette::pop_submenu);
+                if popped {
+                    let restore = self
+                        .command_palette
+                        .as_mut()
+                        .and_then(|palette| palette.theme_restore.take());
+                    if let Some(saved) = restore {
+                        self.apply_theme_preference(saved);
+                    }
+                    self.painter.invalidate_overlay();
+                    self.window.request_redraw();
+                } else {
+                    self.close_palette(true);
+                }
+                return;
+            }
+            Key::Named(NamedKey::Enter) if !ctrl && !alt && !super_key => {
+                let action = self
+                    .command_palette
+                    .as_ref()
+                    .and_then(|palette| palette.selected_entry().map(|e| e.action.clone()));
+                if let Some(action) = action {
+                    self.execute_palette_action(event_loop, action);
+                } else {
+                    self.close_palette(true);
+                }
+                return;
+            }
+            Key::Named(NamedKey::ArrowDown) if !ctrl && !alt && !super_key => {
+                if let Some(palette) = &mut self.command_palette {
+                    changed = palette.step(1);
+                }
+            }
+            Key::Named(NamedKey::ArrowUp) if !ctrl && !alt && !super_key => {
+                if let Some(palette) = &mut self.command_palette {
+                    changed = palette.step(-1);
+                }
+            }
+            Key::Named(NamedKey::Tab) if !ctrl && !alt && !super_key => {
+                if let Some(palette) = &mut self.command_palette {
+                    changed = palette.step(if shift { -1 } else { 1 });
+                }
+            }
+            Key::Named(NamedKey::Backspace) if !alt && !super_key => {
+                if let Some(palette) = &mut self.command_palette {
+                    if palette.query.is_empty() && palette.pop_submenu() {
+                        let restore = palette.theme_restore.take();
+                        if let Some(saved) = restore {
+                            self.apply_theme_preference(saved);
+                        }
+                        self.painter.invalidate_overlay();
+                        self.window.request_redraw();
+                        return;
+                    }
+                    changed = if ctrl {
+                        palette.delete_word()
+                    } else {
+                        palette.backspace()
+                    };
+                }
+            }
+            Key::Character(text) if ctrl && !alt && !super_key => {
+                if let Some(palette) = &mut self.command_palette {
+                    if text.eq_ignore_ascii_case("n") || text.eq_ignore_ascii_case("j") {
+                        changed = palette.step(1);
+                    } else if text.eq_ignore_ascii_case("p") || text.eq_ignore_ascii_case("k") {
+                        changed = palette.step(-1);
+                    } else if text.eq_ignore_ascii_case("w") {
+                        changed = palette.delete_word();
+                    } else if text.eq_ignore_ascii_case("u") {
+                        changed = palette.clear_query();
+                    }
+                }
+            }
+            Key::Named(NamedKey::Space) if !ctrl && !alt && !super_key => {
+                if let Some(palette) = &mut self.command_palette {
+                    changed = palette.push_text(" ");
+                }
+            }
+            Key::Character(text) if !ctrl && !alt && !super_key => {
+                if let Some(palette) = &mut self.command_palette {
+                    changed = palette.push_text(text);
+                }
+            }
+            _ => return,
+        }
+
+        if changed {
+            self.sync_palette_theme_preview();
+            self.painter.invalidate_overlay();
+            self.window.request_redraw();
+        }
+    }
+
+    fn execute_palette_action(&mut self, event_loop: &ActiveEventLoop, action: PaletteAction) {
+        match action {
+            PaletteAction::OpenThemes => {
+                let themes = theme::Preference::list_available(self.config_dir.as_deref());
+                let entries = palette::build_theme_entries(themes);
+                let restore = self.theme_preference.clone();
+                if let Some(cmd_palette) = &mut self.command_palette {
+                    cmd_palette.theme_restore = Some(restore);
+                    cmd_palette.push_submenu("Theme", entries, 0);
+                }
+                self.sync_palette_theme_preview();
+                self.painter.invalidate_overlay();
+                self.window.request_redraw();
+            }
+            PaletteAction::ApplyTheme(name) => {
+                let dir = self
+                    .config_dir
+                    .as_deref()
+                    .unwrap_or(std::path::Path::new(""));
+                let mut errors = Vec::new();
+                match theme::Preference::load(dir, &name, &mut errors) {
+                    Ok(pref) => {
+                        self.close_palette(false);
+                        self.apply_theme_preference(pref);
+                        self.show_notice(NoticeKind::Success, format!("Theme: {name}"));
+                    }
+                    Err(error) => {
+                        self.close_palette(true);
+                        self.show_notice(NoticeKind::Warning, error.into());
+                    }
+                }
+            }
+            PaletteAction::OpenCommands => {
+                let entries = {
+                    let screen = self.tabs[self.active].focused_pane().session.screen();
+                    palette::build_command_history_entries(screen.view())
+                };
+                if entries.is_empty() {
+                    self.close_palette(true);
+                    self.show_notice(
+                        NoticeKind::Warning,
+                        "No command history recorded in pane".into(),
+                    );
+                    return;
+                }
+                if let Some(cmd_palette) = &mut self.command_palette {
+                    cmd_palette.push_submenu("Commands", entries, 0);
+                }
+                self.painter.invalidate_overlay();
+                self.window.request_redraw();
+            }
+            PaletteAction::JumpToRow(row) => {
+                self.close_palette(true);
+                self.tabs[self.active].focused_pane_mut().jump_to_row(row);
+            }
+            PaletteAction::OpenScrollbar => {
+                let (entries, selected) = palette::build_scrollbar_entries(self.scrollbar);
+                if let Some(cmd_palette) = &mut self.command_palette {
+                    cmd_palette.push_submenu("Scrollbar", entries, selected);
+                }
+                self.painter.invalidate_overlay();
+                self.window.request_redraw();
+            }
+            PaletteAction::SetScrollbar(policy) => {
+                self.close_palette(true);
+                self.scrollbar = policy;
+                for tab in &mut self.tabs {
+                    for pane in &mut tab.panes {
+                        pane.update_scrollbar_hover(policy);
+                    }
+                }
+                let label = match policy {
+                    ScrollbarPolicy::Auto => "Scrollbar: Auto",
+                    ScrollbarPolicy::Always => "Scrollbar: Always",
+                    ScrollbarPolicy::Never => "Scrollbar: Hidden",
+                };
+                self.show_notice(NoticeKind::Success, label.into());
+            }
+            PaletteAction::SetMode(mode) => {
+                self.close_palette(true);
+                self.set_mode(mode);
+            }
+            PaletteAction::ToggleCopyOnSelect => {
+                self.close_palette(true);
+                self.copy_on_select = !self.copy_on_select;
+                let label = if self.copy_on_select {
+                    "Copy on select: On"
+                } else {
+                    "Copy on select: Off"
+                };
+                self.show_notice(NoticeKind::Success, label.into());
+            }
+            PaletteAction::Shortcut(shortcut) => {
+                self.close_palette(true);
+                self.run_shortcut(event_loop, shortcut);
+            }
+        }
     }
 
     fn confirm_layout(&self) -> Option<confirm::Layout> {
@@ -1666,13 +2103,18 @@ impl Client {
     }
 
     fn apply_config(&mut self, old: &Config, new: &Config, system_theme: Theme, force: bool) {
+        self.system_theme = system_theme;
         if old.theme != new.theme {
-            let selected = new.theme.resolve(system_theme);
-            self.window.set_theme(Some(selected));
-            (self.palette, self.scheme) = new.theme.palette(selected);
+            self.apply_theme_preference(new.theme.clone());
+        }
+        if old.mode != new.mode {
+            self.mode = new.mode;
+        }
+        if old.scrollbar != new.scrollbar {
+            self.scrollbar = new.scrollbar;
             for tab in &mut self.tabs {
                 for pane in &mut tab.panes {
-                    pane.session.set_theme(&self.palette, Some(self.scheme));
+                    pane.update_scrollbar_hover(self.scrollbar);
                 }
             }
         }
@@ -2022,7 +2464,10 @@ impl Client {
             let Some(mut frame) = pane.session.presentation_frame() else {
                 return Ok(());
             };
-            let focused = self.focused && self.confirm.is_none() && pane.id == active_tab.focused;
+            let focused = self.focused
+                && self.confirm.is_none()
+                && self.command_palette.is_none()
+                && pane.id == active_tab.focused;
             if pane.vi.is_some() || pane.search.is_some() || pane.hints.is_some() || !focused {
                 frame.cursor_appearance.visible = false;
             }
@@ -2051,7 +2496,7 @@ impl Client {
                 hints: pane.hints.as_ref(),
                 focused,
                 zoomed: zoomed && pane.id == active_tab.focused,
-                scrollbar: pane.scrollbar_view(scale),
+                scrollbar: pane.scrollbar_view(scale, self.scrollbar),
                 dim_alpha,
             });
         }
@@ -2071,6 +2516,7 @@ impl Client {
                     text: notice.text.as_str(),
                 }),
                 confirm: self.confirm.as_ref(),
+                command_palette: self.command_palette.as_ref(),
                 scale,
                 tab_bar: tab_bar::View {
                     layout: &self.bar,
