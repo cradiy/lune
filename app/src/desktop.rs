@@ -1,3 +1,4 @@
+pub mod cli;
 mod clipboard;
 mod config;
 mod cursor;
@@ -20,7 +21,11 @@ mod vi;
 
 use std::io;
 use std::num::NonZeroU32;
+use std::os::unix::process::CommandExt;
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use lune_terminal::{ClipboardQuery, ColorScheme, Palette, PixelPosition, PixelSize};
@@ -34,8 +39,11 @@ use winit::window::{CursorIcon, Fullscreen, Theme, Window, WindowId};
 
 use crate::{GridGeometry, PixelRect, SessionReady};
 
+use cli::LaunchOptions;
 use clipboard::ClipboardType;
-use config::{ClipboardPolicy, Config, MAX_FONT_SIZE, MIN_FONT_SIZE, NotificationPolicy};
+use config::{
+    ClipboardPolicy, Config, ConfigSource, MAX_FONT_SIZE, MIN_FONT_SIZE, NotificationPolicy,
+};
 use font::{Font, physical_font_size};
 use notify::Notifier;
 use paint::Painter;
@@ -71,8 +79,27 @@ enum Event {
     ConfigReload(bool),
 }
 
-pub fn run() -> Result<()> {
-    let loaded = Config::load();
+pub fn run(mut options: LaunchOptions) -> Result<()> {
+    if let Some(path) = options.working_directory.take() {
+        let resolved = if path.is_absolute() {
+            path
+        } else {
+            std::env::current_dir()?.join(path)
+        };
+        if !resolved.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "Working directory does not exist or is not a directory: {}",
+                    resolved.display()
+                ),
+            )
+            .into());
+        }
+        options.working_directory = Some(resolved);
+    }
+    let config_source = ConfigSource::from_option(options.config.take());
+    let loaded = Config::load(&config_source);
     let startup_notice = config::format_errors(&loaded.errors);
     let event_loop = EventLoop::<Event>::with_user_event()
         .with_wayland()
@@ -80,18 +107,20 @@ pub fn run() -> Result<()> {
     log::debug!("Wayland event loop ready");
     let proxy = event_loop.create_proxy();
     let config_watch =
-        Config::directory().and_then(|directory| {
-            match config::watch::Watch::start(directory, proxy.clone()) {
+        config_source.watch_target().and_then(
+            |(directory, file)| match config::watch::Watch::start(directory, file, proxy.clone()) {
                 Ok(watch) => Some(watch),
                 Err(error) => {
                     log::warn!("Could not start the configuration watcher: {error}");
                     None
                 }
-            }
-        });
+            },
+        );
     let mut app = App {
         proxy,
+        config_source,
         config: loaded.config,
+        launch: Some(options),
         startup_notice,
         client: None,
         error: None,
@@ -106,7 +135,9 @@ pub fn run() -> Result<()> {
 
 struct App {
     proxy: EventLoopProxy<Event>,
+    config_source: ConfigSource,
     config: Config,
+    launch: Option<LaunchOptions>,
     startup_notice: Option<String>,
     client: Option<Client>,
     error: Option<Box<dyn std::error::Error>>,
@@ -132,7 +163,7 @@ impl App {
     }
 
     fn reload_config(&mut self, force: bool) {
-        let loaded = match Config::load_checked() {
+        let loaded = match Config::load_checked(&self.config_source) {
             Ok(loaded) => loaded,
             Err(error) => {
                 let notice = config::format_errors(&[error]);
@@ -172,11 +203,15 @@ impl App {
 impl ApplicationHandler<Event> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.client.is_none() {
+            let launch = self.launch.take().unwrap_or_default();
+            let custom_config = self.config_source.custom_path().map(PathBuf::from);
             match Client::new(
                 event_loop,
                 self.proxy.clone(),
                 &self.config,
                 self.system_theme,
+                launch,
+                custom_config,
                 self.startup_notice.take(),
             ) {
                 Ok(client) => self.client = Some(client),
@@ -294,6 +329,9 @@ struct Client {
     pointer: Option<PhysicalPosition<f64>>,
     dragging_divider: Option<Divider>,
     cursor_icon: CursorIcon,
+    default_title: String,
+    custom_app_id: Option<String>,
+    custom_config: Option<PathBuf>,
 }
 
 impl Client {
@@ -302,14 +340,22 @@ impl Client {
         proxy: EventLoopProxy<Event>,
         config: &Config,
         system_theme: Theme,
+        launch: LaunchOptions,
+        custom_config: Option<PathBuf>,
         startup_notice: Option<String>,
     ) -> Result<Self> {
         let selected_theme = config.theme.resolve(system_theme);
+        let default_title = launch
+            .title
+            .filter(|title| !title.is_empty())
+            .unwrap_or_else(|| "Lune".into());
+        let custom_app_id = launch.app_id;
+        let app_id = custom_app_id.as_deref().unwrap_or("lune");
         let window = Arc::new(
             event_loop.create_window(
                 Window::default_attributes()
-                    .with_title("Lune")
-                    .with_name("lune", "")
+                    .with_title(&default_title)
+                    .with_name(app_id, "")
                     .with_theme(Some(selected_theme))
                     .with_transparent(true)
                     .with_inner_size(LogicalSize::new(960, 600))
@@ -336,7 +382,8 @@ impl Client {
             grid,
             &palette,
             scheme,
-            None,
+            launch.working_directory,
+            launch.command.as_deref(),
         )?;
         let readiness = Readiness::new(proxy.clone())?;
         readiness.arm(pane.id, &mut pane.registration, pane.session.interests())?;
@@ -389,6 +436,9 @@ impl Client {
             pointer: None,
             dragging_divider: None,
             cursor_icon: CursorIcon::Default,
+            default_title,
+            custom_app_id,
+            custom_config,
         })
     }
 
@@ -727,6 +777,7 @@ impl Client {
             Action::ReloadConfig => {
                 let _ = self.proxy.send_event(Event::ConfigReload(true));
             }
+            Action::NewWindow => self.spawn_new_window(),
             Action::OpenDirectory => {
                 if !self.directory_open_pending {
                     let pane = self.tabs[self.active].focused_pane();
@@ -847,6 +898,7 @@ impl Client {
             &self.palette,
             self.scheme,
             cwd,
+            None,
         )?;
         self.readiness
             .arm(new_id, &mut pane.registration, pane.session.interests())?;
@@ -958,6 +1010,7 @@ impl Client {
             &self.palette,
             self.scheme,
             cwd,
+            None,
         )?;
         self.readiness
             .arm(id, &mut pane.registration, pane.session.interests())?;
@@ -1071,10 +1124,56 @@ impl Client {
         self.window.request_redraw();
     }
 
+    fn spawn_new_window(&self) {
+        let exe = match std::env::current_exe() {
+            Ok(exe) => exe,
+            Err(error) => {
+                log::warn!("Could not resolve Lune executable for new window: {error}");
+                return;
+            }
+        };
+        let cwd = self.tabs[self.active].focused_pane().working_directory();
+        let config = self.custom_config.clone();
+        let app_id = self.custom_app_id.clone();
+        if let Err(error) = thread::Builder::new()
+            .name("lune-new-window".into())
+            .spawn(move || {
+                let mut command = Command::new(exe);
+                if let Some(dir) = cwd {
+                    command.arg("--working-directory").arg(dir);
+                }
+                if let Some(path) = config {
+                    command.arg("--config").arg(path);
+                }
+                if let Some(id) = app_id {
+                    command.arg("--app-id").arg(id);
+                }
+                command
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .process_group(0);
+                match command.spawn() {
+                    Ok(mut child) => {
+                        let _ = child.wait();
+                    }
+                    Err(error) => {
+                        log::warn!("Could not launch new Lune window: {error}");
+                    }
+                }
+            })
+        {
+            log::warn!("Could not start new-window worker thread: {error}");
+        }
+    }
+
     fn update_window_title(&self) {
         let title = &self.tabs[self.active].focused_pane().title;
-        self.window
-            .set_title(if title.is_empty() { "Lune" } else { title });
+        self.window.set_title(if title.is_empty() {
+            &self.default_title
+        } else {
+            title
+        });
     }
 
     fn apply_system_theme(&mut self, theme: Theme) {

@@ -1,4 +1,4 @@
-use std::ffi::CString;
+use std::ffi::{CString, OsString};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
@@ -32,15 +32,17 @@ pub(in crate::desktop) struct Watch {
 impl Watch {
     pub(in crate::desktop) fn start(
         directory: PathBuf,
+        file_name: OsString,
         proxy: EventLoopProxy<Event>,
     ) -> io::Result<Self> {
-        Self::start_with(directory, move || {
+        Self::start_with(directory, file_name, move || {
             proxy.send_event(Event::ConfigReload(false)).is_ok()
         })
     }
 
     fn start_with(
         directory: PathBuf,
+        file_name: OsString,
         on_change: impl Fn() -> bool + Send + 'static,
     ) -> io::Result<Self> {
         // SAFETY: inotify_init1 takes flags and returns a new descriptor on success.
@@ -50,7 +52,7 @@ impl Watch {
         }
         // SAFETY: The successful call transferred ownership of the descriptor.
         let inotify = unsafe { OwnedFd::from_raw_fd(fd) };
-        let mut watches = WatchSet::new(directory);
+        let mut watches = WatchSet::new(directory, file_name);
         watches.refresh(&inotify);
         let (stop, worker_stop) = UnixStream::pair()?;
         let worker = thread::Builder::new()
@@ -77,13 +79,14 @@ struct WatchSet {
     config_dir: PathBuf,
     themes_dir: PathBuf,
     config_name: Vec<u8>,
+    file_name: Vec<u8>,
     parent_wd: Option<libc::c_int>,
     config_wd: Option<libc::c_int>,
     themes_wd: Option<libc::c_int>,
 }
 
 impl WatchSet {
-    fn new(config_dir: PathBuf) -> Self {
+    fn new(config_dir: PathBuf, file_name: OsString) -> Self {
         let parent_dir = config_dir.parent().map(Path::to_path_buf);
         let config_name = config_dir
             .file_name()
@@ -95,6 +98,7 @@ impl WatchSet {
             config_dir,
             themes_dir,
             config_name,
+            file_name: file_name.as_bytes().to_vec(),
             parent_wd: None,
             config_wd: None,
             themes_wd: None,
@@ -129,7 +133,7 @@ impl WatchSet {
                 self.config_wd = None;
                 relevant = true;
                 rewatch = true;
-            } else if name == b"lune.conf" {
+            } else if name == self.file_name.as_slice() {
                 relevant = true;
             } else if name == b"themes" {
                 relevant = true;
@@ -270,7 +274,10 @@ mod tests {
         fs::create_dir_all(&themes_dir).unwrap();
 
         let (tx, rx) = mpsc::channel();
-        let watch = Watch::start_with(config_dir.clone(), move || tx.send(()).is_ok()).unwrap();
+        let watch = Watch::start_with(config_dir.clone(), "lune.conf".into(), move || {
+            tx.send(()).is_ok()
+        })
+        .unwrap();
 
         // Atomic save via temp file + rename (vim/nvim/helix style).
         let temp = config_dir.join("lune.conf.tmp");

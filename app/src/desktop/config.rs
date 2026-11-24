@@ -1,4 +1,5 @@
 use std::env;
+use std::ffi::OsString;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -6,6 +7,48 @@ use std::path::{Path, PathBuf};
 use super::theme::Preference;
 
 pub(super) mod watch;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum ConfigSource {
+    Default,
+    File(PathBuf),
+}
+
+impl ConfigSource {
+    pub(super) fn from_option(path: Option<PathBuf>) -> Self {
+        match path {
+            Some(path) => {
+                let resolved = if path.is_absolute() {
+                    path
+                } else {
+                    env::current_dir()
+                        .map(|cwd| cwd.join(&path))
+                        .unwrap_or(path)
+                };
+                Self::File(resolved)
+            }
+            None => Self::Default,
+        }
+    }
+
+    pub(super) fn watch_target(&self) -> Option<(PathBuf, OsString)> {
+        match self {
+            Self::Default => Config::directory().map(|dir| (dir, OsString::from("lune.conf"))),
+            Self::File(path) => {
+                let parent = path.parent()?.to_path_buf();
+                let file_name = path.file_name()?.to_os_string();
+                Some((parent, file_name))
+            }
+        }
+    }
+
+    pub(super) fn custom_path(&self) -> Option<&Path> {
+        match self {
+            Self::Default => None,
+            Self::File(path) => Some(path.as_path()),
+        }
+    }
+}
 
 pub(super) const MIN_FONT_SIZE: f32 = 8.0;
 pub(super) const MAX_FONT_SIZE: f32 = 32.0;
@@ -64,8 +107,8 @@ impl Config {
             .map(|directory| directory.join("lune"))
     }
 
-    pub(super) fn load() -> Loaded {
-        match Self::load_checked() {
+    pub(super) fn load(source: &ConfigSource) -> Loaded {
+        match Self::load_checked(source) {
             Ok(loaded) => loaded,
             Err(error) => Loaded {
                 config: Self::default(),
@@ -74,31 +117,49 @@ impl Config {
         }
     }
 
-    pub(super) fn load_checked() -> Result<Loaded, String> {
-        let Some(directory) = Self::directory() else {
-            return Ok(Loaded {
-                config: Self::default(),
-                errors: Vec::new(),
-            });
-        };
-        match fs::read_to_string(directory.join("lune.conf")) {
-            Ok(text) => Ok(Self::parse(&text, &directory)),
-            Err(error) if error.kind() == ErrorKind::NotFound => Ok(Loaded {
-                config: Self::default(),
-                errors: Vec::new(),
-            }),
-            Err(error) => {
-                log::warn!("Could not read lune.conf: {error}");
-                Err(format!("lune.conf: {error}"))
+    pub(super) fn load_checked(source: &ConfigSource) -> Result<Loaded, String> {
+        match source {
+            ConfigSource::Default => {
+                let Some(directory) = Self::directory() else {
+                    return Ok(Loaded {
+                        config: Self::default(),
+                        errors: Vec::new(),
+                    });
+                };
+                match fs::read_to_string(directory.join("lune.conf")) {
+                    Ok(text) => Ok(Self::parse("lune.conf", &text, &directory)),
+                    Err(error) if error.kind() == ErrorKind::NotFound => Ok(Loaded {
+                        config: Self::default(),
+                        errors: Vec::new(),
+                    }),
+                    Err(error) => {
+                        log::warn!("Could not read lune.conf: {error}");
+                        Err(format!("lune.conf: {error}"))
+                    }
+                }
+            }
+            ConfigSource::File(path) => {
+                let display = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string());
+                let directory = path.parent().unwrap_or_else(|| Path::new(""));
+                match fs::read_to_string(path) {
+                    Ok(text) => Ok(Self::parse(&display, &text, directory)),
+                    Err(error) => {
+                        log::warn!("Could not read {}: {error}", path.display());
+                        Err(format!("{display}: {error}"))
+                    }
+                }
             }
         }
     }
 
-    fn parse(text: &str, directory: &Path) -> Loaded {
+    fn parse(file: &str, text: &str, directory: &Path) -> Loaded {
         let mut config = Self::default();
         let mut errors = Vec::new();
         let mut theme_errors = Vec::new();
-        parse_settings("lune.conf", text, &mut errors, |key, value| {
+        parse_settings(file, text, &mut errors, |key, value| {
             if key == "theme" {
                 let mut current_theme_errors = Vec::new();
                 config.theme = Preference::load(directory, value, &mut current_theme_errors)?;
@@ -224,6 +285,7 @@ mod tests {
     #[test]
     fn invalid_settings_preserve_valid_font_overrides() {
         let loaded = Config::parse(
+            "lune.conf",
             "# Font settings\r\nfont-family = Fixture Mono\r\nfont-size=19.5\r\n\
              background-opacity = 0.85\r\nbackground-opacity = 1.5\r\nbackground-opacity = NaN\r\n\
              clipboard-write = deny\r\nclipboard-read = allow\r\nclipboard-read = invalid\r\n\

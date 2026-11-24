@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::ffi::OsString;
 use std::io;
 use std::path::PathBuf;
 use std::process::Command;
@@ -166,6 +167,7 @@ pub(super) struct Pane {
 }
 
 impl Pane {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn spawn(
         id: PaneId,
         window: Arc<Window>,
@@ -174,11 +176,21 @@ impl Pane {
         palette: &Palette,
         scheme: ColorScheme,
         cwd: Option<PathBuf>,
+        program: Option<&[OsString]>,
     ) -> Result<Self> {
-        let shell = std::env::var_os("SHELL")
-            .filter(|shell| !shell.is_empty())
-            .unwrap_or_else(|| "/bin/sh".into());
-        let mut command = Command::new(shell);
+        let mut command = match program {
+            Some([executable, args @ ..]) => {
+                let mut command = Command::new(executable);
+                command.args(args);
+                command
+            }
+            _ => {
+                let shell = std::env::var_os("SHELL")
+                    .filter(|shell| !shell.is_empty())
+                    .unwrap_or_else(|| "/bin/sh".into());
+                Command::new(shell)
+            }
+        };
         if let Some(dir) = cwd {
             command.current_dir(dir);
         }
