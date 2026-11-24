@@ -16,11 +16,15 @@ pub(super) struct Selection {
 }
 
 impl Selection {
-    pub(super) fn new(view: ScreenView<'_>, range: Range<CellPosition>, anchor: Anchor) -> Self {
+    pub(super) fn new(
+        view: ScreenView<'_>,
+        range: Range<CellPosition>,
+        anchor: Option<Anchor>,
+    ) -> Self {
         let rows = row_revisions(view, range.start.row..range.end.row + 1).collect();
         Self {
             range,
-            anchor: Some(anchor),
+            anchor,
             rows,
             discarded_rows: view.discarded_history_rows(),
         }
@@ -245,7 +249,7 @@ impl Unit {
     }
 }
 
-fn cell_range(
+pub(super) fn cell_range(
     view: ScreenView<'_>,
     mut anchor: CellPosition,
     mut focus: CellPosition,
@@ -370,7 +374,7 @@ fn next_cell(view: ScreenView<'_>, position: CellPosition) -> Option<CellPositio
     }
 }
 
-fn line_span(view: ScreenView<'_>, row: usize) -> Option<Range<CellPosition>> {
+pub(super) fn line_span(view: ScreenView<'_>, row: usize) -> Option<Range<CellPosition>> {
     let mut first = row;
     while let Some(previous) = first.checked_sub(1)
         && view.row(previous)?.wrap_end().is_some()
@@ -541,7 +545,7 @@ mod tests {
         let mut drag = click.drag(view);
         drag.move_to(point(2, 0));
         let original = drag.range(view).unwrap();
-        let mut selection = Selection::new(view, original.clone(), drag.anchor.clone());
+        let mut selection = Selection::new(view, original.clone(), Some(drag.anchor.clone()));
         for range in [point(0, 0)..point(3, 1), point(4, 0)..point(5, 1), original] {
             selection.set_range(view, range);
             assert!(selection.refresh(view));

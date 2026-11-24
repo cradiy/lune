@@ -8,6 +8,7 @@ mod selection;
 mod shortcuts;
 mod text;
 mod theme;
+mod vi;
 
 use std::collections::VecDeque;
 use std::io;
@@ -180,6 +181,8 @@ struct Client {
     selection_click: Option<selection::Click>,
     selection_drag: Option<selection::Drag>,
     selection: Option<selection::Selection>,
+    vi: Option<vi::Mode>,
+    vi_search: Option<vi::Search>,
 }
 
 impl Client {
@@ -245,6 +248,8 @@ impl Client {
             selection_click: None,
             selection_drag: None,
             selection: None,
+            vi: None,
+            vi_search: None,
         })
     }
 
@@ -279,6 +284,9 @@ impl Client {
                     }
                     self.selection_click = None;
                     self.selection_drag = None;
+                    if let Some(vi) = &mut self.vi {
+                        vi.cancel_pending();
+                    }
                     self.modifiers = ModifiersState::empty();
                     self.set_preedit(String::new());
                 }
@@ -299,13 +307,23 @@ impl Client {
                 self.set_preedit(String::new());
             }
             WindowEvent::Ime(Ime::Preedit(text, _)) => {
-                if self.preedit.is_empty() && !text.is_empty() {
+                if self.vi.is_none() && self.preedit.is_empty() && !text.is_empty() {
                     self.follow_output();
                 }
-                self.set_preedit(text);
+                if self.vi.as_ref().is_none_or(|vi| vi.prompt.is_some()) {
+                    self.set_preedit(text);
+                }
             }
             WindowEvent::Ime(Ime::Commit(mut text)) => {
                 self.set_preedit(String::new());
+                if let Some(vi) = &mut self.vi {
+                    if let Some(prompt) = &mut vi.prompt {
+                        prompt.push(&text);
+                        self.update_ime_area();
+                        self.redraw_vi();
+                    }
+                    return Ok(());
+                }
                 self.follow_output();
                 while text.len() > MAX_INPUT_BYTES {
                     let rest = text.split_off(text.floor_char_boundary(MAX_INPUT_BYTES));
@@ -384,6 +402,9 @@ impl Client {
                     .is_some_and(|selection| !selection.refresh(view))
             {
                 self.clear_selection();
+                if let Some(vi) = &mut self.vi {
+                    vi.clear_visual();
+                }
             } else if view.discarded_history_rows() != discarded_rows {
                 self.selection_click = None;
                 let removed = view.discarded_history_rows().wrapping_sub(discarded_rows);
@@ -397,6 +418,7 @@ impl Client {
                 }
             }
         }
+        self.refresh_vi();
         self.update_ime_area();
         if self.session.presentation_frame().is_some() {
             self.window.request_redraw();
@@ -483,12 +505,27 @@ impl Client {
             self.resize_pending = false;
             return Ok(());
         };
-        match self.session.resize(geometry.pty_size()) {
+        let previous = self.session.geometry().pty_size();
+        let next = geometry.pty_size();
+        let vi_row = self.vi.as_ref().map(|vi| {
+            vi.cursor
+                .row
+                .saturating_sub(self.session.screen().viewport().range().start)
+        });
+        match self.session.resize(next) {
             Ok(()) => {
                 self.resize_pending = false;
                 self.painter.set_metrics(metrics);
                 self.painter.resize(size);
                 self.clear_selection();
+                if let Some(vi) = &mut self.vi {
+                    vi.clear_visual();
+                }
+                if let Some(row) = vi_row
+                    && (previous.columns != next.columns || previous.rows != next.rows)
+                {
+                    self.reset_vi_cursor(row);
+                }
                 self.update_ime_area();
                 self.window.request_redraw();
             }
@@ -500,12 +537,16 @@ impl Client {
     }
 
     fn draw(&mut self) -> Result<()> {
-        if let Some(frame) = self.session.presentation_frame() {
+        if let Some(mut frame) = self.session.presentation_frame() {
+            if self.vi.is_some() {
+                frame.cursor_appearance.visible = false;
+            }
             self.painter.draw(
                 &self.window,
                 &frame,
                 self.selection.as_ref().map(|selection| &selection.range),
                 &self.preedit,
+                self.vi.as_ref(),
             )?;
         }
         Ok(())
@@ -516,10 +557,18 @@ impl Client {
             return;
         }
         let geometry = self.session.geometry();
-        let Some(cursor) = self.session.screen().viewport().cursor() else {
+        let viewport = self.session.screen().viewport();
+        let (row, column) = if let Some(vi) = &self.vi {
+            if vi.prompt.is_none() {
+                return;
+            }
+            (viewport.rows() - 1, 0)
+        } else if let Some(cursor) = viewport.cursor() {
+            (cursor.row, cursor.column)
+        } else {
             return;
         };
-        let Some(rect) = geometry.row_rect(cursor.row, cursor.column..cursor.column + 1) else {
+        let Some(rect) = geometry.row_rect(row, column..column + 1) else {
             return;
         };
         let origin = rect.origin;
@@ -565,6 +614,10 @@ impl Client {
             }
             return;
         }
+        if self.vi.is_some() {
+            self.vi_key(event);
+            return;
+        }
         if let Some(input) = input::key(event, self.modifiers) {
             self.follow_output();
             self.push_input(input);
@@ -574,7 +627,12 @@ impl Client {
     fn run_shortcut(&mut self, action: Action) {
         match action {
             Action::Copy => self.copy(),
-            Action::Paste => self.paste(ClipboardType::Regular),
+            Action::Paste => {
+                if self.vi.is_none() {
+                    self.paste(ClipboardType::Regular);
+                }
+            }
+            Action::ToggleVi => self.toggle_vi(),
             Action::OpenDirectory => {
                 if !self.directory_open_pending {
                     let uri = self
@@ -659,11 +717,15 @@ impl Client {
     }
 
     fn mouse_reporting(&self) -> bool {
-        self.session.screen().viewport_offset() == 0
+        self.vi.is_none()
+            && self.session.screen().viewport_offset() == 0
             && self.session.processor().input_modes().mouse_tracking != MouseTracking::Disabled
     }
 
     fn button(&mut self, state: ElementState, button: winit::event::MouseButton) {
+        if self.vi.is_some() {
+            return;
+        }
         let button = match button {
             winit::event::MouseButton::Left => MouseButton::Left,
             winit::event::MouseButton::Right => MouseButton::Right,
@@ -711,8 +773,9 @@ impl Client {
         };
         let steps = (self.wheel as isize).clamp(-32, 32);
         self.wheel = self.wheel.fract();
-        if self.session.screen().active_buffer() == ScreenBuffer::Primary
-            && (!self.mouse_reporting() || self.modifiers.shift_key())
+        if self.vi.is_some()
+            || self.session.screen().active_buffer() == ScreenBuffer::Primary
+                && (!self.mouse_reporting() || self.modifiers.shift_key())
         {
             self.scroll_history(steps * 3);
         } else {
@@ -738,6 +801,7 @@ impl Client {
         if self.session.scroll_history(steps) {
             self.selection_click = None;
             self.selection_drag = None;
+            self.scroll_vi_cursor();
             self.window.request_redraw();
         }
     }
@@ -837,7 +901,11 @@ impl Client {
         match (&mut self.selection, range) {
             (Some(selection), Some(range)) => selection.set_range(view, range),
             (selection, Some(range)) => {
-                *selection = Some(selection::Selection::new(view, range, drag.anchor.clone()));
+                *selection = Some(selection::Selection::new(
+                    view,
+                    range,
+                    Some(drag.anchor.clone()),
+                ));
             }
             (selection, None) => *selection = None,
         }
@@ -868,13 +936,16 @@ impl Client {
 
     fn selected_text(&self) -> Option<String> {
         let selection = self.selection.as_ref()?;
-        let text = self
+        let mut text = self
             .session
             .screen()
             .view()
             .selection_text(selection.range.clone())
             .ok()?
             .to_string();
+        if self.vi.as_ref().is_some_and(vi::Mode::linewise) {
+            text.push('\n');
+        }
         (!text.is_empty()).then_some(text)
     }
 

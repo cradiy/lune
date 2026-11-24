@@ -185,6 +185,7 @@ impl TextRenderer {
         cursor: Option<PresentedCursor>,
         selection: Option<&Range<CellPosition>>,
         preedit: &str,
+        vi: Option<&super::vi::Mode>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         self.area = frame.geometry.text_area_pixels().unwrap();
         self.generation += 1;
@@ -346,20 +347,34 @@ impl TextRenderer {
                 self.unit(paint.rect, glyph.unit, glyph.style, glyph.color, 1.0);
             }
         }
-        if !preedit.is_empty()
-            && let Some(cursor) = frame.viewport.cursor()
-            && let Some(mut rect) = frame.geometry.row_rect(cursor.row, cursor.column..columns)
-        {
-            let width = self
-                .font
-                .measure_text(self.metrics, preedit)
-                .min(rect.size.width.get())
-                .min(ATLAS_SIDE as u32);
-            if let Some(width) = NonZeroU32::new(width) {
-                rect.size.width = width;
-                self.rect(rect, frame.palette.graphics_color(250), 1.0);
-                self.glyph(rect, preedit, 8, frame.palette.graphics_color(251), 1.0);
+        if let Some(vi) = vi {
+            if let Some(prompt) = &vi.prompt {
+                let text = if preedit.is_empty() {
+                    std::borrow::Cow::Borrowed(prompt.text())
+                } else {
+                    std::borrow::Cow::Owned(format!("{}{preedit}", prompt.text()))
+                };
+                if let Some(rect) = frame
+                    .geometry
+                    .row_rect(frame.viewport.rows() - 1, 0..columns)
+                {
+                    self.label(rect, &text, frame, true);
+                }
+            } else {
+                let text = match columns {
+                    1 => "V",
+                    2..=3 => "VI",
+                    _ => " VI ",
+                };
+                if let Some(rect) = frame.geometry.row_rect(0, columns - text.len()..columns) {
+                    self.label(rect, text, frame, false);
+                }
             }
+        } else if !preedit.is_empty()
+            && let Some(cursor) = frame.viewport.cursor()
+            && let Some(rect) = frame.geometry.row_rect(cursor.row, cursor.column..columns)
+        {
+            self.label(rect, preedit, frame, false);
         }
         if std::mem::size_of_val(self.instances.as_slice()) as u64
             > self.device.limits().max_buffer_size
@@ -370,6 +385,30 @@ impl TextRenderer {
         }
         write_instances(&self.device, &self.queue, &mut self.buffer, &self.instances);
         Ok(())
+    }
+
+    fn label(
+        &mut self,
+        mut rect: PixelRect,
+        text: &str,
+        frame: &PresentationFrame<'_>,
+        fill: bool,
+    ) {
+        let width = self
+            .font
+            .measure_text(self.metrics, text)
+            .min(rect.size.width.get())
+            .min(ATLAS_SIDE as u32);
+        if let Some(width) = NonZeroU32::new(width) {
+            let row = rect;
+            rect.size.width = width;
+            self.rect(
+                if fill { row } else { rect },
+                frame.palette.graphics_color(250),
+                1.0,
+            );
+            self.glyph(rect, text, 8, frame.palette.graphics_color(251), 1.0);
+        }
     }
 
     pub(super) fn draw(&self, pass: &mut wgpu::RenderPass<'_>) {

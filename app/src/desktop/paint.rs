@@ -1,18 +1,20 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use lune_terminal::{CellPosition, PaletteEntry};
+use lune_terminal::{CellPosition, CursorAppearance, PaletteEntry};
 use winit::dpi::PhysicalSize;
 use winit::window::Window;
 
 use crate::gpu::linear_colors;
 use crate::{
-    CellBackgroundRenderer, ImageRenderer, PresentationFrame, PresentationTracker, RowDamage,
+    CellBackgroundRenderer, ImageRenderer, PresentationFrame, PresentationTracker, PresentedCursor,
+    RowDamage,
 };
 
 use super::Result;
 use super::font::{Font, FontMetrics};
 use super::text::TextRenderer;
+use super::vi;
 
 const RETRY_DELAY: Duration = Duration::from_millis(16);
 
@@ -142,6 +144,7 @@ impl Painter {
         frame: &PresentationFrame<'_>,
         selection: Option<&std::ops::Range<CellPosition>>,
         preedit: &str,
+        vi: Option<&vi::Mode>,
     ) -> Result<()> {
         let area = frame.geometry.text_area_pixels().unwrap();
         let (width, height) = (area.width.get(), area.height.get());
@@ -187,8 +190,23 @@ impl Painter {
         };
 
         if text_changed {
-            self.text
-                .prepare(frame, damage.displayed_cursor, selection, preedit)?;
+            let cursor = if let Some(vi) = vi {
+                let rows = frame.viewport.range();
+                rows.contains(&vi.cursor.row).then(|| PresentedCursor {
+                    position: CellPosition {
+                        row: vi.cursor.row - rows.start,
+                        column: vi.cursor.column,
+                    },
+                    appearance: CursorAppearance {
+                        blinking: false,
+                        ..CursorAppearance::default()
+                    },
+                    color: frame.palette.color(PaletteEntry::Cursor),
+                })
+            } else {
+                damage.displayed_cursor
+            };
+            self.text.prepare(frame, cursor, selection, preedit, vi)?;
         }
         self.backgrounds
             .prepare(&self.device, &self.queue, frame)
