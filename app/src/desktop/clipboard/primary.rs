@@ -68,7 +68,7 @@ impl Primary {
                     worker_queue.ready.notify_all();
                 }
                 if let Err(error) = result {
-                    eprintln!("Lune primary selection: {error}");
+                    log::warn!("Primary selection worker stopped: {error}");
                 }
             })?;
         Ok(Self { commands, queue })

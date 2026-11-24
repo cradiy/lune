@@ -56,6 +56,7 @@ pub fn run() -> Result<()> {
     let event_loop = EventLoop::<Event>::with_user_event()
         .with_wayland()
         .build()?;
+    log::debug!("Wayland event loop ready");
     let mut app = App {
         proxy: event_loop.create_proxy(),
         client: None,
@@ -123,7 +124,7 @@ impl ApplicationHandler<Event> for App {
                             client.inputs.remove(index);
                         }
                         Err(error) => {
-                            eprintln!("Lune clipboard: {error}");
+                            log::warn!("Clipboard paste failed: {error}");
                             client.inputs.remove(index);
                         }
                     }
@@ -133,14 +134,14 @@ impl ApplicationHandler<Event> for App {
             Event::CopyReady(result) => {
                 client.copy_pending = false;
                 if let Err(error) = result {
-                    eprintln!("Lune clipboard: {error}");
+                    log::warn!("Clipboard copy failed: {error}");
                 }
                 Ok(())
             }
             Event::DirectoryOpened(result) => {
                 client.directory_open_pending = false;
                 if let Err(error) = result {
-                    eprintln!("Lune directory: {error}");
+                    log::warn!("Working directory open failed: {error}");
                 }
                 Ok(())
             }
@@ -213,7 +214,13 @@ impl Client {
             .env("COLORTERM", "truecolor")
             .env("TERM_PROGRAM", "Lune");
         let (palette, scheme) = theme::palette(window.theme().unwrap_or(Theme::Dark));
-        let mut session = Session::spawn(command, geometry.pty_size(), palette.clone())?;
+        let pty_size = geometry.pty_size();
+        log::debug!(
+            "Starting PTY session with {} columns and {} rows",
+            pty_size.columns,
+            pty_size.rows
+        );
+        let mut session = Session::spawn(command, pty_size, palette.clone())?;
         session.set_theme(&palette, Some(scheme));
         session.set_history_limits(HistoryLimits {
             max_rows: 10_000,
@@ -223,6 +230,7 @@ impl Client {
         readiness.arm(session.interests())?;
         window.set_ime_allowed(true);
         window.request_redraw();
+        log::info!("Wayland terminal ready");
         Ok(Self {
             window,
             readiness,
@@ -255,7 +263,10 @@ impl Client {
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) -> Result<()> {
         match event {
-            WindowEvent::CloseRequested | WindowEvent::Destroyed => event_loop.exit(),
+            WindowEvent::CloseRequested | WindowEvent::Destroyed => {
+                log::debug!("Terminal window closed");
+                event_loop.exit();
+            }
             WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
                 self.resize_pending = true
             }
@@ -380,6 +391,11 @@ impl Client {
             outcome = self.session.wait_and_pump(Some(Duration::ZERO))?;
         }
         if matches!(outcome, WaitOutcome::ChildExited(_) | WaitOutcome::Finished) {
+            if let WaitOutcome::ChildExited(status) = outcome {
+                log::info!("PTY child exited: {status}");
+            } else {
+                log::info!("PTY session finished");
+            }
             event_loop.exit();
             return Ok(());
         }
@@ -432,7 +448,7 @@ impl Client {
             self.paste_deadline = None;
             self.inputs
                 .retain(|input| !matches!(input, Input::PendingPaste));
-            eprintln!("Lune clipboard: Paste timed out");
+            log::warn!("Clipboard paste timed out");
         }
         let interests = self.session.interests();
         if interests.immediate
@@ -514,6 +530,13 @@ impl Client {
         });
         match self.session.resize(next) {
             Ok(()) => {
+                if next != previous {
+                    log::debug!(
+                        "PTY resized to {} columns and {} rows",
+                        next.columns,
+                        next.rows
+                    );
+                }
                 self.resize_pending = false;
                 self.painter.set_metrics(metrics);
                 self.painter.resize(size);
@@ -642,7 +665,7 @@ impl Client {
                         .map(str::to_owned);
                     match directory::open(uri, self.proxy.clone()) {
                         Ok(()) => self.directory_open_pending = true,
-                        Err(error) => eprintln!("Lune directory: {error}"),
+                        Err(error) => log::warn!("Failed to start the directory worker: {error}"),
                     }
                 }
             }
@@ -929,7 +952,7 @@ impl Client {
         if let Some(text) = self.selected_text() {
             match clipboard::write(text, self.proxy.clone()) {
                 Ok(()) => self.copy_pending = true,
-                Err(error) => eprintln!("Lune clipboard: {error}"),
+                Err(error) => log::warn!("Failed to start the clipboard copy worker: {error}"),
             }
         }
     }
@@ -957,7 +980,7 @@ impl Client {
             self.primary_selection = match clipboard::Primary::new() {
                 Ok(primary) => Some(primary),
                 Err(error) => {
-                    eprintln!("Lune primary selection: {error}");
+                    log::warn!("Failed to start the primary selection worker: {error}");
                     return;
                 }
             };
@@ -982,7 +1005,7 @@ impl Client {
                 self.paste_worker = true;
                 self.paste_deadline = Some(Instant::now() + PASTE_TIMEOUT);
             }
-            Err(error) => eprintln!("Lune clipboard: {error}"),
+            Err(error) => log::warn!("Failed to start the clipboard paste worker: {error}"),
         }
     }
 }

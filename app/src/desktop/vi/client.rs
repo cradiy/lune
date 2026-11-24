@@ -19,6 +19,7 @@ impl Client {
         let mut vi = Mode::new(screen.active_buffer(), screen.viewport(), self.vi_columns());
         vi.search = self.vi_search.take();
         self.vi = Some(vi);
+        log::debug!("Entered Vi mode");
         self.window.set_ime_allowed(false);
         self.set_preedit(String::new());
         self.redraw_vi();
@@ -26,6 +27,7 @@ impl Client {
 
     pub(in crate::desktop) fn leave_vi(&mut self) {
         self.vi_search = self.vi.take().and_then(|vi| vi.search);
+        log::debug!("Left Vi mode");
         self.window.set_ime_allowed(true);
         self.set_preedit(String::new());
         self.follow_output();

@@ -8,7 +8,8 @@ publish = false
 default = ["desktop"]
 desktop = [
     "wgpu-renderer", "dep:calloop", "dep:calloop-wayland-source", "dep:cosmic-text",
-    "dep:guillotiere", "dep:pollster", "dep:regex", "dep:wayland-client", "dep:wayland-protocols",
+    "dep:env_logger", "dep:guillotiere", "dep:log", "dep:pollster", "dep:regex",
+    "dep:wayland-client", "dep:wayland-protocols",
     "dep:wl-clipboard-rs", "dep:winit",
 ]
 wgpu-renderer = ["dep:bytemuck", "dep:wgpu"]
@@ -28,7 +29,9 @@ bytemuck = { version = "1", optional = true }
 calloop = { version = "0.13", optional = true }
 calloop-wayland-source = { version = "0.3", optional = true }
 cosmic-text = { version = "0.19", optional = true }
+env_logger = { version = "0.11", default-features = false, features = ["humantime"], optional = true }
 guillotiere = { version = "0.7", optional = true }
+log = { version = "0.4", optional = true }
 pollster = { version = "0.4", optional = true }
 regex = { version = "1", optional = true }
 wayland-client = { version = "0.31", optional = true }

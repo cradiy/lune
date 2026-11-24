@@ -31,6 +31,7 @@ pub(super) struct Painter {
     retry: Option<Instant>,
     force_present: bool,
     dirty: bool,
+    graphics_prepare_failed: bool,
 }
 
 impl Painter {
@@ -66,6 +67,10 @@ impl Painter {
         let images = ImageRenderer::new(&device, config.format);
         let metrics = font.measure(font_size);
         let text = TextRenderer::new(&device, &queue, config.format, font, metrics);
+        log::debug!(
+            "Vulkan renderer ready with surface format {:?}",
+            config.format
+        );
         let mut tracker = PresentationTracker::default();
         tracker.set_cursor_blink_interval(Duration::from_millis(530), Instant::now());
         Ok(Self {
@@ -81,6 +86,7 @@ impl Painter {
             retry: None,
             force_present: false,
             dirty: true,
+            graphics_prepare_failed: false,
         })
     }
 
@@ -179,6 +185,7 @@ impl Painter {
                 return Ok(());
             }
             Acquired::Lost => {
+                log::debug!("Recreating the lost Wayland surface");
                 self.surface = self.instance.create_surface(window.clone())?;
                 self.surface.configure(&self.device, &self.config);
                 self.retry = Some(Instant::now() + RETRY_DELAY);
@@ -260,8 +267,12 @@ impl Painter {
             self.surface.configure(&self.device, &self.config);
         }
         if failures != 0 {
+            if !self.graphics_prepare_failed {
+                log::warn!("Failed to prepare {failures} terminal graphics placements");
+            }
             self.retry = Some(Instant::now() + Duration::from_millis(100));
         }
+        self.graphics_prepare_failed = failures != 0;
         Ok(())
     }
 }
