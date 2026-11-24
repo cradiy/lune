@@ -1,30 +1,49 @@
+use std::collections::VecDeque;
 use std::ops::Range;
 use std::time::{Duration, Instant};
 
 use lune_terminal::{CellPosition, Row, RowRevision, ScreenView};
 
 const MULTI_CLICK_INTERVAL: Duration = Duration::from_millis(500);
+const EDGE_SCROLL_DELAY: Duration = Duration::from_millis(120);
+const EDGE_SCROLL_INTERVAL: Duration = Duration::from_millis(40);
 
 pub(super) struct Selection {
     pub(super) range: Range<CellPosition>,
     pub(super) anchor: Option<Anchor>,
-    rows: Vec<RowRevision>,
+    rows: VecDeque<RowRevision>,
     discarded_rows: u64,
 }
 
 impl Selection {
     pub(super) fn new(view: ScreenView<'_>, range: Range<CellPosition>, anchor: Anchor) -> Self {
-        let rows = view
-            .iter_rows()
-            .skip(range.start.row)
-            .take(range.end.row - range.start.row + 1)
-            .map(Row::revision)
-            .collect();
+        let rows = row_revisions(view, range.start.row..range.end.row + 1).collect();
         Self {
             range,
             anchor: Some(anchor),
             rows,
             discarded_rows: view.discarded_history_rows(),
+        }
+    }
+
+    pub(super) fn set_range(&mut self, view: ScreenView<'_>, range: Range<CellPosition>) {
+        let old = self.range.start.row..self.range.end.row + 1;
+        let new = range.start.row..range.end.row + 1;
+        self.range = range;
+        if old == new {
+            return;
+        }
+        let shared = old.start.max(new.start)..old.end.min(new.end);
+        if shared.is_empty() {
+            self.rows.clear();
+            self.rows.extend(row_revisions(view, new));
+        } else {
+            drop(self.rows.drain(..shared.start - old.start));
+            self.rows.truncate(shared.len());
+            for revision in row_revisions(view, new.start..shared.start).rev() {
+                self.rows.push_front(revision);
+            }
+            self.rows.extend(row_revisions(view, shared.end..new.end));
         }
     }
 
@@ -38,15 +57,27 @@ impl Selection {
             let removed = removed as usize;
             self.range.start.row -= removed;
             self.range.end.row -= removed;
-            self.anchor = self.anchor.take().and_then(|anchor| anchor.rebase(removed));
+            if let Some(anchor) = &mut self.anchor
+                && anchor.rebase(removed).is_none()
+            {
+                self.anchor = None;
+            }
             self.discarded_rows = discarded_rows;
         }
-        view.iter_rows()
-            .skip(self.range.start.row)
-            .take(self.rows.len())
-            .map(Row::revision)
+        row_revisions(view, self.range.start.row..self.range.end.row + 1)
             .eq(self.rows.iter().copied())
     }
+}
+
+fn row_revisions(
+    view: ScreenView<'_>,
+    rows: Range<usize>,
+) -> impl DoubleEndedIterator<Item = RowRevision> {
+    (rows.start..rows.end.min(view.rows())).map(move |index| {
+        view.row(index)
+            .expect("A selection row is in bounds")
+            .revision()
+    })
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -110,13 +141,13 @@ pub(super) struct Anchor {
 }
 
 impl Anchor {
-    fn rebase(mut self, removed: usize) -> Option<Self> {
+    fn rebase(&mut self, removed: usize) -> Option<()> {
         self.position.row = self.position.row.checked_sub(removed)?;
         if let Some(span) = &mut self.span {
             span.start.row = span.start.row.checked_sub(removed)?;
             span.end.row -= removed;
         }
-        Some(self)
+        Some(())
     }
 
     pub(super) fn drag(self, select_on_click: bool) -> Drag {
@@ -124,17 +155,57 @@ impl Anchor {
             anchor: self,
             focus: None,
             select_on_click,
+            edge_scroll: None,
         }
     }
 }
 
 pub(super) struct Drag {
     pub(super) anchor: Anchor,
+    pub(super) edge_scroll: Option<EdgeScroll>,
     focus: Option<CellPosition>,
     select_on_click: bool,
 }
 
+pub(super) struct EdgeScroll {
+    pub(super) deadline: Instant,
+    rows: isize,
+}
+
+impl EdgeScroll {
+    pub(super) fn due(&mut self, now: Instant) -> Option<isize> {
+        if now < self.deadline {
+            return None;
+        }
+        self.deadline = now + EDGE_SCROLL_INTERVAL;
+        Some(self.rows)
+    }
+}
+
 impl Drag {
+    pub(super) fn rebase(&mut self, removed: usize) -> Option<()> {
+        self.anchor.rebase(removed)?;
+        if let Some(focus) = &mut self.focus {
+            focus.row = focus.row.checked_sub(removed)?;
+        }
+        Some(())
+    }
+
+    pub(super) fn set_edge_scroll(&mut self, rows: isize, now: Instant) {
+        if rows == 0 {
+            self.edge_scroll = None;
+        } else if self
+            .edge_scroll
+            .as_ref()
+            .is_none_or(|scroll| scroll.rows != rows)
+        {
+            self.edge_scroll = Some(EdgeScroll {
+                rows,
+                deadline: now + EDGE_SCROLL_DELAY,
+            });
+        }
+    }
+
     pub(super) fn move_to(&mut self, focus: CellPosition) -> bool {
         if !self.select_on_click && self.focus.is_none() && focus == self.anchor.position {
             return false;
@@ -469,7 +540,12 @@ mod tests {
         let click = Click::new(point(1, 0), std::time::Instant::now(), false);
         let mut drag = click.drag(view);
         drag.move_to(point(2, 0));
-        let mut selection = Selection::new(view, drag.range(view).unwrap(), drag.anchor);
+        let original = drag.range(view).unwrap();
+        let mut selection = Selection::new(view, original.clone(), drag.anchor.clone());
+        for range in [point(0, 0)..point(3, 1), point(4, 0)..point(5, 1), original] {
+            selection.set_range(view, range);
+            assert!(selection.refresh(view));
+        }
 
         screen.scroll_viewport_up(3);
         assert!(selection.refresh(screen.view()));
@@ -479,6 +555,8 @@ mod tests {
         let view = screen.view();
         assert!(selection.refresh(view));
         assert_eq!(selection.range, point(0, 0)..point(1, 1));
+        assert!(drag.rebase(1).is_some());
+        assert_eq!(drag.range(view), Some(selection.range.clone()));
         assert_eq!(
             view.selection_text(selection.range.clone())
                 .unwrap()
@@ -493,5 +571,6 @@ mod tests {
             .advance(b"\r\nh", &mut screen, &mut writer)
             .unwrap();
         assert!(!selection.refresh(screen.view()));
+        assert!(drag.rebase(1).is_none());
     }
 }

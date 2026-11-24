@@ -304,9 +304,12 @@ impl Client {
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
-                self.pointer = Some(position);
+                let moved = self.pointer.replace(position) != Some(position);
                 if self.selection_drag.is_some() {
                     self.extend_selection();
+                    if moved {
+                        self.update_selection_scroll(position.y);
+                    }
                 } else {
                     self.mouse_event(MouseEvent::Motion(self.pressed));
                 }
@@ -370,7 +373,15 @@ impl Client {
                 self.clear_selection();
             } else if view.discarded_history_rows() != discarded_rows {
                 self.selection_click = None;
-                self.selection_drag = None;
+                let removed = view.discarded_history_rows().wrapping_sub(discarded_rows);
+                let removed = usize::try_from(removed).unwrap_or(usize::MAX);
+                if self
+                    .selection_drag
+                    .as_mut()
+                    .is_some_and(|drag| drag.rebase(removed).is_none())
+                {
+                    self.selection_drag = None;
+                }
             }
         }
         self.update_ime_area();
@@ -400,6 +411,7 @@ impl Client {
             return Ok(());
         }
         self.apply_resize()?;
+        self.tick_selection_scroll(now);
         while let Some(input) = self.inputs.front() {
             match input.queue(&mut self.session) {
                 Ok(()) => {
@@ -426,6 +438,11 @@ impl Client {
                 .into_iter()
                 .chain(self.painter.deadline())
                 .chain(self.paste_deadline)
+                .chain(
+                    self.selection_drag
+                        .as_ref()
+                        .and_then(|drag| drag.edge_scroll.as_ref().map(|scroll| scroll.deadline)),
+                )
                 .min();
             event_loop.set_control_flow(deadline.map_or(ControlFlow::Wait, ControlFlow::WaitUntil));
         }
@@ -727,6 +744,44 @@ impl Client {
         }
     }
 
+    fn update_selection_scroll(&mut self, y: f64) {
+        let Some(drag) = &mut self.selection_drag else {
+            return;
+        };
+        let screen = self.session.screen();
+        let band = f64::from(self.painter.metrics().cell.height.get()) * 0.4;
+        let rows = if let Some(area) = self.session.geometry().text_area_pixels()
+            && screen.active_buffer() == ScreenBuffer::Primary
+        {
+            let offset = screen.viewport_offset();
+            if y < band && offset < screen.history().len() {
+                2
+            } else if y >= f64::from(area.height.get()) - band && offset > 0 {
+                -2
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+        drag.set_edge_scroll(rows, Instant::now());
+    }
+
+    fn tick_selection_scroll(&mut self, now: Instant) {
+        let Some(drag) = &mut self.selection_drag else {
+            return;
+        };
+        let Some(rows) = drag.edge_scroll.as_mut().and_then(|scroll| scroll.due(now)) else {
+            return;
+        };
+        if self.session.scroll_history(rows) {
+            self.extend_selection();
+            self.window.request_redraw();
+        } else {
+            drag.edge_scroll = None;
+        }
+    }
+
     fn selection_position(&self, clamp: bool) -> Option<CellPosition> {
         let pixel = self.pointer_pixel(clamp)?;
         let mut position = self.session.geometry().cell_at(pixel)?;
@@ -781,8 +836,13 @@ impl Client {
         if self.selection.as_ref().map(|selection| &selection.range) == range.as_ref() {
             return;
         }
-        self.selection =
-            range.map(|range| selection::Selection::new(view, range, drag.anchor.clone()));
+        match (&mut self.selection, range) {
+            (Some(selection), Some(range)) => selection.set_range(view, range),
+            (selection, Some(range)) => {
+                *selection = Some(selection::Selection::new(view, range, drag.anchor.clone()));
+            }
+            (selection, None) => *selection = None,
+        }
         self.painter.invalidate_overlay();
         self.window.request_redraw();
     }
