@@ -11,9 +11,11 @@ use lune_terminal::{
 use crate::gpu::{create_quad_pipeline, linear_colors, write_instances};
 use crate::{PixelRect, PresentationFrame, PresentationStyle, PresentedCursor};
 
+use super::confirm;
 use super::font::{Font, FontMetrics};
 use super::ligature;
 use super::paint::PaneOverlay;
+use super::scrollbar::ScrollbarView;
 use super::split::{Axis, Divider};
 use super::tab_bar;
 use super::url::HoveredLink;
@@ -253,6 +255,7 @@ impl TextRenderer {
             preedit,
             vi,
             zoomed,
+            scrollbar,
         } = *overlay;
         let hovered_hyperlink = match hovered_link {
             Some(HoveredLink::Explicit(id)) => Some(*id),
@@ -598,7 +601,23 @@ impl TextRenderer {
             }
         }
         self.progress_bar(frame.palette, progress, progress_phase);
+        if let Some(scrollbar) = scrollbar {
+            self.scrollbar(frame.palette, scrollbar);
+        }
         Ok(instance_start..self.instances.len() as u32)
+    }
+
+    fn scrollbar(&mut self, palette: &lune_terminal::Palette, view: ScrollbarView) {
+        let background = palette.color(PaletteEntry::Background);
+        let foreground = palette.color(PaletteEntry::Foreground);
+        let track_color = mix_color(background, foreground, 32);
+        let (thumb_color, thumb_alpha) = if view.highlighted {
+            (mix_color(background, foreground, 170), 0.85)
+        } else {
+            (mix_color(background, foreground, 120), 0.65)
+        };
+        self.rect(view.track, track_color, 0.28);
+        self.rect(view.thumb, thumb_color, thumb_alpha);
     }
 
     pub(super) fn prepare_chrome(
@@ -639,6 +658,183 @@ impl TextRenderer {
             self.notice_banner(rect, notice, palette);
         }
         start..self.instances.len() as u32
+    }
+
+    pub(super) fn prepare_modal(
+        &mut self,
+        area: PixelSize,
+        palette: &lune_terminal::Palette,
+        dialog: &confirm::Dialog,
+        scale: f64,
+        background_opacity: f32,
+    ) -> Range<u32> {
+        let start = self.instances.len() as u32;
+        self.area = area;
+        let bg = palette.color(PaletteEntry::Background);
+        let fg = palette.color(PaletteEntry::Foreground);
+        let backdrop_alpha = if background_opacity < 1.0 {
+            (background_opacity * 0.94).max(0.84)
+        } else {
+            0.94
+        };
+        self.rect(
+            PixelRect {
+                origin: PixelPosition { x: 0, y: 0 },
+                size: area,
+            },
+            bg,
+            backdrop_alpha,
+        );
+        let Some(layout) = confirm::Layout::compute(area, self.metrics, scale) else {
+            return start..self.instances.len() as u32;
+        };
+        self.centered_text(layout.message_y, &dialog.message, fg);
+
+        let green = palette.color(PaletteEntry::Indexed(2));
+        let red = palette.color(PaletteEntry::Indexed(1));
+        let amber = palette.color(PaletteEntry::Indexed(3));
+        let muted_border = mix_color(bg, fg, 115);
+
+        for (button, rect, accel, rest, accel_color) in [
+            (confirm::Button::Yes, layout.yes, "Y", "es", green),
+            (confirm::Button::No, layout.no, "N", "o", red),
+        ] {
+            let active = dialog.selected == button || dialog.hovered == Some(button);
+            let fill = mix_color(bg, fg, if active { 18 } else { 8 });
+            let (border_color, border_alpha) = if active {
+                (amber, 0.95)
+            } else {
+                (muted_border, 0.8)
+            };
+            self.rounded_rect(rect, layout.radius, 0, fill, 0.55);
+            self.rounded_rect(
+                rect,
+                layout.radius,
+                layout.border,
+                border_color,
+                border_alpha,
+            );
+            self.button_label(rect, accel, rest, accel_color, fg);
+        }
+        start..self.instances.len() as u32
+    }
+
+    fn centered_text(&mut self, y: u32, text: &str, color: Rgb) {
+        let cell_h = self.metrics.cell.height;
+        let max_chunk_w = (ATLAS_SIDE as u32).saturating_sub(64);
+        let mut chunks: Vec<(&str, u32)> = Vec::new();
+        let mut start = 0;
+        while start < text.len() {
+            let mut end = start;
+            let mut width = 0;
+            for (offset, ch) in text[start..].char_indices() {
+                let next_end = start + offset + ch.len_utf8();
+                let next_w = self.font.measure_text(self.metrics, &text[start..next_end]);
+                if next_w > max_chunk_w && end > start {
+                    break;
+                }
+                end = next_end;
+                width = next_w;
+            }
+            if end == start {
+                break;
+            }
+            chunks.push((&text[start..end], width));
+            start = end;
+        }
+        let total_w: u32 = chunks.iter().map(|(_, w)| *w).sum();
+        let mut x = self.area.width.get().saturating_sub(total_w) / 2;
+        for (chunk, chunk_w) in chunks {
+            let available = self.area.width.get().saturating_sub(x);
+            let draw_w = chunk_w.min(available).min(ATLAS_SIDE as u32);
+            if let Some(width) = NonZeroU32::new(draw_w) {
+                let rect = PixelRect {
+                    origin: PixelPosition { x, y },
+                    size: PixelSize {
+                        width,
+                        height: cell_h,
+                    },
+                };
+                self.glyph(rect, chunk, LABEL_CACHE, color, 1.0);
+            }
+            x = x.saturating_add(chunk_w);
+            if x >= self.area.width.get() {
+                break;
+            }
+        }
+    }
+
+    fn button_label(
+        &mut self,
+        rect: PixelRect,
+        accel: &str,
+        rest: &str,
+        accel_color: Rgb,
+        rest_color: Rgb,
+    ) {
+        let cell_h = self.metrics.cell.height;
+        let accel_w = self.font.measure_text(self.metrics, accel);
+        let rest_w = self.font.measure_text(self.metrics, rest);
+        let total_w = accel_w.saturating_add(rest_w);
+        let x = rect.origin.x + rect.size.width.get().saturating_sub(total_w) / 2;
+        let y = rect.origin.y + rect.size.height.get().saturating_sub(cell_h.get()) / 2;
+        if let Some(width) = NonZeroU32::new(accel_w) {
+            self.glyph(
+                PixelRect {
+                    origin: PixelPosition { x, y },
+                    size: PixelSize {
+                        width,
+                        height: cell_h,
+                    },
+                },
+                accel,
+                LABEL_CACHE,
+                accel_color,
+                1.0,
+            );
+        }
+        if let Some(width) = NonZeroU32::new(rest_w) {
+            self.glyph(
+                PixelRect {
+                    origin: PixelPosition {
+                        x: x.saturating_add(accel_w),
+                        y,
+                    },
+                    size: PixelSize {
+                        width,
+                        height: cell_h,
+                    },
+                },
+                rest,
+                LABEL_CACHE,
+                rest_color,
+                1.0,
+            );
+        }
+    }
+
+    fn rounded_rect(
+        &mut self,
+        rect: PixelRect,
+        radius: u32,
+        thickness: u32,
+        color: Rgb,
+        alpha: f32,
+    ) {
+        let w = rect.size.width.get().min(2047);
+        let h = rect.size.height.get().min(2047);
+        let r = radius.min(63).min(w / 2).min(h / 2);
+        let t = thickness.min(15);
+        let packed = r | (t << 6) | (w << 10) | (h << 21);
+        let half_w = w as f32 * 0.5;
+        let half_h = h as f32 * 0.5;
+        self.quad(
+            rect,
+            color,
+            alpha,
+            [-half_w, -half_h, w as f32, h as f32],
+            [6, packed],
+        );
     }
 
     pub(super) fn prepare_tab_bar(

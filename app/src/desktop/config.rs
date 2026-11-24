@@ -87,6 +87,7 @@ pub(super) struct Config {
     pub(super) cursor_blink: bool,
     pub(super) cursor_animation: bool,
     pub(super) shell: Option<Vec<OsString>>,
+    pub(super) confirm_close: bool,
     pub(super) clipboard_write: ClipboardPolicy,
     pub(super) clipboard_read: ClipboardPolicy,
     pub(super) notifications: NotificationPolicy,
@@ -107,6 +108,7 @@ impl Default for Config {
             cursor_blink: true,
             cursor_animation: true,
             shell: None,
+            confirm_close: true,
             clipboard_write: ClipboardPolicy::Allow,
             clipboard_read: ClipboardPolicy::Deny,
             notifications: NotificationPolicy::Unfocused,
@@ -268,6 +270,11 @@ impl Config {
             }
             "shell" => {
                 self.shell = Some(parse_command_words(value)?);
+            }
+            "confirm-close" => {
+                self.confirm_close = value
+                    .parse()
+                    .map_err(|_| "confirm-close must be true or false")?;
             }
             "keybind" => {
                 self.keybinds.push(shortcuts::parse_keybind(value)?);
@@ -433,6 +440,7 @@ mod tests {
              cursor-style = bar\r\ncursor-style = triangle\r\n\
              cursor-blink = false\r\ncursor-animation = false\r\n\
              shell = /usr/bin/zsh -l\r\nshell = \"unterminated\r\n\
+             confirm-close = false\r\nconfirm-close = maybe\r\n\
              keybind = alt+v=split_right\r\nkeybind = bad\r\n\
              clipboard-write = deny\r\nclipboard-read = allow\r\nclipboard-read = invalid\r\n\
              notifications = always\r\nnotifications = bad\r\n\
@@ -458,15 +466,16 @@ mod tests {
                 .as_slice()
             )
         );
+        assert!(!config.confirm_close);
         assert_eq!(config.keybinds.len(), 1);
         assert_eq!(config.clipboard_write, super::ClipboardPolicy::Deny);
         assert_eq!(config.clipboard_read, super::ClipboardPolicy::Allow);
         assert_eq!(config.notifications, super::NotificationPolicy::Always);
-        assert_eq!(loaded.errors.len(), 13);
+        assert_eq!(loaded.errors.len(), 14);
         assert_eq!(
             format_errors(&loaded.errors).as_deref(),
             Some(
-                " Config error: lune.conf:5: background-opacity must be between 0.0 and 1.0 (+12 more) "
+                " Config error: lune.conf:5: background-opacity must be between 0.0 and 1.0 (+13 more) "
             )
         );
     }

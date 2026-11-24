@@ -17,8 +17,10 @@ use crate::{
     PresentedCursor, RowDamage,
 };
 
+use super::confirm;
 use super::cursor::CursorMotion;
 use super::font::{Font, FontMetrics};
+use super::scrollbar::ScrollbarView;
 use super::split::Divider;
 use super::text::TextRenderer;
 use super::url::HoveredLink;
@@ -35,6 +37,7 @@ pub(super) struct PaneOverlay<'a> {
     pub(super) preedit: &'a str,
     pub(super) vi: Option<&'a vi::Mode>,
     pub(super) zoomed: bool,
+    pub(super) scrollbar: Option<ScrollbarView>,
 }
 
 pub(super) struct PaneDraw<'a> {
@@ -48,6 +51,7 @@ pub(super) struct PaneDraw<'a> {
     pub(super) vi: Option<&'a vi::Mode>,
     pub(super) focused: bool,
     pub(super) zoomed: bool,
+    pub(super) scrollbar: Option<ScrollbarView>,
 }
 
 pub(super) struct WindowChrome<'a> {
@@ -56,6 +60,8 @@ pub(super) struct WindowChrome<'a> {
     pub(super) dividers: &'a [Divider],
     pub(super) focused_rect: Option<PixelRect>,
     pub(super) notice: Option<&'a str>,
+    pub(super) confirm: Option<&'a confirm::Dialog>,
+    pub(super) scale: f64,
     pub(super) tab_bar: tab_bar::View<'a>,
 }
 
@@ -79,6 +85,7 @@ pub(super) struct Painter {
     pane_ranges: Vec<(PaneId, Range<u32>)>,
     chrome_range: Range<u32>,
     tab_bar_range: Range<u32>,
+    modal_range: Range<u32>,
     cursor_pane: Option<PaneId>,
     cursor_motion: CursorMotion,
     cursor_buffer: ScreenBuffer,
@@ -155,6 +162,7 @@ impl Painter {
             pane_ranges: Vec::new(),
             chrome_range: 0..0,
             tab_bar_range: 0..0,
+            modal_range: 0..0,
             cursor_pane: None,
             cursor_motion: CursorMotion::default(),
             cursor_buffer: ScreenBuffer::Primary,
@@ -533,6 +541,7 @@ impl Painter {
                     preedit: pane.preedit,
                     vi: pane.vi,
                     zoomed: pane.zoomed,
+                    scrollbar: pane.scrollbar,
                 };
                 let range = self.text.prepare_pane(
                     &pane.frame,
@@ -558,6 +567,22 @@ impl Painter {
             self.tab_bar_range =
                 self.text
                     .prepare_tab_bar(&chrome.tab_bar, progress_phase, background_opacity);
+            if let Some(dialog) = chrome.confirm
+                && let (Some(width), Some(height)) = (
+                    NonZeroU32::new(self.config.width),
+                    NonZeroU32::new(self.config.height),
+                )
+            {
+                self.modal_range = self.text.prepare_modal(
+                    PixelSize { width, height },
+                    chrome.palette,
+                    dialog,
+                    chrome.scale,
+                    background_opacity,
+                );
+            } else {
+                self.modal_range = 0..0;
+            }
             self.text.finish_frame()?;
         }
 
@@ -681,6 +706,19 @@ impl Painter {
                 pass.set_scissor_rect(0, top, self.config.width, bar_height);
                 self.text
                     .draw_range(&mut pass, self.tab_bar_range.clone(), false);
+            }
+            if !self.modal_range.is_empty() {
+                pass.set_viewport(
+                    0.0,
+                    0.0,
+                    self.config.width as f32,
+                    self.config.height as f32,
+                    0.0,
+                    1.0,
+                );
+                pass.set_scissor_rect(0, 0, self.config.width, self.config.height);
+                self.text
+                    .draw_range(&mut pass, self.modal_range.clone(), false);
             }
         }
         self.queue.submit([encoder.finish()]);

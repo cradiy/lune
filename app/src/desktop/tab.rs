@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -25,6 +25,7 @@ use super::directory;
 use super::input::{self, Input};
 use super::notify::Notifier;
 use super::readiness::{Readiness, Registration};
+use super::scrollbar::{ScrollbarMetrics, ScrollbarView};
 use super::split::{PaneRect, SplitLayout, SplitTree};
 use super::url::{self, DetectedUrl, HoveredLink};
 use super::{Event, PASTE_TIMEOUT, PaneId, Result, selection, vi};
@@ -161,6 +162,8 @@ pub(super) struct Pane {
     selection_click: Option<selection::Click>,
     pub(super) selection_drag: Option<selection::Drag>,
     pub(super) selection: Option<selection::Selection>,
+    pub(super) scrollbar_drag: Option<f64>,
+    pub(super) scrollbar_hovered: bool,
     pub(super) hovered_link: Option<HoveredLink>,
     hyperlink_click: Option<HyperlinkId>,
     pub(super) vi: Option<vi::Mode>,
@@ -252,6 +255,8 @@ impl Pane {
             selection_click: None,
             selection_drag: None,
             selection: None,
+            scrollbar_drag: None,
+            scrollbar_hovered: false,
             hovered_link: None,
             hyperlink_click: None,
             vi: None,
@@ -265,6 +270,67 @@ impl Pane {
             self.session.foreground_process_group(),
             self.session.child_id(),
         )
+    }
+
+    pub(super) fn foreground_process_name(&self) -> Option<String> {
+        let child = self.session.child_id();
+        let pgid = self
+            .session
+            .foreground_process_group()
+            .filter(|&pgid| pgid != child)?;
+        let name = std::fs::read_to_string(format!("/proc/{pgid}/comm"))
+            .ok()
+            .map(|text| text.trim().to_owned())
+            .filter(|text| !text.is_empty())
+            .unwrap_or_else(|| "a running process".into());
+        Some(name)
+    }
+
+    pub(super) fn drop_path(&mut self, path: &Path) {
+        if self.vi.is_some() || self.inputs.len() >= INPUT_LIMIT {
+            return;
+        }
+        let mut quoted = shell_quote_path(path);
+        quoted.push(' ');
+        self.follow_output();
+        self.push_input(Input::Paste(quoted));
+    }
+
+    fn scrollbar_metrics(&self, scale: f64) -> Option<ScrollbarMetrics> {
+        let screen = self.session.screen();
+        if screen.active_buffer() != ScreenBuffer::Primary {
+            return None;
+        }
+        let history_rows = screen.history().len();
+        let offset = screen.viewport_offset();
+        if history_rows == 0 || (offset == 0 && self.scrollbar_drag.is_none()) {
+            return None;
+        }
+        let area = self.session.geometry().text_area_pixels()?;
+        ScrollbarMetrics::compute(area, history_rows, screen.viewport().rows(), offset, scale)
+    }
+
+    pub(super) fn scrollbar_view(&self, scale: f64) -> Option<ScrollbarView> {
+        self.scrollbar_metrics(scale)
+            .map(|metrics| metrics.view(self.scrollbar_hovered || self.scrollbar_drag.is_some()))
+    }
+
+    pub(super) fn update_scrollbar_hover(&mut self) {
+        let hovered = self
+            .visible
+            .then(|| {
+                let pos = self.pointer?;
+                let metrics = self.scrollbar_metrics(self.window.scale_factor())?;
+                let local_x = pos.x - f64::from(self.origin.x);
+                let local_y = pos.y - f64::from(self.origin.y);
+                Some(metrics.contains(local_x, local_y))
+            })
+            .flatten()
+            .unwrap_or(false);
+        if self.scrollbar_hovered != hovered {
+            self.scrollbar_hovered = hovered;
+            self.invalidate_overlay();
+        }
     }
 
     pub(super) fn invalidate_overlay(&mut self) {
@@ -289,6 +355,8 @@ impl Pane {
             }
             self.selection_click = None;
             self.selection_drag = None;
+            self.scrollbar_drag = None;
+            self.scrollbar_hovered = false;
             self.hyperlink_click = None;
             if let Some(vi) = &mut self.vi {
                 vi.cancel_pending();
@@ -299,6 +367,17 @@ impl Pane {
 
     pub(super) fn pointer_moved(&mut self, position: PhysicalPosition<f64>) {
         let moved = self.pointer.replace(position) != Some(position);
+        if let Some(grab_offset_y) = self.scrollbar_drag {
+            if let Some(metrics) = self.scrollbar_metrics(self.window.scale_factor()) {
+                let local_y = position.y - f64::from(self.origin.y);
+                let target = metrics.offset_for_y(local_y, grab_offset_y);
+                let current = self.session.screen().viewport_offset();
+                if target != current {
+                    self.scroll_history(target as isize - current as isize);
+                }
+            }
+            return;
+        }
         if self.selection_drag.is_some() {
             self.extend_selection();
             if moved {
@@ -307,6 +386,7 @@ impl Pane {
         } else {
             self.mouse_event(MouseEvent::Motion(self.pressed));
         }
+        self.update_scrollbar_hover();
         self.update_hovered_hyperlink();
     }
 
@@ -317,6 +397,8 @@ impl Pane {
         let active_hover = self.visible
             && self.vi.is_none()
             && self.selection_drag.is_none()
+            && self.scrollbar_drag.is_none()
+            && !self.scrollbar_hovered
             && (!self.mouse_reporting() || ctrl_only);
         let next = if active_hover {
             self.hyperlink_at_pointer()
@@ -791,6 +873,39 @@ impl Pane {
         primary: &mut Option<clipboard::Primary>,
         hyperlink_open_pending: &mut bool,
     ) {
+        if !state.is_pressed()
+            && button == winit::event::MouseButton::Left
+            && self.scrollbar_drag.take().is_some()
+        {
+            self.update_scrollbar_hover();
+            self.invalidate_overlay();
+            return;
+        }
+        if state.is_pressed()
+            && button == winit::event::MouseButton::Left
+            && let Some(pos) = self.pointer
+            && let Some(metrics) = self.scrollbar_metrics(self.window.scale_factor())
+        {
+            let local_x = pos.x - f64::from(self.origin.x);
+            let local_y = pos.y - f64::from(self.origin.y);
+            if metrics.contains(local_x, local_y) {
+                let grab = if metrics.thumb_contains_y(local_y) {
+                    local_y - f64::from(metrics.thumb.origin.y)
+                } else {
+                    let center = f64::from(metrics.thumb.size.height.get()) * 0.5;
+                    let target = metrics.offset_for_y(local_y, center);
+                    let current = self.session.screen().viewport_offset();
+                    if target != current {
+                        self.scroll_history(target as isize - current as isize);
+                    }
+                    center
+                };
+                self.scrollbar_drag = Some(grab);
+                self.scrollbar_hovered = true;
+                self.invalidate_overlay();
+                return;
+            }
+        }
         if self.vi.is_some() {
             return;
         }
@@ -925,8 +1040,9 @@ impl Pane {
             self.selection_drag = None;
             self.hyperlink_click = None;
             self.scroll_vi_cursor();
+            self.update_scrollbar_hover();
             self.update_hovered_hyperlink();
-            self.window.request_redraw();
+            self.invalidate_overlay();
         }
     }
 
@@ -1163,5 +1279,49 @@ fn publish_primary_text(text: String, primary: &mut Option<clipboard::Primary>) 
     }
     if let Some(primary) = primary {
         primary.publish(text);
+    }
+}
+
+fn shell_quote_path(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    if !text.is_empty()
+        && text.chars().all(|ch| {
+            ch.is_ascii_alphanumeric()
+                || matches!(ch, '/' | '.' | '_' | '-' | '+' | ':' | '@' | ',' | '=')
+        })
+    {
+        return text.into_owned();
+    }
+    let mut quoted = String::with_capacity(text.len() + 2);
+    quoted.push('\'');
+    for ch in text.chars() {
+        if ch == '\'' {
+            quoted.push_str("'\\''");
+        } else {
+            quoted.push(ch);
+        }
+    }
+    quoted.push('\'');
+    quoted
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::shell_quote_path;
+
+    #[test]
+    fn shell_quote_path_escapes_spaces_and_quotes_safely() {
+        assert_eq!(shell_quote_path(Path::new("/tmp/foo.txt")), "/tmp/foo.txt");
+        assert_eq!(
+            shell_quote_path(Path::new("/tmp/my file.txt")),
+            "'/tmp/my file.txt'"
+        );
+        assert_eq!(
+            shell_quote_path(Path::new("/tmp/it's $HOME.txt")),
+            "'/tmp/it'\\''s $HOME.txt'"
+        );
+        assert_eq!(shell_quote_path(Path::new("")), "''");
     }
 }

@@ -53,6 +53,25 @@ fn fragment(input: Vertex) -> @location(0) vec4f {
         let cov = select(0.0, 1.0, local < dash);
         return vec4f(input.color.rgb, input.color.a * cov);
     }
+    if input.sprite.x == 6u {
+        let radius = f32(input.sprite.y & 0x3fu);
+        let thickness = f32((input.sprite.y >> 6u) & 0xfu);
+        let size = vec2f(
+            f32((input.sprite.y >> 10u) & 0x7ffu),
+            f32((input.sprite.y >> 21u) & 0x7ffu),
+        );
+        let half_size = size * 0.5;
+        let p = abs(input.uv) - (half_size - vec2f(radius));
+        let sdf = length(max(p, vec2f(0.0))) + min(max(p.x, p.y), 0.0) - radius;
+        var cov: f32;
+        if thickness == 0.0 {
+            cov = clamp(0.5 - sdf, 0.0, 1.0);
+        } else {
+            let edge = abs(sdf + thickness * 0.5) - thickness * 0.5;
+            cov = clamp(0.5 - edge, 0.0, 1.0);
+        }
+        return vec4f(input.color.rgb, input.color.a * cov);
+    }
     let glyph = textureLoad(atlas, vec2i(input.uv), i32(input.sprite.y), 0);
     let color = select(input.color.rgb, glyph.rgb, input.sprite.x == 2u);
     return vec4f(color, glyph.a * input.color.a);

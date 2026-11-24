@@ -1,6 +1,7 @@
 pub mod cli;
 mod clipboard;
 mod config;
+mod confirm;
 mod cursor;
 mod directory;
 mod font;
@@ -9,6 +10,7 @@ mod ligature;
 mod notify;
 mod paint;
 mod readiness;
+mod scrollbar;
 mod selection;
 mod shortcuts;
 mod split;
@@ -36,7 +38,7 @@ use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{Ime, KeyEvent, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
-use winit::keyboard::ModifiersState;
+use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::platform::wayland::{EventLoopBuilderExtWayland, WindowAttributesExtWayland};
 use winit::window::{CursorIcon, Fullscreen, Theme, Window, WindowId};
 
@@ -341,6 +343,8 @@ struct Client {
     cursor_style: CursorShape,
     cursor_blink: bool,
     shell: Option<Vec<OsString>>,
+    confirm_close: bool,
+    confirm: Option<confirm::Dialog>,
 }
 
 impl Client {
@@ -465,6 +469,8 @@ impl Client {
             cursor_style: config.cursor_style,
             cursor_blink: config.cursor_blink,
             shell: config.shell.clone(),
+            confirm_close: config.confirm_close,
+            confirm: None,
         })
     }
 
@@ -505,9 +511,27 @@ impl Client {
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) -> Result<()> {
         match event {
-            WindowEvent::CloseRequested | WindowEvent::Destroyed => {
-                log::debug!("Terminal window closed");
+            WindowEvent::CloseRequested => {
+                if self.confirm.is_none() && self.confirm_window_close() {
+                    log::debug!("Terminal window closed");
+                    event_loop.exit();
+                }
+            }
+            WindowEvent::Destroyed => {
+                log::debug!("Terminal window destroyed");
                 event_loop.exit();
+            }
+            WindowEvent::DroppedFile(path) => {
+                if self.confirm.is_some() {
+                    return Ok(());
+                }
+                if let Some(point) = self.pointer
+                    && let Some(target_id) = self.tabs[self.active].layout.pane_at(point)
+                    && target_id != self.tabs[self.active].focused
+                {
+                    self.focus_pane(target_id);
+                }
+                self.tabs[self.active].focused_pane_mut().drop_path(&path);
             }
             WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
                 self.resize_pending = true
@@ -552,6 +576,12 @@ impl Client {
                 is_synthetic: false,
                 ..
             } => {
+                if self.confirm.is_some() {
+                    if event.state.is_pressed() {
+                        self.handle_confirm_key(event_loop, &event);
+                    }
+                    return Ok(());
+                }
                 if event.state.is_pressed() {
                     self.key(event_loop, &event);
                 } else {
@@ -573,9 +603,27 @@ impl Client {
                 pane.ime_enabled = false;
                 pane.set_preedit(String::new());
             }
-            WindowEvent::Ime(ime) => self.tabs[self.active].focused_pane_mut().ime(ime),
+            WindowEvent::Ime(ime) => {
+                if self.confirm.is_none() {
+                    self.tabs[self.active].focused_pane_mut().ime(ime);
+                }
+            }
             WindowEvent::CursorMoved { position, .. } => {
                 self.pointer = Some(position);
+                if self.confirm.is_some() {
+                    let hovered = self
+                        .confirm_layout()
+                        .and_then(|layout| layout.hit(position));
+                    if let Some(dialog) = &mut self.confirm
+                        && dialog.hovered != hovered
+                    {
+                        dialog.hovered = hovered;
+                        self.painter.invalidate_overlay();
+                        self.window.request_redraw();
+                    }
+                    self.update_cursor_icon();
+                    return Ok(());
+                }
                 if let Some(divider) = self.dragging_divider {
                     let ratio = divider.ratio_for(position);
                     if self.tabs[self.active].tree.set_ratio(divider.path, ratio) {
@@ -590,7 +638,11 @@ impl Client {
                 let captured = tab
                     .panes
                     .iter()
-                    .find(|pane| pane.selection_drag.is_some() || pane.pressed.is_some())
+                    .find(|pane| {
+                        pane.selection_drag.is_some()
+                            || pane.scrollbar_drag.is_some()
+                            || pane.pressed.is_some()
+                    })
                     .map(|pane| pane.id);
                 if let Some(id) = captured {
                     if let Some(pane) = tab.pane_mut(id) {
@@ -606,6 +658,7 @@ impl Client {
                             pane.pointer_moved(position);
                         } else if pane.pointer.is_some() {
                             pane.pointer = None;
+                            pane.update_scrollbar_hover();
                             pane.update_hovered_hyperlink();
                         }
                     }
@@ -614,15 +667,43 @@ impl Client {
             }
             WindowEvent::CursorLeft { .. } => {
                 self.pointer = None;
+                if let Some(dialog) = &mut self.confirm
+                    && dialog.hovered.take().is_some()
+                {
+                    self.painter.invalidate_overlay();
+                    self.window.request_redraw();
+                }
                 for pane in &mut self.tabs[self.active].panes {
-                    if pane.pressed.is_none() && pane.selection_drag.is_none() {
+                    if pane.pressed.is_none()
+                        && pane.selection_drag.is_none()
+                        && pane.scrollbar_drag.is_none()
+                    {
                         pane.pointer = None;
                     }
+                    pane.update_scrollbar_hover();
                     pane.update_hovered_hyperlink();
                 }
                 self.update_cursor_icon();
             }
             WindowEvent::MouseInput { state, button, .. } => {
+                if self.confirm.is_some() {
+                    if state.is_pressed()
+                        && button == winit::event::MouseButton::Left
+                        && let Some(point) = self.pointer
+                        && let Some(hit) =
+                            self.confirm_layout().and_then(|layout| layout.hit(point))
+                    {
+                        match hit {
+                            confirm::Button::Yes => {
+                                if let Some(dialog) = self.confirm.take() {
+                                    self.execute_confirm(event_loop, dialog.target);
+                                }
+                            }
+                            confirm::Button::No => self.dismiss_confirm(),
+                        }
+                    }
+                    return Ok(());
+                }
                 if !state.is_pressed()
                     && button == winit::event::MouseButton::Left
                     && self.dragging_divider.take().is_some()
@@ -637,7 +718,9 @@ impl Client {
                     {
                         match button {
                             winit::event::MouseButton::Left => self.select_tab(index),
-                            winit::event::MouseButton::Middle => self.close_tab(event_loop, index),
+                            winit::event::MouseButton::Middle => {
+                                self.request_close_tab(event_loop, index);
+                            }
                             _ => {}
                         }
                     }
@@ -680,7 +763,11 @@ impl Client {
                     let target_id = self.tabs[self.active]
                         .panes
                         .iter()
-                        .find(|pane| pane.selection_drag.is_some() || pane.pressed.is_some())
+                        .find(|pane| {
+                            pane.selection_drag.is_some()
+                                || pane.scrollbar_drag.is_some()
+                                || pane.pressed.is_some()
+                        })
                         .map(|pane| pane.id)
                         .unwrap_or(self.tabs[self.active].focused);
                     if let Some(pane) = self.tabs[self.active].pane_mut(target_id) {
@@ -695,6 +782,9 @@ impl Client {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
+                if self.confirm.is_some() {
+                    return Ok(());
+                }
                 if self.pointer.is_some_and(|point| self.bar.contains(point)) {
                     if self.tabs.len() > 1 {
                         let (x, y) = match delta {
@@ -731,21 +821,34 @@ impl Client {
     }
 
     fn update_cursor_icon(&mut self) {
-        let next = if let Some(divider) = self.dragging_divider {
+        let next = if let Some(dialog) = &self.confirm {
+            if dialog.hovered.is_some() {
+                CursorIcon::Pointer
+            } else {
+                CursorIcon::Default
+            }
+        } else if let Some(divider) = self.dragging_divider {
             divider_cursor(divider.axis)
         } else if let Some(point) = self.pointer {
             if self.bar.contains(point) {
                 CursorIcon::Default
             } else {
                 let tab = &self.tabs[self.active];
-                let busy = tab
-                    .panes
-                    .iter()
-                    .any(|pane| pane.selection_drag.is_some() || pane.pressed.is_some());
+                let busy = tab.panes.iter().any(|pane| {
+                    pane.selection_drag.is_some()
+                        || pane.scrollbar_drag.is_some()
+                        || pane.pressed.is_some()
+                });
                 if !busy
                     && let Some(divider) = tab.layout.divider_at(point, self.divider_grab_margin())
                 {
                     divider_cursor(divider.axis)
+                } else if tab
+                    .panes
+                    .iter()
+                    .any(|pane| pane.visible && pane.scrollbar_hovered)
+                {
+                    CursorIcon::Default
                 } else if tab
                     .panes
                     .iter()
@@ -864,7 +967,7 @@ impl Client {
             }
             Action::CloseTab => {
                 let focused = self.tabs[self.active].focused;
-                self.close_pane(event_loop, self.active, focused);
+                self.request_close_pane(event_loop, self.active, focused);
             }
             Action::NextTab => self.select_tab((self.active + 1) % self.tabs.len()),
             Action::PreviousTab => {
@@ -1230,6 +1333,163 @@ impl Client {
         self.window.request_redraw();
     }
 
+    fn confirm_layout(&self) -> Option<confirm::Layout> {
+        let size = self.painter.size();
+        let area = PixelSize {
+            width: NonZeroU32::new(size.width)?,
+            height: NonZeroU32::new(size.height)?,
+        };
+        confirm::Layout::compute(area, self.painter.metrics(), self.window.scale_factor())
+    }
+
+    fn open_confirm(&mut self, target: confirm::CloseTarget, message: String) {
+        self.dragging_divider = None;
+        let mut dialog = confirm::Dialog::new(target, message);
+        if let Some(point) = self.pointer {
+            dialog.hovered = self.confirm_layout().and_then(|layout| layout.hit(point));
+        }
+        self.confirm = Some(dialog);
+        self.painter.reset_cursor_motion();
+        self.painter.invalidate_overlay();
+        self.update_cursor_icon();
+        self.window.request_redraw();
+    }
+
+    fn dismiss_confirm(&mut self) {
+        if self.confirm.take().is_some() {
+            self.painter.invalidate_overlay();
+            self.update_cursor_icon();
+            self.window.request_redraw();
+        }
+    }
+
+    fn execute_confirm(&mut self, event_loop: &ActiveEventLoop, target: confirm::CloseTarget) {
+        self.painter.invalidate_overlay();
+        self.update_cursor_icon();
+        match target {
+            confirm::CloseTarget::Window => {
+                log::debug!("Terminal window closed");
+                event_loop.exit();
+            }
+            confirm::CloseTarget::Tab(index) => {
+                if index < self.tabs.len() {
+                    self.close_tab(event_loop, index);
+                }
+            }
+            confirm::CloseTarget::Pane(pane_id) => {
+                if let Some(tab_index) =
+                    self.tabs.iter().position(|tab| tab.pane(pane_id).is_some())
+                {
+                    self.close_pane(event_loop, tab_index, pane_id);
+                }
+            }
+        }
+    }
+
+    fn handle_confirm_key(&mut self, event_loop: &ActiveEventLoop, event: &KeyEvent) {
+        match &event.logical_key {
+            Key::Character(text) if text.eq_ignore_ascii_case("y") => {
+                if let Some(dialog) = self.confirm.take() {
+                    self.execute_confirm(event_loop, dialog.target);
+                }
+            }
+            Key::Character(text) if text.eq_ignore_ascii_case("n") => {
+                self.dismiss_confirm();
+            }
+            Key::Named(NamedKey::Escape) => {
+                self.dismiss_confirm();
+            }
+            Key::Named(NamedKey::Enter | NamedKey::Space) => {
+                if let Some(dialog) = self.confirm.take() {
+                    match dialog.selected {
+                        confirm::Button::Yes => self.execute_confirm(event_loop, dialog.target),
+                        confirm::Button::No => {
+                            self.painter.invalidate_overlay();
+                            self.update_cursor_icon();
+                            self.window.request_redraw();
+                        }
+                    }
+                }
+            }
+            Key::Named(NamedKey::ArrowLeft | NamedKey::ArrowRight | NamedKey::Tab) => {
+                if let Some(dialog) = &mut self.confirm {
+                    dialog.selected = dialog.selected.toggle();
+                    self.painter.invalidate_overlay();
+                    self.window.request_redraw();
+                }
+            }
+            Key::Character(text)
+                if text.eq_ignore_ascii_case("h") || text.eq_ignore_ascii_case("l") =>
+            {
+                if let Some(dialog) = &mut self.confirm {
+                    dialog.selected = dialog.selected.toggle();
+                    self.painter.invalidate_overlay();
+                    self.window.request_redraw();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn confirm_window_close(&mut self) -> bool {
+        if !self.confirm_close {
+            return true;
+        }
+        let total_panes: usize = self.tabs.iter().map(|tab| tab.panes.len()).sum();
+        let processes: Vec<String> = self
+            .tabs
+            .iter()
+            .flat_map(|tab| tab.panes.iter())
+            .filter_map(Pane::foreground_process_name)
+            .collect();
+        if total_panes <= 1 && processes.is_empty() {
+            return true;
+        }
+        let message = confirm::format_running("window", &processes, total_panes);
+        self.open_confirm(confirm::CloseTarget::Window, message);
+        false
+    }
+
+    fn request_close_pane(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        tab_index: usize,
+        pane_id: PaneId,
+    ) {
+        if !self.confirm_close {
+            self.close_pane(event_loop, tab_index, pane_id);
+            return;
+        }
+        let Some(process) = self.tabs[tab_index]
+            .pane(pane_id)
+            .and_then(Pane::foreground_process_name)
+        else {
+            self.close_pane(event_loop, tab_index, pane_id);
+            return;
+        };
+        let message = confirm::format_running("pane", &[process], 1);
+        self.open_confirm(confirm::CloseTarget::Pane(pane_id), message);
+    }
+
+    fn request_close_tab(&mut self, event_loop: &ActiveEventLoop, index: usize) {
+        if !self.confirm_close {
+            self.close_tab(event_loop, index);
+            return;
+        }
+        let tab = &self.tabs[index];
+        let processes: Vec<String> = tab
+            .panes
+            .iter()
+            .filter_map(Pane::foreground_process_name)
+            .collect();
+        if tab.panes.len() <= 1 && processes.is_empty() {
+            self.close_tab(event_loop, index);
+            return;
+        }
+        let message = confirm::format_running("tab", &processes, tab.panes.len());
+        self.open_confirm(confirm::CloseTarget::Tab(index), message);
+    }
+
     fn set_notice(&mut self, text: Option<String>) {
         let changed = match text {
             Some(text) => {
@@ -1294,6 +1554,10 @@ impl Client {
             self.keymap = Keymap::from_overrides(&new.keybinds);
         }
         self.shell = new.shell.clone();
+        self.confirm_close = new.confirm_close;
+        if !self.confirm_close {
+            self.dismiss_confirm();
+        }
         if old.font_size_points != new.font_size_points {
             self.base_font_size_points = new.font_size_points;
             self.font_size_points = new.font_size_points;
@@ -1560,6 +1824,7 @@ impl Client {
                 self.painter.invalidate_overlay();
             }
         }
+        let scale = self.window.scale_factor();
         let active_tab = &self.tabs[self.active];
         let zoomed = active_tab.is_zoomed();
         let mut draw_panes = Vec::with_capacity(active_tab.layout.panes.len());
@@ -1571,7 +1836,7 @@ impl Client {
             let Some(mut frame) = pane.session.presentation_frame() else {
                 return Ok(());
             };
-            let focused = self.focused && pane.id == active_tab.focused;
+            let focused = self.focused && self.confirm.is_none() && pane.id == active_tab.focused;
             if pane.vi.is_some() || !focused {
                 frame.cursor_appearance.visible = false;
             }
@@ -1593,6 +1858,7 @@ impl Client {
                 vi: pane.vi.as_ref(),
                 focused,
                 zoomed: zoomed && pane.id == active_tab.focused,
+                scrollbar: pane.scrollbar_view(scale),
             });
         }
         let focused_rect = (active_tab.layout.panes.len() > 1)
@@ -1607,6 +1873,8 @@ impl Client {
                 dividers: &active_tab.layout.dividers,
                 focused_rect,
                 notice: self.notice.as_ref().map(|notice| notice.text.as_str()),
+                confirm: self.confirm.as_ref(),
+                scale,
                 tab_bar: tab_bar::View {
                     layout: &self.bar,
                     tabs: &self.tabs,
