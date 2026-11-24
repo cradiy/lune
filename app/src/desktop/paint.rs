@@ -1,4 +1,5 @@
 use std::num::NonZeroU32;
+use std::ops::Range;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -15,10 +16,19 @@ use crate::{
 use super::Result;
 use super::cursor::CursorMotion;
 use super::font::{Font, FontMetrics};
+use super::tab_bar;
 use super::text::TextRenderer;
 use super::vi;
 
 const RETRY_DELAY: Duration = Duration::from_millis(16);
+
+pub(super) struct Overlay<'a> {
+    pub(super) selection: Option<&'a Range<CellPosition>>,
+    pub(super) preedit: &'a str,
+    pub(super) vi: Option<&'a vi::Mode>,
+    pub(super) focused: bool,
+    pub(super) tab_bar: tab_bar::View<'a>,
+}
 
 pub(super) struct Painter {
     instance: wgpu::Instance,
@@ -118,6 +128,10 @@ impl Painter {
         self.text.metrics()
     }
 
+    pub(super) fn size(&self) -> PhysicalSize<u32> {
+        PhysicalSize::new(self.config.width, self.config.height)
+    }
+
     pub(super) fn measure(&mut self, size: f32) -> FontMetrics {
         self.text.measure(size)
     }
@@ -131,6 +145,15 @@ impl Painter {
     }
 
     pub(super) fn invalidate_overlay(&mut self) {
+        self.dirty = true;
+    }
+
+    pub(super) fn switch_session(&mut self) {
+        self.tracker.invalidate();
+        self.images.reset_session();
+        self.reset_cursor_motion();
+        self.retry = None;
+        self.graphics_prepare_failed = false;
         self.dirty = true;
     }
 
@@ -169,14 +192,19 @@ impl Painter {
         &mut self,
         window: &Arc<Window>,
         frame: &PresentationFrame<'_>,
-        selection: Option<&std::ops::Range<CellPosition>>,
-        preedit: &str,
-        vi: Option<&vi::Mode>,
-        focused: bool,
+        overlay: Overlay<'_>,
     ) -> Result<()> {
+        let Overlay {
+            selection,
+            preedit,
+            vi,
+            focused,
+            tab_bar,
+        } = overlay;
+        let bar_height = tab_bar.layout.height;
         let area = frame.geometry.text_area_pixels().unwrap();
         let (width, height) = (area.width.get(), area.height.get());
-        if width > self.config.width || height > self.config.height {
+        if width > self.config.width || height > self.config.height.saturating_sub(bar_height) {
             return Ok(());
         }
 
@@ -256,8 +284,14 @@ impl Painter {
         };
 
         if text_changed {
-            self.text
-                .prepare(frame, cursor.filter(|_| !moving), selection, preedit, vi)?;
+            self.text.prepare(
+                frame,
+                cursor.filter(|_| !moving),
+                selection,
+                preedit,
+                vi,
+                &tab_bar,
+            )?;
         }
         let mut draw_moving_cursor = false;
         if let Some(position) = position
@@ -320,6 +354,19 @@ impl Painter {
                 .draw_frame(&mut pass, &self.backgrounds, |pass| {
                     self.text.draw(pass, draw_moving_cursor)
                 });
+            if bar_height != 0 {
+                let top = tab_bar.layout.top;
+                pass.set_viewport(
+                    0.0,
+                    top as f32,
+                    self.config.width as f32,
+                    bar_height as f32,
+                    0.0,
+                    1.0,
+                );
+                pass.set_scissor_rect(0, top, self.config.width, bar_height);
+                self.text.draw_tab_bar(&mut pass);
+            }
         }
         self.queue.submit([encoder.finish()]);
         window.pre_present_notify();

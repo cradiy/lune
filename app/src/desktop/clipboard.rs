@@ -8,7 +8,7 @@ use wl_clipboard_rs::{copy, paste};
 
 use crate::MAX_PASTE_BYTES;
 
-use super::{Event, PASTE_TIMEOUT};
+use super::{Event, PASTE_TIMEOUT, TabId};
 
 pub(super) use wl_clipboard_rs::paste::ClipboardType;
 
@@ -39,6 +39,7 @@ pub(super) fn write(text: String, proxy: EventLoopProxy<Event>) -> io::Result<()
 pub(super) fn read(
     clipboard: ClipboardType,
     primary: Option<&Primary>,
+    tab: TabId,
     proxy: EventLoopProxy<Event>,
 ) -> io::Result<()> {
     let publication = primary
@@ -52,7 +53,7 @@ pub(super) fn read(
                 Some(publication) if !publication.wait(deadline) => Err("Paste timed out".into()),
                 _ => read_text(clipboard, deadline),
             };
-            let _ = proxy.send_event(Event::PasteReady(result));
+            let _ = proxy.send_event(Event::PasteReady(tab, result));
         })?;
     Ok(())
 }

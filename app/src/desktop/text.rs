@@ -4,8 +4,8 @@ use std::ops::Range;
 
 use guillotiere::{Allocation, AtlasAllocator, size2};
 use lune_terminal::{
-    CellPosition, CellText, Color, CursorShape, DisplayUnit, PixelPosition, PixelSize, Rgb,
-    SizedTextRow, Style, Underline,
+    CellPosition, CellText, Color, CursorShape, DisplayUnit, PaletteEntry, PixelPosition,
+    PixelSize, Rgb, SizedTextRow, Style, Underline,
 };
 
 use crate::gpu::{create_quad_pipeline, linear_colors, write_instances};
@@ -13,12 +13,14 @@ use crate::{PixelRect, PresentationFrame, PresentationStyle, PresentedCursor};
 
 use super::font::{Font, FontMetrics};
 use super::ligature;
+use super::tab_bar;
 
 const ATLAS_SIDE: i32 = 1024;
 const MAX_ATLAS_LAYERS: u32 = 32;
 const LABEL_CACHE: usize = 8;
 const ICON_CACHE: usize = 9;
-const LIGATURE_CACHE: usize = ICON_CACHE + 4;
+const TAB_LABEL_CACHE: usize = ICON_CACHE + 4;
+const LIGATURE_CACHE: usize = TAB_LABEL_CACHE + 1;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -141,6 +143,7 @@ pub(super) struct TextRenderer {
     evicted: bool,
     image: Vec<u8>,
     instances: Vec<Quad>,
+    terminal_instances: u32,
     buffer: Option<wgpu::Buffer>,
     motion_buffer: Option<wgpu::Buffer>,
     area: PixelSize,
@@ -188,6 +191,7 @@ impl TextRenderer {
             evicted: false,
             image: Vec::new(),
             instances: Vec::new(),
+            terminal_instances: 0,
             buffer: None,
             motion_buffer: None,
             area: metrics.cell,
@@ -223,6 +227,7 @@ impl TextRenderer {
         selection: Option<&Range<CellPosition>>,
         preedit: &str,
         vi: Option<&super::vi::Mode>,
+        tab_bar: &tab_bar::View<'_>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         self.area = frame.geometry.text_area_pixels().unwrap();
         self.generation += 1;
@@ -489,6 +494,8 @@ impl TextRenderer {
         {
             self.label(rect, preedit, frame, false);
         }
+        self.terminal_instances = self.instances.len() as u32;
+        self.tab_bar(tab_bar);
         if std::mem::size_of_val(self.instances.as_slice()) as u64
             > self.device.limits().max_buffer_size
         {
@@ -498,6 +505,66 @@ impl TextRenderer {
         }
         write_instances(&self.device, &self.queue, &mut self.buffer, &self.instances);
         Ok(())
+    }
+
+    fn tab_bar(&mut self, view: &tab_bar::View<'_>) {
+        let layout = view.layout;
+        let Some(area) = layout.area() else {
+            return;
+        };
+        let terminal_area = std::mem::replace(&mut self.area, area);
+        let background = view.palette.color(PaletteEntry::Background);
+        let foreground = view.palette.color(PaletteEntry::Foreground);
+        let accent = view.palette.color(PaletteEntry::Indexed(4));
+        let active_text = [
+            background,
+            foreground,
+            view.palette.color(PaletteEntry::Indexed(0)),
+        ]
+        .into_iter()
+        .max_by_key(|&color| luminance(color).abs_diff(luminance(accent)))
+        .unwrap();
+        let inactive = mix_color(background, accent, 36);
+        let inactive_text = mix_color(background, mix_color(foreground, accent, 88), 106);
+        for (index, fill_rect, title, title_end) in layout.tabs() {
+            let Some(tab) = view.tabs.get(index) else {
+                break;
+            };
+            let (fill, color) = if index == view.active {
+                (accent, active_text)
+            } else {
+                (inactive, inactive_text)
+            };
+            self.faded_tab(fill_rect, background, fill, layout.fade_cell_width());
+            if title_end != 0
+                && let Some(label) = tab.label().get(..title_end)
+            {
+                self.tab_label(title, label, color);
+            }
+        }
+        self.area = terminal_area;
+    }
+
+    fn faded_tab(&mut self, center: PixelRect, background: Rgb, color: Rgb, cell: NonZeroU32) {
+        let mut edge = center;
+        edge.size.width = cell;
+        for (offset, amount) in [176, 112, 56].into_iter().enumerate() {
+            let offset = offset as u32 * cell.get();
+            let color = mix_color(background, color, amount);
+            edge.origin.x = center.origin.x - offset - cell.get();
+            self.rect(edge, color, 1.0);
+            edge.origin.x = center.origin.x + center.size.width.get() + offset;
+            self.rect(edge, color, 1.0);
+        }
+        self.rect(center, color, 1.0);
+    }
+
+    fn tab_label(&mut self, mut rect: PixelRect, text: &str, color: Rgb) {
+        rect.size.width = rect
+            .size
+            .width
+            .min(NonZeroU32::new(ATLAS_SIDE as u32).unwrap());
+        self.glyph(rect, text, TAB_LABEL_CACHE, color, 1.0);
     }
 
     fn label(
@@ -536,20 +603,32 @@ impl TextRenderer {
     }
 
     pub(super) fn draw(&self, pass: &mut wgpu::RenderPass<'_>, moving: bool) {
-        if self.instances.is_empty() && !moving {
+        if self.terminal_instances == 0 && !moving {
             return;
         }
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bind_group, &[]);
         if let Some(buffer) = &self.buffer
-            && !self.instances.is_empty()
+            && self.terminal_instances != 0
         {
             pass.set_vertex_buffer(0, buffer.slice(..));
-            pass.draw(0..4, 0..self.instances.len() as u32);
+            pass.draw(0..4, 0..self.terminal_instances);
         }
         if moving && let Some(buffer) = &self.motion_buffer {
             pass.set_vertex_buffer(0, buffer.slice(..));
             pass.draw(0..4, 0..1);
+        }
+    }
+
+    pub(super) fn draw_tab_bar(&self, pass: &mut wgpu::RenderPass<'_>) {
+        let count = self.instances.len() as u32;
+        if self.terminal_instances < count
+            && let Some(buffer) = &self.buffer
+        {
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.set_vertex_buffer(0, buffer.slice(..));
+            pass.draw(0..4, self.terminal_instances..count);
         }
     }
 
@@ -583,7 +662,7 @@ impl TextRenderer {
     ) -> bool {
         let width = rect.size.width.get();
         let cache = &mut self.glyphs[cache_index];
-        if cache_index == LABEL_CACHE
+        if matches!(cache_index, LABEL_CACHE | TAB_LABEL_CACHE)
             && cache
                 .get(text)
                 .is_some_and(|sprite| sprite.allocation.rectangle.width() != width as i32)
@@ -599,7 +678,10 @@ impl TextRenderer {
             let rendition = if ligature_run {
                 cache_index - LIGATURE_CACHE
             } else {
-                cache_index & 3
+                match cache_index {
+                    TAB_LABEL_CACHE => 0,
+                    _ => cache_index & 3,
+                }
             };
             let Some(colored) = self.font.rasterize(
                 self.metrics,
@@ -923,6 +1005,20 @@ fn aligned_offset(space: u32, alignment: u8) -> u32 {
         2 => space / 2,
         _ => 0,
     }
+}
+
+fn mix_color(background: Rgb, foreground: Rgb, amount: u16) -> Rgb {
+    let channel =
+        |a: u8, b: u8| ((u16::from(a) * (255 - amount) + u16::from(b) * amount) / 255) as u8;
+    Rgb {
+        red: channel(background.red, foreground.red),
+        green: channel(background.green, foreground.green),
+        blue: channel(background.blue, foreground.blue),
+    }
+}
+
+fn luminance(color: Rgb) -> u32 {
+    u32::from(color.red) * 299 + u32::from(color.green) * 587 + u32::from(color.blue) * 114
 }
 
 fn allocate(layers: &mut [AtlasAllocator], size: guillotiere::Size) -> Option<(usize, Allocation)> {

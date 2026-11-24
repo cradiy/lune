@@ -321,6 +321,24 @@ pub struct ImageRenderer {
 }
 
 impl ImageRenderer {
+    #[cfg(all(feature = "desktop", target_os = "linux"))]
+    pub(crate) fn reset_session(&mut self) {
+        self.images.clear();
+        self.inactive_images.clear();
+        self.inactive_texture_stamp = None;
+        self.graphics_buffer = ScreenBuffer::Primary;
+        self.palette_revision = None;
+        self.has_indexed = false;
+        self.prepared = None;
+        self.draws.clear();
+        self.visible_images.clear();
+        self.visible_animations.clear();
+        self.animation_membership = None;
+        self.placeholder_rows.clear();
+        self.parent_origins = GraphicsPlaceholderCache::default();
+        self.placeholder_locations.clear();
+    }
+
     pub fn new(device: &Device, format: TextureFormat) -> Self {
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: None,

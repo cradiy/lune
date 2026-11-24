@@ -3,9 +3,9 @@ use winit::event::KeyEvent;
 use winit::keyboard::{Key, NamedKey};
 
 use super::{Command, Mode, normalize};
-use crate::desktop::{Client, selection::Selection, shortcuts};
+use crate::desktop::{Tab, selection::Selection, shortcuts};
 
-impl Client {
+impl Tab {
     pub(in crate::desktop) fn toggle_vi(&mut self) {
         if self.vi.is_some() {
             self.leave_vi();
@@ -20,7 +20,7 @@ impl Client {
         vi.search = self.vi_search.take();
         self.vi = Some(vi);
         log::debug!("Entered Vi mode");
-        self.window.set_ime_allowed(false);
+        self.set_ime_allowed();
         self.set_preedit(String::new());
         self.redraw_vi();
     }
@@ -28,13 +28,13 @@ impl Client {
     pub(in crate::desktop) fn leave_vi(&mut self) {
         self.vi_search = self.vi.take().and_then(|vi| vi.search);
         log::debug!("Left Vi mode");
-        self.window.set_ime_allowed(true);
+        self.set_ime_allowed();
         self.set_preedit(String::new());
         self.follow_output();
         self.redraw_vi();
     }
 
-    pub(in crate::desktop) fn vi_key(&mut self, event: &KeyEvent) {
+    pub(in crate::desktop) fn vi_key(&mut self, event: &KeyEvent, copy_pending: &mut bool) {
         let vi = self.vi.as_ref().unwrap();
         if vi.prompt.is_some() {
             self.vi_search_key(event);
@@ -83,10 +83,10 @@ impl Client {
                 0
             }
             Command::Yank => {
-                if self.copy_pending || self.selection.is_none() {
+                if *copy_pending || self.selection.is_none() {
                     return;
                 }
-                self.copy();
+                self.copy(copy_pending);
                 self.vi.as_mut().unwrap().clear_visual();
                 0
             }
@@ -100,7 +100,7 @@ impl Client {
             }
             Command::Search(direction) => {
                 vi.start_search(direction);
-                self.window.set_ime_allowed(true);
+                self.set_ime_allowed();
                 self.update_ime_area();
                 self.redraw_vi();
                 return;
@@ -131,7 +131,7 @@ impl Client {
             } else {
                 vi.prompt = None;
             }
-            self.window.set_ime_allowed(false);
+            self.set_ime_allowed();
             self.set_preedit(String::new());
             self.reveal_vi_cursor();
             self.update_vi_selection();
@@ -231,8 +231,7 @@ impl Client {
     }
 
     pub(in crate::desktop) fn redraw_vi(&mut self) {
-        self.painter.invalidate_overlay();
-        self.window.request_redraw();
+        self.invalidate_overlay();
     }
 
     fn vi_columns(&self) -> usize {

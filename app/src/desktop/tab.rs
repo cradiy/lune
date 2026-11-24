@@ -1,0 +1,743 @@
+use std::collections::VecDeque;
+use std::io;
+use std::process::Command;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use lune_terminal::{
+    CellPosition, ColorScheme, HistoryLimits, MouseButton, MouseEvent, MouseTracking, Palette,
+    PixelPosition, PixelSize, ScreenBuffer,
+};
+use winit::dpi::{PhysicalPosition, PhysicalSize};
+use winit::event::{ElementState, Ime, KeyEvent, MouseScrollDelta};
+use winit::event_loop::EventLoopProxy;
+use winit::keyboard::ModifiersState;
+use winit::window::{UserAttentionType, Window};
+
+use crate::{GridGeometry, MAX_INPUT_BYTES, Session, SessionReady, WaitOutcome};
+
+use super::clipboard::{self, ClipboardType};
+use super::input::{self, Input};
+use super::readiness::{Readiness, Registration};
+use super::{Event, PASTE_TIMEOUT, Result, TabId, selection, vi};
+
+const INPUT_LIMIT: usize = 1024;
+
+pub(super) struct Tab {
+    pub(super) id: TabId,
+    pub(super) session: Session,
+    pub(super) registration: Registration,
+    window: Arc<Window>,
+    proxy: EventLoopProxy<Event>,
+    pub(super) title: String,
+    pub(super) title_changed: bool,
+    inputs: VecDeque<Input>,
+    paste_worker: bool,
+    paste_deadline: Option<Instant>,
+    pub(super) active: bool,
+    pub(super) dirty: bool,
+    pub(super) restart_blink: bool,
+    pub(super) modifiers: ModifiersState,
+    pub(super) ime_enabled: bool,
+    pub(super) ime_area: Option<(PixelPosition, PixelSize)>,
+    pub(super) preedit: String,
+    pub(super) pointer: Option<PhysicalPosition<f64>>,
+    pub(super) pressed: Option<MouseButton>,
+    wheel: f64,
+    selection_click: Option<selection::Click>,
+    pub(super) selection_drag: Option<selection::Drag>,
+    pub(super) selection: Option<selection::Selection>,
+    pub(super) vi: Option<vi::Mode>,
+    pub(super) vi_search: Option<vi::Search>,
+}
+
+impl Tab {
+    pub(super) fn spawn(
+        id: TabId,
+        window: Arc<Window>,
+        proxy: EventLoopProxy<Event>,
+        grid: GridGeometry,
+        palette: &Palette,
+        scheme: ColorScheme,
+    ) -> Result<Self> {
+        let shell = std::env::var_os("SHELL")
+            .filter(|shell| !shell.is_empty())
+            .unwrap_or_else(|| "/bin/sh".into());
+        let mut command = Command::new(shell);
+        command
+            .env("TERM", "xterm-256color")
+            .env("COLORTERM", "truecolor")
+            .env("TERM_PROGRAM", "Lune");
+        let pty_size = grid.pty_size();
+        log::debug!(
+            "Starting PTY session with {} columns and {} rows",
+            pty_size.columns,
+            pty_size.rows
+        );
+        let mut session = Session::spawn(command, pty_size, palette.clone())?;
+        session.set_theme(palette, Some(scheme));
+        session.set_history_limits(HistoryLimits {
+            max_rows: 10_000,
+            max_bytes: 32 << 20,
+        })?;
+        Ok(Self {
+            id,
+            session,
+            registration: Registration::default(),
+            window,
+            proxy,
+            title: String::new(),
+            title_changed: false,
+            inputs: VecDeque::new(),
+            paste_worker: false,
+            paste_deadline: None,
+            active: false,
+            dirty: true,
+            restart_blink: false,
+            modifiers: ModifiersState::empty(),
+            ime_enabled: false,
+            ime_area: None,
+            preedit: String::new(),
+            pointer: None,
+            pressed: None,
+            wheel: 0.0,
+            selection_click: None,
+            selection_drag: None,
+            selection: None,
+            vi: None,
+            vi_search: None,
+        })
+    }
+
+    pub(super) fn invalidate_overlay(&mut self) {
+        self.dirty = true;
+        if self.active {
+            self.window.request_redraw();
+        }
+    }
+
+    pub(super) fn set_ime_allowed(&self) {
+        if self.active {
+            self.window
+                .set_ime_allowed(self.vi.as_ref().is_none_or(|vi| vi.prompt.is_some()));
+        }
+    }
+
+    pub(super) fn focus(&mut self, focused: bool) {
+        self.push_input(Input::Focus(focused));
+        if !focused {
+            if let Some(button) = self.pressed.take() {
+                self.mouse_event(MouseEvent::Release(button));
+            }
+            self.selection_click = None;
+            self.selection_drag = None;
+            if let Some(vi) = &mut self.vi {
+                vi.cancel_pending();
+            }
+            self.set_preedit(String::new());
+        }
+    }
+
+    pub(super) fn pointer_moved(&mut self, position: PhysicalPosition<f64>) {
+        let moved = self.pointer.replace(position) != Some(position);
+        if self.selection_drag.is_some() {
+            self.extend_selection();
+            if moved {
+                self.update_selection_scroll(position.y);
+            }
+        } else {
+            self.mouse_event(MouseEvent::Motion(self.pressed));
+        }
+    }
+
+    pub(super) fn label(&self) -> &str {
+        if self.title.is_empty() {
+            "Terminal"
+        } else {
+            &self.title
+        }
+    }
+
+    pub(super) fn ime(&mut self, ime: Ime) {
+        match ime {
+            Ime::Preedit(text, _) => {
+                if self.vi.is_none() && self.preedit.is_empty() && !text.is_empty() {
+                    self.follow_output();
+                }
+                if self.vi.as_ref().is_none_or(|vi| vi.prompt.is_some()) {
+                    self.set_preedit(text);
+                }
+            }
+            Ime::Commit(mut text) => {
+                self.set_preedit(String::new());
+                if let Some(vi) = &mut self.vi {
+                    if let Some(prompt) = &mut vi.prompt {
+                        prompt.push(&text);
+                        self.update_ime_area();
+                        self.redraw_vi();
+                    }
+                    return;
+                }
+                self.follow_output();
+                while text.len() > MAX_INPUT_BYTES {
+                    let rest = text.split_off(text.floor_char_boundary(MAX_INPUT_BYTES));
+                    self.push_input(Input::Text(text));
+                    text = rest;
+                }
+                if !text.is_empty() {
+                    self.push_input(Input::Text(text));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub(super) fn dispatch(&mut self, ready: SessionReady, focused: bool) -> Result<bool> {
+        let selection_source = (self.selection.is_some()
+            || self.selection_click.is_some()
+            || self.selection_drag.is_some())
+        .then(|| {
+            let screen = self.session.screen();
+            (
+                screen.active_buffer(),
+                screen.view().discarded_history_rows(),
+            )
+        });
+        let outcome = self.session.dispatch_ready(ready)?;
+        let Some(mut outcome) = outcome else {
+            return Ok(true);
+        };
+        let start = Instant::now();
+        for _ in 0..if self.active { 16 } else { 0 } {
+            if outcome != WaitOutcome::Pumped || start.elapsed() >= Duration::from_millis(2) {
+                break;
+            }
+            outcome = self.session.wait_and_pump(Some(Duration::ZERO))?;
+        }
+        if matches!(outcome, WaitOutcome::ChildExited(_) | WaitOutcome::Finished) {
+            if let WaitOutcome::ChildExited(status) = outcome {
+                log::info!("PTY child exited: {status}");
+            } else {
+                log::info!("PTY session finished");
+            }
+            return Ok(false);
+        }
+        let notifications = self.session.take_notifications();
+        if let Some(title) = notifications.window_title
+            && self.title != title
+        {
+            self.title.clear();
+            self.title
+                .extend(title.chars().filter(|ch| !ch.is_control()).take(128));
+            self.title_changed = true;
+        }
+        if notifications.bell && !focused {
+            self.window
+                .request_user_attention(Some(UserAttentionType::Informational));
+        }
+        if let Some((buffer, discarded_rows)) = selection_source {
+            let screen = self.session.screen();
+            let view = screen.view();
+            if screen.active_buffer() != buffer
+                || self
+                    .selection
+                    .as_mut()
+                    .is_some_and(|selection| !selection.refresh(view))
+            {
+                self.clear_selection();
+                if let Some(vi) = &mut self.vi {
+                    vi.clear_visual();
+                }
+            } else if view.discarded_history_rows() != discarded_rows {
+                self.selection_click = None;
+                let removed = view.discarded_history_rows().wrapping_sub(discarded_rows);
+                let removed = usize::try_from(removed).unwrap_or(usize::MAX);
+                if self
+                    .selection_drag
+                    .as_mut()
+                    .is_some_and(|drag| drag.rebase(removed).is_none())
+                {
+                    self.selection_drag = None;
+                }
+            }
+        }
+        self.refresh_vi();
+        self.update_ime_area();
+        if self.active && self.session.presentation_frame().is_some() {
+            self.window.request_redraw();
+        }
+        Ok(true)
+    }
+
+    pub(super) fn service(
+        &mut self,
+        readiness: &Readiness,
+        grid: GridGeometry,
+        now: Instant,
+    ) -> Result<(bool, Option<Instant>)> {
+        self.resize(grid)?;
+        self.flush_input(now)?;
+        let interests = self.session.interests();
+        readiness.arm(self.id, &mut self.registration, interests)?;
+        let deadline = interests
+            .presentation_deadline
+            .into_iter()
+            .chain(self.paste_deadline)
+            .min();
+        Ok((interests.immediate, deadline))
+    }
+
+    fn resize(&mut self, grid: GridGeometry) -> Result<()> {
+        let previous = self.session.geometry().pty_size();
+        let next = grid.pty_size();
+        if next == previous {
+            return Ok(());
+        }
+        let vi_row = self.vi.as_ref().map(|vi| {
+            vi.cursor
+                .row
+                .saturating_sub(self.session.screen().viewport().range().start)
+        });
+        match self.session.resize(next) {
+            Ok(()) => {
+                log::debug!(
+                    "PTY resized to {} columns and {} rows",
+                    next.columns,
+                    next.rows
+                );
+                self.clear_selection();
+                if let Some(vi) = &mut self.vi {
+                    vi.clear_visual();
+                }
+                if let Some(row) = vi_row
+                    && (previous.columns != next.columns || previous.rows != next.rows)
+                {
+                    self.reset_vi_cursor(row);
+                }
+                self.update_ime_area();
+                self.invalidate_overlay();
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {}
+            Err(error) => return Err(error.into()),
+        }
+        Ok(())
+    }
+
+    pub(super) fn update_ime_area(&mut self) {
+        if !self.active || !self.ime_enabled {
+            return;
+        }
+        let geometry = self.session.geometry();
+        let viewport = self.session.screen().viewport();
+        let (row, column) = if let Some(vi) = &self.vi {
+            if vi.prompt.is_none() {
+                return;
+            }
+            (viewport.rows() - 1, 0)
+        } else if let Some(cursor) = viewport.cursor() {
+            (cursor.row, cursor.column)
+        } else {
+            return;
+        };
+        let Some(rect) = geometry.row_rect(row, column..column + 1) else {
+            return;
+        };
+        let origin = rect.origin;
+        if self.ime_area != Some((origin, rect.size)) {
+            self.window.set_ime_cursor_area(
+                PhysicalPosition::new(origin.x as i32, origin.y as i32),
+                PhysicalSize::new(rect.size.width.get(), rect.size.height.get()),
+            );
+            self.ime_area = Some((origin, rect.size));
+        }
+    }
+
+    pub(super) fn set_preedit(&mut self, mut text: String) {
+        text.truncate(text.floor_char_boundary(1024));
+        if self.preedit != text {
+            self.preedit = text;
+            self.invalidate_overlay();
+        }
+    }
+
+    fn push_input(&mut self, input: Input) {
+        if self.inputs.len() >= INPUT_LIMIT {
+            return;
+        }
+        if matches!(input, Input::Mouse(MouseEvent::Motion(_), ..))
+            && matches!(
+                self.inputs.back(),
+                Some(Input::Mouse(MouseEvent::Motion(_), ..))
+            )
+        {
+            self.inputs.pop_back();
+        }
+        self.inputs.push_back(input);
+    }
+
+    fn flush_input(&mut self, now: Instant) -> Result<()> {
+        if self.paste_deadline.is_some_and(|deadline| deadline <= now) {
+            self.paste_deadline = None;
+            self.inputs
+                .retain(|input| !matches!(input, Input::PendingPaste));
+            log::warn!("Clipboard paste timed out");
+        }
+        while let Some(input) = self.inputs.front() {
+            match input.queue(&mut self.session) {
+                Ok(()) => {
+                    self.inputs.pop_front();
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
+                    self.inputs.clear();
+                    break;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn finish_paste(&mut self, result: std::result::Result<String, String>) {
+        self.paste_worker = false;
+        if self.paste_deadline.take().is_some()
+            && let Some(index) = self
+                .inputs
+                .iter()
+                .position(|input| matches!(input, Input::PendingPaste))
+        {
+            match result {
+                Ok(text) if !text.is_empty() => self.inputs[index] = Input::Paste(text),
+                Ok(_) => {
+                    self.inputs.remove(index);
+                }
+                Err(error) => {
+                    log::warn!("Clipboard paste failed: {error}");
+                    self.inputs.remove(index);
+                }
+            }
+        }
+    }
+
+    pub(super) fn key(&mut self, event: &KeyEvent, copy_pending: &mut bool) {
+        if self.vi.is_some() {
+            self.vi_key(event, copy_pending);
+        } else if let Some(input) = input::key(event, self.modifiers) {
+            self.follow_output();
+            self.push_input(input);
+        }
+    }
+
+    pub(super) fn follow_output(&mut self) {
+        let was_scrolled = self.session.screen().viewport_offset() != 0;
+        self.session.follow_output();
+        self.clear_selection();
+        self.restart_blink = true;
+        if self.active && was_scrolled {
+            self.window.request_redraw();
+        }
+    }
+
+    fn pointer_pixel(&self, clamp: bool) -> Option<PixelPosition> {
+        let pointer = self.pointer?;
+        let area = self.session.geometry().text_area_pixels()?;
+        let (x, y) = (pointer.x, pointer.y);
+        if !clamp
+            && (x < 0.0
+                || y < 0.0
+                || x >= f64::from(area.width.get())
+                || y >= f64::from(area.height.get()))
+        {
+            return None;
+        }
+        Some(PixelPosition {
+            x: (x as u32).min(area.width.get() - 1),
+            y: (y as u32).min(area.height.get() - 1),
+        })
+    }
+
+    pub(super) fn mouse_event(&mut self, event: MouseEvent) {
+        if matches!(event, MouseEvent::Motion(_)) && !self.mouse_reporting() {
+            return;
+        }
+        let clamp = self.pressed.is_some() || matches!(event, MouseEvent::Release(_));
+        if let Some(pixel) = self.pointer_pixel(clamp) {
+            self.push_input(Input::Mouse(
+                event,
+                pixel,
+                input::terminal_modifiers(self.modifiers),
+            ));
+        }
+    }
+
+    fn mouse_reporting(&self) -> bool {
+        self.vi.is_none()
+            && self.session.screen().viewport_offset() == 0
+            && self.session.processor().input_modes().mouse_tracking != MouseTracking::Disabled
+    }
+
+    pub(super) fn button(
+        &mut self,
+        state: ElementState,
+        button: winit::event::MouseButton,
+        primary: &mut Option<clipboard::Primary>,
+    ) {
+        if self.vi.is_some() {
+            return;
+        }
+        let button = match button {
+            winit::event::MouseButton::Left => MouseButton::Left,
+            winit::event::MouseButton::Right => MouseButton::Right,
+            winit::event::MouseButton::Middle => MouseButton::Middle,
+            winit::event::MouseButton::Back => MouseButton::Button8,
+            winit::event::MouseButton::Forward => MouseButton::Button9,
+            _ => return,
+        };
+        if state.is_pressed() {
+            let mouse_reporting = self.mouse_reporting();
+            let local = !mouse_reporting || self.modifiers.shift_key();
+            if button != MouseButton::Left || !local {
+                self.selection_click = None;
+            }
+            if button == MouseButton::Left && local {
+                self.start_selection();
+            } else if button == MouseButton::Middle && local {
+                if self.pointer_pixel(false).is_some() {
+                    self.paste(ClipboardType::Primary, primary.as_ref());
+                }
+            } else if mouse_reporting && self.pointer_pixel(false).is_some() {
+                self.pressed = Some(button);
+                self.mouse_event(MouseEvent::Press(button));
+            }
+        } else if button == MouseButton::Left && self.selection_drag.is_some() {
+            self.extend_selection();
+            self.selection_drag = None;
+            self.publish_primary_selection(primary);
+        } else if self.pressed == Some(button) {
+            self.mouse_event(MouseEvent::Release(button));
+            self.pressed = None;
+        }
+    }
+
+    pub(super) fn scroll(&mut self, delta: MouseScrollDelta) {
+        let horizontal = match delta {
+            MouseScrollDelta::LineDelta(x, y) => {
+                self.wheel += f64::from(y);
+                x
+            }
+            MouseScrollDelta::PixelDelta(position) => {
+                self.wheel += position.y
+                    / f64::from(self.session.geometry().cell_pixels().unwrap().height.get());
+                0.0
+            }
+        };
+        let steps = (self.wheel as isize).clamp(-32, 32);
+        self.wheel = self.wheel.fract();
+        if self.vi.is_some()
+            || self.session.screen().active_buffer() == ScreenBuffer::Primary
+                && (!self.mouse_reporting() || self.modifiers.shift_key())
+        {
+            self.scroll_history(steps * 3);
+        } else {
+            let event = if steps > 0 {
+                MouseEvent::WheelUp
+            } else {
+                MouseEvent::WheelDown
+            };
+            for _ in 0..steps.unsigned_abs() {
+                self.mouse_event(event);
+            }
+            if horizontal != 0.0 && self.mouse_reporting() {
+                self.mouse_event(if horizontal > 0.0 {
+                    MouseEvent::WheelLeft
+                } else {
+                    MouseEvent::WheelRight
+                });
+            }
+        }
+    }
+
+    pub(super) fn scroll_history(&mut self, steps: isize) {
+        if self.session.scroll_history(steps) {
+            self.selection_click = None;
+            self.selection_drag = None;
+            self.scroll_vi_cursor();
+            self.window.request_redraw();
+        }
+    }
+
+    fn update_selection_scroll(&mut self, y: f64) {
+        let Some(drag) = &mut self.selection_drag else {
+            return;
+        };
+        let screen = self.session.screen();
+        let band = f64::from(self.session.geometry().cell_pixels().unwrap().height.get()) * 0.4;
+        let rows = if let Some(area) = self.session.geometry().text_area_pixels()
+            && screen.active_buffer() == ScreenBuffer::Primary
+        {
+            let offset = screen.viewport_offset();
+            if y < band && offset < screen.history().len() {
+                2
+            } else if y >= f64::from(area.height.get()) - band && offset > 0 {
+                -2
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+        drag.set_edge_scroll(rows, Instant::now());
+    }
+
+    pub(super) fn tick_selection_scroll(&mut self, now: Instant) {
+        let Some(drag) = &mut self.selection_drag else {
+            return;
+        };
+        let Some(rows) = drag.edge_scroll.as_mut().and_then(|scroll| scroll.due(now)) else {
+            return;
+        };
+        if self.session.scroll_history(rows) {
+            self.extend_selection();
+            self.window.request_redraw();
+        } else {
+            drag.edge_scroll = None;
+        }
+    }
+
+    fn selection_position(&self, clamp: bool) -> Option<CellPosition> {
+        let pixel = self.pointer_pixel(clamp)?;
+        let mut position = self.session.geometry().cell_at(pixel)?;
+        position.row += self.session.screen().viewport().range().start;
+        Some(position)
+    }
+
+    fn start_selection(&mut self) {
+        let previous = self.selection_click.take();
+        let shift = self.modifiers.shift_key();
+        let Some(position) = self.selection_position(false) else {
+            if !shift {
+                self.clear_selection();
+            }
+            return;
+        };
+        let now = Instant::now();
+        let next = previous.and_then(|click| click.next(position, now, shift));
+        let repeated = next.is_some();
+        let click = next.unwrap_or_else(|| selection::Click::new(position, now, shift));
+        if shift
+            && !repeated
+            && let Some(anchor) = self
+                .selection
+                .as_ref()
+                .and_then(|selection| selection.anchor.as_ref())
+        {
+            self.selection_drag = Some(anchor.clone().drag(true));
+        } else {
+            self.clear_selection();
+            self.selection_drag = Some(click.drag(self.session.screen().view()));
+        }
+        self.extend_selection();
+        self.selection_click = Some(click);
+    }
+
+    fn extend_selection(&mut self) {
+        let Some(focus) = self.selection_position(true) else {
+            return;
+        };
+        let Some(drag) = &mut self.selection_drag else {
+            return;
+        };
+        if !drag.move_to(focus) {
+            return;
+        }
+        if drag.moved() {
+            self.selection_click = None;
+        }
+        let view = self.session.screen().view();
+        let range = drag.range(view);
+        if self.selection.as_ref().map(|selection| &selection.range) == range.as_ref() {
+            return;
+        }
+        match (&mut self.selection, range) {
+            (Some(selection), Some(range)) => selection.set_range(view, range),
+            (selection, Some(range)) => {
+                *selection = Some(selection::Selection::new(
+                    view,
+                    range,
+                    Some(drag.anchor.clone()),
+                ));
+            }
+            (selection, None) => *selection = None,
+        }
+        self.invalidate_overlay();
+    }
+
+    pub(super) fn clear_selection(&mut self) {
+        self.selection_click = None;
+        self.selection_drag = None;
+        if self.selection.take().is_some() {
+            self.invalidate_overlay();
+        }
+    }
+
+    pub(super) fn copy(&self, copy_pending: &mut bool) {
+        if *copy_pending {
+            return;
+        }
+        if let Some(text) = self.selected_text() {
+            match clipboard::write(text, self.proxy.clone()) {
+                Ok(()) => *copy_pending = true,
+                Err(error) => log::warn!("Failed to start the clipboard copy worker: {error}"),
+            }
+        }
+    }
+
+    fn selected_text(&self) -> Option<String> {
+        let selection = self.selection.as_ref()?;
+        let mut text = self
+            .session
+            .screen()
+            .view()
+            .selection_text(selection.range.clone())
+            .ok()?
+            .to_string();
+        if self.vi.as_ref().is_some_and(vi::Mode::linewise) {
+            text.push('\n');
+        }
+        (!text.is_empty()).then_some(text)
+    }
+
+    fn publish_primary_selection(&self, primary: &mut Option<clipboard::Primary>) {
+        let Some(text) = self.selected_text() else {
+            return;
+        };
+        if primary.is_none() {
+            *primary = match clipboard::Primary::new() {
+                Ok(primary) => Some(primary),
+                Err(error) => {
+                    log::warn!("Failed to start the primary selection worker: {error}");
+                    return;
+                }
+            };
+        }
+        if let Some(primary) = primary {
+            primary.publish(text);
+        }
+    }
+
+    pub(super) fn paste(&mut self, clipboard: ClipboardType, primary: Option<&clipboard::Primary>) {
+        if self.paste_worker || self.inputs.len() >= INPUT_LIMIT {
+            return;
+        }
+        match clipboard::read(clipboard, primary, self.id, self.proxy.clone()) {
+            Ok(()) => {
+                self.follow_output();
+                self.push_input(Input::PendingPaste);
+                self.paste_worker = true;
+                self.paste_deadline = Some(Instant::now() + PASTE_TIMEOUT);
+            }
+            Err(error) => log::warn!("Failed to start the clipboard paste worker: {error}"),
+        }
+    }
+}

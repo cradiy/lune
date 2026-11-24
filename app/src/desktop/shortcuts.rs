@@ -14,6 +14,10 @@ pub(super) enum Action {
     Zoom(Zoom),
     Scroll(Scroll),
     ToggleVi,
+    NewTab,
+    CloseTab,
+    NextTab,
+    PreviousTab,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -85,6 +89,14 @@ const WAYLAND_BINDINGS: &[Binding] = &[
     Binding::new(Action::Copy, CTRL_SHIFT, Letter("c")),
     Binding::new(Action::Paste, CTRL_SHIFT, Letter("v")),
     Binding::new(Action::OpenDirectory, CTRL_SHIFT, Letter("o")),
+    Binding::new(Action::NewTab, CTRL_SHIFT, Letter("t")),
+    Binding::new(Action::CloseTab, CTRL_SHIFT, Letter("w")),
+    Binding::new(Action::PreviousTab, CTRL_SHIFT, Named(NamedKey::ArrowLeft)),
+    Binding::new(Action::NextTab, CTRL_SHIFT, Named(NamedKey::ArrowRight)),
+    Binding::new(Action::PreviousTab, CTRL_SHIFT, Letter("h")),
+    Binding::new(Action::NextTab, CTRL_SHIFT, Letter("l")),
+    Binding::new(Action::NextTab, Mods::CONTROL, Named(NamedKey::Tab)),
+    Binding::new(Action::PreviousTab, CTRL_SHIFT, Named(NamedKey::Tab)),
     Binding::new(Action::ToggleVi, CTRL_SHIFT, ShortcutKey::Space),
     Binding::new(
         Action::ToggleFullscreen,
