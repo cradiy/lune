@@ -45,22 +45,7 @@ impl Font {
                 system.db_mut().set_monospace_family(family);
             }
         }
-        let family = family.and_then(|requested| {
-            let installed = system
-                .db()
-                .faces()
-                .flat_map(|face| &face.families)
-                .find(|(name, _)| name.eq_ignore_ascii_case(requested));
-            match installed {
-                Some((name, _)) => Some(name.clone()),
-                None => {
-                    log::warn!(
-                        "Configured font family is unavailable. Using the default monospace font."
-                    );
-                    None
-                }
-            }
-        });
+        let family = resolve_family(&system, family);
         Self {
             system,
             family,
@@ -68,6 +53,16 @@ impl Font {
             buffer: Buffer::new_empty(Metrics::new(16.0, 21.0)),
             swash: SwashCache::new(),
         }
+    }
+
+    pub(super) fn reconfigure(&mut self, family: Option<&str>, ligatures: bool) -> bool {
+        let resolved = resolve_family(&self.system, family);
+        if self.family == resolved && self.ligatures == ligatures {
+            return false;
+        }
+        self.family = resolved;
+        self.ligatures = ligatures;
+        true
     }
 
     pub(super) fn ligatures(&self) -> bool {
@@ -232,6 +227,25 @@ impl Font {
         )
         .then_some((width, image.content == SwashContent::Color))
     }
+}
+
+fn resolve_family(system: &FontSystem, family: Option<&str>) -> Option<String> {
+    family.and_then(|requested| {
+        let installed = system
+            .db()
+            .faces()
+            .flat_map(|face| &face.families)
+            .find(|(name, _)| name.eq_ignore_ascii_case(requested));
+        match installed {
+            Some((name, _)) => Some(name.clone()),
+            None => {
+                log::warn!(
+                    "Configured font family is unavailable. Using the default monospace font."
+                );
+                None
+            }
+        }
+    })
 }
 
 fn blend_bitmap(

@@ -30,6 +30,8 @@ pub(super) struct Overlay<'a> {
     pub(super) hovered_hyperlink: Option<HyperlinkId>,
     pub(super) progress: Progress,
     pub(super) progress_phase: f32,
+    pub(super) background_opacity: f32,
+    pub(super) notice: Option<&'a str>,
     pub(super) preedit: &'a str,
     pub(super) vi: Option<&'a vi::Mode>,
     pub(super) focused: bool,
@@ -40,6 +42,8 @@ pub(super) struct Painter {
     instance: wgpu::Instance,
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
+    alpha_modes: Vec<wgpu::CompositeAlphaMode>,
+    background_opacity: f32,
     device: wgpu::Device,
     queue: wgpu::Queue,
     backgrounds: CellBackgroundRenderer,
@@ -60,6 +64,7 @@ impl Painter {
         window: Arc<Window>,
         mut font: Font,
         physical_font_size: f32,
+        background_opacity: f32,
     ) -> Result<Self> {
         let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
         descriptor.backends = wgpu::Backends::VULKAN;
@@ -81,20 +86,29 @@ impl Painter {
         let mut config = surface
             .get_default_config(&adapter, size.width.max(1), size.height.max(1))
             .ok_or_else(|| std::io::Error::other("No compatible Wayland surface format"))?;
-        config.format = surface
-            .get_capabilities(&adapter)
+        let capabilities = surface.get_capabilities(&adapter);
+        config.format = capabilities
             .formats
             .into_iter()
             .find(|format| format.is_srgb())
             .ok_or_else(|| std::io::Error::other("The Wayland surface has no sRGB format"))?;
+        let background_opacity = background_opacity.clamp(0.0, 1.0);
+        let alpha_modes = capabilities.alpha_modes;
+        config.alpha_mode = choose_alpha_mode(&alpha_modes, background_opacity);
+        if background_opacity < 1.0 && config.alpha_mode == wgpu::CompositeAlphaMode::Opaque {
+            log::warn!(
+                "Wayland surface does not support alpha compositing; rendering opaque background"
+            );
+        }
         surface.configure(&device, &config);
         let backgrounds = CellBackgroundRenderer::new(&device, config.format);
         let images = ImageRenderer::new(&device, config.format);
         let metrics = font.measure(physical_font_size);
         let text = TextRenderer::new(&device, &queue, config.format, font, metrics);
         log::debug!(
-            "Vulkan renderer ready with surface format {:?}",
-            config.format
+            "Vulkan renderer ready with surface format {:?} and alpha mode {:?}",
+            config.format,
+            config.alpha_mode
         );
         let mut tracker = PresentationTracker::default();
         tracker.set_cursor_blink_interval(Duration::from_millis(530), Instant::now());
@@ -102,6 +116,8 @@ impl Painter {
             instance,
             surface,
             config,
+            alpha_modes,
+            background_opacity,
             device,
             queue,
             backgrounds,
@@ -142,6 +158,38 @@ impl Painter {
 
     pub(super) fn measure(&mut self, size: f32) -> FontMetrics {
         self.text.measure(size)
+    }
+
+    pub(super) fn set_font(&mut self, family: Option<&str>, ligatures: bool, size: f32) -> bool {
+        if !self.text.set_font(family, ligatures) {
+            return false;
+        }
+        let metrics = self.text.measure(size);
+        self.text.set_metrics(metrics);
+        self.reset_cursor_motion();
+        self.dirty = true;
+        self.force_present = true;
+        true
+    }
+
+    pub(super) fn set_background_opacity(&mut self, opacity: f32) {
+        let opacity = opacity.clamp(0.0, 1.0);
+        if self.background_opacity == opacity {
+            return;
+        }
+        self.background_opacity = opacity;
+        let alpha_mode = choose_alpha_mode(&self.alpha_modes, opacity);
+        if opacity < 1.0 && alpha_mode == wgpu::CompositeAlphaMode::Opaque {
+            log::warn!(
+                "Wayland surface does not support alpha compositing; rendering opaque background"
+            );
+        }
+        if alpha_mode != self.config.alpha_mode {
+            self.config.alpha_mode = alpha_mode;
+            self.surface.configure(&self.device, &self.config);
+        }
+        self.dirty = true;
+        self.force_present = true;
     }
 
     pub(super) fn set_metrics(&mut self, metrics: FontMetrics) {
@@ -208,6 +256,11 @@ impl Painter {
         mut overlay: Overlay<'_>,
     ) -> Result<()> {
         let now = Instant::now();
+        overlay.background_opacity = if self.config.alpha_mode == wgpu::CompositeAlphaMode::Opaque {
+            1.0
+        } else {
+            self.background_opacity
+        };
         if overlay.progress == Progress::Indeterminate {
             let start = *self.progress_animation.get_or_insert(now);
             overlay.progress_phase = (now.duration_since(start).as_secs_f32() * 0.75).fract();
@@ -343,6 +396,16 @@ impl Painter {
             PaletteEntry::Background
         });
         let lut = linear_colors();
+        let clear_alpha = if self.config.alpha_mode == wgpu::CompositeAlphaMode::Opaque {
+            1.0
+        } else {
+            f64::from(self.background_opacity)
+        };
+        let clear_scale = if self.config.alpha_mode == wgpu::CompositeAlphaMode::PreMultiplied {
+            clear_alpha
+        } else {
+            1.0
+        };
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -351,10 +414,10 @@ impl Painter {
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: lut[background.red as usize].into(),
-                            g: lut[background.green as usize].into(),
-                            b: lut[background.blue as usize].into(),
-                            a: 1.0,
+                            r: f64::from(lut[background.red as usize]) * clear_scale,
+                            g: f64::from(lut[background.green as usize]) * clear_scale,
+                            b: f64::from(lut[background.blue as usize]) * clear_scale,
+                            a: clear_alpha,
                         }),
                         store: wgpu::StoreOp::Store,
                     },
@@ -408,6 +471,31 @@ impl Painter {
     }
 }
 
+fn choose_alpha_mode(modes: &[wgpu::CompositeAlphaMode], opacity: f32) -> wgpu::CompositeAlphaMode {
+    use wgpu::CompositeAlphaMode as Mode;
+    let preferred: &[Mode] = if opacity >= 1.0 {
+        &[
+            Mode::Opaque,
+            Mode::PreMultiplied,
+            Mode::PostMultiplied,
+            Mode::Auto,
+        ]
+    } else {
+        &[
+            Mode::PreMultiplied,
+            Mode::PostMultiplied,
+            Mode::Auto,
+            Mode::Opaque,
+        ]
+    };
+    preferred
+        .iter()
+        .copied()
+        .find(|mode| modes.contains(mode))
+        .or_else(|| modes.first().copied())
+        .unwrap_or(Mode::Auto)
+}
+
 fn cursor_origin(frame: &PresentationFrame<'_>, position: CellPosition) -> Option<PixelPosition> {
     let row = frame.viewport.row(position.row)?;
     if row.sized_text_at(position.column).is_some() {
@@ -419,4 +507,23 @@ fn cursor_origin(frame: &PresentationFrame<'_>, position: CellPosition) -> Optio
         .geometry
         .row_rect(position.row, leading..leading + 1)
         .map(|rect| rect.origin)
+}
+
+#[cfg(test)]
+mod tests {
+    use wgpu::CompositeAlphaMode as Mode;
+
+    use super::choose_alpha_mode;
+
+    #[test]
+    fn alpha_mode_prefers_opaque_at_full_opacity_and_premultiplied_when_translucent() {
+        let all = [Mode::Opaque, Mode::PreMultiplied, Mode::PostMultiplied];
+        assert_eq!(choose_alpha_mode(&all, 1.0), Mode::Opaque);
+        assert_eq!(choose_alpha_mode(&all, 0.85), Mode::PreMultiplied);
+        assert_eq!(
+            choose_alpha_mode(&[Mode::Opaque, Mode::PostMultiplied], 0.5),
+            Mode::PostMultiplied
+        );
+        assert_eq!(choose_alpha_mode(&[Mode::Opaque], 0.5), Mode::Opaque);
+    }
 }

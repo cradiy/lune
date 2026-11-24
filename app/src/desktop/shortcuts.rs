@@ -17,6 +17,7 @@ pub(super) enum Action {
     PreviousPrompt,
     NextPrompt,
     CopyLastOutput,
+    ReloadConfig,
     NewTab,
     CloseTab,
     NextTab,
@@ -108,6 +109,8 @@ const WAYLAND_BINDINGS: &[Binding] = &[
         .primary_screen()
         .repeating(),
     Binding::new(Action::CopyLastOutput, CTRL_SHIFT, Letter("g")).primary_screen(),
+    Binding::new(Action::ReloadConfig, CTRL_SHIFT, Symbol(",")),
+    Binding::new(Action::ReloadConfig, CTRL_SHIFT, Symbol("<")),
     Binding::new(
         Action::ToggleFullscreen,
         Mods::empty(),

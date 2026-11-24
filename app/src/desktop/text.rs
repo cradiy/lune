@@ -207,11 +207,23 @@ impl TextRenderer {
         self.font.measure(size)
     }
 
+    pub(super) fn set_font(&mut self, family: Option<&str>, ligatures: bool) -> bool {
+        if !self.font.reconfigure(family, ligatures) {
+            return false;
+        }
+        self.clear_glyph_cache();
+        true
+    }
+
     pub(super) fn set_metrics(&mut self, metrics: FontMetrics) {
         if self.metrics == metrics {
             return;
         }
         self.metrics = metrics;
+        self.clear_glyph_cache();
+    }
+
+    fn clear_glyph_cache(&mut self) {
         for layer in &mut self.layers {
             layer.clear();
         }
@@ -232,6 +244,8 @@ impl TextRenderer {
             hovered_hyperlink,
             progress,
             progress_phase,
+            background_opacity,
+            notice,
             preedit,
             vi,
             tab_bar,
@@ -241,6 +255,8 @@ impl TextRenderer {
         let hovered_hyperlink = *hovered_hyperlink;
         let progress = *progress;
         let progress_phase = *progress_phase;
+        let background_opacity = *background_opacity;
+        let notice = *notice;
         let preedit = *preedit;
         let vi = *vi;
         self.area = frame.geometry.text_area_pixels().unwrap();
@@ -547,9 +563,14 @@ impl TextRenderer {
         {
             self.label(rect, preedit, frame, false);
         }
+        if let Some(notice) = notice
+            && let Some(rect) = frame.geometry.row_rect(0, 0..columns)
+        {
+            self.notice_banner(rect, notice, frame);
+        }
         self.progress_bar(frame.palette, progress, progress_phase);
         self.terminal_instances = self.instances.len() as u32;
-        self.tab_bar(tab_bar, progress_phase);
+        self.tab_bar(tab_bar, progress_phase, background_opacity);
         if std::mem::size_of_val(self.instances.as_slice()) as u64
             > self.device.limits().max_buffer_size
         {
@@ -653,7 +674,7 @@ impl TextRenderer {
         }
     }
 
-    fn tab_bar(&mut self, view: &tab_bar::View<'_>, progress_phase: f32) {
+    fn tab_bar(&mut self, view: &tab_bar::View<'_>, progress_phase: f32, background_opacity: f32) {
         let layout = view.layout;
         let Some(area) = layout.area() else {
             return;
@@ -676,12 +697,20 @@ impl TextRenderer {
             let Some(tab) = view.tabs.get(index) else {
                 break;
             };
-            let (fill, color) = if index == view.active {
+            let active = index == view.active;
+            let (fill, color) = if active {
                 (accent, active_text)
             } else {
                 (inactive, inactive_text)
             };
-            self.faded_tab(fill_rect, background, fill, layout.fade_cell_width());
+            self.faded_tab(
+                fill_rect,
+                background,
+                fill,
+                layout.fade_cell_width(),
+                background_opacity,
+                active,
+            );
             if title_end != 0
                 && let Some(label) = tab.label().get(..title_end)
             {
@@ -737,18 +766,36 @@ impl TextRenderer {
         self.area = terminal_area;
     }
 
-    fn faded_tab(&mut self, center: PixelRect, background: Rgb, color: Rgb, cell: NonZeroU32) {
+    fn faded_tab(
+        &mut self,
+        center: PixelRect,
+        background: Rgb,
+        color: Rgb,
+        cell: NonZeroU32,
+        background_opacity: f32,
+        active: bool,
+    ) {
         let mut edge = center;
         edge.size.width = cell;
+        let opaque = background_opacity >= 1.0;
+        let center_alpha = if opaque || active {
+            1.0
+        } else {
+            background_opacity.max(0.55)
+        };
         for (offset, amount) in [176, 112, 56].into_iter().enumerate() {
             let offset = offset as u32 * cell.get();
-            let color = mix_color(background, color, amount);
+            let (edge_color, edge_alpha) = if opaque {
+                (mix_color(background, color, amount), 1.0)
+            } else {
+                (color, center_alpha * (f32::from(amount) / 255.0))
+            };
             edge.origin.x = center.origin.x - offset - cell.get();
-            self.rect(edge, color, 1.0);
+            self.rect(edge, edge_color, edge_alpha);
             edge.origin.x = center.origin.x + center.size.width.get() + offset;
-            self.rect(edge, color, 1.0);
+            self.rect(edge, edge_color, edge_alpha);
         }
-        self.rect(center, color, 1.0);
+        self.rect(center, color, center_alpha);
     }
 
     fn tab_label(&mut self, mut rect: PixelRect, text: &str, color: Rgb) {
@@ -757,6 +804,44 @@ impl TextRenderer {
             .width
             .min(NonZeroU32::new(ATLAS_SIDE as u32).unwrap());
         self.glyph(rect, text, TAB_LABEL_CACHE, color, 1.0);
+    }
+
+    fn notice_banner(&mut self, mut rect: PixelRect, text: &str, frame: &PresentationFrame<'_>) {
+        let accent = frame.palette.color(PaletteEntry::Indexed(1));
+        let background = frame.palette.color(PaletteEntry::Background);
+        let foreground = frame.palette.color(PaletteEntry::Foreground);
+        let fill = mix_color(background, accent, 200);
+        let text_color = [
+            background,
+            foreground,
+            frame.palette.color(PaletteEntry::Indexed(0)),
+            frame.palette.color(PaletteEntry::Indexed(15)),
+        ]
+        .into_iter()
+        .max_by_key(|&color| luminance(color).abs_diff(luminance(fill)))
+        .unwrap();
+        self.rect(rect, fill, 0.96);
+        let stripe_width = NonZeroU32::new(3.min(rect.size.width.get())).unwrap();
+        self.rect(
+            PixelRect {
+                origin: rect.origin,
+                size: PixelSize {
+                    width: stripe_width,
+                    height: rect.size.height,
+                },
+            },
+            accent,
+            1.0,
+        );
+        let width = self
+            .font
+            .measure_text(self.metrics, text)
+            .min(rect.size.width.get())
+            .min(ATLAS_SIDE as u32);
+        if let Some(width) = NonZeroU32::new(width) {
+            rect.size.width = width;
+            self.glyph(rect, text, LABEL_CACHE, text_color, 1.0);
+        }
     }
 
     fn label(

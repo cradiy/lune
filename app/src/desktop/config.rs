@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 
 use super::theme::Preference;
 
+pub(super) mod watch;
+
 pub(super) const MIN_FONT_SIZE: f32 = 8.0;
 pub(super) const MAX_FONT_SIZE: f32 = 32.0;
 
@@ -23,11 +25,13 @@ pub(super) enum NotificationPolicy {
     Deny,
 }
 
+#[derive(PartialEq)]
 pub(super) struct Config {
     pub(super) font_family: Option<String>,
     pub(super) font_size_points: f32,
     pub(super) font_ligatures: bool,
     pub(super) theme: Preference,
+    pub(super) background_opacity: f32,
     pub(super) clipboard_write: ClipboardPolicy,
     pub(super) clipboard_read: ClipboardPolicy,
     pub(super) notifications: NotificationPolicy,
@@ -40,6 +44,7 @@ impl Default for Config {
             font_size_points: 15.0,
             font_ligatures: true,
             theme: Preference::System,
+            background_opacity: 1.0,
             clipboard_write: ClipboardPolicy::Allow,
             clipboard_read: ClipboardPolicy::Deny,
             notifications: NotificationPolicy::Unfocused,
@@ -47,35 +52,64 @@ impl Default for Config {
     }
 }
 
+pub(super) struct Loaded {
+    pub(super) config: Config,
+    pub(super) errors: Vec<String>,
+}
+
 impl Config {
-    pub(super) fn load() -> Self {
-        let directory = absolute_env_path("XDG_CONFIG_HOME")
+    pub(super) fn directory() -> Option<PathBuf> {
+        absolute_env_path("XDG_CONFIG_HOME")
             .or_else(|| absolute_env_path("HOME").map(|home| home.join(".config")))
-            .map(|directory| directory.join("lune"));
-        let Some(directory) = directory else {
-            return Self::default();
+            .map(|directory| directory.join("lune"))
+    }
+
+    pub(super) fn load() -> Loaded {
+        match Self::load_checked() {
+            Ok(loaded) => loaded,
+            Err(error) => Loaded {
+                config: Self::default(),
+                errors: vec![error],
+            },
+        }
+    }
+
+    pub(super) fn load_checked() -> Result<Loaded, String> {
+        let Some(directory) = Self::directory() else {
+            return Ok(Loaded {
+                config: Self::default(),
+                errors: Vec::new(),
+            });
         };
         match fs::read_to_string(directory.join("lune.conf")) {
-            Ok(text) => Self::parse(&text, &directory),
-            Err(error) if error.kind() == ErrorKind::NotFound => Self::default(),
+            Ok(text) => Ok(Self::parse(&text, &directory)),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(Loaded {
+                config: Self::default(),
+                errors: Vec::new(),
+            }),
             Err(error) => {
                 log::warn!("Could not read lune.conf: {error}");
-                Self::default()
+                Err(format!("lune.conf: {error}"))
             }
         }
     }
 
-    fn parse(text: &str, directory: &Path) -> Self {
+    fn parse(text: &str, directory: &Path) -> Loaded {
         let mut config = Self::default();
-        parse_settings("lune.conf", text, |key, value| {
+        let mut errors = Vec::new();
+        let mut theme_errors = Vec::new();
+        parse_settings("lune.conf", text, &mut errors, |key, value| {
             if key == "theme" {
-                config.theme = Preference::load(directory, value)?;
+                let mut current_theme_errors = Vec::new();
+                config.theme = Preference::load(directory, value, &mut current_theme_errors)?;
+                theme_errors = current_theme_errors;
                 Ok(())
             } else {
                 config.set(key, value)
             }
         });
-        config
+        errors.extend(theme_errors);
+        Loaded { config, errors }
     }
 
     fn set(&mut self, key: &str, value: &str) -> Result<(), &'static str> {
@@ -97,6 +131,13 @@ impl Config {
                 self.font_ligatures = value
                     .parse()
                     .map_err(|_| "font-ligatures must be true or false")?;
+            }
+            "background-opacity" => {
+                self.background_opacity = value
+                    .parse::<f32>()
+                    .ok()
+                    .filter(|value| value.is_finite() && (0.0..=1.0).contains(value))
+                    .ok_or("background-opacity must be between 0.0 and 1.0")?;
             }
             "clipboard-write" => {
                 self.clipboard_write = parse_clipboard_policy(value)?;
@@ -135,9 +176,20 @@ fn parse_clipboard_policy(value: &str) -> Result<ClipboardPolicy, &'static str> 
     }
 }
 
+pub(super) fn format_errors(errors: &[String]) -> Option<String> {
+    let first = errors.first()?;
+    let extra = errors.len() - 1;
+    Some(if extra == 0 {
+        format!(" Config error: {first} ")
+    } else {
+        format!(" Config error: {first} (+{extra} more) ")
+    })
+}
+
 pub(super) fn parse_settings(
     file: &str,
     text: &str,
+    errors: &mut Vec<String>,
     mut set: impl FnMut(&str, &str) -> Result<(), &'static str>,
 ) {
     for (index, line) in text.lines().enumerate() {
@@ -150,7 +202,9 @@ pub(super) fn parse_settings(
             .ok_or("expected key = value")
             .and_then(|(key, value)| set(key.trim(), value.trim()));
         if let Err(error) = result {
-            log::warn!("{file} line {}: {error}", index + 1);
+            let line_number = index + 1;
+            log::warn!("{file} line {line_number}: {error}");
+            errors.push(format!("{file}:{line_number}: {error}"));
         }
     }
 }
@@ -165,21 +219,31 @@ fn absolute_env_path(name: &str) -> Option<PathBuf> {
 mod tests {
     use std::path::Path;
 
-    use super::Config;
+    use super::{Config, format_errors};
 
     #[test]
     fn invalid_settings_preserve_valid_font_overrides() {
-        let config = Config::parse(
+        let loaded = Config::parse(
             "# Font settings\r\nfont-family = Fixture Mono\r\nfont-size=19.5\r\n\
+             background-opacity = 0.85\r\nbackground-opacity = 1.5\r\nbackground-opacity = NaN\r\n\
              clipboard-write = deny\r\nclipboard-read = allow\r\nclipboard-read = invalid\r\n\
              notifications = always\r\nnotifications = bad\r\n\
              font-family=\r\nunknown-key=true\r\nfont-size=NaN\r\nfont-size=33\r\n",
             Path::new(""),
         );
+        let config = loaded.config;
         assert_eq!(config.font_family.as_deref(), Some("Fixture Mono"));
         assert_eq!(config.font_size_points, 19.5);
+        assert_eq!(config.background_opacity, 0.85);
         assert_eq!(config.clipboard_write, super::ClipboardPolicy::Deny);
         assert_eq!(config.clipboard_read, super::ClipboardPolicy::Allow);
         assert_eq!(config.notifications, super::NotificationPolicy::Always);
+        assert_eq!(loaded.errors.len(), 8);
+        assert_eq!(
+            format_errors(&loaded.errors).as_deref(),
+            Some(
+                " Config error: lune.conf:5: background-opacity must be between 0.0 and 1.0 (+7 more) "
+            )
+        );
     }
 }

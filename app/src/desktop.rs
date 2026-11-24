@@ -46,6 +46,12 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 type TabId = u32;
 
 const PASTE_TIMEOUT: Duration = Duration::from_secs(2);
+const NOTICE_DURATION: Duration = Duration::from_secs(6);
+
+struct Notice {
+    text: String,
+    expires: Instant,
+}
 
 enum Event {
     PtyReady(u64),
@@ -56,34 +62,38 @@ enum Event {
     DirectoryOpened(io::Result<()>),
     HyperlinkOpened(io::Result<()>),
     SystemTheme(Theme),
+    ConfigReload(bool),
 }
 
 pub fn run() -> Result<()> {
-    let config = Config::load();
+    let loaded = Config::load();
+    let startup_notice = config::format_errors(&loaded.errors);
     let event_loop = EventLoop::<Event>::with_user_event()
         .with_wayland()
         .build()?;
     log::debug!("Wayland event loop ready");
     let proxy = event_loop.create_proxy();
-    let theme_watch = if matches!(config.theme, theme::Preference::System) {
-        match theme::system::Watch::start(proxy.clone()) {
-            Ok(watch) => Some(watch),
-            Err(error) => {
-                log::warn!("Could not start the system theme watcher: {error}");
-                None
+    let config_watch =
+        Config::directory().and_then(|directory| {
+            match config::watch::Watch::start(directory, proxy.clone()) {
+                Ok(watch) => Some(watch),
+                Err(error) => {
+                    log::warn!("Could not start the configuration watcher: {error}");
+                    None
+                }
             }
-        }
-    } else {
-        None
-    };
+        });
     let mut app = App {
         proxy,
-        config,
+        config: loaded.config,
+        startup_notice,
         client: None,
         error: None,
         system_theme: Theme::Dark,
-        _theme_watch: theme_watch,
+        _theme_watch: None,
+        _config_watch: config_watch,
     };
+    app.sync_theme_watch();
     event_loop.run_app(&mut app)?;
     app.error.map_or(Ok(()), Err)
 }
@@ -91,13 +101,60 @@ pub fn run() -> Result<()> {
 struct App {
     proxy: EventLoopProxy<Event>,
     config: Config,
+    startup_notice: Option<String>,
     client: Option<Client>,
     error: Option<Box<dyn std::error::Error>>,
     system_theme: Theme,
     _theme_watch: Option<theme::system::Watch>,
+    _config_watch: Option<config::watch::Watch>,
 }
 
 impl App {
+    fn sync_theme_watch(&mut self) {
+        if matches!(self.config.theme, theme::Preference::System) {
+            if self._theme_watch.is_none() {
+                match theme::system::Watch::start(self.proxy.clone()) {
+                    Ok(watch) => self._theme_watch = Some(watch),
+                    Err(error) => {
+                        log::warn!("Could not start the system theme watcher: {error}");
+                    }
+                }
+            }
+        } else {
+            self._theme_watch = None;
+        }
+    }
+
+    fn reload_config(&mut self, force: bool) {
+        let loaded = match Config::load_checked() {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                let notice = config::format_errors(&[error]);
+                if let Some(client) = &mut self.client {
+                    client.set_notice(notice);
+                } else {
+                    self.startup_notice = notice;
+                }
+                return;
+            }
+        };
+        let notice = config::format_errors(&loaded.errors);
+        if let Some(client) = &mut self.client {
+            client.set_notice(notice);
+        } else {
+            self.startup_notice = notice;
+        }
+        if !force && loaded.config == self.config {
+            return;
+        }
+        if let Some(client) = &mut self.client {
+            client.apply_config(&self.config, &loaded.config, self.system_theme);
+        }
+        self.config = loaded.config;
+        self.sync_theme_watch();
+        log::info!("Reloaded configuration");
+    }
+
     fn report(&mut self, event_loop: &ActiveEventLoop, result: Result<()>) {
         if let Err(error) = result {
             self.error = Some(error);
@@ -114,6 +171,7 @@ impl ApplicationHandler<Event> for App {
                 self.proxy.clone(),
                 &self.config,
                 self.system_theme,
+                self.startup_notice.take(),
             ) {
                 Ok(client) => self.client = Some(client),
                 Err(error) => self.report(event_loop, Err(error)),
@@ -131,11 +189,18 @@ impl ApplicationHandler<Event> for App {
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: Event) {
+        if let Event::ConfigReload(force) = event {
+            self.reload_config(force);
+            return;
+        }
         if let Event::SystemTheme(theme) = event {
             if self.system_theme == theme {
                 return;
             }
             self.system_theme = theme;
+            if !matches!(self.config.theme, theme::Preference::System) {
+                return;
+            }
         }
         let Some(client) = &mut self.client else {
             return;
@@ -180,6 +245,7 @@ impl ApplicationHandler<Event> for App {
                 client.apply_system_theme(theme);
                 Ok(())
             }
+            Event::ConfigReload(_) => unreachable!(),
         };
         self.report(event_loop, result);
     }
@@ -212,6 +278,7 @@ struct Client {
     clipboard_read: ClipboardPolicy,
     notifications_policy: NotificationPolicy,
     notifier: Option<Notifier>,
+    notice: Option<Notice>,
     font_size_points: f32,
     base_font_size_points: f32,
     resize_pending: bool,
@@ -227,6 +294,7 @@ impl Client {
         proxy: EventLoopProxy<Event>,
         config: &Config,
         system_theme: Theme,
+        startup_notice: Option<String>,
     ) -> Result<Self> {
         let selected_theme = config.theme.resolve(system_theme);
         let window = Arc::new(
@@ -235,6 +303,7 @@ impl Client {
                     .with_title("Lune")
                     .with_name("lune", "")
                     .with_theme(Some(selected_theme))
+                    .with_transparent(true)
                     .with_inner_size(LogicalSize::new(960, 600))
                     .with_min_inner_size(LogicalSize::new(180, 100)),
             )?,
@@ -244,6 +313,7 @@ impl Client {
             window.clone(),
             Font::new(config.font_family.as_deref(), config.font_ligatures),
             physical_font_size(config.font_size_points, scale),
+            config.background_opacity,
         ))?;
         let bar = tab_bar::Layout::default();
         let grid = geometry(window.inner_size(), painter.metrics(), 0)
@@ -286,6 +356,10 @@ impl Client {
             clipboard_read: config.clipboard_read,
             notifications_policy: config.notifications,
             notifier,
+            notice: startup_notice.map(|text| Notice {
+                text,
+                expires: Instant::now() + NOTICE_DURATION,
+            }),
             font_size_points: config.font_size_points,
             base_font_size_points: config.font_size_points,
             resize_pending: false,
@@ -422,6 +496,9 @@ impl Client {
             Action::PreviousPrompt => tab.jump_prompt(false),
             Action::NextPrompt => tab.jump_prompt(true),
             Action::CopyLastOutput => tab.copy_last_output(&mut self.copy_pending),
+            Action::ReloadConfig => {
+                let _ = self.proxy.send_event(Event::ConfigReload(true));
+            }
             Action::OpenDirectory => {
                 if !self.directory_open_pending {
                     let uri = tab.session.processor().working_directory_uri();
@@ -562,6 +639,71 @@ impl Client {
         self.window.request_redraw();
     }
 
+    fn set_notice(&mut self, text: Option<String>) {
+        let changed = match text {
+            Some(text) => {
+                self.notice = Some(Notice {
+                    text,
+                    expires: Instant::now() + NOTICE_DURATION,
+                });
+                true
+            }
+            None => self.notice.take().is_some(),
+        };
+        if changed {
+            self.painter.invalidate_overlay();
+            self.window.request_redraw();
+        }
+    }
+
+    fn apply_config(&mut self, old: &Config, new: &Config, system_theme: Theme) {
+        if old.theme != new.theme {
+            let selected = new.theme.resolve(system_theme);
+            self.window.set_theme(Some(selected));
+            (self.palette, self.scheme) = new.theme.palette(selected);
+            for tab in &mut self.tabs {
+                tab.session.set_theme(&self.palette, Some(self.scheme));
+            }
+        }
+        if old.background_opacity != new.background_opacity {
+            self.painter.set_background_opacity(new.background_opacity);
+        }
+        let mut layout_changed = false;
+        if old.font_size_points != new.font_size_points {
+            self.base_font_size_points = new.font_size_points;
+            self.font_size_points = new.font_size_points;
+            layout_changed = true;
+        }
+        if old.font_family != new.font_family || old.font_ligatures != new.font_ligatures {
+            let physical_font =
+                physical_font_size(self.font_size_points, self.window.scale_factor());
+            self.painter.set_font(
+                new.font_family.as_deref(),
+                new.font_ligatures,
+                physical_font,
+            );
+            layout_changed = true;
+        }
+        self.clipboard_write = new.clipboard_write;
+        self.clipboard_read = new.clipboard_read;
+        self.notifications_policy = new.notifications;
+        if new.notifications == NotificationPolicy::Deny {
+            self.notifier = None;
+        } else if self.notifier.is_none() {
+            match Notifier::start() {
+                Ok(notifier) => self.notifier = Some(notifier),
+                Err(error) => log::warn!("Could not start desktop notifications: {error}"),
+            }
+        }
+        if layout_changed {
+            self.resize_pending = true;
+            self.apply_resize();
+        } else {
+            self.painter.invalidate_overlay();
+            self.window.request_redraw();
+        }
+    }
+
     fn pty_ready(&mut self, event_loop: &ActiveEventLoop, token: u64) -> Result<()> {
         let (id, sequence) = Readiness::decode(token);
         if let Some(index) = self.tabs.iter().position(|tab| tab.id == id)
@@ -670,10 +812,22 @@ impl Client {
         }
         let blink = std::mem::take(&mut self.tabs[self.active].restart_blink)
             && self.painter.restart_blink(now);
-        if self.painter.tick(now) || blink {
+        let notice_expired = self
+            .notice
+            .as_ref()
+            .is_some_and(|notice| now >= notice.expires);
+        if notice_expired {
+            self.notice = None;
+            self.painter.invalidate_overlay();
+        }
+        if self.painter.tick(now) || blink || notice_expired {
             self.window.request_redraw();
         }
-        deadline = deadline.into_iter().chain(self.painter.deadline()).min();
+        deadline = deadline
+            .into_iter()
+            .chain(self.painter.deadline())
+            .chain(self.notice.as_ref().map(|notice| notice.expires))
+            .min();
         let flow = if immediate {
             ControlFlow::Poll
         } else {
@@ -738,6 +892,8 @@ impl Client {
                     hovered_hyperlink: tab.hovered_hyperlink,
                     progress: tab.progress,
                     progress_phase: 0.0,
+                    background_opacity: 1.0,
+                    notice: self.notice.as_ref().map(|notice| notice.text.as_str()),
                     preedit: &tab.preedit,
                     vi: tab.vi.as_ref(),
                     focused: self.focused,

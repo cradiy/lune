@@ -8,13 +8,14 @@ use super::config::parse_settings;
 
 pub(super) mod system;
 
+#[derive(PartialEq, Eq)]
 pub(super) enum Preference {
     System,
     Fixed(Theme),
     Custom(Theme, Box<Colors>),
 }
 
-#[derive(Default)]
+#[derive(Default, PartialEq, Eq)]
 pub(super) struct Colors {
     ansi: [Option<u32>; 16],
     foreground: Option<u32>,
@@ -25,7 +26,11 @@ pub(super) struct Colors {
 }
 
 impl Preference {
-    pub(super) fn load(directory: &Path, name: &str) -> Result<Self, &'static str> {
+    pub(super) fn load(
+        directory: &Path,
+        name: &str,
+        errors: &mut Vec<String>,
+    ) -> Result<Self, &'static str> {
         match name {
             "system" => Ok(Self::System),
             "dark" => Ok(Self::Fixed(Theme::Dark)),
@@ -41,7 +46,7 @@ impl Preference {
                         log::debug!("Could not read {file}: {error}");
                         "could not read the selected theme file"
                     })?;
-                Ok(Self::parse(&file, &text))
+                Ok(Self::parse(&file, &text, errors))
             }
             _ => Err("theme names must contain only letters, digits, hyphens, or underscores"),
         }
@@ -61,10 +66,10 @@ impl Preference {
         }
     }
 
-    fn parse(file: &str, text: &str) -> Self {
+    fn parse(file: &str, text: &str, errors: &mut Vec<String>) -> Self {
         let mut variant = Theme::Dark;
         let mut colors = Colors::default();
-        parse_settings(file, text, |key, value| {
+        parse_settings(file, text, errors, |key, value| {
             if key == "variant" {
                 variant = match value {
                     "dark" => Theme::Dark,
@@ -198,10 +203,13 @@ mod tests {
 
     #[test]
     fn custom_theme_inherits_the_variant_and_keeps_valid_color_overrides() {
+        let mut errors = Vec::new();
         let preference = Preference::parse(
             "fixture.conf",
             "# Theme fixture\nbackground = #d0e0f0\ncolor1 = #A123b4\ncolor1 = #+12345\nvariant = light\n",
+            &mut errors,
         );
+        assert_eq!(errors.len(), 1);
         let (palette, scheme) = preference.palette(preference.resolve(Theme::Dark));
         let (light, _) = super::palette(Theme::Light);
         assert_eq!(scheme, ColorScheme::Light);
