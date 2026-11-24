@@ -3,6 +3,7 @@ pub mod cli;
 mod clipboard;
 mod config;
 mod confirm;
+mod contrast;
 mod cursor;
 mod directory;
 mod font;
@@ -56,7 +57,7 @@ use config::{
 };
 use font::{Font, physical_font_size};
 use notify::Notifier;
-use paint::{NoticeKind, NoticeView, Painter};
+use paint::{NoticeKind, NoticeView, Painter, PainterOptions};
 use readiness::Readiness;
 use shortcuts::{Action, Keymap, Scroll, Zoom};
 use split::{Axis, Direction as SplitDirection, Divider, SplitTree};
@@ -393,13 +394,18 @@ impl Client {
             )?,
         );
         let scale = window.scale_factor();
+        let font_config = config.font_config();
         let painter = pollster::block_on(Painter::new(
             window.clone(),
-            Font::new(config.font_family.as_deref(), config.font_ligatures),
-            physical_font_size(config.font_size_points, scale),
-            config.background_opacity,
-            config.cursor_blink,
-            config.cursor_animation,
+            Font::new(&font_config),
+            PainterOptions {
+                physical_font_size: physical_font_size(config.font_size_points, scale),
+                scale_factor: scale,
+                background_opacity: config.background_opacity,
+                minimum_contrast: config.minimum_contrast,
+                cursor_blink: config.cursor_blink,
+                cursor_animation: config.cursor_animation,
+            },
         ))?;
         let bar = tab_bar::Layout::default();
         let padding = physical_padding(config.window_padding, scale);
@@ -1711,15 +1717,16 @@ impl Client {
             self.font_size_points = new.font_size_points;
             layout_changed = true;
         }
-        if old.font_family != new.font_family || old.font_ligatures != new.font_ligatures {
-            let physical_font =
-                physical_font_size(self.font_size_points, self.window.scale_factor());
-            self.painter.set_font(
-                new.font_family.as_deref(),
-                new.font_ligatures,
-                physical_font,
-            );
+        let old_font = old.font_config();
+        let new_font = new.font_config();
+        if old_font != new_font {
+            let scale = self.window.scale_factor();
+            let physical_font = physical_font_size(self.font_size_points, scale);
+            self.painter.set_font(&new_font, physical_font, scale);
             layout_changed = true;
+        }
+        if old.minimum_contrast != new.minimum_contrast {
+            self.painter.set_minimum_contrast(new.minimum_contrast);
         }
         self.clipboard_write = new.clipboard_write;
         self.clipboard_read = new.clipboard_read;
@@ -1919,10 +1926,11 @@ impl Client {
             return;
         }
         let size = self.window.inner_size();
-        let physical_font = physical_font_size(self.font_size_points, self.window.scale_factor());
+        let scale = self.window.scale_factor();
+        let physical_font = physical_font_size(self.font_size_points, scale);
         let current = self.painter.metrics();
         let metrics = if current.size != physical_font {
-            self.painter.measure(physical_font)
+            self.painter.measure(physical_font, scale)
         } else {
             current
         };

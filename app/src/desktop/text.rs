@@ -13,7 +13,8 @@ use crate::{PixelRect, PresentationFrame, PresentationStyle, PresentedCursor};
 
 use super::box_drawing;
 use super::confirm;
-use super::font::{Font, FontMetrics};
+use super::contrast;
+use super::font::{Font, FontConfig, FontMetrics};
 use super::hints::HintMode;
 use super::ime::Preedit;
 use super::ligature;
@@ -150,6 +151,7 @@ pub(super) struct TextRenderer {
     sized_glyphs: HashMap<SizedRaster, HashMap<Box<str>, Sprite>>,
     font: Font,
     metrics: FontMetrics,
+    minimum_contrast: f32,
     generation: u64,
     evicted: bool,
     image: Vec<u8>,
@@ -166,6 +168,7 @@ impl TextRenderer {
         format: wgpu::TextureFormat,
         font: Font,
         metrics: FontMetrics,
+        minimum_contrast: f32,
     ) -> Self {
         let atlas = atlas_texture(device, 1);
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -197,6 +200,7 @@ impl TextRenderer {
             sized_glyphs: HashMap::new(),
             font,
             metrics,
+            minimum_contrast,
             generation: 0,
             evicted: false,
             image: Vec::new(),
@@ -211,15 +215,23 @@ impl TextRenderer {
         self.metrics
     }
 
-    pub(super) fn measure(&mut self, size: f32) -> FontMetrics {
-        self.font.measure(size)
+    pub(super) fn measure(&mut self, size: f32, scale_factor: f64) -> FontMetrics {
+        self.font.measure(size, scale_factor)
     }
 
-    pub(super) fn set_font(&mut self, family: Option<&str>, ligatures: bool) -> bool {
-        if !self.font.reconfigure(family, ligatures) {
+    pub(super) fn set_font(&mut self, config: &FontConfig) -> bool {
+        if !self.font.reconfigure(config) {
             return false;
         }
         self.clear_glyph_cache();
+        true
+    }
+
+    pub(super) fn set_minimum_contrast(&mut self, value: f32) -> bool {
+        if self.minimum_contrast == value {
+            return false;
+        }
+        self.minimum_contrast = value;
         true
     }
 
@@ -367,6 +379,25 @@ impl TextRenderer {
                         continue;
                     }
                     let alpha = if style.style.faint { 0.6 } else { 1.0 };
+                    let run_fg = contrast::enforce(
+                        style.foreground,
+                        style.background,
+                        self.minimum_contrast,
+                    );
+                    let run_underline = if style.style.underline_color == Color::Default {
+                        run_fg
+                    } else {
+                        contrast::enforce(
+                            style.underline_color,
+                            style.background,
+                            self.minimum_contrast,
+                        )
+                    };
+                    let styled_run = PresentationStyle {
+                        foreground: run_fg,
+                        underline_color: run_underline,
+                        ..style
+                    };
                     let span = run.columns();
                     let mut units = run.units();
                     while let Some(unit) = units.next() {
@@ -379,12 +410,18 @@ impl TextRenderer {
                         let in_active_match = active_search_span
                             .as_ref()
                             .is_some_and(|span| span.contains(&unit.column));
+                        let exempt = matches!(
+                            unit.text,
+                            CellText::Scalar(ch) if contrast::is_exempt_character(ch)
+                        );
                         let color = if unit_selected {
                             frame.palette.graphics_color(251)
                         } else if in_active_match {
                             search_active_fg
-                        } else {
+                        } else if exempt {
                             style.foreground
+                        } else {
+                            run_fg
                         };
                         if ligatures
                             && let CellText::Scalar(character) = unit.text
@@ -452,8 +489,8 @@ impl TextRenderer {
                             }
                         }
                     }
-                    let link = style.style.hyperlink;
-                    let mut link_style = *style.style;
+                    let link = styled_run.style.hyperlink;
+                    let mut link_style = *styled_run.style;
                     let decorated = if link != HyperlinkId(0) {
                         if hovered_hyperlink == Some(link) {
                             link_style.underline = Underline::Curly;
@@ -462,10 +499,10 @@ impl TextRenderer {
                         }
                         PresentationStyle {
                             style: &link_style,
-                            ..style
+                            ..styled_run
                         }
                     } else {
-                        style
+                        styled_run
                     };
                     if decorated.style.strikethrough || decorated.style.underline != Underline::None
                     {
@@ -499,11 +536,11 @@ impl TextRenderer {
                         let start = run_cols.start.max(detected.start);
                         let end = run_cols.end.min(detected.end);
                         if start < end {
-                            let mut url_style = *style.style;
+                            let mut url_style = *styled_run.style;
                             url_style.underline = Underline::Single;
                             let url_decorated = PresentationStyle {
                                 style: &url_style,
-                                ..style
+                                ..styled_run
                             };
                             self.row_decorations(frame, row, start..end, url_decorated, alpha);
                         }
@@ -546,6 +583,29 @@ impl TextRenderer {
                             style.underline_color = foreground;
                         }
                         style.foreground = foreground;
+                    } else {
+                        let mut chars = part.text().chars();
+                        let exempt = chars
+                            .next()
+                            .filter(|_| chars.next().is_none())
+                            .is_some_and(contrast::is_exempt_character);
+                        if !exempt {
+                            let fg = contrast::enforce(
+                                style.foreground,
+                                style.background,
+                                self.minimum_contrast,
+                            );
+                            if style.style.underline_color == Color::Default {
+                                style.underline_color = fg;
+                            } else {
+                                style.underline_color = contrast::enforce(
+                                    style.underline_color,
+                                    style.background,
+                                    self.minimum_contrast,
+                                );
+                            }
+                            style.foreground = fg;
+                        }
                     }
                     let alpha = if style.style.faint { 0.6 } else { 1.0 };
                     let rendition =

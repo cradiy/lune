@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 
 use lune_terminal::{CursorShape, HistoryLimits};
 
+use super::contrast::{MAX_CONTRAST, MIN_CONTRAST};
+use super::font::{FontConfig, FontFeature, MetricAdjustment};
 use super::shortcuts::{self, Keybind};
 use super::theme::Preference;
 
@@ -79,8 +81,17 @@ pub(super) enum NotificationPolicy {
 #[derive(PartialEq)]
 pub(super) struct Config {
     pub(super) font_family: Option<String>,
+    pub(super) font_family_bold: Option<String>,
+    pub(super) font_family_italic: Option<String>,
+    pub(super) font_family_bold_italic: Option<String>,
     pub(super) font_size_points: f32,
     pub(super) font_ligatures: bool,
+    pub(super) font_features: Vec<FontFeature>,
+    pub(super) font_thicken: bool,
+    pub(super) adjust_cell_height: MetricAdjustment,
+    pub(super) adjust_cell_width: MetricAdjustment,
+    pub(super) adjust_baseline: MetricAdjustment,
+    pub(super) minimum_contrast: f32,
     pub(super) theme: Preference,
     pub(super) background_opacity: f32,
     pub(super) unfocused_split_opacity: f32,
@@ -104,8 +115,17 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             font_family: None,
+            font_family_bold: None,
+            font_family_italic: None,
+            font_family_bold_italic: None,
             font_size_points: 15.0,
             font_ligatures: true,
+            font_features: Vec::new(),
+            font_thicken: false,
+            adjust_cell_height: MetricAdjustment::default(),
+            adjust_cell_width: MetricAdjustment::default(),
+            adjust_baseline: MetricAdjustment::default(),
+            minimum_contrast: MIN_CONTRAST,
             theme: Preference::System,
             background_opacity: 1.0,
             unfocused_split_opacity: DEFAULT_UNFOCUSED_SPLIT_OPACITY,
@@ -128,6 +148,21 @@ impl Default for Config {
 }
 
 impl Config {
+    pub(super) fn font_config(&self) -> FontConfig {
+        FontConfig {
+            family: self.font_family.clone(),
+            family_bold: self.font_family_bold.clone(),
+            family_italic: self.font_family_italic.clone(),
+            family_bold_italic: self.font_family_bold_italic.clone(),
+            ligatures: self.font_ligatures,
+            features: self.font_features.clone(),
+            thicken: self.font_thicken,
+            adjust_cell_height: self.adjust_cell_height,
+            adjust_cell_width: self.adjust_cell_width,
+            adjust_baseline: self.adjust_baseline,
+        }
+    }
+
     pub(super) fn history_limits(&self) -> HistoryLimits {
         if self.scrollback_lines == 0 {
             return HistoryLimits {
@@ -227,10 +262,16 @@ impl Config {
     fn set(&mut self, key: &str, value: &str) -> Result<(), &'static str> {
         match key {
             "font-family" => {
-                if value.is_empty() || value.chars().any(char::is_control) {
-                    return Err("font-family must be a font family name");
-                }
-                self.font_family = (!value.eq_ignore_ascii_case("monospace")).then(|| value.into());
+                self.font_family = parse_font_family(value)?;
+            }
+            "font-family-bold" => {
+                self.font_family_bold = parse_font_family(value)?;
+            }
+            "font-family-italic" => {
+                self.font_family_italic = parse_font_family(value)?;
+            }
+            "font-family-bold-italic" => {
+                self.font_family_bold_italic = parse_font_family(value)?;
             }
             "font-size" => {
                 self.font_size_points = value
@@ -243,6 +284,36 @@ impl Config {
                 self.font_ligatures = value
                     .parse()
                     .map_err(|_| "font-ligatures must be true or false")?;
+            }
+            "font-feature" => {
+                let mut parsed = Vec::new();
+                for part in value.split(',') {
+                    parsed.push(FontFeature::parse(part)?);
+                }
+                self.font_features.extend(parsed);
+            }
+            "font-thicken" => {
+                self.font_thicken = value
+                    .parse()
+                    .map_err(|_| "font-thicken must be true or false")?;
+            }
+            "adjust-cell-height" => {
+                self.adjust_cell_height = parse_metric_adjustment(value, -20..=40, -30.0..=100.0)?;
+            }
+            "adjust-cell-width" => {
+                self.adjust_cell_width = parse_metric_adjustment(value, -10..=20, -30.0..=50.0)?;
+            }
+            "adjust-baseline" => {
+                self.adjust_baseline = parse_metric_adjustment(value, -20..=20, -50.0..=50.0)?;
+            }
+            "minimum-contrast" => {
+                self.minimum_contrast = value
+                    .parse::<f32>()
+                    .ok()
+                    .filter(|value| {
+                        value.is_finite() && (MIN_CONTRAST..=MAX_CONTRAST).contains(value)
+                    })
+                    .ok_or("minimum-contrast must be between 1.0 and 21.0")?;
             }
             "background-opacity" => {
                 self.background_opacity = value
@@ -325,6 +396,36 @@ impl Config {
             _ => return Err("unknown setting"),
         }
         Ok(())
+    }
+}
+
+fn parse_font_family(value: &str) -> Result<Option<String>, &'static str> {
+    if value.is_empty() || value.chars().any(char::is_control) {
+        return Err("font-family must be a font family name");
+    }
+    Ok((!value.eq_ignore_ascii_case("monospace")).then(|| value.into()))
+}
+
+fn parse_metric_adjustment(
+    value: &str,
+    pixel_range: std::ops::RangeInclusive<i32>,
+    percent_range: std::ops::RangeInclusive<f32>,
+) -> Result<MetricAdjustment, &'static str> {
+    if let Some(raw) = value.strip_suffix('%') {
+        let pct = raw
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .filter(|v| v.is_finite() && percent_range.contains(v))
+            .ok_or("metric adjustment percentage is out of range")?;
+        Ok(MetricAdjustment::Percent(pct))
+    } else {
+        let px = value
+            .parse::<i32>()
+            .ok()
+            .filter(|v| pixel_range.contains(v))
+            .ok_or("metric adjustment pixels are out of range")?;
+        Ok(MetricAdjustment::Pixels(px))
     }
 }
 
@@ -468,6 +569,14 @@ mod tests {
         let loaded = Config::parse(
             "lune.conf",
             "# Font settings\r\nfont-family = Fixture Mono\r\nfont-size=19.5\r\n\
+             font-family-bold = Fixture Bold\r\nfont-family-italic = Fixture Italic\r\n\
+             font-family-bold-italic = Fixture Bold Italic\r\n\
+             font-feature = ss01, -calt, cv02=2\r\nfont-feature = bad\r\n\
+             font-thicken = true\r\nfont-thicken = maybe\r\n\
+             adjust-cell-height = 10%\r\nadjust-cell-height = 200%\r\n\
+             adjust-cell-width = 1\r\nadjust-cell-width = 50\r\n\
+             adjust-baseline = -1\r\nadjust-baseline = 99\r\n\
+             minimum-contrast = 4.5\r\nminimum-contrast = 25\r\n\
              background-opacity = 0.85\r\nbackground-opacity = 1.5\r\nbackground-opacity = NaN\r\n\
              unfocused-split-opacity = 0.6\r\nunfocused-split-opacity = 0.05\r\n\
              window-padding = 12\r\nwindow-padding = 999\r\n\
@@ -487,6 +596,21 @@ mod tests {
         );
         let config = loaded.config;
         assert_eq!(config.font_family.as_deref(), Some("Fixture Mono"));
+        assert_eq!(config.font_family_bold.as_deref(), Some("Fixture Bold"));
+        assert_eq!(config.font_family_italic.as_deref(), Some("Fixture Italic"));
+        assert_eq!(
+            config.font_family_bold_italic.as_deref(),
+            Some("Fixture Bold Italic")
+        );
+        assert_eq!(config.font_features.len(), 3);
+        assert!(config.font_thicken);
+        assert_eq!(
+            config.adjust_cell_height,
+            super::MetricAdjustment::Percent(10.0)
+        );
+        assert_eq!(config.adjust_cell_width, super::MetricAdjustment::Pixels(1));
+        assert_eq!(config.adjust_baseline, super::MetricAdjustment::Pixels(-1));
+        assert_eq!(config.minimum_contrast, 4.5);
         assert_eq!(config.font_size_points, 19.5);
         assert_eq!(config.background_opacity, 0.85);
         assert_eq!(config.unfocused_split_opacity, 0.6);
@@ -513,11 +637,11 @@ mod tests {
         assert_eq!(config.clipboard_write, super::ClipboardPolicy::Deny);
         assert_eq!(config.clipboard_read, super::ClipboardPolicy::Allow);
         assert_eq!(config.notifications, super::NotificationPolicy::Always);
-        assert_eq!(loaded.errors.len(), 18);
+        assert_eq!(loaded.errors.len(), 24);
         assert_eq!(
             format_errors(&loaded.errors).as_deref(),
             Some(
-                "Config error: lune.conf:5: background-opacity must be between 0.0 and 1.0 (+17 more)"
+                "Config error: lune.conf:8: font-feature tag must be 4 printable ASCII characters (+23 more)"
             )
         );
     }

@@ -19,7 +19,7 @@ use crate::{
 
 use super::confirm;
 use super::cursor::CursorMotion;
-use super::font::{Font, FontMetrics};
+use super::font::{Font, FontConfig, FontMetrics};
 use super::hints::HintMode;
 use super::ime::Preedit;
 use super::scrollbar::ScrollbarView;
@@ -120,15 +120,29 @@ pub(super) struct Painter {
     dirty: bool,
 }
 
+pub(super) struct PainterOptions {
+    pub(super) physical_font_size: f32,
+    pub(super) scale_factor: f64,
+    pub(super) background_opacity: f32,
+    pub(super) minimum_contrast: f32,
+    pub(super) cursor_blink: bool,
+    pub(super) cursor_animation: bool,
+}
+
 impl Painter {
     pub(super) async fn new(
         window: Arc<Window>,
         mut font: Font,
-        physical_font_size: f32,
-        background_opacity: f32,
-        cursor_blink: bool,
-        cursor_animation: bool,
+        options: PainterOptions,
     ) -> Result<Self> {
+        let PainterOptions {
+            physical_font_size,
+            scale_factor,
+            background_opacity,
+            minimum_contrast,
+            cursor_blink,
+            cursor_animation,
+        } = options;
         let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
         descriptor.backends = wgpu::Backends::VULKAN;
         let instance = wgpu::Instance::new(descriptor);
@@ -164,8 +178,15 @@ impl Painter {
             );
         }
         surface.configure(&device, &config);
-        let metrics = font.measure(physical_font_size);
-        let text = TextRenderer::new(&device, &queue, config.format, font, metrics);
+        let metrics = font.measure(physical_font_size, scale_factor);
+        let text = TextRenderer::new(
+            &device,
+            &queue,
+            config.format,
+            font,
+            metrics,
+            minimum_contrast,
+        );
         log::debug!(
             "Vulkan renderer ready with surface format {:?} and alpha mode {:?}",
             config.format,
@@ -220,20 +241,27 @@ impl Painter {
         PhysicalSize::new(self.config.width, self.config.height)
     }
 
-    pub(super) fn measure(&mut self, size: f32) -> FontMetrics {
-        self.text.measure(size)
+    pub(super) fn measure(&mut self, size: f32, scale_factor: f64) -> FontMetrics {
+        self.text.measure(size, scale_factor)
     }
 
-    pub(super) fn set_font(&mut self, family: Option<&str>, ligatures: bool, size: f32) -> bool {
-        if !self.text.set_font(family, ligatures) {
+    pub(super) fn set_font(&mut self, config: &FontConfig, size: f32, scale_factor: f64) -> bool {
+        if !self.text.set_font(config) {
             return false;
         }
-        let metrics = self.text.measure(size);
+        let metrics = self.text.measure(size, scale_factor);
         self.text.set_metrics(metrics);
         self.reset_cursor_motion();
         self.dirty = true;
         self.force_present = true;
         true
+    }
+
+    pub(super) fn set_minimum_contrast(&mut self, value: f32) {
+        if self.text.set_minimum_contrast(value) {
+            self.dirty = true;
+            self.force_present = true;
+        }
     }
 
     pub(super) fn set_background_opacity(&mut self, opacity: f32) {
