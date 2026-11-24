@@ -24,6 +24,7 @@ use super::scrollbar::ScrollbarView;
 use super::search::SearchBar;
 use super::selection::SelectionKind;
 use super::split::{Axis, Divider};
+use super::svg::{self, SvgCache, SvgMode};
 use super::tab_bar;
 use super::url::HoveredLink;
 use super::vi;
@@ -92,6 +93,14 @@ struct SizedRaster {
     rendition: usize,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct SvgSpriteKey {
+    source: usize,
+    width: u32,
+    height: u32,
+    colored: bool,
+}
+
 #[derive(Clone, Copy)]
 struct TextArea {
     row: PixelRect,
@@ -150,6 +159,8 @@ pub(super) struct TextRenderer {
     layers: Vec<AtlasAllocator>,
     glyphs: [HashMap<Box<str>, Sprite>; LIGATURE_CACHE + 4],
     sized_glyphs: HashMap<SizedRaster, HashMap<Box<str>, Sprite>>,
+    svg: SvgCache,
+    svg_sprites: HashMap<SvgSpriteKey, Sprite>,
     font: Font,
     metrics: FontMetrics,
     minimum_contrast: f32,
@@ -199,6 +210,8 @@ impl TextRenderer {
             layers: vec![AtlasAllocator::new(size2(ATLAS_SIDE, ATLAS_SIDE))],
             glyphs: Default::default(),
             sized_glyphs: HashMap::new(),
+            svg: SvgCache::default(),
+            svg_sprites: HashMap::new(),
             font,
             metrics,
             minimum_contrast,
@@ -252,6 +265,7 @@ impl TextRenderer {
             cache.clear();
         }
         self.sized_glyphs.clear();
+        self.svg_sprites.clear();
     }
 
     pub(super) fn begin_frame(&mut self) {
@@ -1044,6 +1058,22 @@ impl TextRenderer {
                 );
                 inner_left = inner_left.saturating_add(width.get() + badge_gap);
             }
+        } else {
+            let icon_size = (cell_h * 3 / 4).clamp(10, cell_h);
+            if cursor_right > inner_left + icon_size + badge_gap
+                && self.svg_mask(
+                    PixelPosition {
+                        x: inner_left,
+                        y: text_y + cell_h.saturating_sub(icon_size) / 2,
+                    },
+                    icon_size,
+                    svg::icons::SEARCH,
+                    mix_color(bg, fg, 150),
+                    1.0,
+                )
+            {
+                inner_left = inner_left.saturating_add(icon_size + badge_gap);
+            }
         }
 
         // Right-aligned toggles: `.*` (regex) and `Aa` (case-sensitive).
@@ -1427,34 +1457,49 @@ impl TextRenderer {
         let mut input_left = layout.input_origin.x;
         let input_right = layout.input_origin.x.saturating_add(layout.input_max_w);
 
-        // Prompt prefix or submenu breadcrumb.
-        let prefix = match cmd_palette.breadcrumb {
-            Some(name) => std::borrow::Cow::Owned(format!("{name} >")),
-            None => std::borrow::Cow::Borrowed(">"),
-        };
-        let prefix_w = self.font.measure_text(self.metrics, &prefix);
-        if let Some(width) = NonZeroU32::new(
-            prefix_w
-                .min(input_right.saturating_sub(input_left))
-                .min(ATLAS_SIDE as u32),
-        ) {
-            self.glyph(
-                PixelRect {
-                    origin: PixelPosition {
+        // Search icon at root, or submenu breadcrumb.
+        if let Some(name) = cmd_palette.breadcrumb {
+            let prefix = format!("{name} >");
+            let prefix_w = self.font.measure_text(self.metrics, &prefix);
+            if let Some(width) = NonZeroU32::new(
+                prefix_w
+                    .min(input_right.saturating_sub(input_left))
+                    .min(ATLAS_SIDE as u32),
+            ) {
+                self.glyph(
+                    PixelRect {
+                        origin: PixelPosition {
+                            x: input_left,
+                            y: layout.input_origin.y,
+                        },
+                        size: PixelSize {
+                            width,
+                            height: self.metrics.cell.height,
+                        },
+                    },
+                    &prefix,
+                    LABEL_CACHE,
+                    accent,
+                    1.0,
+                );
+                input_left = input_left.saturating_add(width.get() + gap);
+            }
+        } else {
+            let icon_size = (cell_h * 4 / 5).clamp(12, cell_h);
+            if input_right > input_left + icon_size + gap
+                && self.svg_mask(
+                    PixelPosition {
                         x: input_left,
-                        y: layout.input_origin.y,
+                        y: layout.input_origin.y + cell_h.saturating_sub(icon_size) / 2,
                     },
-                    size: PixelSize {
-                        width,
-                        height: self.metrics.cell.height,
-                    },
-                },
-                &prefix,
-                LABEL_CACHE,
-                accent,
-                1.0,
-            );
-            input_left = input_left.saturating_add(width.get() + gap);
+                    icon_size,
+                    svg::icons::SEARCH,
+                    accent,
+                    1.0,
+                )
+            {
+                input_left = input_left.saturating_add(icon_size + gap);
+            }
         }
 
         // Right-aligned match counter.
@@ -2498,6 +2543,103 @@ impl TextRenderer {
         );
     }
 
+    #[allow(dead_code)]
+    pub(super) fn svg_color(
+        &mut self,
+        origin: PixelPosition,
+        size: u32,
+        source: &'static str,
+        alpha: f32,
+    ) -> bool {
+        self.svg_draw(
+            origin,
+            size,
+            size,
+            source,
+            SvgMode::Color,
+            Rgb {
+                red: 255,
+                green: 255,
+                blue: 255,
+            },
+            alpha,
+        )
+    }
+
+    pub(super) fn svg_mask(
+        &mut self,
+        origin: PixelPosition,
+        size: u32,
+        source: &'static str,
+        color: Rgb,
+        alpha: f32,
+    ) -> bool {
+        self.svg_draw(origin, size, size, source, SvgMode::Mask, color, alpha)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn svg_draw(
+        &mut self,
+        origin: PixelPosition,
+        width: u32,
+        height: u32,
+        source: &'static str,
+        mode: SvgMode,
+        color: Rgb,
+        alpha: f32,
+    ) -> bool {
+        let (Some(w_nz), Some(h_nz)) = (NonZeroU32::new(width), NonZeroU32::new(height)) else {
+            return false;
+        };
+        if width > ATLAS_SIDE as u32 || height > ATLAS_SIDE as u32 {
+            return false;
+        }
+        let colored = mode == SvgMode::Color;
+        let key = SvgSpriteKey {
+            source: source.as_ptr() as usize,
+            width,
+            height,
+            colored,
+        };
+        let sprite = if let Some(sprite) = self.svg_sprites.get_mut(&key) {
+            sprite.generation = self.generation;
+            *sprite
+        } else {
+            let Ok(raster) = self.svg.rasterize(source, width, height, mode) else {
+                return false;
+            };
+            self.image.clear();
+            self.image.extend_from_slice(&raster.rgba);
+            let Some(sprite) = self.upload_sprite(raster.width, raster.height, raster.colored)
+            else {
+                return false;
+            };
+            self.svg_sprites.insert(key, sprite);
+            sprite
+        };
+        let corner = sprite.allocation.rectangle.min;
+        let rect = PixelRect {
+            origin,
+            size: PixelSize {
+                width: w_nz,
+                height: h_nz,
+            },
+        };
+        self.quad(
+            rect,
+            color,
+            alpha,
+            [
+                corner.x as f32,
+                corner.y as f32,
+                width as f32,
+                height as f32,
+            ],
+            [if sprite.colored { 2 } else { 1 }, sprite.layer as u32],
+        );
+        true
+    }
+
     fn upload_sprite(&mut self, width: u32, height: u32, colored: bool) -> Option<Sprite> {
         let (layer, allocation) = self.allocate_sprite(size2(width as i32, height as i32))?;
         self.queue.write_texture(
@@ -2547,6 +2689,13 @@ impl TextRenderer {
                 });
             }
             self.sized_glyphs.retain(|_, cache| !cache.is_empty());
+            self.svg_sprites.retain(|_, sprite| {
+                if sprite.generation == self.generation {
+                    return true;
+                }
+                self.layers[sprite.layer].deallocate(sprite.allocation.id);
+                false
+            });
             if let Some(allocation) = allocate(&mut self.layers, size) {
                 return Some(allocation);
             }

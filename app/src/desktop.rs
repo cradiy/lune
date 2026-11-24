@@ -22,6 +22,7 @@ mod selection;
 mod shell_integration;
 mod shortcuts;
 mod split;
+mod svg;
 mod tab;
 mod tab_bar;
 mod text;

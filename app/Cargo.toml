@@ -9,7 +9,7 @@ default = ["desktop"]
 desktop = [
     "wgpu-renderer", "dep:calloop", "dep:calloop-wayland-source", "dep:cosmic-text",
     "dep:env_logger", "dep:event-listener", "dep:futures-lite", "dep:guillotiere",
-    "dep:image", "dep:log", "dep:lune-text", "dep:pollster", "dep:regex", "dep:unicode-segmentation", "dep:zbus",
+    "dep:image", "dep:log", "dep:lune-text", "dep:pollster", "dep:regex", "dep:resvg", "dep:unicode-segmentation", "dep:zbus",
     "dep:wayland-client", "dep:wayland-protocols",
     "dep:wl-clipboard-rs", "dep:winit",
 ]
@@ -39,6 +39,7 @@ log = { version = "0.4", optional = true }
 lune-text = { path = "../crates/text", optional = true }
 pollster = { version = "0.4", optional = true }
 regex = { version = "1", optional = true }
+resvg = { version = "0.46", default-features = false, optional = true }
 unicode-segmentation = { version = "=1.13.3", optional = true }
 wayland-client = { version = "0.31", optional = true }
 wayland-protocols = { version = "0.32", features = ["client", "staging"], optional = true }
