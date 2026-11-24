@@ -1,3 +1,4 @@
+mod bg_image;
 mod box_drawing;
 pub mod cli;
 mod clipboard;
@@ -199,7 +200,7 @@ impl App {
             return;
         }
         if let Some(client) = &mut self.client {
-            client.apply_config(&self.config, &loaded.config, self.system_theme);
+            client.apply_config(&self.config, &loaded.config, self.system_theme, force);
         }
         self.config = loaded.config;
         self.sync_theme_watch();
@@ -395,7 +396,7 @@ impl Client {
         );
         let scale = window.scale_factor();
         let font_config = config.font_config();
-        let painter = pollster::block_on(Painter::new(
+        let mut painter = pollster::block_on(Painter::new(
             window.clone(),
             Font::new(&font_config),
             PainterOptions {
@@ -407,6 +408,12 @@ impl Client {
                 cursor_animation: config.cursor_animation,
             },
         ))?;
+        let bg_image_error = painter
+            .set_background_image(config.background_image_config(), true)
+            .err();
+        if let Some(error) = &bg_image_error {
+            log::warn!("{error}");
+        }
         let bar = tab_bar::Layout::default();
         let padding = physical_padding(config.window_padding, scale);
         let content_area = content_rect(window.inner_size(), 0, padding, painter.metrics().cell)
@@ -472,11 +479,19 @@ impl Client {
             clipboard_read: config.clipboard_read,
             notifications_policy: config.notifications,
             notifier,
-            notice: startup_notice.map(|text| Notice {
-                kind: NoticeKind::Error,
-                text,
-                expires: Instant::now() + TOAST_ERROR_DURATION,
-            }),
+            notice: startup_notice
+                .map(|text| Notice {
+                    kind: NoticeKind::Error,
+                    text,
+                    expires: Instant::now() + TOAST_ERROR_DURATION,
+                })
+                .or_else(|| {
+                    bg_image_error.map(|text| Notice {
+                        kind: NoticeKind::Warning,
+                        text,
+                        expires: Instant::now() + TOAST_WARNING_DURATION,
+                    })
+                }),
             font_size_points: config.font_size_points,
             base_font_size_points: config.font_size_points,
             resize_pending: false,
@@ -1650,7 +1665,7 @@ impl Client {
         }
     }
 
-    fn apply_config(&mut self, old: &Config, new: &Config, system_theme: Theme) {
+    fn apply_config(&mut self, old: &Config, new: &Config, system_theme: Theme, force: bool) {
         if old.theme != new.theme {
             let selected = new.theme.resolve(system_theme);
             self.window.set_theme(Some(selected));
@@ -1727,6 +1742,16 @@ impl Client {
         }
         if old.minimum_contrast != new.minimum_contrast {
             self.painter.set_minimum_contrast(new.minimum_contrast);
+        }
+        let old_bg_image = old.background_image_config();
+        let new_bg_image = new.background_image_config();
+        if (old_bg_image != new_bg_image || (force && new_bg_image.path.is_some()))
+            && let Err(error) = self.painter.set_background_image(new_bg_image, force)
+        {
+            log::warn!("{error}");
+            if self.notice.is_none() {
+                self.show_notice(NoticeKind::Warning, error);
+            }
         }
         self.clipboard_write = new.clipboard_write;
         self.clipboard_read = new.clipboard_read;

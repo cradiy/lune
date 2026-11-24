@@ -17,6 +17,7 @@ use crate::{
     PresentedCursor, RowDamage,
 };
 
+use super::bg_image::{BackgroundImageConfig, BackgroundImageRenderer};
 use super::confirm;
 use super::cursor::CursorMotion;
 use super::font::{Font, FontConfig, FontMetrics};
@@ -104,6 +105,7 @@ pub(super) struct Painter {
     queue: wgpu::Queue,
     gpus: HashMap<PaneId, PaneGpu>,
     trackers: Vec<(PaneId, PresentationTracker)>,
+    background_image: BackgroundImageRenderer,
     text: TextRenderer,
     pane_ranges: Vec<(PaneId, Range<u32>)>,
     chrome_range: Range<u32>,
@@ -179,6 +181,7 @@ impl Painter {
         }
         surface.configure(&device, &config);
         let metrics = font.measure(physical_font_size, scale_factor);
+        let background_image = BackgroundImageRenderer::new(&device, config.format);
         let text = TextRenderer::new(
             &device,
             &queue,
@@ -202,6 +205,7 @@ impl Painter {
             queue,
             gpus: HashMap::new(),
             trackers: Vec::new(),
+            background_image,
             text,
             pane_ranges: Vec::new(),
             chrome_range: 0..0,
@@ -261,6 +265,29 @@ impl Painter {
         if self.text.set_minimum_contrast(value) {
             self.dirty = true;
             self.force_present = true;
+        }
+    }
+
+    pub(super) fn set_background_image(
+        &mut self,
+        config: BackgroundImageConfig,
+        force_reload: bool,
+    ) -> std::result::Result<(), String> {
+        let result =
+            self.background_image
+                .configure(&self.device, &self.queue, config, force_reload);
+        match result {
+            Ok(true) => {
+                self.dirty = true;
+                self.force_present = true;
+                Ok(())
+            }
+            Ok(false) => Ok(()),
+            Err(error) => {
+                self.dirty = true;
+                self.force_present = true;
+                Err(error)
+            }
         }
     }
 
@@ -721,6 +748,23 @@ impl Painter {
                 })],
                 ..Default::default()
             });
+            pass.set_viewport(
+                0.0,
+                0.0,
+                self.config.width as f32,
+                self.config.height as f32,
+                0.0,
+                1.0,
+            );
+            pass.set_scissor_rect(0, 0, self.config.width, self.config.height);
+            self.background_image.draw(
+                &mut pass,
+                &self.queue,
+                (self.config.width, self.config.height),
+                background,
+                clear_scale as f32,
+                clear_alpha as f32,
+            );
             for (index, pane) in panes.iter().enumerate() {
                 let Some(gpu) = self.gpus.get(&pane.id) else {
                     continue;

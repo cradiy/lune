@@ -6,6 +6,10 @@ use std::path::{Path, PathBuf};
 
 use lune_terminal::{CursorShape, HistoryLimits};
 
+use super::bg_image::{
+    BackgroundImageConfig, BackgroundImageFit, BackgroundImagePosition,
+    DEFAULT_BACKGROUND_IMAGE_OPACITY,
+};
 use super::contrast::{MAX_CONTRAST, MIN_CONTRAST};
 use super::font::{FontConfig, FontFeature, MetricAdjustment};
 use super::shortcuts::{self, Keybind};
@@ -94,6 +98,10 @@ pub(super) struct Config {
     pub(super) minimum_contrast: f32,
     pub(super) theme: Preference,
     pub(super) background_opacity: f32,
+    pub(super) background_image: Option<PathBuf>,
+    pub(super) background_image_opacity: f32,
+    pub(super) background_image_fit: BackgroundImageFit,
+    pub(super) background_image_position: BackgroundImagePosition,
     pub(super) unfocused_split_opacity: f32,
     pub(super) window_padding: u32,
     pub(super) scrollback_lines: usize,
@@ -128,6 +136,10 @@ impl Default for Config {
             minimum_contrast: MIN_CONTRAST,
             theme: Preference::System,
             background_opacity: 1.0,
+            background_image: None,
+            background_image_opacity: DEFAULT_BACKGROUND_IMAGE_OPACITY,
+            background_image_fit: BackgroundImageFit::Cover,
+            background_image_position: BackgroundImagePosition::Center,
             unfocused_split_opacity: DEFAULT_UNFOCUSED_SPLIT_OPACITY,
             window_padding: 0,
             scrollback_lines: DEFAULT_SCROLLBACK_LINES,
@@ -160,6 +172,15 @@ impl Config {
             adjust_cell_height: self.adjust_cell_height,
             adjust_cell_width: self.adjust_cell_width,
             adjust_baseline: self.adjust_baseline,
+        }
+    }
+
+    pub(super) fn background_image_config(&self) -> BackgroundImageConfig {
+        BackgroundImageConfig {
+            path: self.background_image.clone(),
+            opacity: self.background_image_opacity,
+            fit: self.background_image_fit,
+            position: self.background_image_position,
         }
     }
 
@@ -251,6 +272,9 @@ impl Config {
                 config.theme = Preference::load(directory, value, &mut current_theme_errors)?;
                 theme_errors = current_theme_errors;
                 Ok(())
+            } else if key == "background-image" {
+                config.background_image = resolve_image_path(directory, value)?;
+                Ok(())
             } else {
                 config.set(key, value)
             }
@@ -321,6 +345,19 @@ impl Config {
                     .ok()
                     .filter(|value| value.is_finite() && (0.0..=1.0).contains(value))
                     .ok_or("background-opacity must be between 0.0 and 1.0")?;
+            }
+            "background-image-opacity" => {
+                self.background_image_opacity = value
+                    .parse::<f32>()
+                    .ok()
+                    .filter(|value| value.is_finite() && (0.0..=1.0).contains(value))
+                    .ok_or("background-image-opacity must be between 0.0 and 1.0")?;
+            }
+            "background-image-fit" => {
+                self.background_image_fit = BackgroundImageFit::parse(value)?;
+            }
+            "background-image-position" => {
+                self.background_image_position = BackgroundImagePosition::parse(value)?;
             }
             "unfocused-split-opacity" => {
                 self.unfocused_split_opacity = value
@@ -396,6 +433,26 @@ impl Config {
             _ => return Err("unknown setting"),
         }
         Ok(())
+    }
+}
+
+fn resolve_image_path(directory: &Path, value: &str) -> Result<Option<PathBuf>, &'static str> {
+    if value.is_empty() || value.chars().any(char::is_control) {
+        return Err("background-image must be an image file path or none");
+    }
+    if value.eq_ignore_ascii_case("none") {
+        return Ok(None);
+    }
+    if let Some(rest) = value.strip_prefix("~/") {
+        let home = absolute_env_path("HOME")
+            .ok_or("HOME must be an absolute path to expand '~' in background-image")?;
+        return Ok(Some(home.join(rest)));
+    }
+    let path = PathBuf::from(value);
+    if path.is_absolute() || directory.as_os_str().is_empty() {
+        Ok(Some(path))
+    } else {
+        Ok(Some(directory.join(path)))
     }
 }
 
@@ -577,6 +634,10 @@ mod tests {
              adjust-cell-width = 1\r\nadjust-cell-width = 50\r\n\
              adjust-baseline = -1\r\nadjust-baseline = 99\r\n\
              minimum-contrast = 4.5\r\nminimum-contrast = 25\r\n\
+             background-image = wallpaper.webp\r\nbackground-image = \r\n\
+             background-image-opacity = 0.4\r\nbackground-image-opacity = 2.0\r\n\
+             background-image-fit = contain\r\nbackground-image-fit = zoom\r\n\
+             background-image-position = top-right\r\nbackground-image-position = diagonal\r\n\
              background-opacity = 0.85\r\nbackground-opacity = 1.5\r\nbackground-opacity = NaN\r\n\
              unfocused-split-opacity = 0.6\r\nunfocused-split-opacity = 0.05\r\n\
              window-padding = 12\r\nwindow-padding = 999\r\n\
@@ -611,6 +672,19 @@ mod tests {
         assert_eq!(config.adjust_cell_width, super::MetricAdjustment::Pixels(1));
         assert_eq!(config.adjust_baseline, super::MetricAdjustment::Pixels(-1));
         assert_eq!(config.minimum_contrast, 4.5);
+        assert_eq!(
+            config.background_image.as_deref(),
+            Some(Path::new("wallpaper.webp"))
+        );
+        assert_eq!(config.background_image_opacity, 0.4);
+        assert_eq!(
+            config.background_image_fit,
+            super::BackgroundImageFit::Contain
+        );
+        assert_eq!(
+            config.background_image_position,
+            super::BackgroundImagePosition::TopRight
+        );
         assert_eq!(config.font_size_points, 19.5);
         assert_eq!(config.background_opacity, 0.85);
         assert_eq!(config.unfocused_split_opacity, 0.6);
@@ -637,11 +711,11 @@ mod tests {
         assert_eq!(config.clipboard_write, super::ClipboardPolicy::Deny);
         assert_eq!(config.clipboard_read, super::ClipboardPolicy::Allow);
         assert_eq!(config.notifications, super::NotificationPolicy::Always);
-        assert_eq!(loaded.errors.len(), 24);
+        assert_eq!(loaded.errors.len(), 28);
         assert_eq!(
             format_errors(&loaded.errors).as_deref(),
             Some(
-                "Config error: lune.conf:8: font-feature tag must be 4 printable ASCII characters (+23 more)"
+                "Config error: lune.conf:8: font-feature tag must be 4 printable ASCII characters (+27 more)"
             )
         );
     }
