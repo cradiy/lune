@@ -340,8 +340,6 @@ impl TextRenderer {
                                     && cursor_column != Some(unit.column)
                                     && cursor_column != Some(next)
                                     && source.sized_text_at(next).is_none()
-                                    && selected.as_ref().is_some_and(|span| span.contains(&next))
-                                        == unit_selected
                                     && source.cells().get(next).is_some_and(|cell| {
                                         (cell.is_erased()
                                             || (cell.character() == Some(' ')
