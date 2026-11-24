@@ -2,6 +2,7 @@ use std::collections::{TryReserveError, VecDeque};
 
 use lune_vt::{OscEvent, OscTerminator};
 
+use crate::hyperlinks::{MAX_HYPERLINK_PARAMS_BYTES, MAX_HYPERLINK_URI_BYTES};
 use crate::reply::{ColorReport, ColorTarget};
 use crate::sizing::{self, MAX_SIZED_TEXT_BYTES, MAX_SIZING_METADATA_BYTES};
 use crate::{Palette, PaletteEntry, Rgb};
@@ -11,9 +12,202 @@ pub const MAX_TITLE_BYTES: usize = 4096;
 pub(crate) const MAX_SAVED_TITLES: usize = 10;
 /// Maximum encoded byte length of an OSC 7 working directory URI.
 pub const MAX_WORKING_DIRECTORY_URI_BYTES: usize = MAX_TITLE_BYTES;
+/// Maximum decoded UTF-8 byte length of an OSC 52 clipboard payload.
+pub const MAX_CLIPBOARD_BYTES: usize = 128 * 1024;
 const MAX_COLOR_BYTES: usize = 18;
 /// Maximum number of indexed operations in one OSC 4/104 command.
 pub const MAX_OSC_PALETTE_ENTRIES: usize = 256;
+
+/// Target selections requested by an OSC 52 clipboard command.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ClipboardTargets {
+    pub clipboard: bool,
+    pub primary: bool,
+}
+
+/// An OSC 52 clipboard write payload. An empty payload clears the target selection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClipboardWrite<'a> {
+    pub targets: ClipboardTargets,
+    pub text: &'a str,
+}
+
+/// An OSC 52 clipboard read request preserving the request's wire terminator.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClipboardQuery {
+    pub targets: ClipboardTargets,
+    terminator: OscTerminator,
+}
+
+impl ClipboardQuery {
+    /// Encodes an OSC 52 reply carrying `text` as standard base64 into `out`.
+    pub fn encode_reply(self, text: &str, out: &mut Vec<u8>) -> Result<(), TryReserveError> {
+        let encoded_len = text.len().div_ceil(3) * 4;
+        let terminator: &[u8] = match self.terminator {
+            OscTerminator::Bell => b"\x07",
+            OscTerminator::St => b"\x1b\\",
+        };
+        let total = 7 + encoded_len + terminator.len();
+        out.clear();
+        out.try_reserve_exact(total)?;
+        out.extend_from_slice(b"\x1b]52;");
+        out.push(if self.targets.clipboard { b'c' } else { b'p' });
+        out.push(b';');
+        encode_base64(text.as_bytes(), out);
+        out.extend_from_slice(terminator);
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct Base64Decoder {
+    quantum: [u8; 4],
+    len: u8,
+    pad_seen: bool,
+}
+
+impl Base64Decoder {
+    fn reset(&mut self) {
+        self.len = 0;
+        self.pad_seen = false;
+    }
+
+    fn push(&mut self, bytes: &[u8], out: &mut Vec<u8>) -> bool {
+        for &byte in bytes {
+            if matches!(byte, b'\r' | b'\n' | b' ') {
+                continue;
+            }
+            if byte == b'=' {
+                if self.len < 2 {
+                    return false;
+                }
+                self.pad_seen = true;
+                self.quantum[usize::from(self.len)] = b'=';
+                self.len += 1;
+                if self.len == 4 {
+                    if !self.flush_quantum(out) {
+                        return false;
+                    }
+                    self.len = 0;
+                }
+                continue;
+            }
+            if self.pad_seen {
+                return false;
+            }
+            let Some(value) = base64_value(byte) else {
+                return false;
+            };
+            self.quantum[usize::from(self.len)] = value;
+            self.len += 1;
+            if self.len == 4 {
+                if !self.flush_quantum(out) {
+                    return false;
+                }
+                self.len = 0;
+            }
+        }
+        true
+    }
+
+    fn finish(&mut self, out: &mut Vec<u8>) -> bool {
+        match self.len {
+            0 => true,
+            1 => false,
+            2 => {
+                if self.pad_seen {
+                    return false;
+                }
+                let b0 = (self.quantum[0] << 2) | (self.quantum[1] >> 4);
+                push_clipboard_bytes(out, &[b0])
+            }
+            3 => {
+                if self.pad_seen {
+                    return false;
+                }
+                let b0 = (self.quantum[0] << 2) | (self.quantum[1] >> 4);
+                let b1 = (self.quantum[1] << 4) | (self.quantum[2] >> 2);
+                push_clipboard_bytes(out, &[b0, b1])
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    fn flush_quantum(&self, out: &mut Vec<u8>) -> bool {
+        let q = self.quantum;
+        if q[2] == b'=' {
+            if q[3] != b'=' {
+                return false;
+            }
+            let b0 = (q[0] << 2) | (q[1] >> 4);
+            push_clipboard_bytes(out, &[b0])
+        } else if q[3] == b'=' {
+            let b0 = (q[0] << 2) | (q[1] >> 4);
+            let b1 = (q[1] << 4) | (q[2] >> 2);
+            push_clipboard_bytes(out, &[b0, b1])
+        } else {
+            let b0 = (q[0] << 2) | (q[1] >> 4);
+            let b1 = (q[1] << 4) | (q[2] >> 2);
+            let b2 = (q[2] << 6) | q[3];
+            push_clipboard_bytes(out, &[b0, b1, b2])
+        }
+    }
+}
+
+fn push_clipboard_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> bool {
+    if bytes.len() > MAX_CLIPBOARD_BYTES - out.len() || out.try_reserve(bytes.len()).is_err() {
+        return false;
+    }
+    out.extend_from_slice(bytes);
+    true
+}
+
+#[inline]
+fn base64_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'A'..=b'Z' => Some(byte - b'A'),
+        b'a'..=b'z' => Some(byte - b'a' + 26),
+        b'0'..=b'9' => Some(byte - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    }
+}
+
+fn encode_base64(input: &[u8], out: &mut Vec<u8>) {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let (chunks, remainder) = input.as_chunks::<3>();
+    for chunk in chunks {
+        let n = (u32::from(chunk[0]) << 16) | (u32::from(chunk[1]) << 8) | u32::from(chunk[2]);
+        out.extend_from_slice(&[
+            TABLE[((n >> 18) & 63) as usize],
+            TABLE[((n >> 12) & 63) as usize],
+            TABLE[((n >> 6) & 63) as usize],
+            TABLE[(n & 63) as usize],
+        ]);
+    }
+    match remainder {
+        [b0] => {
+            let n = u32::from(*b0) << 16;
+            out.extend_from_slice(&[
+                TABLE[((n >> 18) & 63) as usize],
+                TABLE[((n >> 12) & 63) as usize],
+                b'=',
+                b'=',
+            ]);
+        }
+        [b0, b1] => {
+            let n = (u32::from(*b0) << 16) | (u32::from(*b1) << 8);
+            out.extend_from_slice(&[
+                TABLE[((n >> 18) & 63) as usize],
+                TABLE[((n >> 12) & 63) as usize],
+                TABLE[((n >> 6) & 63) as usize],
+                b'=',
+            ]);
+        }
+        _ => {}
+    }
+}
 
 #[derive(Clone, Copy, Default)]
 enum Phase {
@@ -25,6 +219,10 @@ enum Phase {
     },
     Title,
     WorkingDirectory,
+    HyperlinkParams,
+    HyperlinkUri,
+    ClipboardTargets,
+    ClipboardData,
     SizedText,
     Color(u8),
     Index,
@@ -39,6 +237,7 @@ pub(crate) enum Outcome {
     Reply(ColorReport),
     Replies,
     SizedText,
+    Hyperlink,
 }
 
 #[derive(Clone, Copy)]
@@ -72,6 +271,18 @@ pub(crate) struct Osc {
     directory_length: usize,
     directory_changed: bool,
     sized_text: Vec<u8>,
+    clipboard_targets: ClipboardTargets,
+    clipboard_target_seen: bool,
+    clipboard_is_query: Option<bool>,
+    clipboard_decoder: Base64Decoder,
+    clipboard_candidate: Vec<u8>,
+    clipboard_text: Vec<u8>,
+    clipboard_write: Option<ClipboardTargets>,
+    clipboard_query: Option<ClipboardQuery>,
+    hyperlink_params: [u8; MAX_HYPERLINK_PARAMS_BYTES],
+    hyperlink_params_len: usize,
+    hyperlink_uri: [u8; MAX_HYPERLINK_URI_BYTES],
+    hyperlink_uri_len: usize,
 }
 
 impl Osc {
@@ -96,6 +307,18 @@ impl Osc {
             directory_length: 0,
             directory_changed: false,
             sized_text: Vec::new(),
+            clipboard_targets: ClipboardTargets::default(),
+            clipboard_target_seen: false,
+            clipboard_is_query: None,
+            clipboard_decoder: Base64Decoder::default(),
+            clipboard_candidate: Vec::new(),
+            clipboard_text: Vec::new(),
+            clipboard_write: None,
+            clipboard_query: None,
+            hyperlink_params: [0; MAX_HYPERLINK_PARAMS_BYTES],
+            hyperlink_params_len: 0,
+            hyperlink_uri: [0; MAX_HYPERLINK_URI_BYTES],
+            hyperlink_uri_len: 0,
         }
     }
 
@@ -191,6 +414,19 @@ impl Osc {
         std::mem::take(&mut self.directory_changed)
     }
 
+    pub(crate) fn take_clipboard_write(&mut self) -> Option<ClipboardTargets> {
+        self.clipboard_write.take()
+    }
+
+    pub(crate) fn clipboard_text(&self) -> &str {
+        std::str::from_utf8(&self.clipboard_text)
+            .expect("Committed clipboard payloads are valid UTF-8")
+    }
+
+    pub(crate) fn take_clipboard_query(&mut self) -> Option<ClipboardQuery> {
+        self.clipboard_query.take()
+    }
+
     pub(crate) fn reset(&mut self) {
         self.directory_changed |= self.directory_length != 0;
         self.directory_length = 0;
@@ -202,6 +438,12 @@ impl Osc {
         self.operation_count = 0;
         self.reply_head = 0;
         self.reply_end = 0;
+        self.clipboard_candidate.clear();
+        self.clipboard_text.clear();
+        self.clipboard_write = None;
+        self.clipboard_query = None;
+        self.hyperlink_params_len = 0;
+        self.hyperlink_uri_len = 0;
     }
 
     #[inline]
@@ -211,6 +453,10 @@ impl Osc {
             Phase::Selector { .. }
                 | Phase::Title
                 | Phase::WorkingDirectory
+                | Phase::HyperlinkParams
+                | Phase::HyperlinkUri
+                | Phase::ClipboardTargets
+                | Phase::ClipboardData
                 | Phase::SizedText
                 | Phase::Color(_)
                 | Phase::Index
@@ -225,6 +471,10 @@ impl Osc {
             self.append_text(bytes);
         } else if matches!(self.phase, Phase::SizedText) {
             self.append_sized_text(bytes);
+        } else if matches!(self.phase, Phase::ClipboardData) {
+            self.append_clipboard_data(bytes);
+        } else if matches!(self.phase, Phase::HyperlinkUri) {
+            self.append_hyperlink_uri(bytes);
         } else if matches!(self.phase, Phase::Selector { .. }) {
             self.command_data(bytes);
         } else {
@@ -242,6 +492,19 @@ impl Osc {
             match byte {
                 b';' if matches!(value, 0 | 2) => self.phase = Phase::Title,
                 b';' if value == 7 => self.phase = Phase::WorkingDirectory,
+                b';' if value == 8 => {
+                    self.hyperlink_params_len = 0;
+                    self.hyperlink_uri_len = 0;
+                    self.phase = Phase::HyperlinkParams;
+                }
+                b';' if value == 52 => {
+                    self.clipboard_targets = ClipboardTargets::default();
+                    self.clipboard_target_seen = false;
+                    self.clipboard_is_query = None;
+                    self.clipboard_decoder.reset();
+                    self.clipboard_candidate.clear();
+                    self.phase = Phase::ClipboardTargets;
+                }
                 b';' if value == 66 => {
                     self.sized_text.clear();
                     self.phase = Phase::SizedText;
@@ -272,8 +535,64 @@ impl Osc {
             self.append_text(bytes);
         } else if matches!(self.phase, Phase::SizedText) {
             self.append_sized_text(bytes);
+        } else if matches!(self.phase, Phase::ClipboardData) {
+            self.append_clipboard_data(bytes);
+        } else if matches!(self.phase, Phase::HyperlinkUri) {
+            self.append_hyperlink_uri(bytes);
         } else {
             self.batch_data(bytes);
+        }
+    }
+
+    #[cold]
+    fn append_hyperlink_uri(&mut self, bytes: &[u8]) {
+        if bytes.iter().any(|&byte| byte < 0x20 || byte == 0x7f)
+            || bytes.len() > MAX_HYPERLINK_URI_BYTES - self.hyperlink_uri_len
+        {
+            self.phase = Phase::Discard;
+            return;
+        }
+        let end = self.hyperlink_uri_len + bytes.len();
+        self.hyperlink_uri[self.hyperlink_uri_len..end].copy_from_slice(bytes);
+        self.hyperlink_uri_len = end;
+    }
+
+    pub(crate) fn hyperlink(&self) -> Option<(&str, Option<&str>)> {
+        let uri = std::str::from_utf8(&self.hyperlink_uri[..self.hyperlink_uri_len]).ok()?;
+        let params =
+            std::str::from_utf8(&self.hyperlink_params[..self.hyperlink_params_len]).ok()?;
+        let id = params
+            .split(':')
+            .filter_map(|pair| pair.split_once('='))
+            .rev()
+            .find_map(|(key, value)| (key == "id" && !value.is_empty()).then_some(value));
+        Some((uri, id))
+    }
+
+    #[cold]
+    fn append_clipboard_data(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        match self.clipboard_is_query {
+            None if bytes == b"?" => {
+                self.clipboard_is_query = Some(true);
+                return;
+            }
+            Some(true) => {
+                self.phase = Phase::Discard;
+                return;
+            }
+            None => {
+                self.clipboard_is_query = Some(false);
+            }
+            Some(false) => {}
+        }
+        if !self
+            .clipboard_decoder
+            .push(bytes, &mut self.clipboard_candidate)
+        {
+            self.phase = Phase::Discard;
         }
     }
 
@@ -337,6 +656,8 @@ impl Osc {
                         Outcome::Done
                     }
                     Phase::WorkingDirectory => self.commit_directory(candidate),
+                    Phase::HyperlinkUri if self.hyperlink().is_some() => Outcome::Hyperlink,
+                    Phase::ClipboardData => self.commit_clipboard(terminator),
                     Phase::SizedText if self.sized_text().is_some() => Outcome::SizedText,
                     Phase::Color(selector) if self.operation_count == 0 => {
                         let entry = role(u16::from(selector));
@@ -394,8 +715,37 @@ impl Osc {
             OscEvent::Cancel => {
                 self.phase = Phase::Idle;
                 self.operation_count = 0;
+                self.clipboard_candidate.clear();
+                self.hyperlink_params_len = 0;
+                self.hyperlink_uri_len = 0;
             }
         }
+        Outcome::Done
+    }
+
+    #[cold]
+    fn commit_clipboard(&mut self, terminator: OscTerminator) -> Outcome {
+        let targets = self.clipboard_targets;
+        if self.clipboard_is_query == Some(true) {
+            if targets.clipboard || targets.primary {
+                self.clipboard_query = Some(ClipboardQuery {
+                    targets,
+                    terminator,
+                });
+            }
+            return Outcome::Done;
+        }
+        if !self.clipboard_decoder.finish(&mut self.clipboard_candidate)
+            || std::str::from_utf8(&self.clipboard_candidate).is_err()
+        {
+            self.clipboard_candidate.clear();
+            return Outcome::Ignored;
+        }
+        if targets.clipboard || targets.primary {
+            std::mem::swap(&mut self.clipboard_text, &mut self.clipboard_candidate);
+            self.clipboard_write = Some(targets);
+        }
+        self.clipboard_candidate.clear();
         Outcome::Done
     }
 
@@ -421,6 +771,63 @@ impl Osc {
                 Phase::WorkingDirectory => {
                     self.append_text(bytes);
                     return;
+                }
+                Phase::HyperlinkParams => {
+                    if let Some(separator) = bytes.iter().position(|&byte| byte == b';') {
+                        let prefix = &bytes[..separator];
+                        if prefix.iter().any(|&byte| byte < 0x20 || byte == 0x7f)
+                            || prefix.len() > MAX_HYPERLINK_PARAMS_BYTES - self.hyperlink_params_len
+                        {
+                            self.phase = Phase::Discard;
+                            return;
+                        }
+                        let end = self.hyperlink_params_len + prefix.len();
+                        self.hyperlink_params[self.hyperlink_params_len..end]
+                            .copy_from_slice(prefix);
+                        self.hyperlink_params_len = end;
+                        self.phase = Phase::HyperlinkUri;
+                        self.append_hyperlink_uri(&bytes[separator + 1..]);
+                        return;
+                    }
+                    if bytes.iter().any(|&byte| byte < 0x20 || byte == 0x7f)
+                        || bytes.len() > MAX_HYPERLINK_PARAMS_BYTES - self.hyperlink_params_len
+                    {
+                        self.phase = Phase::Discard;
+                        return;
+                    }
+                    let end = self.hyperlink_params_len + bytes.len();
+                    self.hyperlink_params[self.hyperlink_params_len..end].copy_from_slice(bytes);
+                    self.hyperlink_params_len = end;
+                    return;
+                }
+                Phase::ClipboardTargets => {
+                    let byte = bytes[0];
+                    bytes = &bytes[1..];
+                    match byte {
+                        b';' => {
+                            if !self.clipboard_target_seen {
+                                self.clipboard_targets.clipboard = true;
+                            }
+                            self.phase = Phase::ClipboardData;
+                            self.append_clipboard_data(bytes);
+                            return;
+                        }
+                        b'c' => {
+                            self.clipboard_targets.clipboard = true;
+                            self.clipboard_target_seen = true;
+                        }
+                        b'p' => {
+                            self.clipboard_targets.primary = true;
+                            self.clipboard_target_seen = true;
+                        }
+                        b's' | b'q' | b'0'..=b'7' => {
+                            self.clipboard_target_seen = true;
+                        }
+                        _ => {
+                            self.phase = Phase::Discard;
+                            return;
+                        }
+                    }
                 }
                 Phase::Index | Phase::ResetIndex => {
                     let byte = bytes[0];

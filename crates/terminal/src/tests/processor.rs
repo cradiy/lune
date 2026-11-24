@@ -60,7 +60,7 @@ fn reverse_video_tracks_display_state_without_mutating_cells_or_palette() {
 fn csi_cursor_save_restore_preserves_rendition_charsets_and_deferred_wrap() {
     let before_restore =
         b"\x1b[2;4r\x1b[?6h\x1b[2;8H\x1b[31m\x1b)0\x0eq\x1b[s\x1b[?6;7l\x1b[32m\x0f";
-    let invalid = b"\x1b[0s\x1b[0u\x1b[?s\x1b[?u\x1b[ s\x1b[ u\x1b[1:0s\x1b[1:0u";
+    let invalid = b"\x1b[0s\x1b[0u\x1b[?s\x1b[?1u\x1b[ s\x1b[ u\x1b[1:0s\x1b[1:0u";
     let restore = b"\x1b[u";
     for chunk in [1, 3, usize::MAX] {
         let mut screen = Screen::new(8, 4).unwrap();

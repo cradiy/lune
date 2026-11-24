@@ -569,3 +569,252 @@ fn editing_and_function_keys_preserve_distinct_sequences_across_all_mode_combina
         }
     }
 }
+
+#[test]
+fn kitty_keyboard_stacks_are_buffer_local_bounded_and_queryable_across_splits() {
+    let wire = b"\x1b[?u\x1b[>1u\x1b[?u\x1b[=2;2u\x1b[?u\x1b[>8u\x1b[?u\x1b[?1049h\x1b[?u\x1b[>31u\x1b[=1;3u\x1b[?u\x1b[?1049l\x1b[?u\x1b[<u\x1b[?u\x1b[<9u\x1b[?u";
+    let expected = b"\x1b[?0u\x1b[?1u\x1b[?3u\x1b[?8u\x1b[?0u\x1b[?30u\x1b[?8u\x1b[?3u\x1b[?0u";
+    let mut text = |_: &mut Screen, _: &str, _| Ok::<_, StorageError>(());
+    for split in 0..=wire.len() {
+        let mut screen = Screen::new(8, 4).unwrap();
+        let mut processor = support::processor();
+        let mut output = Vec::new();
+        for mut chunk in [&wire[..split], &wire[split..]] {
+            loop {
+                let result = processor.advance(chunk, &mut screen, &mut text);
+                while !processor.reply_bytes().is_empty() {
+                    output.extend_from_slice(processor.reply_bytes());
+                    assert!(processor.consume_reply(processor.reply_bytes().len()));
+                }
+                match result {
+                    Ok(consumed) => {
+                        assert_eq!(consumed, chunk.len());
+                        break;
+                    }
+                    Err(error) => {
+                        assert!(matches!(error.error, crate::ProcessFailure::ReplyPending));
+                        chunk = &chunk[error.consumed..];
+                    }
+                }
+            }
+        }
+        assert_eq!(output, expected);
+        assert_eq!(
+            (processor.parse_errors(), processor.ignored_sequences()),
+            (0, 0)
+        );
+    }
+
+    // Overflowing the stack keeps the newest MAX_KITTY_KEYBOARD_STACK entries and RIS clears it.
+    let mut screen = Screen::new(8, 4).unwrap();
+    let mut processor = support::processor();
+    for step in 1..=(crate::MAX_KITTY_KEYBOARD_STACK + 3) {
+        let cmd = format!("\x1b[>{}u", step & 31);
+        processor
+            .advance(cmd.as_bytes(), &mut screen, &mut text)
+            .unwrap();
+    }
+    assert_eq!(
+        processor.input_modes().kitty_keyboard.bits(),
+        ((crate::MAX_KITTY_KEYBOARD_STACK + 3) & 31) as u8
+    );
+    processor
+        .advance(
+            format!("\x1b[<{}u", crate::MAX_KITTY_KEYBOARD_STACK - 1).as_bytes(),
+            &mut screen,
+            &mut text,
+        )
+        .unwrap();
+    assert_eq!(processor.input_modes().kitty_keyboard.bits(), 4);
+    processor
+        .advance(b"\x1b[<u", &mut screen, &mut text)
+        .unwrap();
+    assert_eq!(processor.input_modes().kitty_keyboard.bits(), 0);
+    // Reject invalid modes and preserve SCORC (`CSI u`).
+    processor
+        .advance(b"\x1b[>5u\x1b[=1;4u\x1b[?1u\x1b[u", &mut screen, &mut text)
+        .unwrap();
+    assert_eq!(processor.input_modes().kitty_keyboard.bits(), 5);
+    assert_eq!(processor.ignored_sequences(), 2);
+    processor.advance(b"\x1bc", &mut screen, &mut text).unwrap();
+    assert_eq!(processor.input_modes().kitty_keyboard.bits(), 0);
+}
+
+#[test]
+fn kitty_keyboard_encodes_disambiguated_events_alternates_and_text() {
+    use crate::{KeyEvent, KeyEventKind, KeyInput, KeyModifiers, KittyKeyboardFlags};
+
+    let mut modes = InputModes {
+        kitty_keyboard: KittyKeyboardFlags::new(KittyKeyboardFlags::DISAMBIGUATE),
+        ..InputModes::default()
+    };
+    let press = |key, modifiers| KeyEvent {
+        key,
+        shifted_key: None,
+        base_layout_key: None,
+        modifiers,
+        kind: KeyEventKind::Press,
+        text: None,
+    };
+
+    // Disambiguate: Escape, Ctrl+I vs Tab, Shift+Tab, Super+a, F3, keypad.
+    assert_eq!(
+        modes
+            .encode_key_event(press(KeyInput::Named(Key::Escape), KeyModifiers::default()))
+            .unwrap()
+            .as_bytes(),
+        b"\x1b[27u"
+    );
+    assert_eq!(
+        modes
+            .encode_key_event(press(KeyInput::Named(Key::Tab), KeyModifiers::default()))
+            .unwrap()
+            .as_bytes(),
+        b"\t"
+    );
+    assert_eq!(
+        modes
+            .encode_key_event(press(
+                KeyInput::Character('i'),
+                KeyModifiers {
+                    control: true,
+                    ..KeyModifiers::default()
+                }
+            ))
+            .unwrap()
+            .as_bytes(),
+        b"\x1b[105;5u"
+    );
+    assert_eq!(
+        modes
+            .encode_key_event(press(
+                KeyInput::Named(Key::Tab),
+                KeyModifiers {
+                    shift: true,
+                    ..KeyModifiers::default()
+                }
+            ))
+            .unwrap()
+            .as_bytes(),
+        b"\x1b[9;2u"
+    );
+    assert_eq!(
+        modes
+            .encode_key_event(press(
+                KeyInput::Character('a'),
+                KeyModifiers {
+                    super_key: true,
+                    ..KeyModifiers::default()
+                }
+            ))
+            .unwrap()
+            .as_bytes(),
+        b"\x1b[97;9u"
+    );
+    assert_eq!(
+        modes
+            .encode_key_event(press(
+                KeyInput::Named(Key::Function(3)),
+                KeyModifiers::default()
+            ))
+            .unwrap()
+            .as_bytes(),
+        b"\x1b[13~"
+    );
+    assert_eq!(
+        modes
+            .encode_key_event(press(
+                KeyInput::Named(Key::KeypadEnter),
+                KeyModifiers::default()
+            ))
+            .unwrap()
+            .as_bytes(),
+        b"\x1b[57414u"
+    );
+    // Plain character without REPORT_ALL_KEYS sends raw UTF-8 text.
+    assert_eq!(
+        modes
+            .encode_key_event(press(KeyInput::Character('a'), KeyModifiers::default()))
+            .unwrap()
+            .as_bytes(),
+        b"a"
+    );
+    // Release is suppressed when REPORT_EVENTS is not set.
+    assert!(
+        modes
+            .encode_key_event(KeyEvent {
+                kind: KeyEventKind::Release,
+                ..press(KeyInput::Character('a'), KeyModifiers::default())
+            })
+            .is_none()
+    );
+
+    // Full progressive enhancement flags (all 5 bits = 31).
+    modes.kitty_keyboard = KittyKeyboardFlags::new(KittyKeyboardFlags::ALL);
+    assert_eq!(
+        modes
+            .encode_key_event(KeyEvent {
+                key: KeyInput::Character('a'),
+                shifted_key: Some('A'),
+                base_layout_key: Some('q'),
+                modifiers: KeyModifiers {
+                    shift: true,
+                    control: true,
+                    ..KeyModifiers::default()
+                },
+                kind: KeyEventKind::Repeat,
+                text: Some("A"),
+            })
+            .unwrap()
+            .as_bytes(),
+        b"\x1b[97:65:113;6:2;65u"
+    );
+    // Release omits associated text even when REPORT_TEXT is active.
+    assert_eq!(
+        modes
+            .encode_key_event(KeyEvent {
+                key: KeyInput::Character('a'),
+                shifted_key: Some('A'),
+                base_layout_key: None,
+                modifiers: KeyModifiers::default(),
+                kind: KeyEventKind::Release,
+                text: Some("a"),
+            })
+            .unwrap()
+            .as_bytes(),
+        b"\x1b[97;1:3u"
+    );
+    // Unmodified plain character with REPORT_ALL_KEYS + REPORT_TEXT includes ;1;codepoint.
+    assert_eq!(
+        modes
+            .encode_key_event(KeyEvent {
+                key: KeyInput::Character('a'),
+                shifted_key: None,
+                base_layout_key: None,
+                modifiers: KeyModifiers::default(),
+                kind: KeyEventKind::Press,
+                text: Some("a"),
+            })
+            .unwrap()
+            .as_bytes(),
+        b"\x1b[97;1;97u"
+    );
+    // Base layout key without shifted key uses double colon.
+    assert_eq!(
+        modes
+            .encode_key_event(KeyEvent {
+                key: KeyInput::Character('й'),
+                shifted_key: None,
+                base_layout_key: Some('q'),
+                modifiers: KeyModifiers {
+                    control: true,
+                    ..KeyModifiers::default()
+                },
+                kind: KeyEventKind::Press,
+                text: None,
+            })
+            .unwrap()
+            .as_bytes(),
+        b"\x1b[1081::113;5u"
+    );
+}

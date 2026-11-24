@@ -8,11 +8,20 @@ use super::theme::Preference;
 pub(super) const MIN_FONT_SIZE: f32 = 8.0;
 pub(super) const MAX_FONT_SIZE: f32 = 32.0;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum ClipboardPolicy {
+    #[default]
+    Allow,
+    Deny,
+}
+
 pub(super) struct Config {
     pub(super) font_family: Option<String>,
     pub(super) font_size_points: f32,
     pub(super) font_ligatures: bool,
     pub(super) theme: Preference,
+    pub(super) clipboard_write: ClipboardPolicy,
+    pub(super) clipboard_read: ClipboardPolicy,
 }
 
 impl Default for Config {
@@ -22,6 +31,8 @@ impl Default for Config {
             font_size_points: 15.0,
             font_ligatures: true,
             theme: Preference::System,
+            clipboard_write: ClipboardPolicy::Allow,
+            clipboard_read: ClipboardPolicy::Deny,
         }
     }
 }
@@ -77,9 +88,25 @@ impl Config {
                     .parse()
                     .map_err(|_| "font-ligatures must be true or false")?;
             }
+            "clipboard-write" => {
+                self.clipboard_write = parse_clipboard_policy(value)?;
+            }
+            "clipboard-read" => {
+                self.clipboard_read = parse_clipboard_policy(value)?;
+            }
             _ => return Err("unknown setting"),
         }
         Ok(())
+    }
+}
+
+fn parse_clipboard_policy(value: &str) -> Result<ClipboardPolicy, &'static str> {
+    if value.eq_ignore_ascii_case("allow") {
+        Ok(ClipboardPolicy::Allow)
+    } else if value.eq_ignore_ascii_case("deny") {
+        Ok(ClipboardPolicy::Deny)
+    } else {
+        Err("clipboard policy must be allow or deny")
     }
 }
 
@@ -119,10 +146,13 @@ mod tests {
     fn invalid_settings_preserve_valid_font_overrides() {
         let config = Config::parse(
             "# Font settings\r\nfont-family = Fixture Mono\r\nfont-size=19.5\r\n\
+             clipboard-write = deny\r\nclipboard-read = allow\r\nclipboard-read = invalid\r\n\
              font-family=\r\nunknown-key=true\r\nfont-size=NaN\r\nfont-size=33\r\n",
             Path::new(""),
         );
         assert_eq!(config.font_family.as_deref(), Some("Fixture Mono"));
         assert_eq!(config.font_size_points, 19.5);
+        assert_eq!(config.clipboard_write, super::ClipboardPolicy::Deny);
+        assert_eq!(config.clipboard_read, super::ClipboardPolicy::Allow);
     }
 }

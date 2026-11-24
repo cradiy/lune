@@ -166,7 +166,7 @@ fn titles_reject_invalid_and_oversized_commands_without_publishing_prefixes() {
     let mut cases = vec![
         b"2".to_vec(),
         b"1;icon".to_vec(),
-        b"8;;link".to_vec(),
+        b"999;unknown".to_vec(),
         b"-2;bad".to_vec(),
         b"65536;bad".to_vec(),
         b"000002;bad".to_vec(),
@@ -701,4 +701,159 @@ fn sized_text_survives_reflow_until_a_row_is_evicted() {
 
     screen.set_history_limits(HistoryLimits::default()).unwrap();
     assert!(screen.grid().row(0).unwrap().sized_text_at(0).is_none());
+}
+
+#[test]
+fn osc52_decodes_writes_queries_and_rejects_malformed_payloads_across_splits() {
+    use crate::{ClipboardTargets, ClipboardWrite};
+
+    let wire = b"\x1b]52;c;SGVsbG8g5LiW55WM\x07\x1b]52;p;?\x1b\\";
+    for split in 0..=wire.len() {
+        let mut processor = support::processor();
+        let mut screen = Screen::new(8, 4).unwrap();
+        advance(&mut processor, &mut screen, &wire[..split]);
+        advance(&mut processor, &mut screen, &wire[split..]);
+        let notifications = processor.take_notifications();
+        assert_eq!(
+            notifications.clipboard_write,
+            Some(ClipboardWrite {
+                targets: ClipboardTargets {
+                    clipboard: true,
+                    primary: false,
+                },
+                text: "Hello 世界",
+            })
+        );
+        let query = notifications.clipboard_query.unwrap();
+        assert_eq!(
+            query.targets,
+            ClipboardTargets {
+                clipboard: false,
+                primary: true,
+            }
+        );
+        let mut reply = Vec::new();
+        query.encode_reply("ok!", &mut reply).unwrap();
+        assert_eq!(reply, b"\x1b]52;p;b2sh\x1b\\");
+        assert_eq!(processor.ignored_sequences(), 0);
+    }
+
+    // Empty selection defaults to clipboard; empty payload clears; invalid base64/UTF-8 ignored.
+    let mut processor = support::processor();
+    let mut screen = Screen::new(8, 4).unwrap();
+    advance(&mut processor, &mut screen, b"\x1b]52;;\x07");
+    let notifications = processor.take_notifications();
+    assert_eq!(
+        notifications.clipboard_write,
+        Some(ClipboardWrite {
+            targets: ClipboardTargets {
+                clipboard: true,
+                primary: false,
+            },
+            text: "",
+        })
+    );
+
+    advance(
+        &mut processor,
+        &mut screen,
+        b"\x1b]52;c;!!!\x07\x1b]52;c;/w==\x07\x1b]52;c;?extra\x07\x1b]52;x;YQ==\x07",
+    );
+    let notifications = processor.take_notifications();
+    assert!(notifications.clipboard_write.is_none());
+    assert!(notifications.clipboard_query.is_none());
+    assert_eq!(processor.ignored_sequences(), 4);
+}
+
+#[test]
+fn osc8_hyperlinks_survive_sgr_reset_reflow_and_reclaim_on_collection() {
+    use crate::{HyperlinkId, UnicodeWriter};
+
+    let wire = b"\x1b]8;id=doc:foo=bar;https://example.com/a\x1b\\AB\x1b[0mC\x1b]8;;\x1b\\D\x1b]8;id=doc;https://example.com/a\x07E\x1b]8;;\x07";
+    for split in 0..=wire.len() {
+        let mut processor = support::processor();
+        let mut screen = Screen::new(8, 4).unwrap();
+        let mut writer = UnicodeWriter::default();
+        processor
+            .advance(&wire[..split], &mut screen, &mut writer)
+            .unwrap();
+        processor
+            .advance(&wire[split..], &mut screen, &mut writer)
+            .unwrap();
+        let row = screen.grid().row(0).unwrap();
+        let link_a = processor
+            .styles()
+            .get(row.cells()[0].style())
+            .unwrap()
+            .hyperlink;
+        let link_c = processor
+            .styles()
+            .get(row.cells()[2].style())
+            .unwrap()
+            .hyperlink;
+        let link_d = processor
+            .styles()
+            .get(row.cells()[3].style())
+            .unwrap()
+            .hyperlink;
+        let link_e = processor
+            .styles()
+            .get(row.cells()[4].style())
+            .unwrap()
+            .hyperlink;
+        let erased = processor
+            .styles()
+            .get(row.cells()[5].style())
+            .unwrap()
+            .hyperlink;
+        assert_ne!(link_a, HyperlinkId(0));
+        assert_eq!(link_a, link_c);
+        assert_eq!(link_a, link_e);
+        assert_eq!(link_d, HyperlinkId(0));
+        assert_eq!(erased, HyperlinkId(0));
+        let link = processor.hyperlinks().get(link_a).unwrap();
+        assert_eq!(link.uri(), "https://example.com/a");
+        assert_eq!(link.id(), Some("doc"));
+        assert_eq!(processor.ignored_sequences(), 0);
+    }
+
+    // Erased cells while a hyperlink is open do not inherit the hyperlink,
+    // reflow preserves hyperlinks, and GC reclaims them once cleared.
+    let mut processor = support::processor();
+    let mut screen = Screen::new(6, 4).unwrap();
+    let mut writer = UnicodeWriter::default();
+    processor
+        .advance(
+            b"\x1b]8;;https://example.com/reflow\x1b\\HelloWorld\x1b[K",
+            &mut screen,
+            &mut writer,
+        )
+        .unwrap();
+    screen.reflow(4, 4, StyleId(0)).unwrap();
+    let row1 = screen.grid().row(1).unwrap();
+    let link_id = processor
+        .styles()
+        .get(row1.cells()[0].style())
+        .unwrap()
+        .hyperlink;
+    assert_eq!(
+        processor.hyperlinks().get(link_id).unwrap().uri(),
+        "https://example.com/reflow"
+    );
+    // Erased cells on row 2 have no hyperlink even though OSC 8 is still open.
+    let row2 = screen.grid().row(2).unwrap();
+    assert_eq!(
+        processor
+            .styles()
+            .get(row2.cells()[3].style())
+            .unwrap()
+            .hyperlink,
+        HyperlinkId(0)
+    );
+    processor
+        .advance(b"\x1b]8;;\x1b\\\x1b[2J", &mut screen, &mut writer)
+        .unwrap();
+    assert!(processor.collect_styles(&screen, []).unwrap() > 0);
+    assert!(processor.hyperlinks().get(link_id).is_none());
+    assert!(processor.hyperlinks().is_empty());
 }

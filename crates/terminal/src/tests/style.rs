@@ -22,6 +22,7 @@ fn rendition_composes_in_order_and_resets_independent_attributes() {
             foreground: Color::Indexed(1),
             background: Color::Indexed(12),
             underline_color: Color::Default,
+            hyperlink: crate::HyperlinkId(0),
             bold: true,
             faint: true,
             italic: true,

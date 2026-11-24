@@ -7,11 +7,11 @@ use std::time::{Duration, Instant};
 use lune_pty::{ChildExit, Pty, PtySize};
 use lune_terminal::{
     CellPosition, Color, ColorScheme, CursorAppearance, DisplayUnit, GRAPHICS_PLACEHOLDER,
-    GraphicsImage, GraphicsImageStore, GraphicsPlacement, HistoryLimits, Key, KeySequence,
-    MAX_STYLES, Modifiers, MouseEvent, MouseFormat, MouseSequence, MouseTracking, Palette,
-    PaletteEntry, PixelPosition, ProcessFailure, Processor, Rgb, Row, RowRevision, Screen,
-    ScreenBuffer, StorageError, Style, StyleError, StyleId, StyleRun, StyleTable,
-    TerminalNotifications, TextSink, UnicodeWriter, Viewport,
+    GraphicsImage, GraphicsImageStore, GraphicsPlacement, HistoryLimits, Key, KeyEvent,
+    KeyEventKind, KeySequence, MAX_STYLES, Modifiers, MouseEvent, MouseFormat, MouseSequence,
+    MouseTracking, Palette, PaletteEntry, PixelPosition, ProcessFailure, Processor, Rgb, Row,
+    RowRevision, Screen, ScreenBuffer, StorageError, Style, StyleError, StyleId, StyleRun,
+    StyleTable, TerminalNotifications, TextSink, UnicodeWriter, Viewport,
 };
 
 use crate::{GridGeometry, PixelRect};
@@ -561,6 +561,14 @@ impl<T: Read + Write> Session<T> {
         self.queue_key_sequence(KeySequence::from_character(character, modifiers), repeat)
     }
 
+    /// Queues a rich keyboard event using active Kitty keyboard protocol or legacy encoding.
+    pub fn queue_key_event(&mut self, event: KeyEvent<'_>) -> io::Result<bool> {
+        self.queue_key_sequence(
+            self.processor.input_modes().encode_key_event(event),
+            event.kind == KeyEventKind::Repeat,
+        )
+    }
+
     fn queue_key_sequence(
         &mut self,
         sequence: Option<KeySequence>,
@@ -793,8 +801,20 @@ impl<T: Read + Write> Session<T> {
                 Err(error) => {
                     // An empty suffix can still have a pending processor event.
                     bytes.start += error.consumed;
-                    if !matches!(error.error, ProcessFailure::ReplyPending) {
-                        return Err(io::Error::other(error.error));
+                    match error.error {
+                        ProcessFailure::ReplyPending => {}
+                        ProcessFailure::Style(StyleError::CapacityExceeded) => {
+                            if self
+                                .processor
+                                .collect_styles(&self.screen, [])
+                                .map_err(io::Error::other)?
+                                == 0
+                            {
+                                return Err(io::Error::other(StyleError::CapacityExceeded));
+                            }
+                            continue;
+                        }
+                        other => return Err(io::Error::other(other)),
                     }
                 }
             }

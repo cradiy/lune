@@ -19,7 +19,7 @@ fn color_key(color: Color) -> u64 {
 }
 
 #[derive(Default, PartialEq, Eq)]
-struct StyleKey([u8; 12]);
+struct StyleKey([u8; 16]);
 
 impl std::hash::Hash for StyleKey {
     #[inline]
@@ -40,9 +40,10 @@ fn key(style: Style) -> StyleKey {
         | (u64::from(style.underline as u8) << 7);
     let base =
         color_key(style.foreground) | (color_key(style.background) << 25) | (attributes << 50);
-    let mut bytes = [0; 12];
+    let mut bytes = [0; 16];
     bytes[..8].copy_from_slice(&base.to_ne_bytes());
-    bytes[8..].copy_from_slice(&(color_key(style.underline_color) as u32).to_ne_bytes());
+    bytes[8..12].copy_from_slice(&(color_key(style.underline_color) as u32).to_ne_bytes());
+    bytes[12..16].copy_from_slice(&style.hyperlink.0.to_ne_bytes());
     StyleKey(bytes)
 }
 
@@ -127,6 +128,10 @@ impl StyleTable {
     /// Number of live entries, including default rendition.
     pub fn style_count(&self) -> usize {
         self.styles.len() + 1
+    }
+
+    pub(crate) fn live_styles(&self) -> impl Iterator<Item = &Style> {
+        self.slots.iter().filter_map(|slot| slot.style.as_ref())
     }
 
     /// Resolves an ID in constant time. Reclaimed or unknown IDs return `None`.

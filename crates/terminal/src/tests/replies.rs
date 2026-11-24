@@ -834,3 +834,109 @@ fn mode_replies_capture_state_before_backpressure_and_follow_stream_reset_rules(
         .unwrap();
     assert_eq!(processor.reply_bytes(), b"\x1b[?1004;2$y");
 }
+
+#[test]
+fn grapheme_clustering_mode_reports_permanently_set_and_accepts_toggles() {
+    let wire = b"\x1b[?2027$p\x1b[?2027h\x1b[?2027$p\x1b[?2027l\x1b[?2027$p\x1b[?7;2027l\x1b[?7$p";
+    for split in 0..=wire.len() {
+        let mut screen = Screen::new(8, 4).unwrap();
+        let mut processor = support::processor();
+        let mut output = Vec::new();
+        drive(&mut processor, &mut screen, &wire[..split], &mut output);
+        drive(&mut processor, &mut screen, &wire[split..], &mut output);
+        assert_eq!(
+            output,
+            b"\x1b[?2027;3$y\x1b[?2027;3$y\x1b[?2027;3$y\x1b[?7;2$y"
+        );
+        assert_eq!(
+            (processor.parse_errors(), processor.ignored_sequences()),
+            (0, 0)
+        );
+    }
+}
+
+#[test]
+fn termcap_queries_encode_supported_and_unknown_entries_in_order_across_splits() {
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02X}")).collect()
+    }
+
+    let wire = format!(
+        "\x1bP+q{};{};{};{};{};{};{};{};{};{};{};5a\x1b\\TAIL",
+        hex(b"TN").to_lowercase(),
+        hex(b"Co"),
+        hex(b"colors"),
+        hex(b"RGB"),
+        hex(b"Tc"),
+        hex(b"Sync"),
+        hex(b"Smulx"),
+        hex(b"Setulc"),
+        hex(b"Ms"),
+        hex(b"unknown"),
+        "ZZ",
+    );
+    let expected = format!(
+        "\x1bP1+r{}={}\x1b\\\
+         \x1bP1+r{}={}\x1b\\\
+         \x1bP1+r{}={}\x1b\\\
+         \x1bP1+r{}\x1b\\\
+         \x1bP1+r{}\x1b\\\
+         \x1bP1+r{}\x1b\\\
+         \x1bP1+r{}={}\x1b\\\
+         \x1bP1+r{}={}\x1b\\\
+         \x1bP1+r{}={}\x1b\\\
+         \x1bP0+r{}\x1b\\\
+         \x1bP0+r\x1b\\\
+         \x1bP0+r{}\x1b\\",
+        hex(b"TN"),
+        hex(b"xterm-256color"),
+        hex(b"Co"),
+        hex(b"256"),
+        hex(b"colors"),
+        hex(b"256"),
+        hex(b"RGB"),
+        hex(b"Tc"),
+        hex(b"Sync"),
+        hex(b"Smulx"),
+        hex(b"\x1b[4:%p1%dm"),
+        hex(b"Setulc"),
+        hex(b"\x1b[58:2::%p1%{65536}%/%d:%p1%{256}%/%{255}%&%d:%p1%{255}%&%d%;m"),
+        hex(b"Ms"),
+        hex(b"\x1b]52;%p1%s;%p2%s\x1b\\"),
+        hex(b"unknown"),
+        hex(b"Z"),
+    );
+
+    for chunk in [1, 2, 17, wire.len()] {
+        let mut screen = Screen::new(8, 4).unwrap();
+        let mut processor = support::processor();
+        let mut output = Vec::new();
+        for bytes in wire.as_bytes().chunks(chunk) {
+            drive(&mut processor, &mut screen, bytes, &mut output);
+        }
+        assert_eq!(output, expected.as_bytes());
+        assert_eq!(
+            screen.grid().row(0).unwrap().text(0),
+            Some(crate::CellText::Scalar('T'))
+        );
+        assert_eq!(
+            (processor.parse_errors(), processor.ignored_sequences()),
+            (0, 0)
+        );
+    }
+
+    // Oversized batches discard cleanly without partial replies.
+    let mut oversized = b"\x1bP+q".to_vec();
+    for index in 0..=crate::MAX_TERMCAP_QUERIES {
+        if index != 0 {
+            oversized.push(b';');
+        }
+        oversized.extend_from_slice(b"544E");
+    }
+    oversized.extend_from_slice(b"\x1b\\");
+    let mut screen = Screen::new(8, 4).unwrap();
+    let mut processor = support::processor();
+    let mut output = Vec::new();
+    drive(&mut processor, &mut screen, &oversized, &mut output);
+    assert!(output.is_empty());
+}

@@ -76,6 +76,7 @@ const BOLD: Style = Style {
     foreground: Color::Default,
     background: Color::Default,
     underline_color: Color::Default,
+    hyperlink: crate::HyperlinkId(0),
     bold: true,
     faint: false,
     italic: false,

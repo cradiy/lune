@@ -4,8 +4,8 @@ use std::ops::Range;
 
 use guillotiere::{Allocation, AtlasAllocator, size2};
 use lune_terminal::{
-    CellPosition, CellText, Color, CursorShape, DisplayUnit, PaletteEntry, PixelPosition,
-    PixelSize, Rgb, SizedTextRow, Style, Underline,
+    CellText, Color, CursorShape, DisplayUnit, HyperlinkId, PaletteEntry, PixelPosition, PixelSize,
+    Rgb, SizedTextRow, Style, Underline,
 };
 
 use crate::gpu::{create_quad_pipeline, linear_colors, write_instances};
@@ -13,6 +13,7 @@ use crate::{PixelRect, PresentationFrame, PresentationStyle, PresentedCursor};
 
 use super::font::{Font, FontMetrics};
 use super::ligature;
+use super::paint::Overlay;
 use super::tab_bar;
 
 const ATLAS_SIDE: i32 = 1024;
@@ -224,11 +225,20 @@ impl TextRenderer {
         &mut self,
         frame: &PresentationFrame<'_>,
         cursor: Option<PresentedCursor>,
-        selection: Option<&Range<CellPosition>>,
-        preedit: &str,
-        vi: Option<&super::vi::Mode>,
-        tab_bar: &tab_bar::View<'_>,
+        overlay: &Overlay<'_>,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        let Overlay {
+            selection,
+            hovered_hyperlink,
+            preedit,
+            vi,
+            tab_bar,
+            ..
+        } = overlay;
+        let selection = *selection;
+        let hovered_hyperlink = *hovered_hyperlink;
+        let preedit = *preedit;
+        let vi = *vi;
         self.area = frame.geometry.text_area_pixels().unwrap();
         self.generation += 1;
         self.evicted = false;
@@ -359,7 +369,23 @@ impl TextRenderer {
                             }
                         }
                     }
-                    if style.style.strikethrough || style.style.underline != Underline::None {
+                    let link = style.style.hyperlink;
+                    let mut link_style = *style.style;
+                    let decorated = if link != HyperlinkId(0) {
+                        if hovered_hyperlink == Some(link) {
+                            link_style.underline = Underline::Curly;
+                        } else if link_style.underline == Underline::None {
+                            link_style.underline = Underline::Single;
+                        }
+                        PresentationStyle {
+                            style: &link_style,
+                            ..style
+                        }
+                    } else {
+                        style
+                    };
+                    if decorated.style.strikethrough || decorated.style.underline != Underline::None
+                    {
                         let mut columns = run.columns();
                         while let Some(part) = sized.peek().map(|part| part.columns()) {
                             if part.start >= columns.end {
@@ -370,7 +396,7 @@ impl TextRenderer {
                                     frame,
                                     row,
                                     columns.start..part.start,
-                                    style,
+                                    decorated,
                                     alpha,
                                 );
                             }
@@ -380,7 +406,7 @@ impl TextRenderer {
                             }
                             sized.next();
                         }
-                        self.row_decorations(frame, row, columns, style, alpha);
+                        self.row_decorations(frame, row, columns, decorated, alpha);
                     }
                 }
             }
@@ -425,7 +451,22 @@ impl TextRenderer {
                     let rendition =
                         usize::from(style.style.bold) | (usize::from(style.style.italic) << 1);
                     self.sized_glyph(area, part.text(), rendition, style.foreground, alpha);
-                    self.decorations(area, style, alpha);
+                    let link = style.style.hyperlink;
+                    let mut link_style = *style.style;
+                    let decorated = if link != HyperlinkId(0) {
+                        if hovered_hyperlink == Some(link) {
+                            link_style.underline = Underline::Curly;
+                        } else if link_style.underline == Underline::None {
+                            link_style.underline = Underline::Single;
+                        }
+                        PresentationStyle {
+                            style: &link_style,
+                            ..style
+                        }
+                    } else {
+                        style
+                    };
+                    self.decorations(area, decorated, alpha);
                 }
                 if let Some(cursor) = covering {
                     let mut edge = rect;
@@ -968,11 +1009,58 @@ impl TextRenderer {
         }
         if style.style.underline != Underline::None {
             let y = (baseline + thickness).min(height - thickness);
-            line(y, style.underline_color);
-            if style.style.underline == Underline::Double {
-                let second = y.saturating_sub(2 * thickness);
-                if second != y {
-                    line(second, style.underline_color);
+            match style.style.underline {
+                Underline::None => {}
+                Underline::Single => line(y, style.underline_color),
+                Underline::Double => {
+                    line(y, style.underline_color);
+                    let second = y.saturating_sub(2 * thickness);
+                    if second != y {
+                        line(second, style.underline_color);
+                    }
+                }
+                Underline::Curly => {
+                    let band_height = (thickness * 3 + 1).min(height).max(3.min(height));
+                    let wave_y = (baseline + 1).min(height.saturating_sub(band_height));
+                    if let Some((rect, _)) = area.slice(area.font.cell.width, wave_y, band_height) {
+                        let period = (thickness * 6).max(6);
+                        let packed =
+                            (thickness.min(255)) | ((band_height.min(255)) << 8) | (period << 16);
+                        let half_height = rect.size.height.get() as f32 * 0.5;
+                        self.quad(
+                            rect,
+                            style.underline_color,
+                            alpha,
+                            [
+                                rect.origin.x as f32,
+                                -half_height,
+                                rect.size.width.get() as f32,
+                                rect.size.height.get() as f32,
+                            ],
+                            [3, packed],
+                        );
+                    }
+                }
+                Underline::Dotted | Underline::Dashed => {
+                    if let Some((rect, _)) = area.slice(area.font.cell.width, y, thickness) {
+                        let mode = if style.style.underline == Underline::Dotted {
+                            4
+                        } else {
+                            5
+                        };
+                        self.quad(
+                            rect,
+                            style.underline_color,
+                            alpha,
+                            [
+                                rect.origin.x as f32,
+                                0.0,
+                                rect.size.width.get() as f32,
+                                rect.size.height.get() as f32,
+                            ],
+                            [mode, thickness.min(255)],
+                        );
+                    }
                 }
             }
         }

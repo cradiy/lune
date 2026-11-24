@@ -5,18 +5,20 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use lune_terminal::{
-    CellPosition, ColorScheme, HistoryLimits, MouseButton, MouseEvent, MouseTracking, Palette,
-    PixelPosition, PixelSize, ScreenBuffer,
+    CellPosition, ClipboardQuery, ColorScheme, HistoryLimits, HyperlinkId, MouseButton, MouseEvent,
+    MouseTracking, Palette, PixelPosition, PixelSize, ScreenBuffer,
 };
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, Ime, KeyEvent, MouseScrollDelta};
 use winit::event_loop::EventLoopProxy;
 use winit::keyboard::ModifiersState;
-use winit::window::{UserAttentionType, Window};
+use winit::window::{CursorIcon, UserAttentionType, Window};
 
 use crate::{GridGeometry, MAX_INPUT_BYTES, Session, SessionReady, WaitOutcome};
 
 use super::clipboard::{self, ClipboardType};
+use super::config::ClipboardPolicy;
+use super::directory;
 use super::input::{self, Input};
 use super::readiness::{Readiness, Registration};
 use super::{Event, PASTE_TIMEOUT, Result, TabId, selection, vi};
@@ -47,6 +49,8 @@ pub(super) struct Tab {
     selection_click: Option<selection::Click>,
     pub(super) selection_drag: Option<selection::Drag>,
     pub(super) selection: Option<selection::Selection>,
+    pub(super) hovered_hyperlink: Option<HyperlinkId>,
+    hyperlink_click: Option<HyperlinkId>,
     pub(super) vi: Option<vi::Mode>,
     pub(super) vi_search: Option<vi::Search>,
 }
@@ -104,6 +108,8 @@ impl Tab {
             selection_click: None,
             selection_drag: None,
             selection: None,
+            hovered_hyperlink: None,
+            hyperlink_click: None,
             vi: None,
             vi_search: None,
         })
@@ -131,6 +137,7 @@ impl Tab {
             }
             self.selection_click = None;
             self.selection_drag = None;
+            self.hyperlink_click = None;
             if let Some(vi) = &mut self.vi {
                 vi.cancel_pending();
             }
@@ -148,6 +155,38 @@ impl Tab {
         } else {
             self.mouse_event(MouseEvent::Motion(self.pressed));
         }
+        self.update_hovered_hyperlink();
+    }
+
+    pub(super) fn update_hovered_hyperlink(&mut self) {
+        let ctrl_only = self.modifiers.control_key()
+            && !self.modifiers.alt_key()
+            && !self.modifiers.super_key();
+        let active_hover = self.active
+            && self.vi.is_none()
+            && self.selection_drag.is_none()
+            && (!self.mouse_reporting() || ctrl_only);
+        let next = active_hover.then(|| self.hyperlink_at_pointer()).flatten();
+        if self.hovered_hyperlink != next {
+            self.hovered_hyperlink = next;
+            if self.active {
+                self.window.set_cursor(if next.is_some() {
+                    CursorIcon::Pointer
+                } else {
+                    CursorIcon::Default
+                });
+            }
+            self.invalidate_overlay();
+        }
+    }
+
+    fn hyperlink_at_pointer(&self) -> Option<HyperlinkId> {
+        let pixel = self.pointer_pixel(false)?;
+        let cell = self.session.geometry().cell_at(pixel)?;
+        let row = self.session.screen().viewport().row(cell.row)?;
+        let style_id = row.cells().get(cell.column)?.style();
+        let link = self.session.processor().styles().get(style_id)?.hyperlink;
+        (link != HyperlinkId(0)).then_some(link)
     }
 
     pub(super) fn label(&self) -> &str {
@@ -192,7 +231,15 @@ impl Tab {
         }
     }
 
-    pub(super) fn dispatch(&mut self, ready: SessionReady, focused: bool) -> Result<bool> {
+    pub(super) fn dispatch(
+        &mut self,
+        ready: SessionReady,
+        focused: bool,
+        copy_pending: &mut bool,
+        primary: &mut Option<clipboard::Primary>,
+        clipboard_write: ClipboardPolicy,
+        clipboard_read: ClipboardPolicy,
+    ) -> Result<bool> {
         let selection_source = (self.selection.is_some()
             || self.selection_click.is_some()
             || self.selection_drag.is_some())
@@ -235,6 +282,36 @@ impl Tab {
             self.window
                 .request_user_attention(Some(UserAttentionType::Informational));
         }
+        if let Some(write) = notifications.clipboard_write
+            && clipboard_write == ClipboardPolicy::Allow
+        {
+            let text = write.text.to_owned();
+            if write.targets.clipboard && !*copy_pending {
+                match clipboard::write(text.clone(), self.proxy.clone()) {
+                    Ok(()) => *copy_pending = true,
+                    Err(error) => {
+                        log::warn!("Failed to start the OSC 52 copy worker: {error}");
+                    }
+                }
+            }
+            if write.targets.primary {
+                publish_primary_text(text, primary);
+            }
+        }
+        if let Some(query) = notifications.clipboard_query
+            && clipboard_read == ClipboardPolicy::Allow
+        {
+            let kind = if query.targets.clipboard {
+                ClipboardType::Regular
+            } else {
+                ClipboardType::Primary
+            };
+            if let Err(error) =
+                clipboard::read_osc52(kind, primary.as_ref(), self.id, query, self.proxy.clone())
+            {
+                log::warn!("Failed to start the OSC 52 read worker: {error}");
+            }
+        }
         if let Some((buffer, discarded_rows)) = selection_source {
             let screen = self.session.screen();
             let view = screen.view();
@@ -263,6 +340,7 @@ impl Tab {
         }
         self.refresh_vi();
         self.update_ime_area();
+        self.update_hovered_hyperlink();
         if self.active && self.session.presentation_frame().is_some() {
             self.window.request_redraw();
         }
@@ -420,11 +498,55 @@ impl Tab {
         }
     }
 
+    pub(super) fn finish_osc52_read(
+        &mut self,
+        query: ClipboardQuery,
+        result: std::result::Result<String, String>,
+    ) {
+        let text = match result {
+            Ok(text) => text,
+            Err(error) => {
+                log::warn!("OSC 52 clipboard read failed: {error}");
+                return;
+            }
+        };
+        let mut reply = Vec::new();
+        if let Err(error) = query.encode_reply(&text, &mut reply) {
+            log::warn!("OSC 52 reply allocation failed: {error}");
+            return;
+        }
+        for chunk in reply.chunks(MAX_INPUT_BYTES) {
+            self.push_input(Input::Raw(chunk.to_vec()));
+        }
+    }
+
     pub(super) fn key(&mut self, event: &KeyEvent, copy_pending: &mut bool) {
         if self.vi.is_some() {
             self.vi_key(event, copy_pending);
-        } else if let Some(input) = input::key(event, self.modifiers) {
-            self.follow_output();
+        } else {
+            let kitty = !self
+                .session
+                .processor()
+                .input_modes()
+                .kitty_keyboard
+                .is_empty();
+            if let Some(input) = input::key(event, self.modifiers, kitty) {
+                self.follow_output();
+                self.push_input(input);
+            }
+        }
+    }
+
+    pub(super) fn key_release(&mut self, event: &KeyEvent) {
+        if self.vi.is_none()
+            && self
+                .session
+                .processor()
+                .input_modes()
+                .kitty_keyboard
+                .report_events()
+            && let Some(input) = input::key(event, self.modifiers, true)
+        {
             self.push_input(input);
         }
     }
@@ -482,6 +604,7 @@ impl Tab {
         state: ElementState,
         button: winit::event::MouseButton,
         primary: &mut Option<clipboard::Primary>,
+        hyperlink_open_pending: &mut bool,
     ) {
         if self.vi.is_some() {
             return;
@@ -495,13 +618,31 @@ impl Tab {
             _ => return,
         };
         if state.is_pressed() {
+            let ctrl_only = self.modifiers.control_key()
+                && !self.modifiers.alt_key()
+                && !self.modifiers.super_key();
+            if button == MouseButton::Left
+                && ctrl_only
+                && let Some(link_id) = self.hyperlink_at_pointer()
+            {
+                self.open_hyperlink(link_id, hyperlink_open_pending);
+                return;
+            }
             let mouse_reporting = self.mouse_reporting();
             let local = !mouse_reporting || self.modifiers.shift_key();
             if button != MouseButton::Left || !local {
                 self.selection_click = None;
+                self.hyperlink_click = None;
             }
             if button == MouseButton::Left && local {
+                let candidate = (!self.modifiers.shift_key()
+                    && !self.modifiers.alt_key()
+                    && !self.modifiers.super_key()
+                    && !mouse_reporting)
+                    .then(|| self.hyperlink_at_pointer())
+                    .flatten();
                 self.start_selection();
+                self.hyperlink_click = candidate.filter(|_| self.selection.is_none());
             } else if button == MouseButton::Middle && local {
                 if self.pointer_pixel(false).is_some() {
                     self.paste(ClipboardType::Primary, primary.as_ref());
@@ -512,11 +653,39 @@ impl Tab {
             }
         } else if button == MouseButton::Left && self.selection_drag.is_some() {
             self.extend_selection();
+            let moved = self
+                .selection_drag
+                .as_ref()
+                .is_some_and(selection::Drag::moved);
             self.selection_drag = None;
-            self.publish_primary_selection(primary);
+            let clicked_link = self.hyperlink_click.take();
+            if !moved
+                && self.selection.is_none()
+                && let Some(link_id) = clicked_link
+                && self.hyperlink_at_pointer() == Some(link_id)
+            {
+                self.open_hyperlink(link_id, hyperlink_open_pending);
+            } else {
+                self.publish_primary_selection(primary);
+            }
+            self.update_hovered_hyperlink();
         } else if self.pressed == Some(button) {
             self.mouse_event(MouseEvent::Release(button));
             self.pressed = None;
+        }
+    }
+
+    fn open_hyperlink(&self, link_id: HyperlinkId, hyperlink_open_pending: &mut bool) {
+        if *hyperlink_open_pending {
+            return;
+        }
+        if let Some(link) = self.session.processor().hyperlinks().get(link_id) {
+            match directory::open_hyperlink(link.uri().to_owned(), self.proxy.clone()) {
+                Ok(()) => *hyperlink_open_pending = true,
+                Err(error) => {
+                    log::warn!("Failed to start the hyperlink worker: {error}");
+                }
+            }
         }
     }
 
@@ -562,7 +731,9 @@ impl Tab {
         if self.session.scroll_history(steps) {
             self.selection_click = None;
             self.selection_drag = None;
+            self.hyperlink_click = None;
             self.scroll_vi_cursor();
+            self.update_hovered_hyperlink();
             self.window.request_redraw();
         }
     }
@@ -653,6 +824,7 @@ impl Tab {
         }
         if drag.moved() {
             self.selection_click = None;
+            self.hyperlink_click = None;
         }
         let view = self.session.screen().view();
         let range = drag.range(view);
@@ -709,20 +881,8 @@ impl Tab {
     }
 
     fn publish_primary_selection(&self, primary: &mut Option<clipboard::Primary>) {
-        let Some(text) = self.selected_text() else {
-            return;
-        };
-        if primary.is_none() {
-            *primary = match clipboard::Primary::new() {
-                Ok(primary) => Some(primary),
-                Err(error) => {
-                    log::warn!("Failed to start the primary selection worker: {error}");
-                    return;
-                }
-            };
-        }
-        if let Some(primary) = primary {
-            primary.publish(text);
+        if let Some(text) = self.selected_text() {
+            publish_primary_text(text, primary);
         }
     }
 
@@ -739,5 +899,20 @@ impl Tab {
             }
             Err(error) => log::warn!("Failed to start the clipboard paste worker: {error}"),
         }
+    }
+}
+
+fn publish_primary_text(text: String, primary: &mut Option<clipboard::Primary>) {
+    if primary.is_none() {
+        *primary = match clipboard::Primary::new() {
+            Ok(primary) => Some(primary),
+            Err(error) => {
+                log::warn!("Failed to start the primary selection worker: {error}");
+                return;
+            }
+        };
+    }
+    if let Some(primary) = primary {
+        primary.publish(text);
     }
 }

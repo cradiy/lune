@@ -3,6 +3,7 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::thread;
 use std::time::Instant;
 
+use lune_terminal::{ClipboardQuery, MAX_CLIPBOARD_BYTES};
 use winit::event_loop::EventLoopProxy;
 use wl_clipboard_rs::{copy, paste};
 
@@ -51,14 +52,44 @@ pub(super) fn read(
             let deadline = Instant::now() + PASTE_TIMEOUT;
             let result = match publication {
                 Some(publication) if !publication.wait(deadline) => Err("Paste timed out".into()),
-                _ => read_text(clipboard, deadline),
+                _ => read_text(clipboard, deadline, MAX_PASTE_BYTES, true),
             };
             let _ = proxy.send_event(Event::PasteReady(tab, result));
         })?;
     Ok(())
 }
 
-fn read_text(clipboard: ClipboardType, deadline: Instant) -> Result<String, String> {
+pub(super) fn read_osc52(
+    clipboard: ClipboardType,
+    primary: Option<&Primary>,
+    tab: TabId,
+    query: ClipboardQuery,
+    proxy: EventLoopProxy<Event>,
+) -> io::Result<()> {
+    let publication = primary
+        .filter(|_| clipboard == ClipboardType::Primary)
+        .and_then(Primary::publication);
+    thread::Builder::new()
+        .name("lune-osc52-read".into())
+        .spawn(move || {
+            let deadline = Instant::now() + PASTE_TIMEOUT;
+            let result = match publication {
+                Some(publication) if !publication.wait(deadline) => {
+                    Err("Clipboard read timed out".into())
+                }
+                _ => read_text(clipboard, deadline, MAX_CLIPBOARD_BYTES, false),
+            };
+            let _ = proxy.send_event(Event::Osc52ReadReady(tab, query, result));
+        })?;
+    Ok(())
+}
+
+fn read_text(
+    clipboard: ClipboardType,
+    deadline: Instant,
+    limit: usize,
+    strip_controls: bool,
+) -> Result<String, String> {
     let mut reader =
         match paste::get_contents(clipboard, paste::Seat::Unspecified, paste::MimeType::Text) {
             Ok((pipe, _)) => pipe,
@@ -79,13 +110,15 @@ fn read_text(clipboard: ClipboardType, deadline: Instant) -> Result<String, Stri
         if count == 0 {
             break;
         }
-        if bytes.len() + count > MAX_PASTE_BYTES {
-            return Err("Clipboard text exceeds the paste size limit".into());
+        if bytes.len() + count > limit {
+            return Err("Clipboard text exceeds the size limit".into());
         }
         bytes.extend_from_slice(&chunk[..count]);
     }
     let mut text = String::from_utf8(bytes).map_err(|error| error.to_string())?;
-    text.retain(|ch| !ch.is_control() || matches!(ch, '\n' | '\r' | '\t'));
+    if strip_controls {
+        text.retain(|ch| !ch.is_control() || matches!(ch, '\n' | '\r' | '\t'));
+    }
     Ok(text)
 }
 

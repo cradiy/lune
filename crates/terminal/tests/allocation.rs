@@ -256,6 +256,44 @@ fn status_string_queries_capture_and_drain_without_allocation() {
 }
 
 #[test]
+fn termcap_queries_capture_and_drain_without_allocation() {
+    let wire = b"\x1bP+q544e;524742;536574756c63;666f6f;ZZ\x1b\\";
+    let mut screen = Screen::new(8, 4).unwrap();
+    let mut processor = support::processor();
+    let mut text = |_: &mut Screen, _: &str, _: StyleId| Ok::<_, ()>(());
+    let ((), stats) = allocator::measure(Some(0), || {
+        for chunk in [1, 17, wire.len()] {
+            let mut replies = 0;
+            for mut bytes in wire.chunks(chunk) {
+                loop {
+                    let result = processor.advance(bytes, &mut screen, &mut text);
+                    if !processor.reply_bytes().is_empty() {
+                        replies += 1;
+                        while !processor.reply_bytes().is_empty() {
+                            black_box(processor.reply_bytes()[0]);
+                            assert!(processor.consume_reply(1));
+                        }
+                    }
+                    match result {
+                        Ok(count) => {
+                            assert_eq!(count, bytes.len());
+                            break;
+                        }
+                        Err(error) => {
+                            assert!(matches!(error.error, ProcessFailure::ReplyPending));
+                            bytes = &bytes[error.consumed..];
+                        }
+                    }
+                }
+            }
+            assert_eq!(replies, 5);
+            processor.finish(&mut screen, &mut text).unwrap();
+        }
+    });
+    assert_eq!(stats.attempts, 0);
+}
+
+#[test]
 fn dcs_headers_and_raw_payloads_stream_without_allocation() {
     use lune_vt::{DcsEvent, Event, Parser};
 

@@ -3,7 +3,9 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use lune_terminal::{CellPosition, CursorAppearance, PaletteEntry, PixelPosition, ScreenBuffer};
+use lune_terminal::{
+    CellPosition, CursorAppearance, HyperlinkId, PaletteEntry, PixelPosition, ScreenBuffer,
+};
 use winit::dpi::PhysicalSize;
 use winit::window::Window;
 
@@ -24,6 +26,7 @@ const RETRY_DELAY: Duration = Duration::from_millis(16);
 
 pub(super) struct Overlay<'a> {
     pub(super) selection: Option<&'a Range<CellPosition>>,
+    pub(super) hovered_hyperlink: Option<HyperlinkId>,
     pub(super) preedit: &'a str,
     pub(super) vi: Option<&'a vi::Mode>,
     pub(super) focused: bool,
@@ -195,13 +198,12 @@ impl Painter {
         overlay: Overlay<'_>,
     ) -> Result<()> {
         let Overlay {
-            selection,
             preedit,
             vi,
             focused,
-            tab_bar,
+            ..
         } = overlay;
-        let bar_height = tab_bar.layout.height;
+        let bar_height = overlay.tab_bar.layout.height;
         let area = frame.geometry.text_area_pixels().unwrap();
         let (width, height) = (area.width.get(), area.height.get());
         if width > self.config.width || height > self.config.height.saturating_sub(bar_height) {
@@ -284,14 +286,8 @@ impl Painter {
         };
 
         if text_changed {
-            self.text.prepare(
-                frame,
-                cursor.filter(|_| !moving),
-                selection,
-                preedit,
-                vi,
-                &tab_bar,
-            )?;
+            self.text
+                .prepare(frame, cursor.filter(|_| !moving), &overlay)?;
         }
         let mut draw_moving_cursor = false;
         if let Some(position) = position
@@ -355,7 +351,7 @@ impl Painter {
                     self.text.draw(pass, draw_moving_cursor)
                 });
             if bar_height != 0 {
-                let top = tab_bar.layout.top;
+                let top = overlay.tab_bar.layout.top;
                 pass.set_viewport(
                     0.0,
                     top as f32,

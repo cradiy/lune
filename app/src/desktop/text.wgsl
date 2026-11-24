@@ -25,6 +25,34 @@ fn fragment(input: Vertex) -> @location(0) vec4f {
     if input.sprite.x == 0u {
         return input.color;
     }
+    if input.sprite.x == 3u {
+        let thickness = f32(max(input.sprite.y & 0xffu, 1u));
+        let height = f32(max((input.sprite.y >> 8u) & 0xffu, 3u));
+        let period = f32(max(input.sprite.y >> 16u, 4u));
+        let amp = max((height - thickness) * 0.5, 0.5);
+        let freq = 6.2831853 / period;
+        let phase = input.uv.x * freq;
+        let wave_y = amp * sin(phase);
+        let slope = amp * freq * cos(phase);
+        let dist = abs(input.uv.y - wave_y) * inverseSqrt(1.0 + slope * slope);
+        let cov = clamp(thickness * 0.5 + 0.5 - dist, 0.0, 1.0);
+        return vec4f(input.color.rgb, input.color.a * cov);
+    }
+    if input.sprite.x == 4u {
+        let thickness = f32(max(input.sprite.y & 0xffu, 1u));
+        let step = max(thickness * 2.0, 2.0);
+        let local = fract(input.uv.x / step) * step;
+        let cov = select(0.0, 1.0, local < thickness);
+        return vec4f(input.color.rgb, input.color.a * cov);
+    }
+    if input.sprite.x == 5u {
+        let thickness = f32(max(input.sprite.y & 0xffu, 1u));
+        let dash = max(thickness * 4.0, 4.0);
+        let step = dash * 2.0;
+        let local = fract(input.uv.x / step) * step;
+        let cov = select(0.0, 1.0, local < dash);
+        return vec4f(input.color.rgb, input.color.a * cov);
+    }
     let glyph = textureLoad(atlas, vec2i(input.uv), i32(input.sprite.y), 0);
     let color = select(input.color.rgb, glyph.rgb, input.sprite.x == 2u);
     return vec4f(color, glyph.a * input.color.a);

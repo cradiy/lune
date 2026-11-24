@@ -18,18 +18,63 @@ pub(super) fn open(uri: Option<String>, proxy: EventLoopProxy<Event>) -> io::Res
     Ok(())
 }
 
+pub(super) fn open_hyperlink(uri: String, proxy: EventLoopProxy<Event>) -> io::Result<()> {
+    thread::Builder::new()
+        .name("lune-open-hyperlink".into())
+        .spawn(move || {
+            let _ = proxy.send_event(Event::HyperlinkOpened(open_uri(&uri)));
+        })?;
+    Ok(())
+}
+
+fn local_hostname(buffer: &mut [u8; 256]) -> &[u8] {
+    // SAFETY: The destination buffer is writable for the supplied length.
+    let result = unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) };
+    if result == 0 {
+        buffer.split(|&byte| byte == 0).next().unwrap_or_default()
+    } else {
+        &[]
+    }
+}
+
+fn open_uri(uri: &str) -> io::Result<()> {
+    let mut hostname = [0; 256];
+    let target = hyperlink_target(uri, local_hostname(&mut hostname))
+        .ok_or_else(|| io::Error::other("Unsupported or invalid hyperlink URI"))?;
+    let status = Command::new("xdg-open")
+        .arg(target)
+        .stdin(Stdio::null())
+        .status()?;
+    if !status.success() {
+        return Err(io::Error::other(format!("xdg-open returned {status}")));
+    }
+    Ok(())
+}
+
+fn hyperlink_target(uri: &str, hostname: &[u8]) -> Option<OsString> {
+    if uri.is_empty() || uri.bytes().any(|b| b <= 0x20 || b == 0x7f) {
+        return None;
+    }
+    let (scheme, rest) = uri.split_once(':')?;
+    if scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https") {
+        let authority = rest.strip_prefix("//")?;
+        let host = authority.split('/').next().unwrap_or_default();
+        return (!host.is_empty()).then(|| OsString::from(uri));
+    }
+    if scheme.eq_ignore_ascii_case("mailto") {
+        return (!rest.is_empty()).then(|| OsString::from(uri));
+    }
+    if scheme.eq_ignore_ascii_case("file") {
+        return local_path(uri, hostname).map(PathBuf::into_os_string);
+    }
+    None
+}
+
 fn open_directory(uri: Option<&str>) -> io::Result<()> {
     let path = match uri {
         Some(uri) => {
             let mut hostname = [0; 256];
-            // SAFETY: The destination buffer is writable for the supplied length.
-            let result = unsafe { libc::gethostname(hostname.as_mut_ptr().cast(), hostname.len()) };
-            let local = if result == 0 {
-                hostname.split(|&byte| byte == 0).next().unwrap_or_default()
-            } else {
-                &[]
-            };
-            local_path(uri, local)
+            local_path(uri, local_hostname(&mut hostname))
                 .ok_or_else(|| io::Error::other("The shell did not report a local directory"))?
         }
         None => std::env::current_dir()?,
@@ -81,8 +126,40 @@ fn local_path(uri: &str, hostname: &[u8]) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::local_path;
+    use super::{hyperlink_target, local_path};
+    use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
+
+    #[test]
+    fn hyperlink_targets_allow_only_safe_schemes() {
+        let host = b"local.example.test";
+        assert_eq!(
+            hyperlink_target("https://example.com/docs", host).as_deref(),
+            Some(OsStr::new("https://example.com/docs"))
+        );
+        assert_eq!(
+            hyperlink_target("HTTP://example.com", host).as_deref(),
+            Some(OsStr::new("HTTP://example.com"))
+        );
+        assert_eq!(
+            hyperlink_target("mailto:dev@example.com", host).as_deref(),
+            Some(OsStr::new("mailto:dev@example.com"))
+        );
+        assert_eq!(
+            hyperlink_target("file://localhost/tmp/test.txt", host).as_deref(),
+            Some(OsStr::new("/tmp/test.txt"))
+        );
+        for bad in [
+            "",
+            "https://",
+            "https://example.com/has space",
+            "javascript:alert(1)",
+            "file://remote.example.test/etc/passwd",
+            "mailto:",
+        ] {
+            assert!(hyperlink_target(bad, host).is_none(), "{bad}");
+        }
+    }
 
     #[test]
     fn directory_reports_decode_only_local_file_paths() {

@@ -2,14 +2,17 @@ use std::num::NonZeroU32;
 
 use lune_vt::{ControlSequence, OscTerminator, Parameter};
 
-use crate::dcs::StatusQuery;
+use crate::dcs::{MAX_TERMCAP_NAME_BYTES, StatusQuery, Termcap, TermcapReply};
 use crate::{
     Color, CursorShape, InputModes, MouseFormat, MouseTracking, Rgb, Screen, ScreenBuffer, Style,
     StyleId, StyleTable, Underline,
 };
 
-// A full DECRQSS rendition reply fits in 78 bytes.
+// A full DECRQSS rendition reply fits in 78 bytes; Setulc XTGETTCAP fits in 134 bytes.
 const CAPACITY: usize = lune_kitty_graphics::MAX_FEATURE_REPLY_BYTES;
+const MAX_TERMCAP_VALUE_BYTES: usize = Termcap::Setulc.value().unwrap().len();
+const _: () =
+    assert!(5 + MAX_TERMCAP_NAME_BYTES * 2 + 1 + MAX_TERMCAP_VALUE_BYTES * 2 + 2 <= CAPACITY);
 const VERSION_REPLY: &[u8] = concat!(
     "\x1bP>|",
     env!("CARGO_PKG_NAME"),
@@ -62,6 +65,7 @@ pub(crate) enum Report {
     PrimaryDeviceAttributes,
     Version,
     ColorScheme(ColorScheme),
+    KittyKeyboard(u8),
 }
 
 #[derive(Clone, Copy)]
@@ -179,10 +183,50 @@ impl StatusReport {
 }
 
 #[derive(Clone, Copy)]
+enum ModeStatus {
+    NotRecognized,
+    Set,
+    Reset,
+    PermanentlySet,
+}
+
+impl ModeStatus {
+    fn from_bool(enabled: bool) -> Self {
+        if enabled { Self::Set } else { Self::Reset }
+    }
+}
+
+#[derive(Clone, Copy)]
 pub(crate) struct ModeReport {
     private: bool,
     selector: u16,
-    enabled: Option<bool>,
+    status: ModeStatus,
+}
+
+impl TermcapReply {
+    #[cold]
+    pub(crate) fn encode(self, reply: &mut Reply) {
+        reply.clear();
+        match self {
+            Self::Supported(cap) => {
+                reply.append(b"\x1bP1+r");
+                reply.hex_upper(cap.name());
+                if let Some(value) = cap.value() {
+                    reply.append(b"=");
+                    reply.hex_upper(value);
+                }
+                reply.append(b"\x1b\\");
+            }
+            Self::Unsupported { name, len } => {
+                reply.append(b"\x1bP0+r");
+                reply.hex_upper(&name[..usize::from(len)]);
+                reply.append(b"\x1b\\");
+            }
+            Self::Invalid => {
+                reply.append(b"\x1bP0+r\x1b\\");
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -253,6 +297,12 @@ impl Report {
                     ColorScheme::Dark => b"\x1b[?997;1n",
                     ColorScheme::Light => b"\x1b[?997;2n",
                 });
+            }
+            Self::KittyKeyboard(flags) => {
+                reply.clear();
+                reply.append(b"\x1b[?");
+                reply.number(u16::from(flags));
+                reply.append(b"u");
             }
         }
     }
@@ -370,6 +420,13 @@ impl Reply {
         let end = usize::from(self.end);
         self.bytes[end..end + bytes.len()].copy_from_slice(bytes);
         self.end += bytes.len() as u16;
+    }
+
+    fn hex_upper(&mut self, bytes: &[u8]) {
+        const HEX: &[u8; 16] = b"0123456789ABCDEF";
+        for &byte in bytes {
+            self.append(&[HEX[usize::from(byte >> 4)], HEX[usize::from(byte & 15)]]);
+        }
     }
 
     fn number(&mut self, value: u16) {
@@ -579,36 +636,39 @@ pub(crate) fn mode_query(
         .first()
         .and_then(|parameter| parameter.value)
         .unwrap_or(0);
-    let enabled = match (private, selector) {
-        (false, 4) => Some(screen.insert_mode()),
-        (false, 20) => Some(input.new_line),
-        (true, 1) => Some(input.application_cursor),
-        (true, 5) => Some(screen.reverse_video()),
-        (true, 6) => Some(screen.origin_mode()),
-        (true, 7) => Some(screen.auto_wrap()),
-        (true, 8) => Some(auto_repeat),
-        (true, 12) => Some(screen.cursor_appearance().blinking),
-        (true, 25) => Some(screen.cursor_appearance().visible),
-        (true, 47 | 1047 | 1049) => Some(screen.active_buffer() == ScreenBuffer::Alternate),
-        (true, 66) => Some(input.application_keypad),
-        (true, 67) => Some(input.backarrow),
-        (true, 1000) => Some(input.mouse_tracking == MouseTracking::Buttons),
-        (true, 1002) => Some(input.mouse_tracking == MouseTracking::ButtonMotion),
-        (true, 1003) => Some(input.mouse_tracking == MouseTracking::AnyMotion),
-        (true, 1004) => Some(input.focus_reporting),
-        (true, 1006) => Some(input.mouse_format == MouseFormat::Sgr),
-        (true, 1007) => Some(input.alternate_scroll),
-        (true, 1016) => Some(input.mouse_format == MouseFormat::SgrPixels),
-        (true, 2004) => Some(input.bracketed_paste),
-        (true, 2026) => Some(synchronized_output),
-        (true, 2031) => Some(color_scheme_notifications),
-        (true, 2048) => Some(resize_reporting),
-        _ => None,
+    let status = match (private, selector) {
+        (false, 4) => ModeStatus::from_bool(screen.insert_mode()),
+        (false, 20) => ModeStatus::from_bool(input.new_line),
+        (true, 1) => ModeStatus::from_bool(input.application_cursor),
+        (true, 5) => ModeStatus::from_bool(screen.reverse_video()),
+        (true, 6) => ModeStatus::from_bool(screen.origin_mode()),
+        (true, 7) => ModeStatus::from_bool(screen.auto_wrap()),
+        (true, 8) => ModeStatus::from_bool(auto_repeat),
+        (true, 12) => ModeStatus::from_bool(screen.cursor_appearance().blinking),
+        (true, 25) => ModeStatus::from_bool(screen.cursor_appearance().visible),
+        (true, 47 | 1047 | 1049) => {
+            ModeStatus::from_bool(screen.active_buffer() == ScreenBuffer::Alternate)
+        }
+        (true, 66) => ModeStatus::from_bool(input.application_keypad),
+        (true, 67) => ModeStatus::from_bool(input.backarrow),
+        (true, 1000) => ModeStatus::from_bool(input.mouse_tracking == MouseTracking::Buttons),
+        (true, 1002) => ModeStatus::from_bool(input.mouse_tracking == MouseTracking::ButtonMotion),
+        (true, 1003) => ModeStatus::from_bool(input.mouse_tracking == MouseTracking::AnyMotion),
+        (true, 1004) => ModeStatus::from_bool(input.focus_reporting),
+        (true, 1006) => ModeStatus::from_bool(input.mouse_format == MouseFormat::Sgr),
+        (true, 1007) => ModeStatus::from_bool(input.alternate_scroll),
+        (true, 1016) => ModeStatus::from_bool(input.mouse_format == MouseFormat::SgrPixels),
+        (true, 2004) => ModeStatus::from_bool(input.bracketed_paste),
+        (true, 2026) => ModeStatus::from_bool(synchronized_output),
+        (true, 2027) => ModeStatus::PermanentlySet,
+        (true, 2031) => ModeStatus::from_bool(color_scheme_notifications),
+        (true, 2048) => ModeStatus::from_bool(resize_reporting),
+        _ => ModeStatus::NotRecognized,
     };
     Some(ModeReport {
         private,
         selector,
-        enabled,
+        status,
     })
 }
 
@@ -618,16 +678,17 @@ impl ModeReport {
         let Self {
             private,
             selector,
-            enabled,
+            status,
         } = self;
         reply.clear();
         reply.append(if private { b"\x1b[?" } else { b"\x1b[" });
         reply.number(selector);
-        let status = match enabled {
-            None => b'0',
-            Some(true) => b'1',
-            Some(false) => b'2',
+        let code = match status {
+            ModeStatus::NotRecognized => b'0',
+            ModeStatus::Set => b'1',
+            ModeStatus::Reset => b'2',
+            ModeStatus::PermanentlySet => b'3',
         };
-        reply.append(&[b';', status, b'$', b'y']);
+        reply.append(&[b';', code, b'$', b'y']);
     }
 }

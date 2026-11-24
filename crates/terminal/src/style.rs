@@ -1,5 +1,7 @@
 use lune_vt::Parameter;
 
+use crate::HyperlinkId;
+
 /// An unresolved terminal color. Palette indices and defaults retain their
 /// identity so palette and theme changes can be applied when rendering.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -35,6 +37,8 @@ pub struct Style {
     pub background: Color,
     /// Default follows the displayed foreground. Explicit colors are independent of inverse video.
     pub underline_color: Color,
+    /// Optional OSC 8 hyperlink handle attached to written cells. Zero means none.
+    pub hyperlink: HyperlinkId,
     pub bold: bool,
     pub faint: bool,
     pub italic: bool,

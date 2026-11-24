@@ -20,7 +20,7 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use lune_terminal::{ColorScheme, Palette, PixelSize};
+use lune_terminal::{ClipboardQuery, ColorScheme, Palette, PixelSize};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{Ime, KeyEvent, WindowEvent};
@@ -32,7 +32,7 @@ use winit::window::{Fullscreen, Theme, Window, WindowId};
 use crate::{GridGeometry, SessionReady};
 
 use clipboard::ClipboardType;
-use config::{Config, MAX_FONT_SIZE, MIN_FONT_SIZE};
+use config::{ClipboardPolicy, Config, MAX_FONT_SIZE, MIN_FONT_SIZE};
 use font::{Font, FontMetrics, physical_font_size};
 use paint::Painter;
 use readiness::Readiness;
@@ -50,7 +50,9 @@ enum Event {
     PtyError(io::Error),
     CopyReady(std::result::Result<(), String>),
     PasteReady(TabId, std::result::Result<String, String>),
+    Osc52ReadReady(TabId, ClipboardQuery, std::result::Result<String, String>),
     DirectoryOpened(io::Result<()>),
+    HyperlinkOpened(io::Result<()>),
     SystemTheme(Theme),
 }
 
@@ -145,6 +147,12 @@ impl ApplicationHandler<Event> for App {
                 }
                 Ok(())
             }
+            Event::Osc52ReadReady(id, query, result) => {
+                if let Some(tab) = client.tabs.iter_mut().find(|tab| tab.id == id) {
+                    tab.finish_osc52_read(query, result);
+                }
+                Ok(())
+            }
             Event::CopyReady(result) => {
                 client.copy_pending = false;
                 if let Err(error) = result {
@@ -156,6 +164,13 @@ impl ApplicationHandler<Event> for App {
                 client.directory_open_pending = false;
                 if let Err(error) = result {
                     log::warn!("Working directory open failed: {error}");
+                }
+                Ok(())
+            }
+            Event::HyperlinkOpened(result) => {
+                client.hyperlink_open_pending = false;
+                if let Err(error) = result {
+                    log::warn!("Hyperlink open failed: {error}");
                 }
                 Ok(())
             }
@@ -189,7 +204,10 @@ struct Client {
     grid: GridGeometry,
     copy_pending: bool,
     directory_open_pending: bool,
+    hyperlink_open_pending: bool,
     primary_selection: Option<clipboard::Primary>,
+    clipboard_write: ClipboardPolicy,
+    clipboard_read: ClipboardPolicy,
     font_size_points: f32,
     base_font_size_points: f32,
     resize_pending: bool,
@@ -248,7 +266,10 @@ impl Client {
             grid,
             copy_pending: false,
             directory_open_pending: false,
+            hyperlink_open_pending: false,
             primary_selection: None,
+            clipboard_write: config.clipboard_write,
+            clipboard_read: config.clipboard_read,
             font_size_points: config.font_size_points,
             base_font_size_points: config.font_size_points,
             resize_pending: false,
@@ -288,17 +309,25 @@ impl Client {
                     }
                     self.modifiers = ModifiersState::empty();
                     self.tabs[self.active].modifiers = self.modifiers;
+                    self.tabs[self.active].update_hovered_hyperlink();
                 }
             }
             WindowEvent::ModifiersChanged(modifiers) => {
                 self.modifiers = modifiers.state();
                 self.tabs[self.active].modifiers = self.modifiers;
+                self.tabs[self.active].update_hovered_hyperlink();
             }
             WindowEvent::KeyboardInput {
                 event,
                 is_synthetic: false,
                 ..
-            } if event.state.is_pressed() => self.key(event_loop, &event),
+            } => {
+                if event.state.is_pressed() {
+                    self.key(event_loop, &event);
+                } else {
+                    self.tabs[self.active].key_release(&event);
+                }
+            }
             WindowEvent::Ime(Ime::Enabled) => {
                 self.ime_enabled = true;
                 let tab = &mut self.tabs[self.active];
@@ -323,6 +352,7 @@ impl Client {
                 if tab.pressed.is_none() && tab.selection_drag.is_none() {
                     tab.pointer = None;
                 }
+                tab.update_hovered_hyperlink();
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 if state.is_pressed() && self.pointer.is_some_and(|point| self.bar.contains(point))
@@ -334,7 +364,12 @@ impl Client {
                         self.select_tab(index);
                     }
                 } else {
-                    self.tabs[self.active].button(state, button, &mut self.primary_selection);
+                    self.tabs[self.active].button(
+                        state,
+                        button,
+                        &mut self.primary_selection,
+                        &mut self.hyperlink_open_pending,
+                    );
                 }
             }
             WindowEvent::MouseWheel { delta, .. }
@@ -464,6 +499,7 @@ impl Client {
         tab.pointer = self.pointer;
         tab.set_ime_allowed();
         tab.update_ime_area();
+        tab.update_hovered_hyperlink();
         if self.focused {
             tab.focus(true);
         }
@@ -523,7 +559,14 @@ impl Client {
         index: usize,
         ready: SessionReady,
     ) -> Result<bool> {
-        let running = match self.tabs[index].dispatch(ready, self.focused && index == self.active) {
+        let running = match self.tabs[index].dispatch(
+            ready,
+            self.focused && index == self.active,
+            &mut self.copy_pending,
+            &mut self.primary_selection,
+            self.clipboard_write,
+            self.clipboard_read,
+        ) {
             Ok(running) => running,
             Err(error) => {
                 self.tab_error(event_loop, index, error)?;
@@ -661,6 +704,7 @@ impl Client {
                 &frame,
                 paint::Overlay {
                     selection: tab.selection.as_ref().map(|selection| &selection.range),
+                    hovered_hyperlink: tab.hovered_hyperlink,
                     preedit: &tab.preedit,
                     vi: tab.vi.as_ref(),
                     focused: self.focused,

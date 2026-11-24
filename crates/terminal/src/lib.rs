@@ -10,6 +10,7 @@ mod error;
 mod graphics;
 mod grid;
 mod history;
+mod hyperlinks;
 mod input;
 mod lines;
 mod mouse;
@@ -34,13 +35,20 @@ mod writer;
 mod tests;
 
 pub use cell::{Cell, CellText, CellWidth, MAX_CELL_TEXT_BYTES, StyleId};
+pub use dcs::MAX_TERMCAP_QUERIES;
 pub use error::StorageError;
 pub use graphics::{
     GraphicsLayout, GraphicsPlaceholderCache, GraphicsPlaceholderRun, GraphicsPlacement,
 };
 pub use grid::{Grid, MAX_CELLS, MAX_DIMENSION};
 pub use history::{HistoryLimits, MAX_HISTORY_BYTES, MAX_HISTORY_ROWS, RowHistory};
-pub use input::{InputModes, Key, KeySequence, Modifiers};
+pub use hyperlinks::{
+    Hyperlink, HyperlinkId, HyperlinkTable, MAX_HYPERLINK_URI_BYTES, MAX_HYPERLINKS,
+};
+pub use input::{
+    InputModes, Key, KeyEvent, KeyEventKind, KeyInput, KeyModifiers, KeySequence,
+    KittyKeyboardFlags, MAX_KITTY_KEYBOARD_STACK, Modifiers,
+};
 pub use lines::{LogicalLine, LogicalLines};
 pub use lune_kitty_graphics::{
     Image as GraphicsImage, ImageFormat as GraphicsImageFormat, ImageKey as GraphicsImageKey,
@@ -55,7 +63,10 @@ pub use lune_text::WidthPolicy;
 pub use mouse::{
     MouseButton, MouseEvent, MouseFormat, MouseSequence, MouseTracking, PixelPosition,
 };
-pub use osc::{MAX_OSC_PALETTE_ENTRIES, MAX_TITLE_BYTES, MAX_WORKING_DIRECTORY_URI_BYTES};
+pub use osc::{
+    ClipboardQuery, ClipboardTargets, ClipboardWrite, MAX_CLIPBOARD_BYTES, MAX_OSC_PALETTE_ENTRIES,
+    MAX_TITLE_BYTES, MAX_WORKING_DIRECTORY_URI_BYTES,
+};
 pub use palette::{GraphicsColors, Palette, PaletteEntry, Rgb};
 pub use paste::Paste;
 pub use processor::{

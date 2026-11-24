@@ -3,17 +3,18 @@ use std::{collections::TryReserveError, error::Error, fmt};
 use lune_vt::{ApcEvent, ControlSequence, EscapeSequence, Event, OscEvent, Parameter, Parser};
 
 use crate::charsets::Charsets;
-use crate::dcs::Dcs;
+use crate::dcs::{Dcs, DcsOutcome};
 use crate::graphics::Graphics;
-use crate::osc::{Osc, Outcome};
+use crate::input::KittyKeyboardStack;
+use crate::osc::{ClipboardQuery, ClipboardWrite, Osc, Outcome};
 use crate::rendition_stack::RenditionStack;
 use crate::reply::{
     self, ColorReport, ModeReport, Reply, Report, ResizeReport, SizeReport, StatusReport,
 };
 use crate::{
-    ColorScheme, CursorShape, EraseMode, HistoryLimits, InputModes, MouseFormat, Palette,
-    PixelSize, Rgb, Screen, ScreenBuffer, StorageError, Style, StyleError, StyleId, StyleTable,
-    TextSink,
+    ColorScheme, CursorShape, EraseMode, HistoryLimits, HyperlinkId, HyperlinkTable, InputModes,
+    KittyKeyboardFlags, MAX_HYPERLINKS, MouseFormat, Palette, PixelSize, Rgb, Screen, ScreenBuffer,
+    StorageError, Style, StyleError, StyleId, StyleTable, TextSink,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -95,6 +96,8 @@ pub struct TerminalNotifications<'a> {
     pub window_title: Option<&'a str>,
     pub working_directory: WorkingDirectoryChange<'a>,
     pub palette: Option<&'a Palette>,
+    pub clipboard_write: Option<ClipboardWrite<'a>>,
+    pub clipboard_query: Option<ClipboardQuery>,
     pub bell: bool,
 }
 
@@ -110,10 +113,13 @@ enum Pending {
     Unscroll(usize),
     Rendition(Style),
     PopRendition,
+    Hyperlink,
+    SyncTextStyle,
     Reply(Report),
     HostNotice(HostNotice),
     ModeReply(ModeReport),
     StatusReply(StatusReport),
+    TermcapReplies,
     ColorReply(ColorReport),
     GraphicsReply,
     OscReplies,
@@ -139,6 +145,8 @@ impl HostNotice {
 
 struct State {
     style: StyleId,
+    text_style: StyleId,
+    active_hyperlink: HyperlinkId,
     // NUL marks an empty REP source.
     last_graphic: char,
     saved_style: [StyleId; 2],
@@ -146,6 +154,7 @@ struct State {
     charsets: Charsets,
     saved_charsets: [Charsets; 2],
     input: InputModes,
+    kitty_keyboard: [KittyKeyboardStack; 2],
     auto_repeat: bool,
     synchronized_output: bool,
     color_scheme: Option<ColorScheme>,
@@ -162,12 +171,15 @@ impl State {
     fn new(palette: Palette) -> Self {
         Self {
             style: StyleId(0),
+            text_style: StyleId(0),
+            active_hyperlink: HyperlinkId(0),
             last_graphic: '\0',
             saved_style: [StyleId(0); 2],
             renditions: RenditionStack::default(),
             charsets: Charsets::default(),
             saved_charsets: [Charsets::default(); 2],
             input: InputModes::default(),
+            kitty_keyboard: [KittyKeyboardStack::default(); 2],
             auto_repeat: true,
             synchronized_output: false,
             color_scheme: None,
@@ -183,12 +195,15 @@ impl State {
 
     fn reset(&mut self, screen: &mut Screen) {
         self.style = StyleId(0);
+        self.text_style = StyleId(0);
+        self.active_hyperlink = HyperlinkId(0);
         self.last_graphic = '\0';
         self.saved_style = [StyleId(0); 2];
         self.renditions.clear();
         self.charsets = Charsets::default();
         self.saved_charsets = [Charsets::default(); 2];
         self.input = InputModes::default();
+        self.kitty_keyboard = [KittyKeyboardStack::default(); 2];
         self.auto_repeat = true;
         self.synchronized_output = false;
         self.color_scheme_notifications = false;
@@ -203,6 +218,8 @@ impl State {
     fn soft_reset(&mut self, screen: &mut Screen) {
         let index = screen.active_buffer() as usize;
         self.style = StyleId(0);
+        self.text_style = StyleId(0);
+        self.active_hyperlink = HyperlinkId(0);
         self.saved_style[index] = StyleId(0);
         self.charsets = Charsets::default();
         self.saved_charsets[index] = Charsets::default();
@@ -233,6 +250,7 @@ impl State {
 pub struct Processor {
     parser: Parser,
     styles: StyleTable,
+    hyperlinks: HyperlinkTable,
     state: State,
     reply: Reply,
     pending: [Option<Pending>; PENDING_CAPACITY],
@@ -275,6 +293,7 @@ impl Processor {
         Ok(Self {
             parser: Parser::default(),
             styles: StyleTable::new(style_limit)?,
+            hyperlinks: HyperlinkTable::new(MAX_HYPERLINKS),
             state: State::new(palette),
             reply: Reply::default(),
             pending: [None; PENDING_CAPACITY],
@@ -362,6 +381,8 @@ impl Processor {
         let title_changed = osc.take_title_changed();
         let directory_changed = osc.take_working_directory_change();
         let palette_changed = osc.take_palette_change();
+        let clipboard_targets = osc.take_clipboard_write();
+        let clipboard_query = osc.take_clipboard_query();
         let working_directory = if directory_changed {
             osc.working_directory_uri()
                 .map_or(WorkingDirectoryChange::Cleared, WorkingDirectoryChange::Set)
@@ -372,6 +393,11 @@ impl Processor {
             window_title: title_changed.then(|| osc.title()),
             working_directory,
             palette: palette_changed.then(|| osc.palette()),
+            clipboard_write: clipboard_targets.map(|targets| ClipboardWrite {
+                targets,
+                text: osc.clipboard_text(),
+            }),
+            clipboard_query,
             bell: std::mem::take(&mut self.bell_pending),
         }
     }
@@ -520,6 +546,11 @@ impl Processor {
         &self.styles
     }
 
+    /// Resolves OSC 8 hyperlinks referenced by styles in this processor.
+    pub fn hyperlinks(&self) -> &HyperlinkTable {
+        &self.hyperlinks
+    }
+
     /// Traces current rendition, both saved renditions, and both display buffers.
     /// Supply every externally retained ID as an additional root. Reclaimed
     /// history can make room for a pending rendition change before retrying it.
@@ -528,16 +559,22 @@ impl Processor {
         screen: &Screen,
         external: impl IntoIterator<Item = StyleId>,
     ) -> Result<usize, StyleError> {
-        self.styles.collect(
+        let reclaimed = self.styles.collect(
             [
                 self.state.style,
+                self.state.text_style,
                 self.state.saved_style[0],
                 self.state.saved_style[1],
             ]
             .into_iter()
             .chain(screen.style_ids())
             .chain(external),
-        )
+        )?;
+        self.hyperlinks.collect(
+            std::iter::once(self.state.active_hyperlink)
+                .chain(self.styles.live_styles().map(|style| style.hyperlink)),
+        );
+        Ok(reclaimed)
     }
 
     pub fn parse_errors(&self) -> u64 {
@@ -592,7 +629,7 @@ impl Processor {
             if byte.wrapping_sub(b' ') <= last - b' ' {
                 // SAFETY: this slice contains exactly one printable ASCII byte.
                 let value = unsafe { std::str::from_utf8_unchecked(input) };
-                text.write(screen, value, self.state.style)
+                text.write(screen, value, self.state.text_style)
                     .map_err(|error| ProcessError {
                         consumed: 0,
                         error: ProcessFailure::Text(error),
@@ -615,7 +652,7 @@ impl Processor {
                             if let Err(error) = text.write(
                                 screen,
                                 character.encode_utf8(&mut [0; 4]),
-                                self.state.style,
+                                self.state.text_style,
                             ) {
                                 self.pending[0] = Some(Pending::Text(character));
                                 self.end = 1;
@@ -635,7 +672,7 @@ impl Processor {
                     let run = unsafe {
                         std::str::from_utf8_unchecked(&input[consumed..consumed + length])
                     };
-                    text.write(screen, run, self.state.style)
+                    text.write(screen, run, self.state.text_style)
                         .map_err(|error| ProcessError {
                             consumed,
                             error: ProcessFailure::Text(error),
@@ -657,7 +694,7 @@ impl Processor {
                     let character = value.chars().next().expect("One UTF-8 scalar is present");
                     self.state.last_graphic = character;
                     consumed += scalar_bytes;
-                    if let Err(error) = text.write(screen, value, self.state.style) {
+                    if let Err(error) = text.write(screen, value, self.state.text_style) {
                         self.pending[0] = Some(Pending::Text(character));
                         self.end = 1;
                         return Err(ProcessError {
@@ -716,7 +753,7 @@ impl Processor {
                     {
                         pending[*end] = Some(Pending::Index(sequence.final_byte == b'E'));
                         *end += 1;
-                    } else if !escape(screen, sequence, state) {
+                    } else if !escape(screen, sequence, state, pending, end) {
                         *ignored_sequences = ignored_sequences.saturating_add(1);
                     }
                 }
@@ -734,6 +771,12 @@ impl Processor {
                             }]
                         ) {
                             state.style = StyleId(0);
+                            if state.active_hyperlink == HyperlinkId(0) {
+                                state.text_style = StyleId(0);
+                            } else {
+                                pending[*end] = Some(Pending::SyncTextStyle);
+                                *end += 1;
+                            }
                             true
                         } else {
                             let mut next = *styles
@@ -804,6 +847,8 @@ impl Processor {
                     } else if matches!(sequence.final_byte, b'{' | b'}') {
                         sequence.intermediates == b"#"
                             && rendition_stack(sequence, state, styles, pending, end)
+                    } else if sequence.final_byte == b'u' && !sequence.private_markers.is_empty() {
+                        kitty_keyboard_sequence(screen, sequence, state, pending, end)
                     } else {
                         execute_csi(screen, sequence, state, styles, pending, end)
                     };
@@ -829,6 +874,10 @@ impl Processor {
                         }
                         Outcome::SizedText => {
                             pending[*end] = Some(Pending::SizedText { offset: 0 });
+                            *end += 1;
+                        }
+                        Outcome::Hyperlink => {
+                            pending[*end] = Some(Pending::Hyperlink);
                             *end += 1;
                         }
                     }
@@ -953,7 +1002,11 @@ impl Processor {
         while self.head < self.end {
             match self.pending[self.head].expect("A pending action is present") {
                 Pending::Text(character) => text
-                    .write(screen, character.encode_utf8(&mut [0; 4]), self.state.style)
+                    .write(
+                        screen,
+                        character.encode_utf8(&mut [0; 4]),
+                        self.state.text_style,
+                    )
                     .map_err(ProcessFailure::Text)?,
                 Pending::SizedText { offset } => {
                     text.boundary();
@@ -967,7 +1020,7 @@ impl Processor {
                                     payload,
                                     size,
                                     crate::sizing::SizedWidth::Explicit(width),
-                                    self.state.style,
+                                    self.state.text_style,
                                 )
                                 .map_err(ProcessFailure::Screen)?;
                         }
@@ -986,7 +1039,7 @@ impl Processor {
                                     unit,
                                     size,
                                     crate::sizing::SizedWidth::Natural(width.clamp(1, 2)),
-                                    self.state.style,
+                                    self.state.text_style,
                                 )
                             })();
                             if let Err(error) = result {
@@ -1001,9 +1054,13 @@ impl Processor {
                     character,
                     mut remaining,
                 } => {
-                    if let Err(error) =
-                        repeat(character, &mut remaining, screen, text, self.state.style)
-                    {
+                    if let Err(error) = repeat(
+                        character,
+                        &mut remaining,
+                        screen,
+                        text,
+                        self.state.text_style,
+                    ) {
                         self.pending[self.head] = Some(Pending::Repeat {
                             character,
                             remaining,
@@ -1039,14 +1096,46 @@ impl Processor {
                         .map_err(ProcessFailure::Screen)?;
                 }
                 Pending::Rendition(style) => {
-                    self.state.style = self.styles.intern(style).map_err(ProcessFailure::Style)?;
+                    let style_id = self.styles.intern(style).map_err(ProcessFailure::Style)?;
+                    let text_style =
+                        sync_text_style(&mut self.styles, style_id, self.state.active_hyperlink)
+                            .map_err(ProcessFailure::Style)?;
+                    self.state.style = style_id;
+                    self.state.text_style = text_style;
                 }
                 Pending::PopRendition => {
-                    self.state.style = self
+                    let style_id = self
                         .state
                         .renditions
                         .pop(&mut self.styles, self.state.style)
                         .map_err(ProcessFailure::Style)?;
+                    self.state.style = style_id;
+                    match sync_text_style(&mut self.styles, style_id, self.state.active_hyperlink) {
+                        Ok(text_style) => self.state.text_style = text_style,
+                        Err(error) => {
+                            self.pending[self.head] = Some(Pending::SyncTextStyle);
+                            return Err(ProcessFailure::Style(error));
+                        }
+                    }
+                }
+                Pending::Hyperlink => {
+                    let (uri, id) = self.state.osc.hyperlink().expect("Validated OSC 8");
+                    let link = self
+                        .hyperlinks
+                        .intern(uri, id)
+                        .map_err(ProcessFailure::Style)?;
+                    let text_style = sync_text_style(&mut self.styles, self.state.style, link)
+                        .map_err(ProcessFailure::Style)?;
+                    self.state.active_hyperlink = link;
+                    self.state.text_style = text_style;
+                }
+                Pending::SyncTextStyle => {
+                    self.state.text_style = sync_text_style(
+                        &mut self.styles,
+                        self.state.style,
+                        self.state.active_hyperlink,
+                    )
+                    .map_err(ProcessFailure::Style)?;
                 }
                 Pending::Reply(reply) => {
                     if !self.reply.is_empty() {
@@ -1071,6 +1160,19 @@ impl Processor {
                         return Err(ProcessFailure::ReplyPending);
                     }
                     reply.encode(&mut self.reply);
+                }
+                Pending::TermcapReplies => {
+                    if !self.reply.is_empty() {
+                        return Err(ProcessFailure::ReplyPending);
+                    }
+                    self.state
+                        .dcs
+                        .next_reply()
+                        .expect("A captured termcap reply is pending")
+                        .encode(&mut self.reply);
+                    if self.state.dcs.has_replies() {
+                        return Err(ProcessFailure::ReplyPending);
+                    }
                 }
                 Pending::ColorReply(reply) => {
                     if !self.reply.is_empty() {
@@ -1186,13 +1288,13 @@ fn dcs_event(
     pending: &mut [Option<Pending>; PENDING_CAPACITY],
     end: &mut usize,
 ) {
-    if let Some(query) = state.dcs.event(event) {
-        pending[*end] = Some(Pending::StatusReply(StatusReport::capture(
-            query,
-            screen,
-            styles,
-            state.style,
-        )));
+    if let Some(outcome) = state.dcs.event(event) {
+        pending[*end] = Some(match outcome {
+            DcsOutcome::Status(query) => {
+                Pending::StatusReply(StatusReport::capture(query, screen, styles, state.style))
+            }
+            DcsOutcome::Termcap => Pending::TermcapReplies,
+        });
         *end += 1;
     }
 }
@@ -1270,7 +1372,13 @@ fn execute(
     Ok(())
 }
 
-fn escape(screen: &mut Screen, sequence: EscapeSequence<'_>, state: &mut State) -> bool {
+fn escape(
+    screen: &mut Screen,
+    sequence: EscapeSequence<'_>,
+    state: &mut State,
+    pending: &mut [Option<Pending>; PENDING_CAPACITY],
+    end: &mut usize,
+) -> bool {
     match sequence.intermediates {
         [] => {}
         [designation @ (b'(' | b')')] => {
@@ -1281,6 +1389,8 @@ fn escape(screen: &mut Screen, sequence: EscapeSequence<'_>, state: &mut State) 
         [b'#'] if sequence.final_byte == b'8' => {
             screen.alignment_test();
             state.style = StyleId(0);
+            state.text_style = StyleId(0);
+            state.active_hyperlink = HyperlinkId(0);
             return true;
         }
         _ => return false,
@@ -1290,7 +1400,7 @@ fn escape(screen: &mut Screen, sequence: EscapeSequence<'_>, state: &mut State) 
             save_cursor(screen, state);
         }
         b'8' => {
-            restore_cursor(screen, state);
+            restore_cursor(screen, state, pending, end);
         }
         b'H' => screen.set_tab_stop(),
         b'=' => state.input.application_keypad = true,
@@ -1309,11 +1419,36 @@ fn save_cursor(screen: &mut Screen, state: &mut State) {
     state.saved_charsets[index] = state.charsets;
 }
 
-fn restore_cursor(screen: &mut Screen, state: &mut State) {
+fn restore_cursor(
+    screen: &mut Screen,
+    state: &mut State,
+    pending: &mut [Option<Pending>; PENDING_CAPACITY],
+    end: &mut usize,
+) {
     screen.restore_cursor();
     let index = screen.active_buffer() as usize;
     state.style = state.saved_style[index];
     state.charsets = state.saved_charsets[index];
+    if state.active_hyperlink == HyperlinkId(0) {
+        state.text_style = state.style;
+    } else {
+        pending[*end] = Some(Pending::SyncTextStyle);
+        *end += 1;
+    }
+}
+
+#[inline]
+fn sync_text_style(
+    styles: &mut StyleTable,
+    base: StyleId,
+    hyperlink: HyperlinkId,
+) -> Result<StyleId, StyleError> {
+    if hyperlink == HyperlinkId(0) {
+        return Ok(base);
+    }
+    let mut style = *styles.get(base).expect("Base rendition is rooted");
+    style.hyperlink = hyperlink;
+    styles.intern(style)
 }
 
 fn value(parameters: &[Parameter], index: usize, default: usize) -> usize {
@@ -1408,7 +1543,7 @@ fn execute_csi(
     if matches!(sequence.final_byte, b'h' | b'l') && sequence.intermediates.is_empty() {
         set_modes(screen, sequence, state, pending, end)
     } else {
-        csi(screen, sequence, state, styles)
+        csi(screen, sequence, state, styles, pending, end)
     }
 }
 
@@ -1457,6 +1592,7 @@ fn set_modes(
                                 | 1049
                                 | 2004
                                 | 2026
+                                | 2027
                                 | 2031
                                 | 2048
                         )
@@ -1477,6 +1613,7 @@ fn set_modes(
             (true, Some(67)) => state.input.backarrow = enabled,
             (true, Some(2004)) => state.input.bracketed_paste = enabled,
             (true, Some(2026)) => state.synchronized_output = enabled,
+            (true, Some(2027)) => {}
             (true, Some(2031)) => state.color_scheme_notifications = enabled,
             (true, Some(2048)) => {
                 if enabled {
@@ -1519,12 +1656,13 @@ fn set_modes(
                     save_cursor(screen, state);
                 }
                 screen.select_buffer(target);
+                state.input.kitty_keyboard = state.kitty_keyboard[target as usize].current();
                 if save {
                     if enabled {
                         screen.clear_alternate_display(state.style);
                         state.graphics.clear_unplaced(screen);
                     } else {
-                        restore_cursor(screen, state);
+                        restore_cursor(screen, state, pending, end);
                     }
                 }
             }
@@ -1532,7 +1670,7 @@ fn set_modes(
                 if enabled {
                     save_cursor(screen, state);
                 } else {
-                    restore_cursor(screen, state);
+                    restore_cursor(screen, state, pending, end);
                 }
             }
             (true, Some(12 | 25)) => {
@@ -1561,6 +1699,8 @@ fn csi(
     sequence: ControlSequence<'_>,
     state: &mut State,
     styles: &StyleTable,
+    pending: &mut [Option<Pending>; PENDING_CAPACITY],
+    end: &mut usize,
 ) -> bool {
     let style = state.style;
     let p = sequence.parameters;
@@ -1643,7 +1783,7 @@ fn csi(
         b'I' => screen.tab_forward(n),
         b'Z' => screen.tab_backward(n),
         b's' if p.is_empty() => save_cursor(screen, state),
-        b'u' if p.is_empty() => restore_cursor(screen, state),
+        b'u' if p.is_empty() => restore_cursor(screen, state, pending, end),
         b'@' => screen.insert_cells(n, style),
         b'P' => screen.delete_cells(n, style),
         b'X' => screen.erase_cells(n, style),
@@ -1683,6 +1823,51 @@ fn csi(
         _ => return false,
     }
     true
+}
+
+#[cold]
+fn kitty_keyboard_sequence(
+    screen: &Screen,
+    sequence: ControlSequence<'_>,
+    state: &mut State,
+    pending: &mut [Option<Pending>; PENDING_CAPACITY],
+    end: &mut usize,
+) -> bool {
+    let p = sequence.parameters;
+    if !sequence.intermediates.is_empty() || p.iter().any(|p| p.is_subparameter) {
+        return false;
+    }
+    let index = screen.active_buffer() as usize;
+    match sequence.private_markers {
+        [b'?'] if p.is_empty() => {
+            pending[*end] = Some(Pending::Reply(Report::KittyKeyboard(
+                state.input.kitty_keyboard.bits(),
+            )));
+            *end += 1;
+            true
+        }
+        [b'>'] if p.len() <= 1 => {
+            let flags = KittyKeyboardFlags::new(value(p, 0, 0) as u8);
+            state.kitty_keyboard[index].push(flags);
+            state.input.kitty_keyboard = state.kitty_keyboard[index].current();
+            true
+        }
+        [b'<'] if p.len() <= 1 => {
+            state.kitty_keyboard[index].pop(count(p));
+            state.input.kitty_keyboard = state.kitty_keyboard[index].current();
+            true
+        }
+        [b'='] if p.len() <= 2 => {
+            let flags = KittyKeyboardFlags::new(value(p, 0, 0) as u8);
+            let mode = value(p, 1, 1) as u16;
+            if !state.kitty_keyboard[index].set(flags, mode) {
+                return false;
+            }
+            state.input.kitty_keyboard = state.kitty_keyboard[index].current();
+            true
+        }
+        _ => false,
+    }
 }
 
 #[cold]
