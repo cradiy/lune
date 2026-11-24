@@ -7,8 +7,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use lune_terminal::{
-    CellPosition, ClipboardQuery, ColorScheme, HistoryLimits, HyperlinkId, MouseButton, MouseEvent,
-    MouseTracking, Palette, PixelPosition, PixelSize, Progress, ScreenBuffer,
+    CellPosition, ClipboardQuery, ColorScheme, CursorShape, HistoryLimits, HyperlinkId,
+    MouseButton, MouseEvent, MouseTracking, Palette, PixelPosition, PixelSize, Progress,
+    ScreenBuffer,
 };
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, Ime, KeyEvent, MouseScrollDelta};
@@ -166,15 +167,22 @@ pub(super) struct Pane {
     pub(super) vi_search: Option<vi::Search>,
 }
 
+pub(super) struct PaneConfig<'a> {
+    pub(super) palette: &'a Palette,
+    pub(super) scheme: ColorScheme,
+    pub(super) history_limits: HistoryLimits,
+    pub(super) cursor_style: CursorShape,
+    pub(super) cursor_blink: bool,
+    pub(super) shell: Option<&'a [OsString]>,
+}
+
 impl Pane {
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn spawn(
         id: PaneId,
         window: Arc<Window>,
         proxy: EventLoopProxy<Event>,
         grid: GridGeometry,
-        palette: &Palette,
-        scheme: ColorScheme,
+        config: PaneConfig<'_>,
         cwd: Option<PathBuf>,
         program: Option<&[OsString]>,
     ) -> Result<Self> {
@@ -184,12 +192,19 @@ impl Pane {
                 command.args(args);
                 command
             }
-            _ => {
-                let shell = std::env::var_os("SHELL")
-                    .filter(|shell| !shell.is_empty())
-                    .unwrap_or_else(|| "/bin/sh".into());
-                Command::new(shell)
-            }
+            _ => match config.shell {
+                Some([executable, args @ ..]) => {
+                    let mut command = Command::new(executable);
+                    command.args(args);
+                    command
+                }
+                _ => {
+                    let shell = std::env::var_os("SHELL")
+                        .filter(|shell| !shell.is_empty())
+                        .unwrap_or_else(|| "/bin/sh".into());
+                    Command::new(shell)
+                }
+            },
         };
         if let Some(dir) = cwd {
             command.current_dir(dir);
@@ -204,12 +219,10 @@ impl Pane {
             pty_size.columns,
             pty_size.rows
         );
-        let mut session = Session::spawn(command, pty_size, palette.clone())?;
-        session.set_theme(palette, Some(scheme));
-        session.set_history_limits(HistoryLimits {
-            max_rows: 10_000,
-            max_bytes: 32 << 20,
-        })?;
+        let mut session = Session::spawn(command, pty_size, config.palette.clone())?;
+        session.set_theme(config.palette, Some(config.scheme));
+        session.set_default_cursor_appearance(config.cursor_style, config.cursor_blink);
+        session.set_history_limits(config.history_limits)?;
         Ok(Self {
             id,
             origin: PixelPosition { x: 0, y: 0 },

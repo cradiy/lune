@@ -4,9 +4,18 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
+use lune_terminal::{CursorShape, HistoryLimits};
+
+use super::shortcuts::{self, Keybind};
 use super::theme::Preference;
 
 pub(super) mod watch;
+
+pub(super) const MIN_FONT_SIZE: f32 = 8.0;
+pub(super) const MAX_FONT_SIZE: f32 = 32.0;
+pub(super) const MAX_WINDOW_PADDING: u32 = 64;
+pub(super) const DEFAULT_SCROLLBACK_LINES: usize = 10_000;
+pub(super) const MAX_SCROLLBACK_LINES: usize = 1_000_000;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum ConfigSource {
@@ -50,9 +59,6 @@ impl ConfigSource {
     }
 }
 
-pub(super) const MIN_FONT_SIZE: f32 = 8.0;
-pub(super) const MAX_FONT_SIZE: f32 = 32.0;
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) enum ClipboardPolicy {
     #[default]
@@ -75,9 +81,16 @@ pub(super) struct Config {
     pub(super) font_ligatures: bool,
     pub(super) theme: Preference,
     pub(super) background_opacity: f32,
+    pub(super) window_padding: u32,
+    pub(super) scrollback_lines: usize,
+    pub(super) cursor_style: CursorShape,
+    pub(super) cursor_blink: bool,
+    pub(super) cursor_animation: bool,
+    pub(super) shell: Option<Vec<OsString>>,
     pub(super) clipboard_write: ClipboardPolicy,
     pub(super) clipboard_read: ClipboardPolicy,
     pub(super) notifications: NotificationPolicy,
+    pub(super) keybinds: Vec<Keybind>,
 }
 
 impl Default for Config {
@@ -88,9 +101,35 @@ impl Default for Config {
             font_ligatures: true,
             theme: Preference::System,
             background_opacity: 1.0,
+            window_padding: 0,
+            scrollback_lines: DEFAULT_SCROLLBACK_LINES,
+            cursor_style: CursorShape::Block,
+            cursor_blink: true,
+            cursor_animation: true,
+            shell: None,
             clipboard_write: ClipboardPolicy::Allow,
             clipboard_read: ClipboardPolicy::Deny,
             notifications: NotificationPolicy::Unfocused,
+            keybinds: Vec::new(),
+        }
+    }
+}
+
+impl Config {
+    pub(super) fn history_limits(&self) -> HistoryLimits {
+        if self.scrollback_lines == 0 {
+            return HistoryLimits {
+                max_rows: 0,
+                max_bytes: 0,
+            };
+        }
+        let max_bytes = self
+            .scrollback_lines
+            .saturating_mul(3200)
+            .clamp(32 << 20, 512 << 20);
+        HistoryLimits {
+            max_rows: self.scrollback_lines,
+            max_bytes,
         }
     }
 }
@@ -200,6 +239,39 @@ impl Config {
                     .filter(|value| value.is_finite() && (0.0..=1.0).contains(value))
                     .ok_or("background-opacity must be between 0.0 and 1.0")?;
             }
+            "window-padding" => {
+                self.window_padding = value
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|&value| value <= MAX_WINDOW_PADDING)
+                    .ok_or("window-padding must be an integer between 0 and 64")?;
+            }
+            "scrollback-lines" => {
+                self.scrollback_lines = value
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|&value| value <= MAX_SCROLLBACK_LINES)
+                    .ok_or("scrollback-lines must be between 0 and 1000000")?;
+            }
+            "cursor-style" => {
+                self.cursor_style = parse_cursor_style(value)?;
+            }
+            "cursor-blink" => {
+                self.cursor_blink = value
+                    .parse()
+                    .map_err(|_| "cursor-blink must be true or false")?;
+            }
+            "cursor-animation" => {
+                self.cursor_animation = value
+                    .parse()
+                    .map_err(|_| "cursor-animation must be true or false")?;
+            }
+            "shell" => {
+                self.shell = Some(parse_command_words(value)?);
+            }
+            "keybind" => {
+                self.keybinds.push(shortcuts::parse_keybind(value)?);
+            }
             "clipboard-write" => {
                 self.clipboard_write = parse_clipboard_policy(value)?;
             }
@@ -212,6 +284,74 @@ impl Config {
             _ => return Err("unknown setting"),
         }
         Ok(())
+    }
+}
+
+fn parse_command_words(value: &str) -> Result<Vec<OsString>, &'static str> {
+    if value.chars().any(char::is_control) {
+        return Err("shell must not contain control characters");
+    }
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut in_token = false;
+    let mut quote: Option<char> = None;
+    let mut chars = value.chars();
+    while let Some(ch) = chars.next() {
+        match quote {
+            Some(q) => {
+                if ch == q {
+                    quote = None;
+                } else if q == '"' && ch == '\\' {
+                    let next = chars.next().ok_or("trailing backslash in shell setting")?;
+                    current.push(next);
+                } else {
+                    current.push(ch);
+                }
+            }
+            None => match ch {
+                '\'' | '"' => {
+                    quote = Some(ch);
+                    in_token = true;
+                }
+                '\\' => {
+                    let next = chars.next().ok_or("trailing backslash in shell setting")?;
+                    current.push(next);
+                    in_token = true;
+                }
+                c if c.is_whitespace() => {
+                    if in_token {
+                        words.push(OsString::from(std::mem::take(&mut current)));
+                        in_token = false;
+                    }
+                }
+                _ => {
+                    current.push(ch);
+                    in_token = true;
+                }
+            },
+        }
+    }
+    if quote.is_some() {
+        return Err("unterminated quote in shell setting");
+    }
+    if in_token {
+        words.push(OsString::from(current));
+    }
+    if words.is_empty() || words[0].is_empty() {
+        return Err("shell must be a command path or executable name");
+    }
+    Ok(words)
+}
+
+fn parse_cursor_style(value: &str) -> Result<CursorShape, &'static str> {
+    if value.eq_ignore_ascii_case("block") {
+        Ok(CursorShape::Block)
+    } else if value.eq_ignore_ascii_case("bar") || value.eq_ignore_ascii_case("beam") {
+        Ok(CursorShape::Bar)
+    } else if value.eq_ignore_ascii_case("underline") {
+        Ok(CursorShape::Underline)
+    } else {
+        Err("cursor-style must be block, bar, or underline")
     }
 }
 
@@ -288,6 +428,12 @@ mod tests {
             "lune.conf",
             "# Font settings\r\nfont-family = Fixture Mono\r\nfont-size=19.5\r\n\
              background-opacity = 0.85\r\nbackground-opacity = 1.5\r\nbackground-opacity = NaN\r\n\
+             window-padding = 12\r\nwindow-padding = 999\r\n\
+             scrollback-lines = 50000\r\nscrollback-lines = -1\r\n\
+             cursor-style = bar\r\ncursor-style = triangle\r\n\
+             cursor-blink = false\r\ncursor-animation = false\r\n\
+             shell = /usr/bin/zsh -l\r\nshell = \"unterminated\r\n\
+             keybind = alt+v=split_right\r\nkeybind = bad\r\n\
              clipboard-write = deny\r\nclipboard-read = allow\r\nclipboard-read = invalid\r\n\
              notifications = always\r\nnotifications = bad\r\n\
              font-family=\r\nunknown-key=true\r\nfont-size=NaN\r\nfont-size=33\r\n",
@@ -297,14 +443,30 @@ mod tests {
         assert_eq!(config.font_family.as_deref(), Some("Fixture Mono"));
         assert_eq!(config.font_size_points, 19.5);
         assert_eq!(config.background_opacity, 0.85);
+        assert_eq!(config.window_padding, 12);
+        assert_eq!(config.scrollback_lines, 50_000);
+        assert_eq!(config.cursor_style, lune_terminal::CursorShape::Bar);
+        assert!(!config.cursor_blink);
+        assert!(!config.cursor_animation);
+        assert_eq!(
+            config.shell.as_deref(),
+            Some(
+                [
+                    std::ffi::OsString::from("/usr/bin/zsh"),
+                    std::ffi::OsString::from("-l"),
+                ]
+                .as_slice()
+            )
+        );
+        assert_eq!(config.keybinds.len(), 1);
         assert_eq!(config.clipboard_write, super::ClipboardPolicy::Deny);
         assert_eq!(config.clipboard_read, super::ClipboardPolicy::Allow);
         assert_eq!(config.notifications, super::NotificationPolicy::Always);
-        assert_eq!(loaded.errors.len(), 8);
+        assert_eq!(loaded.errors.len(), 13);
         assert_eq!(
             format_errors(&loaded.errors).as_deref(),
             Some(
-                " Config error: lune.conf:5: background-opacity must be between 0.0 and 1.0 (+7 more) "
+                " Config error: lune.conf:5: background-opacity must be between 0.0 and 1.0 (+12 more) "
             )
         );
     }

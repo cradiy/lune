@@ -19,6 +19,7 @@ mod theme;
 mod url;
 mod vi;
 
+use std::ffi::OsString;
 use std::io;
 use std::num::NonZeroU32;
 use std::os::unix::process::CommandExt;
@@ -28,7 +29,9 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use lune_terminal::{ClipboardQuery, ColorScheme, Palette, PixelPosition, PixelSize};
+use lune_terminal::{
+    ClipboardQuery, ColorScheme, CursorShape, HistoryLimits, Palette, PixelPosition, PixelSize,
+};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{Ime, KeyEvent, WindowEvent};
@@ -48,9 +51,9 @@ use font::{Font, physical_font_size};
 use notify::Notifier;
 use paint::Painter;
 use readiness::Readiness;
-use shortcuts::{Action, Scroll, Zoom};
+use shortcuts::{Action, Keymap, Scroll, Zoom};
 use split::{Axis, Direction as SplitDirection, Divider, SplitTree};
-use tab::{Pane, Tab};
+use tab::{Pane, PaneConfig, Tab};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -332,6 +335,12 @@ struct Client {
     default_title: String,
     custom_app_id: Option<String>,
     custom_config: Option<PathBuf>,
+    keymap: Keymap,
+    window_padding: u32,
+    history_limits: HistoryLimits,
+    cursor_style: CursorShape,
+    cursor_blink: bool,
+    shell: Option<Vec<OsString>>,
 }
 
 impl Client {
@@ -368,25 +377,36 @@ impl Client {
             Font::new(config.font_family.as_deref(), config.font_ligatures),
             physical_font_size(config.font_size_points, scale),
             config.background_opacity,
+            config.cursor_blink,
+            config.cursor_animation,
         ))?;
         let bar = tab_bar::Layout::default();
-        let content_area = content_rect(window.inner_size(), 0)
+        let padding = physical_padding(config.window_padding, scale);
+        let content_area = content_rect(window.inner_size(), 0, padding, painter.metrics().cell)
             .ok_or_else(|| io::Error::other("The terminal grid does not fit the Wayland window"))?;
         let grid = GridGeometry::fit(content_area.size, painter.metrics().cell)
             .ok_or_else(|| io::Error::other("The terminal grid does not fit the Wayland window"))?;
         let (palette, scheme) = config.theme.palette(selected_theme);
+        let history_limits = config.history_limits();
         let mut pane = Pane::spawn(
             1,
             window.clone(),
             proxy.clone(),
             grid,
-            &palette,
-            scheme,
+            PaneConfig {
+                palette: &palette,
+                scheme,
+                history_limits,
+                cursor_style: config.cursor_style,
+                cursor_blink: config.cursor_blink,
+                shell: config.shell.as_deref(),
+            },
             launch.working_directory,
             launch.command.as_deref(),
         )?;
         let readiness = Readiness::new(proxy.clone())?;
         readiness.arm(pane.id, &mut pane.registration, pane.session.interests())?;
+        pane.origin = content_area.origin;
         pane.visible = true;
         pane.active = true;
         let tab = Tab::new(pane, content_area);
@@ -439,7 +459,28 @@ impl Client {
             default_title,
             custom_app_id,
             custom_config,
+            keymap: Keymap::from_overrides(&config.keybinds),
+            window_padding: config.window_padding,
+            history_limits,
+            cursor_style: config.cursor_style,
+            cursor_blink: config.cursor_blink,
+            shell: config.shell.clone(),
         })
+    }
+
+    fn pane_config(&self) -> PaneConfig<'_> {
+        PaneConfig {
+            palette: &self.palette,
+            scheme: self.scheme,
+            history_limits: self.history_limits,
+            cursor_style: self.cursor_style,
+            cursor_blink: self.cursor_blink,
+            shell: self.shell.as_deref(),
+        }
+    }
+
+    fn physical_padding(&self) -> u32 {
+        physical_padding(self.window_padding, self.window.scale_factor())
     }
 
     fn pane_mut(&mut self, id: PaneId) -> Option<&mut Pane> {
@@ -730,7 +771,7 @@ impl Client {
             .session
             .screen()
             .active_buffer();
-        if let Some(binding) = shortcuts::binding(event, self.modifiers, buffer) {
+        if let Some(binding) = self.keymap.binding(event, self.modifiers, buffer) {
             if let Some(action) = binding.action(event.repeat) {
                 let pass_through = (self.tabs.len() <= 1
                     && matches!(
@@ -895,8 +936,7 @@ impl Client {
             self.window.clone(),
             self.proxy.clone(),
             grid,
-            &self.palette,
-            self.scheme,
+            self.pane_config(),
             cwd,
             None,
         )?;
@@ -999,7 +1039,9 @@ impl Client {
         let size = self.window.inner_size();
         let metrics = self.painter.metrics();
         let bar_height = tab_bar::Layout::height(size, metrics.cell, self.tabs.len() + 1);
-        let area = content_rect(size, bar_height).unwrap_or(self.content_area);
+        let padding = self.physical_padding();
+        let area =
+            content_rect(size, bar_height, padding, metrics.cell).unwrap_or(self.content_area);
         let grid = GridGeometry::fit(area.size, metrics.cell)
             .unwrap_or(self.tabs[self.active].focused_pane().target_grid);
         let mut pane = Pane::spawn(
@@ -1007,11 +1049,11 @@ impl Client {
             self.window.clone(),
             self.proxy.clone(),
             grid,
-            &self.palette,
-            self.scheme,
+            self.pane_config(),
             cwd,
             None,
         )?;
+        pane.origin = area.origin;
         self.readiness
             .arm(id, &mut pane.registration, pane.session.interests())?;
         self.tabs.push(Tab::new(pane, area));
@@ -1220,6 +1262,38 @@ impl Client {
             self.painter.set_background_opacity(new.background_opacity);
         }
         let mut layout_changed = false;
+        if old.window_padding != new.window_padding {
+            self.window_padding = new.window_padding;
+            layout_changed = true;
+        }
+        if old.scrollback_lines != new.scrollback_lines {
+            self.history_limits = new.history_limits();
+            for tab in &mut self.tabs {
+                for pane in &mut tab.panes {
+                    if let Err(error) = pane.session.set_history_limits(self.history_limits) {
+                        log::warn!("Could not update scrollback limit: {error}");
+                    }
+                }
+            }
+        }
+        if old.cursor_style != new.cursor_style || old.cursor_blink != new.cursor_blink {
+            self.cursor_style = new.cursor_style;
+            self.cursor_blink = new.cursor_blink;
+            for tab in &mut self.tabs {
+                for pane in &mut tab.panes {
+                    pane.session
+                        .set_default_cursor_appearance(new.cursor_style, new.cursor_blink);
+                }
+            }
+            self.painter.set_cursor_blink(new.cursor_blink);
+        }
+        if old.cursor_animation != new.cursor_animation {
+            self.painter.set_cursor_animation(new.cursor_animation);
+        }
+        if old.keybinds != new.keybinds {
+            self.keymap = Keymap::from_overrides(&new.keybinds);
+        }
+        self.shell = new.shell.clone();
         if old.font_size_points != new.font_size_points {
             self.base_font_size_points = new.font_size_points;
             self.font_size_points = new.font_size_points;
@@ -1440,7 +1514,8 @@ impl Client {
             current
         };
         let bar_height = tab_bar::Layout::height(size, metrics.cell, self.tabs.len());
-        let Some(content_area) = content_rect(size, bar_height) else {
+        let padding = self.physical_padding();
+        let Some(content_area) = content_rect(size, bar_height, padding, metrics.cell) else {
             return;
         };
         if GridGeometry::fit(content_area.size, metrics.cell).is_none() {
@@ -1544,12 +1619,40 @@ impl Client {
     }
 }
 
-fn content_rect(size: PhysicalSize<u32>, bar_height: u32) -> Option<PixelRect> {
+fn physical_padding(logical: u32, scale: f64) -> u32 {
+    (f64::from(logical) * scale).round().max(0.0) as u32
+}
+
+fn content_rect(
+    size: PhysicalSize<u32>,
+    bar_height: u32,
+    padding: u32,
+    cell: PixelSize,
+) -> Option<PixelRect> {
+    let available_height = size.height.saturating_sub(bar_height);
+    if padding != 0 {
+        let double = padding.saturating_mul(2);
+        if let (Some(width), Some(height)) = (
+            NonZeroU32::new(size.width.saturating_sub(double)),
+            NonZeroU32::new(available_height.saturating_sub(double)),
+        ) {
+            let padded = PixelRect {
+                origin: PixelPosition {
+                    x: padding,
+                    y: padding,
+                },
+                size: PixelSize { width, height },
+            };
+            if GridGeometry::fit(padded.size, cell).is_some() {
+                return Some(padded);
+            }
+        }
+    }
     Some(PixelRect {
         origin: PixelPosition { x: 0, y: 0 },
         size: PixelSize {
             width: NonZeroU32::new(size.width)?,
-            height: NonZeroU32::new(size.height.saturating_sub(bar_height))?,
+            height: NonZeroU32::new(available_height)?,
         },
     })
 }

@@ -6,12 +6,12 @@ use std::time::{Duration, Instant};
 
 use lune_pty::{ChildExit, Pty, PtySize};
 use lune_terminal::{
-    CellPosition, Color, ColorScheme, CursorAppearance, DisplayUnit, GRAPHICS_PLACEHOLDER,
-    GraphicsImage, GraphicsImageStore, GraphicsPlacement, HistoryLimits, Key, KeyEvent,
-    KeyEventKind, KeySequence, MAX_STYLES, Modifiers, MouseEvent, MouseFormat, MouseSequence,
-    MouseTracking, Palette, PaletteEntry, PixelPosition, ProcessFailure, Processor, Rgb, Row,
-    RowRevision, Screen, ScreenBuffer, StorageError, Style, StyleError, StyleId, StyleRun,
-    StyleTable, TerminalNotifications, TextSink, UnicodeWriter, Viewport,
+    CellPosition, Color, ColorScheme, CursorAppearance, CursorShape, DisplayUnit,
+    GRAPHICS_PLACEHOLDER, GraphicsImage, GraphicsImageStore, GraphicsPlacement, HistoryLimits, Key,
+    KeyEvent, KeyEventKind, KeySequence, MAX_STYLES, Modifiers, MouseEvent, MouseFormat,
+    MouseSequence, MouseTracking, Palette, PaletteEntry, PixelPosition, ProcessFailure, Processor,
+    Rgb, Row, RowRevision, Screen, ScreenBuffer, StorageError, Style, StyleError, StyleId,
+    StyleRun, StyleTable, TerminalNotifications, TextSink, UnicodeWriter, Viewport,
 };
 
 use crate::{GridGeometry, PixelRect};
@@ -488,6 +488,11 @@ impl<T: Read + Write> Session<T> {
 
     pub fn set_theme(&mut self, palette: &Palette, scheme: Option<ColorScheme>) {
         self.processor.set_theme(palette, scheme);
+    }
+
+    pub fn set_default_cursor_appearance(&mut self, shape: CursorShape, blinking: bool) {
+        self.processor
+            .set_default_cursor_appearance(&mut self.screen, shape, blinking);
     }
 
     /// Updates primary scrollback limits and clamps the visible history.

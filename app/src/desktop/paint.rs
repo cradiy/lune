@@ -82,6 +82,8 @@ pub(super) struct Painter {
     cursor_pane: Option<PaneId>,
     cursor_motion: CursorMotion,
     cursor_buffer: ScreenBuffer,
+    cursor_blink: bool,
+    cursor_animation: bool,
     progress_animation: Option<Instant>,
     retry: Option<Instant>,
     force_present: bool,
@@ -94,6 +96,8 @@ impl Painter {
         mut font: Font,
         physical_font_size: f32,
         background_opacity: f32,
+        cursor_blink: bool,
+        cursor_animation: bool,
     ) -> Result<Self> {
         let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
         descriptor.backends = wgpu::Backends::VULKAN;
@@ -154,6 +158,8 @@ impl Painter {
             cursor_pane: None,
             cursor_motion: CursorMotion::default(),
             cursor_buffer: ScreenBuffer::Primary,
+            cursor_blink,
+            cursor_animation,
             progress_animation: None,
             retry: None,
             force_present: false,
@@ -225,6 +231,34 @@ impl Painter {
         }
         self.text.set_metrics(metrics);
         self.dirty = true;
+    }
+
+    pub(super) fn set_cursor_blink(&mut self, enabled: bool) {
+        if self.cursor_blink == enabled {
+            return;
+        }
+        self.cursor_blink = enabled;
+        let now = Instant::now();
+        let interval = if enabled {
+            CURSOR_BLINK_INTERVAL
+        } else {
+            Duration::ZERO
+        };
+        for (_, tracker) in &mut self.trackers {
+            tracker.set_cursor_blink_interval(interval, now);
+        }
+        self.dirty = true;
+        self.force_present = true;
+    }
+
+    pub(super) fn set_cursor_animation(&mut self, enabled: bool) {
+        if self.cursor_animation == enabled {
+            return;
+        }
+        self.cursor_animation = enabled;
+        if !enabled {
+            self.reset_cursor_motion();
+        }
     }
 
     pub(super) fn invalidate_overlay(&mut self) {
@@ -310,7 +344,12 @@ impl Painter {
             });
             if !self.trackers.iter().any(|(id, _)| *id == pane.id) {
                 let mut tracker = PresentationTracker::default();
-                tracker.set_cursor_blink_interval(CURSOR_BLINK_INTERVAL, now);
+                let interval = if self.cursor_blink {
+                    CURSOR_BLINK_INTERVAL
+                } else {
+                    Duration::ZERO
+                };
+                tracker.set_cursor_blink_interval(interval, now);
                 self.trackers.push((pane.id, tracker));
             }
         }
@@ -418,7 +457,8 @@ impl Painter {
         } else {
             CursorMotion::default()
         };
-        let target = if let Some(pane) = focused_pane
+        let target = if self.cursor_animation
+            && let Some(pane) = focused_pane
             && pane.focused
             && pane.vi.is_none()
             && pane.preedit.is_empty()

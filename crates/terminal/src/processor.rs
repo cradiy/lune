@@ -170,6 +170,9 @@ struct State {
     text_area_pixels: Option<PixelSize>,
     cell_pixels: Option<PixelSize>,
     resize_reporting: Option<ResizeReport>,
+    default_cursor_shape: CursorShape,
+    default_cursor_blink: bool,
+    cursor_style_overridden: bool,
 }
 
 impl State {
@@ -195,6 +198,9 @@ impl State {
             text_area_pixels: None,
             cell_pixels: None,
             resize_reporting: None,
+            default_cursor_shape: CursorShape::Block,
+            default_cursor_blink: true,
+            cursor_style_overridden: false,
         }
     }
 
@@ -213,9 +219,14 @@ impl State {
         self.synchronized_output = false;
         self.color_scheme_notifications = false;
         self.resize_reporting = None;
+        self.cursor_style_overridden = false;
         self.osc.reset();
         self.dcs = Dcs::default();
         screen.reset(self.style);
+        let mut appearance = screen.cursor_appearance();
+        appearance.shape = self.default_cursor_shape;
+        appearance.blinking = self.default_cursor_blink;
+        screen.set_cursor_appearance(appearance);
         self.graphics.reset(screen);
     }
 
@@ -269,6 +280,24 @@ pub struct Processor {
 impl Processor {
     pub fn graphics_images(&self, buffer: ScreenBuffer) -> &crate::GraphicsImageStore {
         self.state.graphics.images(buffer)
+    }
+
+    /// Sets the default cursor shape and blink preference used initially and on DECSCUSR 0 resets.
+    /// Applies immediately when the terminal application has not explicitly overridden DECSCUSR.
+    pub fn set_default_cursor_appearance(
+        &mut self,
+        screen: &mut Screen,
+        shape: CursorShape,
+        blinking: bool,
+    ) {
+        self.state.default_cursor_shape = shape;
+        self.state.default_cursor_blink = blinking;
+        if !self.state.cursor_style_overridden {
+            let mut appearance = screen.cursor_appearance();
+            appearance.shape = shape;
+            appearance.blinking = blinking;
+            screen.set_cursor_appearance(appearance);
+        }
     }
 
     /// Sets primary scrollback limits and releases images orphaned by eviction.
@@ -1745,15 +1774,21 @@ fn csi(
         {
             return false;
         }
-        let (shape, blinking) = match value(p, 0, 0) {
-            0 | 1 => (CursorShape::Block, true),
-            2 => (CursorShape::Block, false),
-            3 => (CursorShape::Underline, true),
-            4 => (CursorShape::Underline, false),
-            5 => (CursorShape::Bar, true),
-            6 => (CursorShape::Bar, false),
+        let (shape, blinking, overridden) = match value(p, 0, 0) {
+            0 => (
+                state.default_cursor_shape,
+                state.default_cursor_blink,
+                false,
+            ),
+            1 => (CursorShape::Block, true, true),
+            2 => (CursorShape::Block, false, true),
+            3 => (CursorShape::Underline, true, true),
+            4 => (CursorShape::Underline, false, true),
+            5 => (CursorShape::Bar, true, true),
+            6 => (CursorShape::Bar, false, true),
             _ => return false,
         };
+        state.cursor_style_overridden = overridden;
         let mut appearance = screen.cursor_appearance();
         appearance.shape = shape;
         appearance.blinking = blinking;
