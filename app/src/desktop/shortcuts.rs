@@ -24,7 +24,10 @@ pub(super) enum Action {
     ToggleTabSidebar,
     PreviousPrompt,
     NextPrompt,
+    PreviousFailedPrompt,
     CopyLastOutput,
+    CopyLastCommand,
+    RerunLastCommand,
     ReloadConfig,
     NewWindow,
     NewTab,
@@ -44,9 +47,13 @@ pub(super) enum Action {
 impl Action {
     const fn default_context(self) -> Context {
         match self {
-            Self::Scroll(_) | Self::PreviousPrompt | Self::NextPrompt | Self::CopyLastOutput => {
-                Context::PrimaryScreen
-            }
+            Self::Scroll(_)
+            | Self::PreviousPrompt
+            | Self::NextPrompt
+            | Self::PreviousFailedPrompt
+            | Self::CopyLastOutput
+            | Self::CopyLastCommand
+            | Self::RerunLastCommand => Context::PrimaryScreen,
             _ => Context::Window,
         }
     }
@@ -58,6 +65,7 @@ impl Action {
                 | Self::Scroll(_)
                 | Self::PreviousPrompt
                 | Self::NextPrompt
+                | Self::PreviousFailedPrompt
                 | Self::ResizePane(_)
         )
     }
@@ -377,7 +385,12 @@ const WAYLAND_BINDINGS: &[Binding] = &[
     Binding::new(Action::NextPrompt, CTRL_SHIFT, Named(NamedKey::ArrowDown))
         .primary_screen()
         .repeating(),
+    Binding::new(Action::PreviousFailedPrompt, CTRL_SHIFT, letter("x"))
+        .primary_screen()
+        .repeating(),
     Binding::new(Action::CopyLastOutput, CTRL_SHIFT, letter("g")).primary_screen(),
+    Binding::new(Action::CopyLastCommand, CTRL_SHIFT, letter("y")).primary_screen(),
+    Binding::new(Action::RerunLastCommand, CTRL_SHIFT, letter("r")).primary_screen(),
     Binding::new(Action::ReloadConfig, CTRL_SHIFT, symbol(",")),
     Binding::new(Action::ReloadConfig, CTRL_SHIFT, symbol("<")),
     Binding::new(
@@ -611,7 +624,10 @@ fn parse_action(name: &str) -> Result<KeybindAction, &'static str> {
         "toggle_sidebar" | "toggle_tab_sidebar" => Action::ToggleTabSidebar,
         "previous_prompt" => Action::PreviousPrompt,
         "next_prompt" => Action::NextPrompt,
+        "previous_failed_prompt" => Action::PreviousFailedPrompt,
         "copy_last_output" => Action::CopyLastOutput,
+        "copy_last_command" => Action::CopyLastCommand,
+        "rerun_last_command" => Action::RerunLastCommand,
         "reload_config" => Action::ReloadConfig,
         "new_window" => Action::NewWindow,
         "new_tab" => Action::NewTab,

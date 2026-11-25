@@ -1246,6 +1246,8 @@ impl Client {
                         {
                             self.show_notice(NoticeKind::Success, notice);
                         }
+                        self.painter.invalidate_overlay();
+                        self.window.request_redraw();
                         self.update_cursor_icon();
                         return Ok(());
                     }
@@ -1579,12 +1581,42 @@ impl Client {
             Action::ToggleTabSidebar => self.toggle_tab_sidebar(),
             Action::PreviousPrompt => self.tabs[self.active].focused_pane_mut().jump_prompt(false),
             Action::NextPrompt => self.tabs[self.active].focused_pane_mut().jump_prompt(true),
+            Action::PreviousFailedPrompt => {
+                if !self.tabs[self.active]
+                    .focused_pane_mut()
+                    .jump_previous_failed_prompt()
+                {
+                    self.show_notice(NoticeKind::Warning, "No failed command found".into());
+                }
+            }
             Action::CopyLastOutput => {
                 if let Some(text) = self.tabs[self.active]
                     .focused_pane()
                     .copy_last_output(&mut self.copy_pending)
                 {
                     self.show_notice(NoticeKind::Success, text);
+                } else {
+                    self.show_notice(NoticeKind::Warning, "No command output found".into());
+                }
+            }
+            Action::CopyLastCommand => {
+                if let Some(text) = self.tabs[self.active]
+                    .focused_pane()
+                    .copy_last_command(&mut self.copy_pending)
+                {
+                    self.show_notice(NoticeKind::Success, text);
+                } else {
+                    self.show_notice(NoticeKind::Warning, "No command found".into());
+                }
+            }
+            Action::RerunLastCommand => {
+                if let Some(text) = self.tabs[self.active]
+                    .focused_pane_mut()
+                    .rerun_last_command()
+                {
+                    self.show_notice(NoticeKind::Success, text);
+                } else {
+                    self.show_notice(NoticeKind::Warning, "No command found".into());
                 }
             }
             Action::ReloadConfig => {
@@ -2490,17 +2522,6 @@ impl Client {
                     "Command blocks: Off"
                 };
                 self.show_notice(NoticeKind::Success, label.into());
-            }
-            PaletteAction::CopyLastCommand => {
-                self.close_palette(true);
-                if let Some(notice) = self.tabs[self.active]
-                    .focused_pane()
-                    .copy_last_command(&mut self.copy_pending)
-                {
-                    self.show_notice(NoticeKind::Success, notice);
-                } else {
-                    self.show_notice(NoticeKind::Warning, "No command found".into());
-                }
             }
             PaletteAction::ToggleCopyOnSelect => {
                 self.close_palette(true);

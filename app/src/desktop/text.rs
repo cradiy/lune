@@ -1082,8 +1082,208 @@ impl TextRenderer {
         let red = frame.palette.color(PaletteEntry::Indexed(1));
         let accent = frame.palette.color(PaletteEntry::Indexed(4));
 
+        // Sticky Command Header: pinned glass strip when a long block's prompt scrolled off-screen.
+        let mut sticky_prompt_row = None;
+        if let Some(sticky) = blocks::sticky_block(blocks, first_row)
+            && let Some(cmd) = blocks::extract_command(source, &sticky)
+        {
+            let has_output = blocks::has_output(source, &sticky);
+            if let Some(layout) = blocks::StickyHeaderLayout::compute(
+                self.area,
+                ui_metrics.cell,
+                scale,
+                scrollbar_reserve,
+                true,
+                has_output,
+            ) {
+                sticky_prompt_row = Some(sticky.prompt_row);
+                let sticky_hover = hovered_block
+                    .filter(|h| h.on_sticky && h.prompt_row == sticky.prompt_row)
+                    .and_then(|h| h.hovered_action);
+                let body_hovered = sticky_hover == Some(blocks::BlockAction::JumpToPrompt);
+
+                let status_color = if sticky.is_error() {
+                    red
+                } else if sticky.is_running() {
+                    accent
+                } else {
+                    green
+                };
+                let bar_fill = mix_color(bg, fg, if body_hovered { 28 } else { 20 });
+                let bar_border = if body_hovered {
+                    mix_color(bg, accent, 150)
+                } else {
+                    mix_color(bg, status_color, 105)
+                };
+                self.floating_card(layout.bar, layout.radius, bg, bar_fill, bar_border, 0.95);
+                self.rounded_rect(
+                    layout.accent_bar,
+                    layout.accent_bar.size.width.get() / 2,
+                    0,
+                    status_color,
+                    0.95,
+                );
+
+                // Optional compact status pill before the command text when space allows.
+                let mut text_x = layout.text_x;
+                let mut text_max_w = layout.text_max_w;
+                if let Some(badge) = blocks::format_status_badge(&sticky) {
+                    let badge_text_w = self.font.measure_text(ui_metrics, &badge);
+                    let badge_pad_x = (ui_metrics.cell.width.get() * 2 / 3).max(floor(5.0));
+                    let badge_w = badge_text_w.saturating_add(badge_pad_x * 2);
+                    let badge_gap = floor(8.0);
+                    if text_max_w
+                        > badge_w.saturating_add(badge_gap + ui_metrics.cell.width.get() * 6)
+                        && let (Some(bw), Some(bh)) = (
+                            NonZeroU32::new(badge_w),
+                            NonZeroU32::new(ui_cell_h.saturating_add(floor(2.0))),
+                        )
+                    {
+                        let badge_y = layout.bar.origin.y
+                            + layout.bar.size.height.get().saturating_sub(bh.get()) / 2;
+                        let badge_rect = PixelRect {
+                            origin: PixelPosition {
+                                x: text_x,
+                                y: badge_y,
+                            },
+                            size: PixelSize {
+                                width: bw,
+                                height: bh,
+                            },
+                        };
+                        let (b_fill, b_border, b_fg) = if sticky.is_error() {
+                            (
+                                mix_color(bg, red, 48),
+                                mix_color(bg, red, 165),
+                                mix_color(fg, red, 200),
+                            )
+                        } else if sticky.is_running() {
+                            (
+                                mix_color(bg, accent, 38),
+                                mix_color(bg, accent, 145),
+                                mix_color(fg, accent, 195),
+                            )
+                        } else {
+                            (
+                                mix_color(bg, green, 32),
+                                mix_color(bg, green, 125),
+                                mix_color(fg, green, 190),
+                            )
+                        };
+                        self.rounded_rect(badge_rect, bh.get() / 2, 0, b_fill, 0.90);
+                        self.rounded_rect(badge_rect, bh.get() / 2, 1, b_border, 0.72);
+                        if let Some(tw) = NonZeroU32::new(badge_text_w.min(ATLAS_SIDE as u32)) {
+                            self.glyph(
+                                PixelRect {
+                                    origin: PixelPosition {
+                                        x: text_x + badge_pad_x,
+                                        y: badge_y + bh.get().saturating_sub(ui_cell_h) / 2,
+                                    },
+                                    size: PixelSize {
+                                        width: tw,
+                                        height: ui_metrics.cell.height,
+                                    },
+                                },
+                                &badge,
+                                CHROME_LABEL_CACHE,
+                                b_fg,
+                                1.0,
+                            );
+                        }
+                        let consumed = badge_w.saturating_add(badge_gap);
+                        text_x = text_x.saturating_add(consumed);
+                        text_max_w = text_max_w.saturating_sub(consumed);
+                    }
+                }
+
+                // Single-line command preview.
+                let single_line: std::borrow::Cow<'_, str> = if cmd.contains('\n') {
+                    std::borrow::Cow::Owned(cmd.lines().next().unwrap_or("").trim().to_owned())
+                } else {
+                    std::borrow::Cow::Borrowed(cmd.as_str())
+                };
+                if text_max_w > 0 && !single_line.is_empty() {
+                    let ty = layout.bar.origin.y
+                        + layout.bar.size.height.get().saturating_sub(ui_cell_h) / 2;
+                    let cmd_color = if body_hovered {
+                        fg
+                    } else {
+                        mix_color(bg, fg, 225)
+                    };
+                    self.clamped_chrome_text(
+                        PixelPosition { x: text_x, y: ty },
+                        text_max_w,
+                        &single_line,
+                        cmd_color,
+                    );
+                }
+
+                // Right-aligned quick action buttons on the sticky header.
+                let icon_size = (ui_cell_h.saturating_mul(7) / 10).max(floor(11.0));
+                let icon_gap = (ui_metrics.cell.width.get() / 2).max(floor(4.0));
+                let btn_pad_x = (ui_metrics.cell.width.get() * 2 / 3).max(floor(5.0));
+                let idle_label = mix_color(bg, fg, 210);
+                for button in &layout.buttons {
+                    let btn_hovered = sticky_hover == Some(button.action);
+                    let btn_h = button.rect.size.height.get();
+                    let btn_r = (btn_h / 3).clamp(floor(4.0), btn_h / 2);
+                    if btn_hovered {
+                        self.rounded_rect(button.rect, btn_r, 0, mix_color(bg, accent, 58), 0.92);
+                    }
+                    let icon = match button.action {
+                        blocks::BlockAction::CopyCommand | blocks::BlockAction::CopyOutput => {
+                            svg::icons::COPY
+                        }
+                        blocks::BlockAction::Rerun | blocks::BlockAction::JumpToPrompt => {
+                            svg::icons::PLAY
+                        }
+                    };
+                    let icon_color = if btn_hovered {
+                        if button.action == blocks::BlockAction::Rerun {
+                            green
+                        } else {
+                            accent
+                        }
+                    } else if button.action == blocks::BlockAction::Rerun {
+                        mix_color(bg, green, 200)
+                    } else {
+                        mix_color(bg, accent, 200)
+                    };
+                    let ix = button.rect.origin.x + btn_pad_x;
+                    let iy = button.rect.origin.y + btn_h.saturating_sub(icon_size) / 2;
+                    self.svg_mask(
+                        PixelPosition { x: ix, y: iy },
+                        icon_size,
+                        icon,
+                        icon_color,
+                        0.98,
+                    );
+                    let lx = ix + icon_size + icon_gap;
+                    let ly = button.rect.origin.y + btn_h.saturating_sub(ui_cell_h) / 2;
+                    let avail = button
+                        .rect
+                        .origin
+                        .x
+                        .saturating_add(button.rect.size.width.get())
+                        .saturating_sub(lx + btn_pad_x / 2);
+                    if avail > 0 {
+                        self.clamped_chrome_text(
+                            PixelPosition { x: lx, y: ly },
+                            avail,
+                            button.label,
+                            if btn_hovered { fg } else { idle_label },
+                        );
+                    }
+                }
+            }
+        }
+
         for block in blocks {
-            let is_hovered = hovered_block.is_some_and(|h| h.prompt_row == block.prompt_row);
+            if sticky_prompt_row == Some(block.prompt_row) {
+                continue;
+            }
+            let is_hovered =
+                hovered_block.is_some_and(|h| !h.on_sticky && h.prompt_row == block.prompt_row);
             if is_hovered {
                 let has_command = blocks::has_command(source, block);
                 let has_output = blocks::has_output(source, block);
@@ -1135,7 +1335,9 @@ impl TextRenderer {
                             blocks::BlockAction::CopyCommand | blocks::BlockAction::CopyOutput => {
                                 svg::icons::COPY
                             }
-                            blocks::BlockAction::Rerun => svg::icons::PLAY,
+                            blocks::BlockAction::Rerun | blocks::BlockAction::JumpToPrompt => {
+                                svg::icons::PLAY
+                            }
                         };
                         let icon_color = if btn_hovered {
                             if button.action == blocks::BlockAction::Rerun {

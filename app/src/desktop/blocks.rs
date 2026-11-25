@@ -12,12 +12,14 @@ pub(super) enum BlockAction {
     CopyCommand,
     CopyOutput,
     Rerun,
+    JumpToPrompt,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct HoveredBlock {
     pub(super) prompt_row: usize,
     pub(super) hovered_action: Option<BlockAction>,
+    pub(super) on_sticky: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -184,6 +186,233 @@ impl BlockToolbarLayout {
         }
         None
     }
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct StickyHeaderLayout {
+    pub(super) bar: PixelRect,
+    pub(super) radius: u32,
+    pub(super) accent_bar: PixelRect,
+    pub(super) text_x: u32,
+    pub(super) text_max_w: u32,
+    pub(super) buttons: Vec<ToolbarButton>,
+}
+
+impl StickyHeaderLayout {
+    pub(super) fn compute(
+        pane_area: PixelSize,
+        ui_cell: PixelSize,
+        scale: f64,
+        scrollbar_reserve: u32,
+        has_command: bool,
+        has_output: bool,
+    ) -> Option<Self> {
+        if !has_command {
+            return None;
+        }
+        let scale = scale.max(1.0);
+        let floor = |logical: f64| (logical * scale).round().max(1.0) as u32;
+        let cell_w = ui_cell.width.get().max(1);
+        let cell_h = ui_cell.height.get().max(1);
+
+        let margin_x = floor(6.0);
+        let margin_y = floor(4.0);
+        let right_margin = scrollbar_reserve.saturating_add(margin_x);
+        let bar_w = pane_area
+            .width
+            .get()
+            .saturating_sub(margin_x.saturating_add(right_margin));
+        let pad_y = floor(4.0);
+        let pad_x = floor(8.0);
+        let btn_h = cell_h.saturating_add(floor(4.0)).max(floor(20.0));
+        let bar_h = btn_h.saturating_add(pad_y * 2);
+        if bar_w < cell_w.saturating_mul(16) || pane_area.height.get() < bar_h.saturating_mul(3) {
+            return None;
+        }
+
+        let bar = PixelRect {
+            origin: PixelPosition {
+                x: margin_x,
+                y: margin_y,
+            },
+            size: PixelSize {
+                width: NonZeroU32::new(bar_w)?,
+                height: NonZeroU32::new(bar_h)?,
+            },
+        };
+
+        let accent_w = floor(3.0).clamp(2, 4);
+        let accent_h = bar_h.saturating_sub(pad_y * 2).max(6);
+        let accent_bar = PixelRect {
+            origin: PixelPosition {
+                x: bar.origin.x.saturating_add(pad_x),
+                y: bar.origin.y + bar_h.saturating_sub(accent_h) / 2,
+            },
+            size: PixelSize {
+                width: NonZeroU32::new(accent_w)?,
+                height: NonZeroU32::new(accent_h)?,
+            },
+        };
+
+        let icon_size = (cell_h.saturating_mul(7) / 10).max(floor(11.0));
+        let btn_pad_x = (cell_w * 2 / 3).max(floor(5.0));
+        let icon_gap = (cell_w / 2).max(floor(4.0));
+        let btn_gap = floor(3.0);
+
+        let mut specs: Vec<(BlockAction, &'static str)> = Vec::with_capacity(3);
+        specs.push((BlockAction::CopyCommand, "Cmd"));
+        if has_output {
+            specs.push((BlockAction::CopyOutput, "Out"));
+        }
+        specs.push((BlockAction::Rerun, "Run"));
+
+        let mut widths = Vec::with_capacity(specs.len());
+        let mut total_btns_w = 0u32;
+        for (i, (_, label)) in specs.iter().enumerate() {
+            let label_w = cell_w.saturating_mul(label.len() as u32);
+            let w = btn_pad_x
+                .saturating_mul(2)
+                .saturating_add(icon_size)
+                .saturating_add(icon_gap)
+                .saturating_add(label_w);
+            widths.push(w);
+            total_btns_w = total_btns_w.saturating_add(w);
+            if i + 1 < specs.len() {
+                total_btns_w = total_btns_w.saturating_add(btn_gap);
+            }
+        }
+
+        let text_x = accent_bar
+            .origin
+            .x
+            .saturating_add(accent_w)
+            .saturating_add(pad_x);
+        let buttons_gap = floor(10.0);
+        let buttons_start_x = bar
+            .origin
+            .x
+            .saturating_add(bar_w)
+            .saturating_sub(pad_x.saturating_add(total_btns_w));
+
+        let mut buttons = Vec::with_capacity(specs.len());
+        let text_max_w = if buttons_start_x > text_x.saturating_add(cell_w * 8 + buttons_gap) {
+            let mut cursor_x = buttons_start_x;
+            let btn_y = bar.origin.y + bar_h.saturating_sub(btn_h) / 2;
+            for ((action, label), w) in specs.into_iter().zip(widths) {
+                if let (Some(w_nz), Some(h_nz)) = (NonZeroU32::new(w), NonZeroU32::new(btn_h)) {
+                    buttons.push(ToolbarButton {
+                        action,
+                        label,
+                        rect: PixelRect {
+                            origin: PixelPosition {
+                                x: cursor_x,
+                                y: btn_y,
+                            },
+                            size: PixelSize {
+                                width: w_nz,
+                                height: h_nz,
+                            },
+                        },
+                    });
+                }
+                cursor_x = cursor_x.saturating_add(w).saturating_add(btn_gap);
+            }
+            buttons_start_x.saturating_sub(text_x.saturating_add(buttons_gap))
+        } else {
+            bar.origin
+                .x
+                .saturating_add(bar_w)
+                .saturating_sub(text_x.saturating_add(pad_x))
+        };
+
+        Some(Self {
+            bar,
+            radius: (bar_h / 4).clamp(floor(6.0), bar_h / 2),
+            accent_bar,
+            text_x,
+            text_max_w,
+            buttons,
+        })
+    }
+
+    pub(super) fn contains(&self, local_x: f64, local_y: f64) -> bool {
+        let x = f64::from(self.bar.origin.x);
+        let y = f64::from(self.bar.origin.y);
+        local_x >= x
+            && local_x < x + f64::from(self.bar.size.width.get())
+            && local_y >= y
+            && local_y < y + f64::from(self.bar.size.height.get())
+    }
+
+    pub(super) fn hit(&self, local_x: f64, local_y: f64) -> Option<BlockAction> {
+        if !self.contains(local_x, local_y) {
+            return None;
+        }
+        for button in &self.buttons {
+            let x = f64::from(button.rect.origin.x);
+            let y = f64::from(button.rect.origin.y);
+            if local_x >= x
+                && local_x < x + f64::from(button.rect.size.width.get())
+                && local_y >= y
+                && local_y < y + f64::from(button.rect.size.height.get())
+            {
+                return Some(button.action);
+            }
+        }
+        Some(BlockAction::JumpToPrompt)
+    }
+}
+
+/// Returns the block eligible for a pinned sticky command header at the top of the pane:
+/// its prompt has scrolled above `first_row` and at least two output rows remain visible.
+pub(super) fn sticky_block(blocks: &[CommandBlock], first_row: usize) -> Option<CommandBlock> {
+    let first = blocks.first().copied()?;
+    (first.prompt_row < first_row && first.end_row >= first_row + 2).then_some(first)
+}
+
+/// Finds the nearest earlier `OSC 133;A` prompt row whose recorded exit code is non-zero.
+pub(super) fn previous_failed_prompt(view: ScreenView<'_>, before_row: usize) -> Option<usize> {
+    let mut cursor = before_row;
+    while let Some(prompt_row) = view.previous_prompt(cursor) {
+        if view
+            .row(prompt_row)
+            .is_some_and(|r| r.semantic().exit_code.is_some_and(|code| code != 0))
+        {
+            return Some(prompt_row);
+        }
+        cursor = prompt_row;
+    }
+    None
+}
+
+/// Resolves the command block targeted by keyboard block actions:
+/// when scrolled into history, prefers the block currently anchored at `first_row`;
+/// otherwise returns the most recent block with command input or output.
+pub(super) fn active_target_block(
+    view: ScreenView<'_>,
+    first_row: usize,
+    offset: usize,
+) -> Option<CommandBlock> {
+    if offset > 0
+        && let Some(block) = block_at_row(view, first_row)
+        && (has_command(view, &block) || has_output(view, &block))
+    {
+        return Some(block);
+    }
+    let total = view.rows();
+    if total == 0 {
+        return None;
+    }
+    let mut cursor = total;
+    while let Some(prompt_row) = view.previous_prompt(cursor) {
+        if let Some(block) = block_at_row(view, prompt_row)
+            && (has_command(view, &block) || has_output(view, &block))
+        {
+            return Some(block);
+        }
+        cursor = prompt_row;
+    }
+    None
 }
 
 /// Finds all OSC 133 command blocks intersecting `visible_rows`.
@@ -487,8 +716,9 @@ mod tests {
     use lune_terminal::{HistoryLimits, PixelSize, Processor, Screen, UnicodeWriter};
 
     use super::{
-        BlockAction, BlockToolbarLayout, block_at_row, blocks_in_viewport, extract_command,
-        extract_output, format_duration, last_command_text,
+        BlockAction, BlockToolbarLayout, StickyHeaderLayout, active_target_block, block_at_row,
+        blocks_in_viewport, extract_command, extract_output, format_duration, last_command_text,
+        previous_failed_prompt, sticky_block,
     };
 
     fn make_screen() -> Screen {
@@ -583,6 +813,53 @@ mod tests {
                 f64::from(run_btn.rect.origin.y + 5),
             ),
             Some(BlockAction::Rerun)
+        );
+
+        let sticky = StickyHeaderLayout::compute(area, ui_cell, 1.0, 12, true, true).unwrap();
+        assert_eq!(sticky.buttons.len(), 3);
+        assert_eq!(
+            sticky.hit(
+                f64::from(sticky.text_x + 4),
+                f64::from(sticky.bar.origin.y + 6),
+            ),
+            Some(BlockAction::JumpToPrompt)
+        );
+        let sticky_out = sticky.buttons[1];
+        assert_eq!(
+            sticky.hit(
+                f64::from(sticky_out.rect.origin.x + 5),
+                f64::from(sticky_out.rect.origin.y + 5),
+            ),
+            Some(BlockAction::CopyOutput)
+        );
+    }
+
+    #[test]
+    fn resolves_sticky_failed_and_active_target_blocks() {
+        let screen = make_screen();
+        let view = screen.view();
+        let blocks = blocks_in_viewport(view, 0..view.rows());
+
+        // Scrolled one row into block[1] (rows 2..5 -> prompt_row=2, end_row=5):
+        // at first_row=3, two output rows (3, 4) remain so sticky header activates.
+        let scrolled = blocks_in_viewport(view, 3..view.rows());
+        assert_eq!(sticky_block(&scrolled, 3).unwrap().prompt_row, 2);
+        // At first_row=4 only one row remains, so sticky header stays hidden.
+        let near_end = blocks_in_viewport(view, 4..view.rows());
+        assert!(sticky_block(&near_end, 4).is_none());
+
+        assert_eq!(previous_failed_prompt(view, view.rows()), Some(2));
+        assert_eq!(previous_failed_prompt(view, 2), None);
+
+        // At live bottom (offset=0), target is the most recent finished block (block[1]).
+        assert_eq!(
+            active_target_block(view, 0, 0).unwrap().prompt_row,
+            blocks[1].prompt_row
+        );
+        // When scrolled to block[0] (offset>0, first_row=0), target follows the viewed block.
+        assert_eq!(
+            active_target_block(view, 0, 2).unwrap().prompt_row,
+            blocks[0].prompt_row
         );
     }
 }

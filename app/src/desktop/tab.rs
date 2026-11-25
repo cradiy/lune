@@ -491,20 +491,46 @@ impl Pane {
             x: local_x.max(0.0) as u32,
             y: local_y as u32,
         };
-        let cell = geometry.cell_at(pixel)?;
         let screen = self.session.screen();
         let first_row = screen.viewport().range().start;
         let rows = usize::from(geometry.pty_size().rows);
         let view = screen.view();
+        let scrollbar_reserve = self
+            .scrollbar_view(scale, scrollbar_policy)
+            .map_or(0, |sb| sb.track.size.width.get() + 6);
+
+        // Sticky command header takes hit-test precedence over underlying pane rows.
+        if local_x >= 0.0 && self.vi.is_none() && self.search.is_none() && self.hints.is_none() {
+            let visible_blocks = blocks::blocks_in_viewport(view, first_row..first_row + rows);
+            if let Some(sticky) = blocks::sticky_block(&visible_blocks, first_row)
+                && blocks::has_command(view, &sticky)
+            {
+                let has_output = blocks::has_output(view, &sticky);
+                if let Some(layout) = blocks::StickyHeaderLayout::compute(
+                    pane_area,
+                    ui_cell,
+                    scale,
+                    scrollbar_reserve,
+                    true,
+                    has_output,
+                ) && let Some(action) = layout.hit(local_x, local_y)
+                {
+                    return Some(HoveredBlock {
+                        prompt_row: sticky.prompt_row,
+                        hovered_action: Some(action),
+                        on_sticky: true,
+                    });
+                }
+            }
+        }
+
+        let cell = geometry.cell_at(pixel)?;
         let block = blocks::block_at_row(view, first_row + cell.row)?;
         let has_command = blocks::has_command(view, &block);
         let has_output = blocks::has_output(view, &block);
         if !has_command && !has_output {
             return None;
         }
-        let scrollbar_reserve = self
-            .scrollbar_view(scale, scrollbar_policy)
-            .map_or(0, |sb| sb.track.size.width.get() + 6);
         let vis_start = block
             .prompt_row
             .saturating_sub(first_row)
@@ -523,6 +549,7 @@ impl Pane {
         Some(HoveredBlock {
             prompt_row: block.prompt_row,
             hovered_action,
+            on_sticky: false,
         })
     }
 
@@ -533,13 +560,21 @@ impl Pane {
         let HoveredBlock {
             prompt_row,
             hovered_action: Some(action),
+            ..
         } = self.hovered_block?
         else {
             return None;
         };
+        if action == BlockAction::JumpToPrompt {
+            self.jump_to_row(prompt_row);
+            self.hovered_block = None;
+            self.invalidate_overlay();
+            return None;
+        }
         let view = self.session.screen().view();
         let block = blocks::block_at_row(view, prompt_row)?;
         match action {
+            BlockAction::JumpToPrompt => unreachable!(),
             BlockAction::CopyCommand => {
                 if *copy_pending {
                     return None;
@@ -594,7 +629,13 @@ impl Pane {
         if *copy_pending {
             return None;
         }
-        let cmd = blocks::last_command_text(self.session.screen().view())?;
+        let screen = self.session.screen();
+        let view = screen.view();
+        let first_row = screen.viewport().range().start;
+        let offset = screen.viewport_offset();
+        let cmd = blocks::active_target_block(view, first_row, offset)
+            .and_then(|block| blocks::extract_command(view, &block))
+            .or_else(|| blocks::last_command_text(view))?;
         let notice = format_copied_preview(&cmd);
         match clipboard::write(cmd, self.proxy.clone()) {
             Ok(()) => {
@@ -606,6 +647,54 @@ impl Pane {
                 None
             }
         }
+    }
+
+    pub(super) fn rerun_last_command(&mut self) -> Option<String> {
+        let screen = self.session.screen();
+        if screen.active_buffer() != ScreenBuffer::Primary {
+            return None;
+        }
+        let view = screen.view();
+        let first_row = screen.viewport().range().start;
+        let offset = screen.viewport_offset();
+        let cmd = blocks::active_target_block(view, first_row, offset)
+            .and_then(|block| blocks::extract_command(view, &block))
+            .or_else(|| blocks::last_command_text(view))?;
+        let preview = if cmd.chars().count() > 36 {
+            let short: String = cmd.chars().take(36).collect();
+            format!("Re-running: {short}...")
+        } else {
+            format!("Re-running: {cmd}")
+        };
+        self.follow_output();
+        self.push_input(Input::Text(format!("{cmd}\r")));
+        let _ = self.flush_input(Instant::now());
+        Some(preview)
+    }
+
+    pub(super) fn jump_previous_failed_prompt(&mut self) -> bool {
+        let screen = self.session.screen();
+        if screen.active_buffer() != ScreenBuffer::Primary {
+            return false;
+        }
+        let view = screen.view();
+        let history = view.history_rows();
+        let viewport = screen.viewport();
+        let current_offset = screen.viewport_offset();
+        let anchor = if current_offset == 0 {
+            view.rows()
+        } else {
+            viewport.range().start
+        };
+        let Some(row) = blocks::previous_failed_prompt(view, anchor) else {
+            return false;
+        };
+        let desired_offset = history.saturating_sub(row);
+        let delta = desired_offset as isize - current_offset as isize;
+        if delta != 0 {
+            self.scroll_history(delta);
+        }
+        true
     }
 
     pub(super) fn update_hovered_hyperlink(&mut self) {
@@ -1749,6 +1838,7 @@ impl Pane {
             self.selection_click = None;
             self.selection_drag = None;
             self.hyperlink_click = None;
+            self.hovered_block = None;
             self.scroll_vi_cursor();
             self.update_hovered_hyperlink();
             self.invalidate_overlay();
@@ -1808,13 +1898,17 @@ impl Pane {
         if *copy_pending {
             return None;
         }
-        let view = self.session.screen().view();
-        let range = view.last_command_output()?;
-        let text = view.selection_text(range).ok()?;
-        let text = text.to_string();
-        if text.is_empty() {
-            return None;
-        }
+        let screen = self.session.screen();
+        let view = screen.view();
+        let first_row = screen.viewport().range().start;
+        let offset = screen.viewport_offset();
+        let text = blocks::active_target_block(view, first_row, offset)
+            .and_then(|block| blocks::extract_output(view, &block))
+            .or_else(|| {
+                let range = view.last_command_output()?;
+                let s = view.selection_text(range).ok()?.to_string();
+                (!s.is_empty()).then_some(s)
+            })?;
         let notice = format_copied_summary(&text);
         match clipboard::write(text, self.proxy.clone()) {
             Ok(()) => {

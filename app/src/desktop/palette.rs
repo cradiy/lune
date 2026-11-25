@@ -8,6 +8,7 @@ use winit::dpi::PhysicalPosition;
 
 use crate::PixelRect;
 
+use super::blocks;
 use super::config::{TabPosition, TerminalMode, WindowControlsPolicy};
 use super::font::FontMetrics;
 use super::scrollbar::ScrollbarPolicy;
@@ -25,7 +26,6 @@ pub(super) enum PaletteAction {
     SetTabPosition(TabPosition),
     ToggleWindowControls,
     ToggleCommandBlocks,
-    CopyLastCommand,
     ToggleCopyOnSelect,
     OpenThemes,
     ApplyTheme(String),
@@ -363,31 +363,37 @@ pub(super) fn build_command_history_entries(view: ScreenView<'_>) -> Vec<Palette
         if !semantic.prompt_start {
             continue;
         }
-        let end_col = row.wrap_end().unwrap_or(row.cells().len());
-        let Ok(range) = view.selection_text(
-            lune_terminal::CellPosition {
-                row: row_idx,
-                column: 0,
-            }..lune_terminal::CellPosition {
-                row: row_idx,
-                column: end_col,
-            },
-        ) else {
+        let block = blocks::block_at_row(view, row_idx);
+        let title = block
+            .as_ref()
+            .and_then(|b| blocks::extract_command(view, b))
+            .or_else(|| {
+                let end_col = row.wrap_end().unwrap_or(row.cells().len());
+                let range = view
+                    .selection_text(
+                        lune_terminal::CellPosition {
+                            row: row_idx,
+                            column: 0,
+                        }..lune_terminal::CellPosition {
+                            row: row_idx,
+                            column: end_col,
+                        },
+                    )
+                    .ok()?;
+                let line = range.to_string();
+                let trimmed = line.trim();
+                (!trimmed.is_empty()).then(|| trimmed.to_owned())
+            });
+        let Some(title) = title else {
             continue;
         };
-        let line = range.to_string();
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let detail = match semantic.exit_code {
-            Some(0) => "ok".to_owned(),
-            Some(code) => format!("exit {code}"),
-            None => format!("line {}", row_idx + 1),
-        };
+        let detail = block
+            .as_ref()
+            .and_then(blocks::format_status_badge)
+            .unwrap_or_else(|| format!("line {}", row_idx + 1));
         commands.push(PaletteEntry::new(
             PaletteAction::JumpToRow(row_idx),
-            trimmed.to_owned(),
+            title,
             detail,
         ));
         if commands.len() >= 100 {
@@ -459,13 +465,6 @@ fn build_root_entries(ctx: &PaletteContext<'_>) -> Vec<PaletteEntry> {
             if ctx.command_blocks { "On" } else { "Off" },
         ));
     }
-    if ctx.primary_screen {
-        entries.push(PaletteEntry::new(
-            PaletteAction::CopyLastCommand,
-            "Copy last command",
-            "",
-        ));
-    }
     entries.push(PaletteEntry::new(
         PaletteAction::ToggleCopyOnSelect,
         "Copy on select",
@@ -484,8 +483,18 @@ fn build_root_entries(ctx: &PaletteContext<'_>) -> Vec<PaletteEntry> {
         (Action::Copy, "Copy selection", true),
         (Action::Paste, "Paste clipboard", true),
         (
+            Action::CopyLastCommand,
+            "Copy last command",
+            ctx.primary_screen,
+        ),
+        (
             Action::CopyLastOutput,
             "Copy last command output",
+            ctx.primary_screen,
+        ),
+        (
+            Action::RerunLastCommand,
+            "Re-run last command",
             ctx.primary_screen,
         ),
         (
@@ -496,6 +505,11 @@ fn build_root_entries(ctx: &PaletteContext<'_>) -> Vec<PaletteEntry> {
         (
             Action::NextPrompt,
             "Jump to next prompt",
+            ctx.primary_screen,
+        ),
+        (
+            Action::PreviousFailedPrompt,
+            "Jump to previous failed command",
             ctx.primary_screen,
         ),
         (Action::SplitPane(Axis::Columns), "Split pane right", true),
