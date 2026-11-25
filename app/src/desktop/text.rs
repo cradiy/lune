@@ -58,15 +58,40 @@ impl Quad {
         uv: [f32; 4],
         sprite: [u32; 2],
     ) -> Self {
+        Self::new_float(
+            area,
+            rect.origin.x as f32,
+            rect.origin.y as f32,
+            rect.size.width.get() as f32,
+            rect.size.height.get() as f32,
+            color,
+            alpha,
+            uv,
+            sprite,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_float(
+        area: PixelSize,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        color: Rgb,
+        alpha: f32,
+        uv: [f32; 4],
+        sprite: [u32; 2],
+    ) -> Self {
         let scale_x = 2.0 / area.width.get() as f32;
         let scale_y = 2.0 / area.height.get() as f32;
         let lut = linear_colors();
         Self {
             rect: [
-                rect.origin.x as f32 * scale_x - 1.0,
-                1.0 - rect.origin.y as f32 * scale_y,
-                rect.size.width.get() as f32 * scale_x,
-                -(rect.size.height.get() as f32) * scale_y,
+                x * scale_x - 1.0,
+                1.0 - y * scale_y,
+                width * scale_x,
+                -height * scale_y,
             ],
             uv,
             color: [
@@ -299,18 +324,14 @@ impl TextRenderer {
         text_origin: PixelPosition,
         frame: &PresentationFrame<'_>,
         overlay: &PaneOverlay<'_>,
+        blocks: &[blocks::CommandBlock],
     ) -> Range<u32> {
         let start = self.instances.len() as u32;
-        if !overlay.command_blocks {
+        if !overlay.command_blocks || blocks.is_empty() {
             return start..start;
         }
         let first_row = frame.viewport.range().start;
         let rows = usize::from(frame.geometry.pty_size().rows);
-        let blocks =
-            blocks::blocks_in_viewport(frame.viewport.source(), first_row..first_row + rows);
-        if blocks.is_empty() {
-            return start..start;
-        }
 
         let prev_area = std::mem::replace(&mut self.area, pane_rect.size);
         let gutter = text_origin.x.saturating_sub(pane_rect.origin.x);
@@ -342,7 +363,7 @@ impl TextRenderer {
         let card_x = (rail_x / 2).max(1);
         let card_w = pane_w.saturating_sub(scrollbar_reserve.saturating_add(card_x + 4));
 
-        for block in &blocks {
+        for block in blocks {
             let hovered = overlay
                 .hovered_block
                 .is_some_and(|h| h.prompt_row == block.prompt_row);
@@ -489,6 +510,7 @@ impl TextRenderer {
         frame: &PresentationFrame<'_>,
         cursor: Option<PresentedCursor>,
         overlay: &PaneOverlay<'_>,
+        primary_blocks: &[blocks::CommandBlock],
     ) -> Result<Range<u32>, Box<dyn std::error::Error>> {
         let PaneOverlay {
             selection,
@@ -546,12 +568,6 @@ impl TextRenderer {
                 .sized_text_at(pos.column)
                 .map(|part| (cursor, part))
         });
-        let primary_blocks = if command_blocks {
-            let rows = usize::from(frame.geometry.pty_size().rows);
-            blocks::blocks_in_viewport(frame.viewport.source(), first_row..first_row + rows)
-        } else {
-            Vec::new()
-        };
         for (row, source) in frame.viewport.iter_rows().enumerate() {
             let semantic = source.semantic();
             if !command_blocks
@@ -981,7 +997,7 @@ impl TextRenderer {
             let scrollbar_reserve = scrollbar.map_or(0, |sb| sb.track.size.width.get() + 6);
             self.command_block_overlays(
                 frame,
-                &primary_blocks,
+                primary_blocks,
                 hovered_block,
                 scrollbar_reserve,
                 scale,
@@ -1069,8 +1085,8 @@ impl TextRenderer {
         for block in blocks {
             let is_hovered = hovered_block.is_some_and(|h| h.prompt_row == block.prompt_row);
             if is_hovered {
-                let has_command = blocks::extract_command(source, block).is_some();
-                let has_output = blocks::extract_output(source, block).is_some();
+                let has_command = blocks::has_command(source, block);
+                let has_output = blocks::has_output(source, block);
                 let vis_start = block.prompt_row.saturating_sub(first_row).min(rows - 1);
                 let anchor_y = frame
                     .geometry
@@ -2383,14 +2399,19 @@ impl TextRenderer {
         let ellipsis = "...";
         let ellipsis_w = self.font.measure_text(metrics, ellipsis);
         let budget = max_w.saturating_sub(ellipsis_w);
-        let mut end = 0;
-        for (idx, ch) in text.char_indices() {
-            let next = idx + ch.len_utf8();
-            if self.font.measure_text(metrics, &text[..next]) > budget {
-                break;
+        let mut boundaries: Vec<usize> = text.char_indices().map(|(idx, _)| idx).collect();
+        boundaries.push(text.len());
+        let mut lo = 0usize;
+        let mut hi = boundaries.len() - 1;
+        while lo < hi {
+            let mid = lo + (hi - lo).div_ceil(2);
+            if self.font.measure_text(metrics, &text[..boundaries[mid]]) <= budget {
+                lo = mid;
+            } else {
+                hi = mid - 1;
             }
-            end = next;
         }
+        let end = boundaries[lo];
         let truncated = format!("{}{ellipsis}", text[..end].trim_end());
         let width = self.font.measure_text(metrics, &truncated).min(max_w);
         (std::borrow::Cow::Owned(truncated), width)
@@ -3924,8 +3945,24 @@ impl TextRenderer {
         }
     }
 
-    pub(super) fn prepare_moving_cursor(&mut self, area: PixelSize, rect: PixelRect, color: Rgb) {
-        let quad = Quad::new(area, rect, color, 1.0, [0.0; 4], [0, 0]);
+    pub(super) fn prepare_moving_cursor(
+        &mut self,
+        area: PixelSize,
+        origin: [f32; 2],
+        size: PixelSize,
+        color: Rgb,
+    ) {
+        let quad = Quad::new_float(
+            area,
+            origin[0],
+            origin[1],
+            size.width.get() as f32,
+            size.height.get() as f32,
+            color,
+            1.0,
+            [0.0; 4],
+            [0, 0],
+        );
         write_instances(&self.device, &self.queue, &mut self.motion_buffer, &[quad]);
     }
 

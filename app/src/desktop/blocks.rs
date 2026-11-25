@@ -318,23 +318,72 @@ fn build_block(
     }
 }
 
+fn row_has_non_whitespace(row: &lune_terminal::Row, start_col: usize, end_col: usize) -> bool {
+    let cells = row.cells();
+    let start = start_col.min(cells.len());
+    let end = end_col.min(cells.len());
+    for (offset, cell) in cells[start..end].iter().enumerate() {
+        if cell.is_erased() || cell.is_continuation() {
+            continue;
+        }
+        if cell.has_extended_text() {
+            if row.text(start + offset).is_some_and(|text| match text {
+                lune_terminal::CellText::Extended(s) => !s.trim().is_empty(),
+                lune_terminal::CellText::Scalar(ch) => !ch.is_whitespace(),
+                lune_terminal::CellText::Continuation => false,
+            }) {
+                return true;
+            }
+        } else if cell.character().is_some_and(|ch| !ch.is_whitespace()) {
+            return true;
+        }
+    }
+    false
+}
+
 fn row_is_blank(view: ScreenView<'_>, row_idx: usize) -> bool {
     let Some(row) = view.row(row_idx) else {
         return true;
     };
     let end_col = row.wrap_end().unwrap_or(row.cells().len());
-    let Ok(range) = view.selection_text(
-        CellPosition {
-            row: row_idx,
-            column: 0,
-        }..CellPosition {
-            row: row_idx,
-            column: end_col,
-        },
-    ) else {
-        return true;
+    !row_has_non_whitespace(row, 0, end_col)
+}
+
+/// Fast zero-allocation check for whether a command block has non-empty command input.
+pub(super) fn has_command(view: ScreenView<'_>, block: &CommandBlock) -> bool {
+    let Some(start_col) = block.input_start_col else {
+        return false;
     };
-    range.to_string().trim().is_empty()
+    let last_input_row = match block.output_row {
+        Some(out) if out > block.prompt_row => out - 1,
+        _ => block.prompt_row,
+    }
+    .min(view.rows().saturating_sub(1));
+    for r in block.prompt_row..=last_input_row {
+        let Some(row) = view.row(r) else {
+            continue;
+        };
+        let col0 = if r == block.prompt_row { start_col } else { 0 };
+        let end_col = row.wrap_end().unwrap_or(row.cells().len());
+        if row_has_non_whitespace(row, col0, end_col) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Fast zero-allocation check for whether a command block has non-empty output rows.
+pub(super) fn has_output(view: ScreenView<'_>, block: &CommandBlock) -> bool {
+    let Some(start_row) = block.output_row else {
+        return false;
+    };
+    let end_row = block.end_row.min(view.rows());
+    for r in start_row..end_row {
+        if !row_is_blank(view, r) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Extracts the exact command input text (`OSC 133;B` .. `OSC 133;C`) for a block.

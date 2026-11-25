@@ -497,8 +497,8 @@ impl Pane {
         let rows = usize::from(geometry.pty_size().rows);
         let view = screen.view();
         let block = blocks::block_at_row(view, first_row + cell.row)?;
-        let has_command = blocks::extract_command(view, &block).is_some();
-        let has_output = blocks::extract_output(view, &block).is_some();
+        let has_command = blocks::has_command(view, &block);
+        let has_output = blocks::has_output(view, &block);
         if !has_command && !has_output {
             return None;
         }

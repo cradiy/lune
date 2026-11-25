@@ -20,7 +20,7 @@ use crate::{
 use super::bg_image::{BackgroundImageConfig, BackgroundImageRenderer};
 use super::blocks;
 use super::confirm;
-use super::cursor::CursorMotion;
+use super::cursor::{CursorMotion, CursorTarget};
 use super::font::{Font, FontConfig, FontMetrics};
 use super::hints::HintMode;
 use super::ime::Preedit;
@@ -251,6 +251,7 @@ impl Painter {
         self.surface.configure(&self.device, &self.config);
         self.reset_cursor_motion();
         self.dirty = true;
+        self.force_present = true;
     }
 
     pub(super) fn metrics(&self) -> FontMetrics {
@@ -345,6 +346,7 @@ impl Painter {
         }
         self.text.set_metrics(metrics);
         self.dirty = true;
+        self.force_present = true;
     }
 
     pub(super) fn set_cursor_blink(&mut self, enabled: bool) {
@@ -587,20 +589,28 @@ impl Painter {
         } else {
             CursorMotion::default()
         };
-        let target = if self.cursor_animation
-            && let Some(pane) = focused_pane
-            && pane.focused
-            && pane.vi.is_none()
-            && pane.search.is_none()
-            && pane.hints.is_none()
-            && pane.preedit.is_none()
-            && pane.frame.viewport.offset() == 0
-        {
+        let animation_active = self.cursor_animation
+            && focused_pane.is_some_and(|pane| {
+                pane.focused
+                    && pane.vi.is_none()
+                    && pane.search.is_none()
+                    && pane.hints.is_none()
+                    && pane.preedit.is_none()
+                    && pane.frame.viewport.offset() == 0
+            });
+        let target = if animation_active && let Some(pane) = focused_pane {
             focused_cursor.and_then(|cursor| cursor_origin(&pane.frame, cursor.position))
         } else {
             None
         };
-        let position = motion.advance(target, now);
+        let cursor_input = if !animation_active {
+            CursorTarget::Reset
+        } else if let Some(origin) = target {
+            CursorTarget::Visible(origin)
+        } else {
+            CursorTarget::Hidden
+        };
+        let position = motion.advance(cursor_input, now);
         let moving = position.is_some();
 
         let panes_layout_changed = self.pane_ranges.len() != panes.len()
@@ -674,17 +684,29 @@ impl Painter {
                     scale: chrome.scale,
                     dim_alpha: pane.dim_alpha,
                 };
+                let pane_blocks = if pane.command_blocks {
+                    let first_row = pane.frame.viewport.range().start;
+                    let rows = usize::from(pane.frame.geometry.pty_size().rows);
+                    blocks::blocks_in_viewport(
+                        pane.frame.viewport.source(),
+                        first_row..first_row + rows,
+                    )
+                } else {
+                    Vec::new()
+                };
                 let bg_range = self.text.prepare_pane_blocks_bg(
                     pane.rect,
                     pane.text_origin,
                     &pane.frame,
                     &overlay,
+                    &pane_blocks,
                 );
                 self.pane_bg_ranges.push((pane.id, bg_range));
                 let range = self.text.prepare_pane(
                     &pane.frame,
                     cursor.filter(|_| !pane_moving),
                     &overlay,
+                    &pane_blocks,
                 )?;
                 self.pane_ranges.push((pane.id, range));
             }
@@ -757,33 +779,41 @@ impl Painter {
                 .frame
                 .cursor_paint(cursor, NonZeroU32::new(2).unwrap())?
         {
-            let mut rect = paint.rect;
-            rect.origin.x = position.x + (rect.origin.x - target.x);
-            rect.origin.y = position.y + (rect.origin.y - target.y);
+            let origin = [
+                position[0] + (paint.rect.origin.x as f32 - target.x as f32),
+                position[1] + (paint.rect.origin.y as f32 - target.y as f32),
+            ];
             let area = pane.frame.geometry.text_area_pixels().unwrap();
-            self.text.prepare_moving_cursor(area, rect, paint.color);
+            self.text
+                .prepare_moving_cursor(area, origin, paint.rect.size, paint.color);
             draw_moving_cursor = true;
         }
 
         let mut total_failures = 0usize;
-        if prepare_layers {
+        let prepare_backgrounds = any_rows_changed || panes_layout_changed || self.force_present;
+        let prepare_images = prepare_backgrounds || any_graphics_changed;
+        if prepare_backgrounds || prepare_images {
             for pane in panes {
                 let gpu = self.gpus.get_mut(&pane.id).unwrap();
-                gpu.backgrounds
-                    .prepare(&self.device, &self.queue, &pane.frame)
-                    .map_err(|error| {
-                        std::io::Error::other(format!(
-                            "Failed to prepare terminal backgrounds: {error:?}"
-                        ))
-                    })?;
-                let failures = gpu.images.prepare(&self.device, &self.queue, &pane.frame);
-                if failures != 0 {
-                    if !gpu.graphics_prepare_failed {
-                        log::warn!("Failed to prepare {failures} terminal graphics placements");
-                    }
-                    total_failures += failures;
+                if prepare_backgrounds {
+                    gpu.backgrounds
+                        .prepare(&self.device, &self.queue, &pane.frame)
+                        .map_err(|error| {
+                            std::io::Error::other(format!(
+                                "Failed to prepare terminal backgrounds: {error:?}"
+                            ))
+                        })?;
                 }
-                gpu.graphics_prepare_failed = failures != 0;
+                if prepare_images {
+                    let failures = gpu.images.prepare(&self.device, &self.queue, &pane.frame);
+                    if failures != 0 {
+                        if !gpu.graphics_prepare_failed {
+                            log::warn!("Failed to prepare {failures} terminal graphics placements");
+                        }
+                        total_failures += failures;
+                    }
+                    gpu.graphics_prepare_failed = failures != 0;
+                }
             }
         }
 

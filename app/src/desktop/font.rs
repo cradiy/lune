@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::sync::OnceLock;
 
@@ -127,6 +128,9 @@ pub(super) struct Font {
     adjust_baseline: MetricAdjustment,
     buffer: Buffer,
     swash: SwashCache,
+    /// Cached horizontal pixel widths keyed by `(font_size.to_bits(), text)` to avoid
+    /// repeating HarfBuzz shaping for static UI labels and badges on every frame.
+    width_cache: HashMap<u32, HashMap<Box<str>, u32>>,
 }
 
 impl Font {
@@ -160,6 +164,7 @@ impl Font {
             adjust_baseline: config.adjust_baseline,
             buffer: Buffer::new_empty(Metrics::new(16.0, 21.0)),
             swash: SwashCache::new(),
+            width_cache: HashMap::new(),
         }
     }
 
@@ -182,6 +187,7 @@ impl Font {
         self.adjust_cell_height = config.adjust_cell_height;
         self.adjust_cell_width = config.adjust_cell_width;
         self.adjust_baseline = config.adjust_baseline;
+        self.width_cache.clear();
         true
     }
 
@@ -273,13 +279,31 @@ impl Font {
     }
 
     pub(super) fn measure_text(&mut self, metrics: FontMetrics, text: &str) -> u32 {
+        if text.is_empty() {
+            return 0;
+        }
+        let size_key = metrics.size.to_bits();
+        if let Some(&cached) = self
+            .width_cache
+            .get(&size_key)
+            .and_then(|entries| entries.get(text))
+        {
+            return cached;
+        }
         self.buffer
             .set_metrics(Metrics::new(metrics.size, metrics.cell.height.get() as f32));
         self.shape(text, 0, false);
-        self.buffer
+        let width = self
+            .buffer
             .layout_runs()
             .next()
-            .map_or(0, |run| run.line_w.ceil() as u32)
+            .map_or(0, |run| run.line_w.ceil() as u32);
+        let bucket = self.width_cache.entry(size_key).or_default();
+        if bucket.len() >= 512 {
+            bucket.clear();
+        }
+        bucket.insert(Box::<str>::from(text), width);
+        width
     }
 
     pub(super) fn rasterize(
