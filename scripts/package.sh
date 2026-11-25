@@ -164,6 +164,7 @@ populate_usr_tree() {
     install -Dm0755 "${STAGED_BIN}" "${prefix_root}/bin/${PKG_NAME}"
     install -Dm0644 "${ROOT_DIR}/assets/lune.desktop" "${prefix_root}/share/applications/lune.desktop"
     install -Dm0644 "${ROOT_DIR}/assets/lune.svg" "${prefix_root}/share/icons/hicolor/scalable/apps/lune.svg"
+    install -Dm0644 "${ROOT_DIR}/LICENSE" "${prefix_root}/share/licenses/${PKG_NAME}/LICENSE"
 }
 
 build_tar_gz() {
@@ -184,6 +185,7 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 install -Dm0755 "${DIR}/bin/lune" "${PREFIX}/bin/lune"
 install -Dm0644 "${DIR}/share/applications/lune.desktop" "${PREFIX}/share/applications/lune.desktop"
 install -Dm0644 "${DIR}/share/icons/hicolor/scalable/apps/lune.svg" "${PREFIX}/share/icons/hicolor/scalable/apps/lune.svg"
+install -Dm0644 "${DIR}/share/licenses/lune/LICENSE" "${PREFIX}/share/licenses/lune/LICENSE"
 echo "Installed lune to ${PREFIX}"
 EOF
     chmod 0755 "${stage}/install.sh"
@@ -202,6 +204,7 @@ build_deb() {
     local output="${DIST_DIR}/${PKG_NAME}_${PKG_VERSION}_${DEB_ARCH}.deb"
 
     populate_usr_tree "${stage}/usr"
+    install -Dm0644 "${ROOT_DIR}/LICENSE" "${stage}/usr/share/doc/${PKG_NAME}/copyright"
     mkdir -p "${stage}/DEBIAN"
     chmod 0755 "${stage}" "${stage}/DEBIAN"
 
@@ -261,6 +264,7 @@ build_rpm() {
     cp "${STAGED_BIN}" "${topdir}/SOURCES/${PKG_NAME}"
     cp "${ROOT_DIR}/assets/lune.desktop" "${topdir}/SOURCES/lune.desktop"
     cp "${ROOT_DIR}/assets/lune.svg" "${topdir}/SOURCES/lune.svg"
+    cp "${ROOT_DIR}/LICENSE" "${topdir}/SOURCES/LICENSE"
 
     local rpm_requires=""
     case "${RPM_ARCH}" in
@@ -290,8 +294,10 @@ Lune is a GPU-accelerated Wayland terminal emulator written in Rust.
 install -Dm0755 %{_sourcedir}/${PKG_NAME} %{buildroot}%{_bindir}/${PKG_NAME}
 install -Dm0644 %{_sourcedir}/lune.desktop %{buildroot}%{_datadir}/applications/lune.desktop
 install -Dm0644 %{_sourcedir}/lune.svg %{buildroot}%{_datadir}/icons/hicolor/scalable/apps/lune.svg
+install -Dm0644 %{_sourcedir}/LICENSE %{buildroot}%{_licensedir}/${PKG_NAME}/LICENSE
 
 %files
+%license %{_licensedir}/${PKG_NAME}/LICENSE
 %attr(0755,root,root) %{_bindir}/${PKG_NAME}
 %attr(0644,root,root) %{_datadir}/applications/lune.desktop
 %attr(0644,root,root) %{_datadir}/icons/hicolor/scalable/apps/lune.svg

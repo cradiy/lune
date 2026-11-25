@@ -1,0 +1,99 @@
+# Lune example configuration
+# Copy to ${XDG_CONFIG_HOME:-~/.config}/lune/lune.conf.
+# Changes are reloaded automatically when saved.
+
+# Window chrome and layout
+# mode: classic | modern
+mode = classic
+# tab-position (modern mode): top | left
+tab-position = top
+# window-controls: auto | show | hide
+window-controls = auto
+# command-blocks (modern mode OSC 133 gutter and headers): true | false
+command-blocks = true
+# scrollbar: auto | always | never
+scrollbar = auto
+# window-padding in logical pixels (0..=64)
+window-padding = 0
+
+# Theme and appearance
+# theme: system | dark | light | <name in themes directory or path>
+theme = system
+# background-opacity: 0.0..=1.0
+background-opacity = 1.0
+# unfocused-split-opacity: 0.15..=1.0
+unfocused-split-opacity = 0.75
+# minimum-contrast: 1.0 (disabled) ..= 21.0
+minimum-contrast = 1.0
+
+# Optional background image (PNG, JPEG, or WebP)
+# background-image = wallpaper.png
+# background-image-opacity: 0.0..=1.0
+background-image-opacity = 0.35
+# background-image-fit: cover | contain | stretch | tile | none
+background-image-fit = cover
+# background-image-position: center | top | bottom | left | right | top-left | top-right | bottom-left | bottom-right
+background-image-position = center
+
+# Typography
+# font-family = JetBrains Mono
+# font-family-bold = JetBrains Mono
+# font-family-italic = JetBrains Mono
+# font-family-bold-italic = JetBrains Mono
+# font-size in points (8.0..=32.0)
+font-size = 15.0
+font-ligatures = true
+# font-feature = +calt
+# font-feature = -liga
+font-thicken = false
+# Cell metric adjustments (pixels like "2" or percentages like "10%")
+# adjust-cell-height = 0
+# adjust-cell-width = 0
+# adjust-baseline = 0
+
+# Cursor
+# cursor-style: block | bar | underline
+cursor-style = block
+cursor-blink = true
+cursor-animation = true
+
+# Terminal session and safety
+# scrollback-lines (0..=1000000)
+scrollback-lines = 10000
+# shell = /bin/zsh -l
+shell-integration = true
+confirm-close = true
+confirm-paste = true
+copy-on-select = false
+
+# Clipboard (OSC 52) and desktop notifications
+# clipboard-write: allow | deny
+clipboard-write = allow
+# clipboard-read: allow | deny
+clipboard-read = deny
+# notifications: unfocused | always | deny
+notifications = unfocused
+
+# Custom keybind overrides: keybind = <combo>=<action>
+# Set action to "unbind" or "none" to remove a default binding.
+#
+# Supported actions:
+#   copy, paste, open_directory, toggle_fullscreen,
+#   zoom_in, zoom_out, zoom_reset,
+#   scroll_oldest, scroll_live, scroll_page_up, scroll_page_down,
+#   toggle_vi, search, hints, command_palette,
+#   toggle_mode, toggle_sidebar,
+#   previous_prompt, next_prompt, previous_failed_prompt,
+#   copy_last_output, copy_last_command, select_last_output,
+#   toggle_block_bookmark, previous_bookmark, next_bookmark, search_bookmarks,
+#   rerun_last_command, reload_config,
+#   new_window, new_tab, close_tab, next_tab, previous_tab,
+#   select_tab_1..select_tab_9, move_tab_left, move_tab_right, rename_tab,
+#   split_right, split_down,
+#   focus_pane_left, focus_pane_right, focus_pane_up, focus_pane_down,
+#   resize_pane_left, resize_pane_right, resize_pane_up, resize_pane_down,
+#   toggle_pane_zoom, swap_pane, detach_pane, toggle_broadcast_input
+#
+# keybind = ctrl+shift+k=unbind
+# keybind = ctrl+alt+r=rename_tab
+# keybind = ctrl+alt+i=toggle_broadcast_input

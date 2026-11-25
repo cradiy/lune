@@ -2,6 +2,7 @@
 name = "lune-kitty-graphics"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 description = "Kitty terminal graphics protocol"
 
 [dependencies]

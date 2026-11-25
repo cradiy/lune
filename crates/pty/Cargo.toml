@@ -2,6 +2,7 @@
 name = "lune-pty"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 description = "PTY process lifecycle and byte transport"
 
 [target.'cfg(target_os = "linux")'.dependencies]

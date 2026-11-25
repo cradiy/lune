@@ -2,6 +2,7 @@
 name = "lune-text"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 description = "Bounded incremental grapheme updates and Unicode column widths"
 
 [dependencies]
