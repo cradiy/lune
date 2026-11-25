@@ -1,3 +1,4 @@
+mod app_menu;
 mod bg_image;
 mod blocks;
 mod box_drawing;
@@ -104,6 +105,7 @@ enum Event {
     SystemTheme(Theme),
     ButtonLayout(Option<WindowButtons>),
     ConfigReload(bool),
+    AppMenuAction(Action),
 }
 
 pub fn run(mut options: LaunchOptions) -> Result<()> {
@@ -335,6 +337,10 @@ impl ApplicationHandler<Event> for App {
                 client.apply_system_theme(theme);
                 Ok(())
             }
+            Event::AppMenuAction(action) => {
+                client.run_shortcut(event_loop, action);
+                Ok(())
+            }
             Event::ButtonLayout(_) | Event::ConfigReload(_) => unreachable!(),
         };
         self.report(event_loop, result);
@@ -349,6 +355,9 @@ impl ApplicationHandler<Event> for App {
 }
 
 struct Client {
+    // Declared before `window` so `AppMenu` clears/destroys its Wayland proxy
+    // while `window`'s `wl_display` and `xdg_toplevel` are still live.
+    app_menu: Option<app_menu::AppMenu>,
     window: Arc<Window>,
     painter: Painter,
     readiness: Readiness,
@@ -395,6 +404,7 @@ struct Client {
     custom_app_id: Option<String>,
     custom_config: Option<PathBuf>,
     keymap: Keymap,
+    keymap_generation: u64,
     unfocused_split_opacity: f32,
     window_padding: u32,
     history_limits: HistoryLimits,
@@ -572,6 +582,7 @@ impl Client {
             .and_then(|path| path.parent().map(PathBuf::from))
             .or_else(Config::directory);
         let mut client = Self {
+            app_menu: None,
             window,
             painter,
             readiness,
@@ -630,6 +641,7 @@ impl Client {
             custom_app_id,
             custom_config,
             keymap: Keymap::from_overrides(&config.keybinds),
+            keymap_generation: 0,
             unfocused_split_opacity: config.unfocused_split_opacity,
             window_padding: config.window_padding,
             history_limits,
@@ -652,7 +664,49 @@ impl Client {
             context_menu: None,
         };
         client.reflow_tab_bar();
+        if client
+            .compositor_decorations
+            .as_ref()
+            .is_none_or(|decorations| decorations.has_afar_appmenu)
+        {
+            let menu_state = client.app_menu_state();
+            client.app_menu = app_menu::AppMenu::attach(
+                &client.window,
+                client.proxy.clone(),
+                menu_state,
+                &client.keymap,
+            );
+        }
         Ok(client)
+    }
+
+    fn app_menu_state(&self) -> app_menu::MenuState {
+        let tab = &self.tabs[self.active];
+        let pane = tab.focused_pane();
+        app_menu::MenuState {
+            mode: self.mode,
+            tab_position: self.tab_position,
+            sidebar_collapsed: self.sidebar_collapsed,
+            fullscreen: self.window.fullscreen().is_some(),
+            vi_mode: pane.vi.is_some(),
+            multi_tab: self.tabs.len() > 1,
+            multi_pane: tab.panes.len() > 1,
+            pane_zoomed: tab.zoomed.is_some(),
+            primary_screen: pane.session.screen().active_buffer()
+                == lune_terminal::ScreenBuffer::Primary,
+            keymap_generation: self.keymap_generation,
+        }
+    }
+
+    fn sync_app_menu(&mut self) {
+        if self.app_menu.is_none() {
+            return;
+        }
+        let state = self.app_menu_state();
+        if let Some(app_menu) = &mut self.app_menu {
+            app_menu.dispatch_pending();
+            app_menu.sync(state, &self.keymap);
+        }
     }
 
     fn pane_config(&self) -> PaneConfig<'_> {
@@ -1919,6 +1973,7 @@ impl Client {
         }
         if old.keybinds != new.keybinds {
             self.keymap = Keymap::from_overrides(&new.keybinds);
+            self.keymap_generation = self.keymap_generation.wrapping_add(1);
         }
         self.shell = new.shell.clone();
         self.shell_integration = new.shell_integration;
@@ -2152,6 +2207,7 @@ impl Client {
             .chain(self.notice.as_ref().map(|notice| notice.expires))
             .chain(tab_deadline)
             .min();
+        self.sync_app_menu();
         let flow = if immediate {
             ControlFlow::Poll
         } else {

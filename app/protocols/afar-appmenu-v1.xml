@@ -1,0 +1,90 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="afar_appmenu_v1">
+  <copyright><![CDATA[
+    SPDX-License-Identifier: MIT
+  ]]></copyright>
+
+  <interface name="afar_appmenu_manager_v1" version="1">
+    <description summary="publish a menu for an xdg toplevel">
+      This global lets an application associate a com.canonical.dbusmenu
+      object on the session bus with one of its xdg toplevels.
+    </description>
+
+    <enum name="error">
+      <entry name="already_exists" value="0" summary="the toplevel already has a menu object"/>
+      <entry name="invalid_toplevel" value="1" summary="the toplevel is no longer available"/>
+    </enum>
+
+    <request name="get_menu">
+      <description summary="create a menu association">
+        There can be at most one live afar_appmenu_v1 per xdg_toplevel.
+        Creating a second association raises already_exists. The association
+        starts without an address. It may be created before initial mapping.
+      </description>
+      <arg name="id" type="new_id" interface="afar_appmenu_v1"/>
+      <arg name="toplevel" type="object" interface="xdg_toplevel"/>
+    </request>
+
+    <request name="destroy" type="destructor">
+      <description summary="destroy the manager proxy">
+        Menu objects created by the manager remain valid.
+      </description>
+    </request>
+  </interface>
+
+  <interface name="afar_appmenu_v1" version="1">
+    <description summary="menu association with presentation state">
+      The application starts in local mode. The association is scoped to the
+      xdg_toplevel role, and the advertised address survives unmap and remap.
+      Unmapping revokes global presentation. Destroying the toplevel makes
+      this object inert until the client destroys it.
+    </description>
+
+    <enum name="error">
+      <entry name="invalid_address" value="0" summary="invalid D-Bus name or object path"/>
+    </enum>
+
+    <enum name="mode">
+      <entry name="local" value="0" summary="the application presents its menu locally"/>
+      <entry name="global" value="1" summary="a shell has taken responsibility for the menu"/>
+    </enum>
+
+    <request name="set_address">
+      <description summary="publish a menu address">
+        The D-Bus object must already be exported. This request replaces the
+        previous address immediately and resets presentation to local. It does
+        not wait for wl_surface.commit. Malformed addresses raise invalid_address.
+
+        The serial is chosen by the client and echoed in presentation events.
+        Use a different serial for each update that could still have an event
+        in flight. Apply presentation events for the latest serial only.
+      </description>
+      <arg name="serial" type="uint"/>
+      <arg name="bus_name" type="string"/>
+      <arg name="object_path" type="string"/>
+    </request>
+
+    <request name="clear">
+      <description summary="withdraw the published menu">
+        The address is withdrawn immediately and presentation returns to local
+        for this update. The serial has the same semantics as set_address.
+      </description>
+      <arg name="serial" type="uint"/>
+    </request>
+
+    <request name="destroy" type="destructor">
+      <description summary="destroy the menu association"/>
+    </request>
+
+    <event name="presentation">
+      <description summary="update the menu presentation mode">
+        Local presentation is reported for each set_address or clear request.
+        Global presentation means a shell has accepted responsibility for this
+        published menu. It does not indicate that the window currently has
+        focus. The compositor reports local when that responsibility ends.
+      </description>
+      <arg name="serial" type="uint"/>
+      <arg name="mode" type="uint" enum="mode"/>
+    </event>
+  </interface>
+</protocol>

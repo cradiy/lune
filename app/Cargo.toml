@@ -10,7 +10,7 @@ desktop = [
     "wgpu-renderer", "dep:calloop", "dep:calloop-wayland-source", "dep:cosmic-text",
     "dep:env_logger", "dep:event-listener", "dep:futures-lite", "dep:guillotiere",
     "dep:image", "dep:log", "dep:lune-text", "dep:pollster", "dep:regex", "dep:resvg", "dep:unicode-segmentation", "dep:zbus",
-    "dep:wayland-client", "dep:wayland-protocols",
+    "dep:wayland-backend", "dep:wayland-client", "dep:wayland-protocols", "dep:wayland-scanner",
     "dep:wl-clipboard-rs", "dep:winit",
 ]
 wgpu-renderer = ["dep:bytemuck", "dep:wgpu"]
@@ -41,8 +41,10 @@ pollster = { version = "0.4", optional = true }
 regex = { version = "1", optional = true }
 resvg = { version = "0.46", default-features = false, optional = true }
 unicode-segmentation = { version = "=1.13.3", optional = true }
-wayland-client = { version = "0.31", optional = true }
+wayland-backend = { version = "0.3", features = ["client_system", "dlopen"], optional = true }
+wayland-client = { version = "0.31", features = ["system", "dlopen"], optional = true }
 wayland-protocols = { version = "0.32", features = ["client", "staging", "unstable"], optional = true }
+wayland-scanner = { version = "0.31", optional = true }
 wgpu = { version = "30.0.1", default-features = false, features = ["std", "vulkan", "wgsl"], optional = true }
 wl-clipboard-rs = { version = "0.9.5", optional = true }
 winit = { version = "0.30.13", default-features = false, features = ["rwh_06", "wayland", "wayland-dlopen", "wayland-csd-adwaita"], optional = true }

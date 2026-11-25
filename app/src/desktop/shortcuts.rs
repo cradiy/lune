@@ -203,6 +203,71 @@ impl Keymap {
         let binding = self.bindings.iter().find(|b| b.action == action)?;
         Some(format_binding(binding.modifiers, &binding.key))
     }
+
+    pub(super) fn dbusmenu_shortcut(&self, action: Action) -> Option<Vec<String>> {
+        let binding = self.bindings.iter().find(|b| b.action == action)?;
+        Some(format_dbusmenu_binding(binding.modifiers, &binding.key))
+    }
+}
+
+fn format_dbusmenu_binding(modifiers: ModifiersState, key: &ShortcutKey) -> Vec<String> {
+    let mut parts = Vec::new();
+    if modifiers.control_key() {
+        parts.push("Control".into());
+    }
+    if modifiers.alt_key() {
+        parts.push("Alt".into());
+    }
+    if modifiers.shift_key() {
+        parts.push("Shift".into());
+    }
+    if modifiers.super_key() {
+        parts.push("Super".into());
+    }
+    let key_token: Cow<'static, str> = match key {
+        ShortcutKey::Letter(ch) => Cow::Owned(ch.to_ascii_lowercase()),
+        ShortcutKey::Symbol(sym) => match sym.as_ref() {
+            "+" => Cow::Borrowed("plus"),
+            "-" => Cow::Borrowed("minus"),
+            "=" => Cow::Borrowed("equal"),
+            "," => Cow::Borrowed("comma"),
+            "." => Cow::Borrowed("period"),
+            "/" => Cow::Borrowed("slash"),
+            other => Cow::Owned(other.to_owned()),
+        },
+        ShortcutKey::Space => Cow::Borrowed("space"),
+        ShortcutKey::Named(named) => Cow::Borrowed(match named {
+            NamedKey::Enter => "Return",
+            NamedKey::Tab => "Tab",
+            NamedKey::Escape => "Escape",
+            NamedKey::Backspace => "BackSpace",
+            NamedKey::Delete => "Delete",
+            NamedKey::Insert => "Insert",
+            NamedKey::Home => "Home",
+            NamedKey::End => "End",
+            NamedKey::PageUp => "Page_Up",
+            NamedKey::PageDown => "Page_Down",
+            NamedKey::ArrowUp => "Up",
+            NamedKey::ArrowDown => "Down",
+            NamedKey::ArrowLeft => "Left",
+            NamedKey::ArrowRight => "Right",
+            NamedKey::F1 => "F1",
+            NamedKey::F2 => "F2",
+            NamedKey::F3 => "F3",
+            NamedKey::F4 => "F4",
+            NamedKey::F5 => "F5",
+            NamedKey::F6 => "F6",
+            NamedKey::F7 => "F7",
+            NamedKey::F8 => "F8",
+            NamedKey::F9 => "F9",
+            NamedKey::F10 => "F10",
+            NamedKey::F11 => "F11",
+            NamedKey::F12 => "F12",
+            _ => "Key",
+        }),
+    };
+    parts.push(key_token.into_owned());
+    parts
 }
 
 fn format_binding(modifiers: ModifiersState, key: &ShortcutKey) -> String {

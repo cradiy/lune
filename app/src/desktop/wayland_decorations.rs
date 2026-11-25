@@ -66,6 +66,7 @@ pub(super) struct CompositorDecorations {
     pub(super) decoration_mode: Option<DecorationMode>,
     pub(super) wm_capabilities: Option<WmCapabilities>,
     pub(super) initially_tiled: bool,
+    pub(super) has_afar_appmenu: bool,
 }
 
 /// Resolves which inline titlebar window control buttons should be rendered.
@@ -121,6 +122,10 @@ pub(super) fn probe_wayland_decorations() -> Option<CompositorDecorations> {
     let (globals, mut queue) = registry_queue_init::<ProbeState>(&connection).ok()?;
     let qh = queue.handle();
 
+    let has_afar_appmenu = globals.contents().with_list(|list| {
+        list.iter()
+            .any(|global| global.interface == "afar_appmenu_manager_v1")
+    });
     let compositor: wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).ok()?;
     let wm_base: xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).ok()?;
     let decoration_manager: Option<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1> =
@@ -137,6 +142,7 @@ pub(super) fn probe_wayland_decorations() -> Option<CompositorDecorations> {
     surface.commit();
 
     let mut state = ProbeState::default();
+    state.info.has_afar_appmenu = has_afar_appmenu;
     let _ = queue.roundtrip(&mut state);
     if !state.configured {
         let _ = queue.roundtrip(&mut state);
@@ -319,6 +325,7 @@ mod tests {
                 window_menu: false,
             }),
             initially_tiled: true,
+            has_afar_appmenu: false,
         };
         assert_eq!(
             resolve_window_buttons(WindowControlsPolicy::Auto, Some(&tiling_ssd), None),
@@ -335,6 +342,7 @@ mod tests {
                 window_menu: false,
             }),
             initially_tiled: false,
+            has_afar_appmenu: false,
         };
         assert_eq!(
             resolve_window_buttons(WindowControlsPolicy::Auto, Some(&csd_no_minimize), None),
@@ -355,6 +363,7 @@ mod tests {
                 minimize: true,
             }),
             initially_tiled: false,
+            has_afar_appmenu: false,
         };
         assert_eq!(
             resolve_window_buttons(
