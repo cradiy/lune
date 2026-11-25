@@ -25,6 +25,8 @@ pub(super) enum MenuAction {
         action: BlockAction,
     },
     DuplicateTab(usize),
+    RenameTab(usize),
+    ResetTabTitle(usize),
     CloseTabAt(usize),
     CloseOtherTabs(usize),
     CloseTabsToRight(usize),

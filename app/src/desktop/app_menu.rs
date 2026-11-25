@@ -98,6 +98,7 @@ pub(super) struct MenuState {
     pub(super) multi_tab: bool,
     pub(super) multi_pane: bool,
     pub(super) pane_zoomed: bool,
+    pub(super) broadcast_input: bool,
     pub(super) primary_screen: bool,
     pub(super) keymap_generation: u64,
 }
@@ -823,6 +824,14 @@ impl MenuModel {
                     keymap,
                 ),
                 MenuNode::item(
+                    311,
+                    "Broadcast Input",
+                    Action::ToggleBroadcastInput,
+                    state.multi_pane,
+                    Some(state.broadcast_input),
+                    keymap,
+                ),
+                MenuNode::item(
                     308,
                     "Fullscreen",
                     Action::ToggleFullscreen,
@@ -951,6 +960,24 @@ impl MenuModel {
                     None,
                     keymap,
                 ),
+                MenuNode::item(507, "Rename Tab...", Action::RenameTab, true, None, keymap),
+                MenuNode::separator(508),
+                MenuNode::item(
+                    509,
+                    "Swap Pane",
+                    Action::SwapPane,
+                    state.multi_pane,
+                    None,
+                    keymap,
+                ),
+                MenuNode::item(
+                    510,
+                    "Move Pane to New Tab",
+                    Action::DetachPane,
+                    state.multi_pane,
+                    None,
+                    keymap,
+                ),
                 MenuNode::separator(505),
                 MenuNode::item(
                     506,
@@ -1033,6 +1060,7 @@ mod tests {
             multi_tab: true,
             multi_pane: false,
             pane_zoomed: false,
+            broadcast_input: false,
             primary_screen: true,
             keymap_generation: 0,
         }

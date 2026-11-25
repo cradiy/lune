@@ -62,6 +62,8 @@ impl Client {
             copy_on_select: self.copy_on_select,
             multi_tab: self.tabs.len() > 1,
             multi_pane: tab.panes.len() > 1,
+            broadcast_input: tab.broadcast_input,
+            has_custom_tab_title: tab.custom_title.is_some(),
             primary_screen: pane.session.screen().active_buffer()
                 == lune_terminal::ScreenBuffer::Primary,
         };
@@ -71,6 +73,41 @@ impl Client {
         self.painter.invalidate_overlay();
         self.update_cursor_icon();
         self.window.request_redraw();
+    }
+
+    pub(super) fn open_rename_tab(&mut self, index: usize) {
+        let Some(tab) = self.tabs.get(index) else {
+            return;
+        };
+        let initial = tab.custom_title.as_deref().unwrap_or("");
+        self.dragging_divider = None;
+        self.context_menu = None;
+        self.command_palette = Some(CommandPalette::for_rename_tab(index, initial));
+        self.window.set_ime_allowed(self.focused);
+        self.painter.reset_cursor_motion();
+        self.painter.invalidate_overlay();
+        self.update_cursor_icon();
+        self.window.request_redraw();
+    }
+
+    pub(super) fn set_tab_custom_title(&mut self, index: usize, title: Option<String>) {
+        let Some(tab) = self.tabs.get_mut(index) else {
+            return;
+        };
+        let normalized = title.and_then(|raw| {
+            let trimmed = raw.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_owned())
+        });
+        tab.custom_title = normalized.clone();
+        self.reflow_tab_bar();
+        self.update_window_title();
+        self.painter.invalidate_overlay();
+        self.window.request_redraw();
+        let notice = match normalized {
+            Some(name) => format!("Tab renamed: {name}"),
+            None => "Tab title reset".into(),
+        };
+        self.show_notice(NoticeKind::Success, notice);
     }
 
     pub(super) fn close_palette(&mut self, restore_theme: bool) {
@@ -384,6 +421,19 @@ impl Client {
                 };
                 self.show_notice(NoticeKind::Success, label.into());
             }
+            PaletteAction::ApplyTabTitle(index) => {
+                let query = self
+                    .command_palette
+                    .as_ref()
+                    .map(|palette| palette.query.clone())
+                    .unwrap_or_default();
+                self.close_palette(true);
+                self.set_tab_custom_title(index, Some(query));
+            }
+            PaletteAction::ResetTabTitle => {
+                self.close_palette(true);
+                self.set_tab_custom_title(self.active, None);
+            }
             PaletteAction::Shortcut(shortcut) => {
                 self.close_palette(true);
                 self.run_shortcut(event_loop, shortcut);
@@ -540,6 +590,28 @@ impl Client {
             "Split Down",
             self.shortcut_hint(Action::SplitPane(Axis::Rows)),
         ));
+        if self.tabs[self.active].panes.len() > 1 {
+            let broadcasting = self.tabs[self.active].broadcast_input;
+            entries.push(MenuEntry::item(
+                MenuAction::Shortcut(Action::SwapPane),
+                "Swap Pane",
+                self.shortcut_hint(Action::SwapPane),
+            ));
+            entries.push(MenuEntry::item(
+                MenuAction::Shortcut(Action::DetachPane),
+                "Move Pane to New Tab",
+                self.shortcut_hint(Action::DetachPane),
+            ));
+            entries.push(MenuEntry::item(
+                MenuAction::Shortcut(Action::ToggleBroadcastInput),
+                if broadcasting {
+                    "Stop Broadcast Input"
+                } else {
+                    "Broadcast Input"
+                },
+                self.shortcut_hint(Action::ToggleBroadcastInput),
+            ));
+        }
         entries.push(MenuEntry::Separator);
         entries.push(MenuEntry::item(
             MenuAction::Shortcut(Action::Search),
@@ -567,6 +639,10 @@ impl Client {
     }
 
     pub(super) fn open_tab_context_menu(&mut self, point: PhysicalPosition<f64>, index: usize) {
+        let has_custom_title = self
+            .tabs
+            .get(index)
+            .is_some_and(|tab| tab.custom_title.is_some());
         let mut entries = vec![
             MenuEntry::item(
                 MenuAction::Shortcut(Action::NewTab),
@@ -574,13 +650,25 @@ impl Client {
                 self.shortcut_hint(Action::NewTab),
             ),
             MenuEntry::item(MenuAction::DuplicateTab(index), "Duplicate Tab", ""),
-            MenuEntry::Separator,
-            MenuEntry::danger(
-                MenuAction::CloseTabAt(index),
-                "Close Tab",
-                self.shortcut_hint(Action::CloseTab),
+            MenuEntry::item(
+                MenuAction::RenameTab(index),
+                "Rename Tab",
+                self.shortcut_hint(Action::RenameTab),
             ),
         ];
+        if has_custom_title {
+            entries.push(MenuEntry::item(
+                MenuAction::ResetTabTitle(index),
+                "Reset Tab Title",
+                "",
+            ));
+        }
+        entries.push(MenuEntry::Separator);
+        entries.push(MenuEntry::danger(
+            MenuAction::CloseTabAt(index),
+            "Close Tab",
+            self.shortcut_hint(Action::CloseTab),
+        ));
         if self.tabs.len() > 1 {
             entries.push(MenuEntry::danger(
                 MenuAction::CloseOtherTabs(index),
@@ -724,6 +812,12 @@ impl Client {
                     self.show_notice(NoticeKind::Error, "Could not duplicate tab".into());
                 }
             }
+            MenuAction::RenameTab(index) => {
+                self.open_rename_tab(index);
+            }
+            MenuAction::ResetTabTitle(index) => {
+                self.set_tab_custom_title(index, None);
+            }
             MenuAction::CloseTabAt(index) => {
                 if index < self.tabs.len() {
                     self.request_close_tab(event_loop, index);
@@ -822,7 +916,20 @@ impl Client {
                 }
             }
             confirm::ConfirmTarget::Paste { pane, text } => {
-                if let Some(pane) = self.pane_mut(pane) {
+                let broadcast = self.tabs[self.active].broadcast_input
+                    && self.tabs[self.active].panes.len() > 1
+                    && self.tabs[self.active].focused == pane;
+                if broadcast {
+                    for target in &mut self.tabs[self.active].panes {
+                        if target.id == pane
+                            || (target.vi.is_none()
+                                && target.search.is_none()
+                                && target.hints.is_none())
+                        {
+                            target.commit_paste(text.clone());
+                        }
+                    }
+                } else if let Some(pane) = self.pane_mut(pane) {
                     pane.commit_paste(text);
                 }
                 let focused_pane = self.tabs[self.active].focused_pane_mut();

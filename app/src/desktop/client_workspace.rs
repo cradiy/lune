@@ -151,6 +151,101 @@ impl Client {
         self.window.request_redraw();
     }
 
+    pub(super) fn toggle_broadcast_input(&mut self) {
+        let tab = &mut self.tabs[self.active];
+        if tab.panes.len() <= 1 {
+            tab.broadcast_input = false;
+            self.show_notice(
+                NoticeKind::Warning,
+                "Broadcast input requires split panes".into(),
+            );
+            return;
+        }
+        tab.broadcast_input = !tab.broadcast_input;
+        let count = tab.panes.len();
+        let active = tab.broadcast_input;
+        let notice = if active {
+            format!("Broadcast input: ON ({count} panes)")
+        } else {
+            "Broadcast input: OFF".into()
+        };
+        self.show_notice(NoticeKind::Success, notice);
+    }
+
+    pub(super) fn swap_pane_next(&mut self) {
+        if self.tabs[self.active].panes.len() <= 1 {
+            return;
+        }
+        let cell = self.painter.metrics().cell;
+        let divider = self.divider_thickness();
+        let gutter = self.block_gutter();
+        let tab = &mut self.tabs[self.active];
+        if tab.zoomed.take().is_some() {
+            tab.reflow(self.content_area, divider, cell, gutter, true);
+        }
+        let order: Vec<PaneId> = tab.layout.panes.iter().map(|p| p.id).collect();
+        let Some(pos) = order.iter().position(|&id| id == tab.focused) else {
+            return;
+        };
+        let next_id = order[(pos + 1) % order.len()];
+        if tab.tree.swap_panes(tab.focused, next_id) {
+            self.dragging_divider = None;
+            self.reflow_active_tab();
+            self.painter.reset_cursor_motion();
+            self.painter.invalidate_overlay();
+            self.window.request_redraw();
+        }
+    }
+
+    pub(super) fn detach_pane_to_tab(&mut self) {
+        if self.tabs[self.active].panes.len() <= 1 {
+            self.show_notice(
+                NoticeKind::Warning,
+                "Cannot detach the only pane in a tab".into(),
+            );
+            return;
+        }
+        let source_index = self.active;
+        let target_id = self.tabs[source_index].focused;
+        let (mut detached_pane, surviving_focus) = {
+            let tab = &mut self.tabs[source_index];
+            let Some(pos) = tab.panes.iter().position(|pane| pane.id == target_id) else {
+                return;
+            };
+            let pane = tab.panes.remove(pos);
+            let next_focus = tab.tree.remove(target_id);
+            if tab.zoomed == Some(target_id) || tab.panes.len() <= 1 {
+                tab.zoomed = None;
+            }
+            if tab.panes.len() <= 1 {
+                tab.broadcast_input = false;
+            }
+            (pane, next_focus)
+        };
+        if let Some(next_id) =
+            surviving_focus.or_else(|| self.tabs[source_index].panes.first().map(|pane| pane.id))
+        {
+            self.tabs[source_index].focused = next_id;
+        }
+        for pane in &mut self.tabs[source_index].panes {
+            pane.active = false;
+            pane.visible = false;
+            pane.pointer = None;
+            pane.focus(false);
+        }
+        detached_pane.active = true;
+        detached_pane.visible = true;
+        let new_tab = Tab::new(detached_pane, self.content_area);
+        let insert_at = source_index + 1;
+        self.tabs.insert(insert_at, new_tab);
+        self.active = insert_at;
+        self.dragging_divider = None;
+        self.resize_pending = true;
+        self.apply_resize();
+        self.activate_tab();
+        self.show_notice(NoticeKind::Success, "Moved pane to new tab".into());
+    }
+
     pub(super) fn reflow_active_tab(&mut self) {
         let cell = self.painter.metrics().cell;
         let divider = self.divider_thickness();
@@ -318,6 +413,9 @@ impl Client {
         if tab.zoomed == Some(pane_id) || tab.panes.len() <= 1 {
             tab.zoomed = None;
         }
+        if tab.panes.len() <= 1 {
+            tab.broadcast_input = false;
+        }
         if tab.focused == pane_id
             && let Some(next_id) = next_focus.or_else(|| tab.panes.first().map(|pane| pane.id))
         {
@@ -400,12 +498,17 @@ impl Client {
     }
 
     pub(super) fn update_window_title(&self) {
-        let title = &self.tabs[self.active].focused_pane().title;
-        self.window.set_title(if title.is_empty() {
-            &self.default_title
-        } else {
-            title
-        });
+        let tab = &self.tabs[self.active];
+        let title = tab
+            .custom_title
+            .as_deref()
+            .filter(|title| !title.is_empty())
+            .or_else(|| {
+                let pane_title = tab.focused_pane().title.as_str();
+                (!pane_title.is_empty()).then_some(pane_title)
+            })
+            .unwrap_or(&self.default_title);
+        self.window.set_title(title);
     }
 
     pub(super) fn apply_system_theme(&mut self, theme: Theme) {

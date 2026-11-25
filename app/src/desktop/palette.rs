@@ -34,6 +34,8 @@ pub(super) enum PaletteAction {
     JumpToRow(usize),
     OpenScrollbar,
     SetScrollbar(ScrollbarPolicy),
+    ApplyTabTitle(usize),
+    ResetTabTitle,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -76,6 +78,8 @@ pub(super) struct PaletteContext<'a> {
     pub(super) copy_on_select: bool,
     pub(super) multi_tab: bool,
     pub(super) multi_pane: bool,
+    pub(super) broadcast_input: bool,
+    pub(super) has_custom_tab_title: bool,
     pub(super) primary_screen: bool,
 }
 
@@ -90,6 +94,7 @@ pub(super) struct CommandPalette {
     pub(super) scroll: usize,
     stack: Vec<SavedMenu>,
     pub(super) theme_restore: Option<ThemePreference>,
+    rename_tab: Option<usize>,
 }
 
 impl CommandPalette {
@@ -106,6 +111,30 @@ impl CommandPalette {
             scroll: 0,
             stack: Vec::new(),
             theme_restore: None,
+            rename_tab: None,
+        };
+        palette.refilter();
+        palette
+    }
+
+    pub(super) fn for_rename_tab(tab_index: usize, initial: &str) -> Self {
+        let entries = vec![PaletteEntry::new(
+            PaletteAction::ApplyTabTitle(tab_index),
+            "Apply tab title",
+            "Enter to save, empty resets",
+        )];
+        let mut palette = Self {
+            query: initial.to_owned(),
+            preedit: String::new(),
+            breadcrumb: Some("Rename Tab"),
+            entries,
+            filtered: Vec::new(),
+            selected: 0,
+            hovered: None,
+            scroll: 0,
+            stack: Vec::new(),
+            theme_restore: None,
+            rename_tab: Some(tab_index),
         };
         palette.refilter();
         palette
@@ -272,8 +301,15 @@ impl CommandPalette {
     }
 
     fn refilter(&mut self) {
-        let query = self.query.trim().to_ascii_lowercase();
         self.filtered.clear();
+        if self.rename_tab.is_some() {
+            self.filtered.extend(0..self.entries.len());
+            self.selected = 0;
+            self.scroll = 0;
+            self.hovered = None;
+            return;
+        }
+        let query = self.query.trim().to_ascii_lowercase();
         if query.is_empty() {
             self.filtered.extend(0..self.entries.len());
         } else {
@@ -488,6 +524,20 @@ fn build_root_entries(ctx: &PaletteContext<'_>) -> Vec<PaletteEntry> {
         "Copy on select",
         if ctx.copy_on_select { "On" } else { "Off" },
     ));
+    if ctx.multi_pane {
+        entries.push(PaletteEntry::new(
+            PaletteAction::Shortcut(Action::ToggleBroadcastInput),
+            "Broadcast input to all panes",
+            if ctx.broadcast_input { "On" } else { "Off" },
+        ));
+    }
+    if ctx.has_custom_tab_title {
+        entries.push(PaletteEntry::new(
+            PaletteAction::ResetTabTitle,
+            "Reset tab title",
+            "Automatic",
+        ));
+    }
 
     let actions: &[(Action, &str, bool)] = &[
         (
@@ -553,6 +603,8 @@ fn build_root_entries(ctx: &PaletteContext<'_>) -> Vec<PaletteEntry> {
         (Action::SplitPane(Axis::Columns), "Split pane right", true),
         (Action::SplitPane(Axis::Rows), "Split pane down", true),
         (Action::TogglePaneZoom, "Toggle pane zoom", ctx.multi_pane),
+        (Action::SwapPane, "Swap split pane", ctx.multi_pane),
+        (Action::DetachPane, "Move pane to new tab", ctx.multi_pane),
         (
             Action::FocusPane(SplitDirection::Left),
             "Focus pane left",
@@ -574,6 +626,7 @@ fn build_root_entries(ctx: &PaletteContext<'_>) -> Vec<PaletteEntry> {
             ctx.multi_pane,
         ),
         (Action::NewTab, "New tab", true),
+        (Action::RenameTab, "Rename tab", true),
         (Action::CloseTab, "Close pane or tab", true),
         (Action::NextTab, "Next tab", ctx.multi_tab),
         (Action::PreviousTab, "Previous tab", ctx.multi_tab),
@@ -822,6 +875,8 @@ mod tests {
             copy_on_select: false,
             multi_tab: true,
             multi_pane: true,
+            broadcast_input: false,
+            has_custom_tab_title: false,
             primary_screen: true,
         };
         let mut palette = CommandPalette::new(&ctx);

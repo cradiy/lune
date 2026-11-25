@@ -43,10 +43,14 @@ pub(super) enum Action {
     SelectLastTab,
     MoveTabLeft,
     MoveTabRight,
+    RenameTab,
     SplitPane(Axis),
     FocusPane(SplitDirection),
     ResizePane(SplitDirection),
     TogglePaneZoom,
+    SwapPane,
+    DetachPane,
+    ToggleBroadcastInput,
 }
 
 impl Action {
@@ -450,6 +454,10 @@ const WAYLAND_BINDINGS: &[Binding] = &[
     Binding::new(Action::SelectLastTab, Mods::ALT, symbol("9")),
     Binding::new(Action::MoveTabLeft, CTRL_SHIFT, Named(NamedKey::PageUp)),
     Binding::new(Action::MoveTabRight, CTRL_SHIFT, Named(NamedKey::PageDown)),
+    Binding::new(Action::RenameTab, CTRL_ALT, letter("r")),
+    Binding::new(Action::SwapPane, CTRL_ALT, letter("s")),
+    Binding::new(Action::DetachPane, CTRL_ALT, letter("t")),
+    Binding::new(Action::ToggleBroadcastInput, CTRL_ALT, letter("i")),
     Binding::new(Action::ToggleVi, CTRL_SHIFT, ShortcutKey::Space),
     Binding::new(Action::Search, CTRL_SHIFT, letter("f")),
     Binding::new(Action::Hints, CTRL_SHIFT, letter("s")),
@@ -736,6 +744,7 @@ fn parse_action(name: &str) -> Result<KeybindAction, &'static str> {
         "select_tab_9" | "select_last_tab" => Action::SelectLastTab,
         "move_tab_left" => Action::MoveTabLeft,
         "move_tab_right" => Action::MoveTabRight,
+        "rename_tab" => Action::RenameTab,
         "split_right" | "split_columns" => Action::SplitPane(Axis::Columns),
         "split_down" | "split_rows" => Action::SplitPane(Axis::Rows),
         "focus_pane_left" => Action::FocusPane(SplitDirection::Left),
@@ -747,6 +756,9 @@ fn parse_action(name: &str) -> Result<KeybindAction, &'static str> {
         "resize_pane_up" => Action::ResizePane(SplitDirection::Up),
         "resize_pane_down" => Action::ResizePane(SplitDirection::Down),
         "toggle_pane_zoom" => Action::TogglePaneZoom,
+        "swap_pane" => Action::SwapPane,
+        "detach_pane" | "move_pane_to_tab" => Action::DetachPane,
+        "toggle_broadcast_input" | "broadcast_input" => Action::ToggleBroadcastInput,
         _ => return Err("unknown keybind action"),
     };
     Ok(KeybindAction::Action(action))

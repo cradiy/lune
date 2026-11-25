@@ -63,6 +63,8 @@ pub(super) struct Tab {
     pub(super) panes: Vec<Pane>,
     pub(super) focused: PaneId,
     pub(super) zoomed: Option<PaneId>,
+    pub(super) custom_title: Option<String>,
+    pub(super) broadcast_input: bool,
     pub(super) layout: SplitLayout,
 }
 
@@ -79,6 +81,8 @@ impl Tab {
             panes: vec![pane],
             focused: id,
             zoomed: None,
+            custom_title: None,
+            broadcast_input: false,
             layout,
         }
     }
@@ -106,7 +110,9 @@ impl Tab {
     }
 
     pub(super) fn label(&self) -> &str {
-        self.focused_pane().label()
+        self.custom_title
+            .as_deref()
+            .unwrap_or_else(|| self.focused_pane().label())
     }
 
     pub(super) fn progress(&self) -> Progress {
@@ -1106,7 +1112,7 @@ impl Pane {
                 }
             }
             if write.targets.primary {
-                publish_primary_text(text, ctx.primary);
+                publish_primary_text(text, self.clipboard.as_ref(), ctx.primary);
             }
         }
         if let Some(query) = notifications.clipboard_query
@@ -1553,7 +1559,7 @@ impl Pane {
                             self.push_input(Input::Paste(text));
                             return None;
                         }
-                        publish_primary_text(text.clone(), primary);
+                        publish_primary_text(text.clone(), self.clipboard.as_ref(), primary);
                         if !*copy_pending {
                             match clipboard::write(
                                 text.clone(),
@@ -2317,7 +2323,7 @@ impl Pane {
 
     fn publish_primary_selection(&self, primary: &mut Option<clipboard::Primary>) {
         if let Some(text) = self.selected_text() {
-            publish_primary_text(text, primary);
+            publish_primary_text(text, self.clipboard.as_ref(), primary);
         }
     }
 
@@ -2367,7 +2373,17 @@ fn format_copied_preview(text: &str) -> String {
     }
 }
 
-fn publish_primary_text(text: String, primary: &mut Option<clipboard::Primary>) {
+fn publish_primary_text(
+    text: String,
+    data_device: Option<&clipboard::DataDeviceHandle>,
+    primary: &mut Option<clipboard::Primary>,
+) {
+    if let Some(dd) = data_device
+        && dd.has_primary_selection()
+        && dd.publish_primary(text.clone())
+    {
+        return;
+    }
     if primary.is_none() {
         *primary = match clipboard::Primary::new() {
             Ok(primary) => Some(primary),

@@ -1,7 +1,8 @@
-//! Core Wayland `wl_data_device_manager` clipboard backend.
+//! Core Wayland `wl_data_device_manager` and `zwp_primary_selection_v1`
+//! clipboard backend.
 //!
 //! Runs on a dedicated `calloop` worker thread attached as a guest queue to
-//! winit's `wl_display`, so clipboard offers and `wl_data_source.send`
+//! winit's `wl_display`, so regular clipboard and primary selection offers and
 //! transfers work on every Wayland compositor (including compositors that do
 //! not advertise `ext_data_control_manager_v1` or `zwlr_data_control_manager_v1`)
 //! even while the terminal window is unfocused or idle.
@@ -26,10 +27,16 @@ use wayland_client::protocol::{
 use wayland_client::{
     Connection, Dispatch, Proxy, QueueHandle, WEnum, delegate_noop, event_created_child,
 };
+use wayland_protocols::wp::primary_selection::zv1::client::{
+    zwp_primary_selection_device_manager_v1 as primary_manager,
+    zwp_primary_selection_device_v1 as primary_device,
+    zwp_primary_selection_offer_v1 as primary_offer,
+    zwp_primary_selection_source_v1 as primary_source,
+};
 use winit::raw_window_handle::{HasDisplayHandle, RawDisplayHandle};
 use winit::window::Window;
 
-use super::transfer;
+use super::{ClipboardType, transfer};
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_TRANSFERS: usize = 4;
@@ -63,6 +70,7 @@ unsafe impl Send for SendDisplay {}
 pub(in crate::desktop) struct DataDevice {
     commands: SyncSender<Command>,
     has_data_control: bool,
+    has_primary_selection: bool,
     stop: Ping,
     thread: Option<JoinHandle<()>>,
 }
@@ -71,6 +79,13 @@ pub(in crate::desktop) struct DataDevice {
 pub(in crate::desktop) struct DataDeviceHandle {
     commands: SyncSender<Command>,
     has_data_control: bool,
+    has_primary_selection: bool,
+}
+
+#[derive(Clone, Copy)]
+struct Capabilities {
+    has_data_control: bool,
+    has_primary_selection: bool,
 }
 
 pub(super) enum WriteOutcome {
@@ -87,18 +102,20 @@ pub(super) enum ReadOutcome {
 
 enum Command {
     Write {
+        clipboard: ClipboardType,
         text: String,
-        reply: mpsc::SyncSender<WriteOutcome>,
+        reply: Option<mpsc::SyncSender<WriteOutcome>>,
     },
     Read {
+        clipboard: ClipboardType,
         reply: mpsc::SyncSender<ReadOutcome>,
     },
 }
 
 impl DataDevice {
-    /// Attaches a `wl_data_device_manager` clipboard worker to `window`'s
-    /// Wayland display. Returns `None` if `window` is not on Wayland or the
-    /// compositor does not expose `wl_data_device_manager`.
+    /// Attaches a `wl_data_device_manager` (and optional `zwp_primary_selection_v1`)
+    /// clipboard worker to `window`'s Wayland display. Returns `None` if `window`
+    /// is not on Wayland or the compositor does not expose `wl_data_device_manager`.
     pub(in crate::desktop) fn attach(window: &Window) -> Option<Self> {
         let display_handle = window.display_handle().ok()?;
         let RawDisplayHandle::Wayland(wayland_display) = display_handle.as_raw() else {
@@ -114,7 +131,7 @@ impl DataDevice {
                 return None;
             }
         };
-        let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<bool, String>>(1);
+        let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<Capabilities, String>>(1);
 
         let thread = match thread::Builder::new()
             .name("lune-clipboard".into())
@@ -129,13 +146,16 @@ impl DataDevice {
         };
 
         match ready_rx.recv_timeout(STARTUP_TIMEOUT) {
-            Ok(Ok(has_data_control)) => {
+            Ok(Ok(caps)) => {
                 log::debug!(
-                    "Wayland wl_data_device_manager clipboard ready (data_control={has_data_control})"
+                    "Wayland wl_data_device_manager clipboard ready (data_control={}, primary_selection={})",
+                    caps.has_data_control,
+                    caps.has_primary_selection
                 );
                 Some(Self {
                     commands,
-                    has_data_control,
+                    has_data_control: caps.has_data_control,
+                    has_primary_selection: caps.has_primary_selection,
                     stop,
                     thread: Some(thread),
                 })
@@ -158,6 +178,7 @@ impl DataDevice {
         DataDeviceHandle {
             commands: self.commands.clone(),
             has_data_control: self.has_data_control,
+            has_primary_selection: self.has_primary_selection,
         }
     }
 }
@@ -178,13 +199,31 @@ impl DataDeviceHandle {
         self.has_data_control
     }
 
+    pub(in crate::desktop) fn has_primary_selection(&self) -> bool {
+        self.has_primary_selection
+    }
+
+    pub(in crate::desktop) fn publish_primary(&self, text: String) -> bool {
+        if !self.has_primary_selection {
+            return false;
+        }
+        self.commands
+            .try_send(Command::Write {
+                clipboard: ClipboardType::Primary,
+                text,
+                reply: None,
+            })
+            .is_ok()
+    }
+
     pub(super) fn write(&self, text: String, timeout: Duration) -> WriteOutcome {
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
         if self
             .commands
             .send(Command::Write {
+                clipboard: ClipboardType::Regular,
                 text,
-                reply: reply_tx,
+                reply: Some(reply_tx),
             })
             .is_err()
         {
@@ -195,11 +234,17 @@ impl DataDeviceHandle {
             .unwrap_or(WriteOutcome::Fallback)
     }
 
-    pub(super) fn read(&self, deadline: Instant) -> ReadOutcome {
+    pub(super) fn read(&self, clipboard: ClipboardType, deadline: Instant) -> ReadOutcome {
+        if clipboard == ClipboardType::Primary && !self.has_primary_selection {
+            return ReadOutcome::Fallback;
+        }
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
         if self
             .commands
-            .send(Command::Read { reply: reply_tx })
+            .send(Command::Read {
+                clipboard,
+                reply: reply_tx,
+            })
             .is_err()
         {
             return ReadOutcome::Fallback;
@@ -224,6 +269,7 @@ struct SourceData {
 struct SeatState {
     seat: wl_seat::WlSeat,
     device: wl_data_device::WlDataDevice,
+    primary_device: Option<primary_device::ZwpPrimarySelectionDeviceV1>,
     keyboard: Option<wl_keyboard::WlKeyboard>,
     pointer: Option<wl_pointer::WlPointer>,
     touch: Option<wl_touch::WlTouch>,
@@ -232,6 +278,8 @@ struct SeatState {
     selection_offer: Option<wl_data_offer::WlDataOffer>,
     dnd_offer: Option<wl_data_offer::WlDataOffer>,
     active_source: Option<(wl_data_source::WlDataSource, Arc<String>)>,
+    primary_offer: Option<primary_offer::ZwpPrimarySelectionOfferV1>,
+    active_primary_source: Option<(primary_source::ZwpPrimarySelectionSourceV1, Arc<String>)>,
 }
 
 impl SeatState {
@@ -244,6 +292,15 @@ impl SeatState {
         }
         if let Some((source, _)) = self.active_source.take() {
             source.destroy();
+        }
+        if let Some(offer) = self.primary_offer.take() {
+            offer.destroy();
+        }
+        if let Some((source, _)) = self.active_primary_source.take() {
+            source.destroy();
+        }
+        if let Some(primary) = self.primary_device.take() {
+            primary.destroy();
         }
         if let Some(keyboard) = self.keyboard.take()
             && keyboard.version() >= 3
@@ -273,6 +330,7 @@ struct WorkerState {
     connection: Connection,
     handle: QueueHandle<Self>,
     manager: wl_data_device_manager::WlDataDeviceManager,
+    primary_manager: Option<primary_manager::ZwpPrimarySelectionDeviceManagerV1>,
     seats: HashMap<u32, SeatState>,
     active_seat: Option<u32>,
     has_data_control: bool,
@@ -284,11 +342,16 @@ impl WorkerState {
     fn add_seat(&mut self, registry: &wl_registry::WlRegistry, name: u32, version: u32) {
         let seat = registry.bind::<wl_seat::WlSeat, _, _>(name, version.min(7), &self.handle, name);
         let device = self.manager.get_data_device(&seat, &self.handle, name);
+        let primary_device = self
+            .primary_manager
+            .as_ref()
+            .map(|manager| manager.get_device(&seat, &self.handle, name));
         self.seats.insert(
             name,
             SeatState {
                 seat,
                 device,
+                primary_device,
                 keyboard: None,
                 pointer: None,
                 touch: None,
@@ -297,6 +360,8 @@ impl WorkerState {
                 selection_offer: None,
                 dnd_offer: None,
                 active_source: None,
+                primary_offer: None,
+                active_primary_source: None,
             },
         );
         if self.active_seat.is_none() {
@@ -317,6 +382,9 @@ impl WorkerState {
         self.pending_commands.clear();
         for (_, seat) in self.seats.drain() {
             seat.destroy_all();
+        }
+        if let Some(manager) = self.primary_manager.take() {
+            manager.destroy();
         }
         let _ = self.connection.flush();
     }
@@ -357,16 +425,24 @@ impl WorkerState {
         None
     }
 
-    fn pick_read_seat(&self) -> Option<u32> {
+    fn pick_read_seat(&self, clipboard: ClipboardType) -> Option<u32> {
+        let has_data = |seat: &SeatState| match clipboard {
+            ClipboardType::Regular => {
+                seat.active_source.is_some() || seat.selection_offer.is_some()
+            }
+            ClipboardType::Primary => {
+                seat.active_primary_source.is_some() || seat.primary_offer.is_some()
+            }
+        };
         if let Some(name) = self.active_seat
             && let Some(seat) = self.seats.get(&name)
-            && (seat.active_source.is_some() || seat.selection_offer.is_some() || seat.focused)
+            && (has_data(seat) || seat.focused)
         {
             return Some(name);
         }
         self.seats
             .iter()
-            .find(|(_, seat)| seat.active_source.is_some() || seat.selection_offer.is_some())
+            .find(|(_, seat)| has_data(seat))
             .or_else(|| self.seats.iter().find(|(_, seat)| seat.focused))
             .map(|(&name, _)| name)
             .or(self.active_seat)
@@ -379,7 +455,7 @@ impl WorkerState {
         // If libwayland has unread events already queued for our guest event
         // queue (such as the wl_keyboard.key or wl_data_device.selection that
         // triggered this command), let WaylandSource dispatch them first so
-        // `last_serial` and `selection_offer` are completely up to date.
+        // `last_serial` and selection offers are completely up to date.
         let Some(guard) = self.connection.prepare_read() else {
             return;
         };
@@ -387,12 +463,18 @@ impl WorkerState {
 
         while let Some(command) = self.pending_commands.pop_front() {
             match command {
-                Command::Write { text, reply } => {
-                    let outcome = self.handle_write(text);
-                    let _ = reply.send(outcome);
+                Command::Write {
+                    clipboard,
+                    text,
+                    reply,
+                } => {
+                    let outcome = self.handle_write(clipboard, text);
+                    if let Some(reply) = reply {
+                        let _ = reply.send(outcome);
+                    }
                 }
-                Command::Read { reply } => {
-                    let outcome = self.handle_read();
+                Command::Read { clipboard, reply } => {
+                    let outcome = self.handle_read(clipboard);
                     let _ = reply.send(outcome);
                 }
             }
@@ -400,7 +482,7 @@ impl WorkerState {
         let _ = self.connection.flush();
     }
 
-    fn handle_write(&mut self, text: String) -> WriteOutcome {
+    fn handle_write(&mut self, clipboard: ClipboardType, text: String) -> WriteOutcome {
         let Some(seat_name) = self.pick_write_seat() else {
             return WriteOutcome::Fallback;
         };
@@ -411,23 +493,47 @@ impl WorkerState {
             return WriteOutcome::Fallback;
         };
         let text = Arc::new(text);
-        let source = self.manager.create_data_source(
-            &self.handle,
-            SourceData {
-                seat_name,
-                text: text.clone(),
-            },
-        );
-        for mime in OFFERED_TEXT_MIMES {
-            source.offer((*mime).into());
+        match clipboard {
+            ClipboardType::Regular => {
+                let source = self.manager.create_data_source(
+                    &self.handle,
+                    SourceData {
+                        seat_name,
+                        text: text.clone(),
+                    },
+                );
+                for mime in OFFERED_TEXT_MIMES {
+                    source.offer((*mime).into());
+                }
+                seat.device.set_selection(Some(&source), serial);
+                seat.active_source = Some((source, text));
+                WriteOutcome::Published
+            }
+            ClipboardType::Primary => {
+                let (Some(manager), Some(device)) =
+                    (self.primary_manager.as_ref(), seat.primary_device.as_ref())
+                else {
+                    return WriteOutcome::Fallback;
+                };
+                let source = manager.create_source(
+                    &self.handle,
+                    SourceData {
+                        seat_name,
+                        text: text.clone(),
+                    },
+                );
+                for mime in OFFERED_TEXT_MIMES {
+                    source.offer((*mime).into());
+                }
+                device.set_selection(Some(&source), serial);
+                seat.active_primary_source = Some((source, text));
+                WriteOutcome::Published
+            }
         }
-        seat.device.set_selection(Some(&source), serial);
-        seat.active_source = Some((source, text));
-        WriteOutcome::Published
     }
 
-    fn handle_read(&mut self) -> ReadOutcome {
-        let Some(seat_name) = self.pick_read_seat() else {
+    fn handle_read(&mut self, clipboard: ClipboardType) -> ReadOutcome {
+        let Some(seat_name) = self.pick_read_seat(clipboard) else {
             return if self.has_data_control {
                 ReadOutcome::Fallback
             } else {
@@ -438,25 +544,51 @@ impl WorkerState {
             return ReadOutcome::Empty;
         };
 
-        // Self-paste: return owned selection text directly without a pipe roundtrip.
-        if let Some((_, text)) = &seat.active_source {
-            return ReadOutcome::Text(text.as_ref().clone());
-        }
-
-        if let Some(offer) = &seat.selection_offer {
-            let offered_mimes = offer
-                .data::<OfferMimes>()
-                .and_then(|mimes| mimes.lock().ok().map(|guard| guard.clone()))
-                .unwrap_or_default();
-            let Some(mime) = select_text_mime(&offered_mimes) else {
-                return ReadOutcome::Empty;
-            };
-            let Ok((read_fd, write_fd)) = create_pipe() else {
-                return ReadOutcome::Fallback;
-            };
-            offer.receive(mime.to_owned(), write_fd.as_fd());
-            drop(write_fd);
-            return ReadOutcome::Pipe(read_fd);
+        match clipboard {
+            ClipboardType::Regular => {
+                // Self-paste: return owned selection text directly without a pipe roundtrip.
+                if let Some((_, text)) = &seat.active_source {
+                    return ReadOutcome::Text(text.as_ref().clone());
+                }
+                if let Some(offer) = &seat.selection_offer {
+                    let offered_mimes = offer
+                        .data::<OfferMimes>()
+                        .and_then(|mimes| mimes.lock().ok().map(|guard| guard.clone()))
+                        .unwrap_or_default();
+                    let Some(mime) = select_text_mime(&offered_mimes) else {
+                        return ReadOutcome::Empty;
+                    };
+                    let Ok((read_fd, write_fd)) = create_pipe() else {
+                        return ReadOutcome::Fallback;
+                    };
+                    offer.receive(mime.to_owned(), write_fd.as_fd());
+                    drop(write_fd);
+                    return ReadOutcome::Pipe(read_fd);
+                }
+            }
+            ClipboardType::Primary => {
+                if self.primary_manager.is_none() {
+                    return ReadOutcome::Fallback;
+                }
+                if let Some((_, text)) = &seat.active_primary_source {
+                    return ReadOutcome::Text(text.as_ref().clone());
+                }
+                if let Some(offer) = &seat.primary_offer {
+                    let offered_mimes = offer
+                        .data::<OfferMimes>()
+                        .and_then(|mimes| mimes.lock().ok().map(|guard| guard.clone()))
+                        .unwrap_or_default();
+                    let Some(mime) = select_text_mime(&offered_mimes) else {
+                        return ReadOutcome::Empty;
+                    };
+                    let Ok((read_fd, write_fd)) = create_pipe() else {
+                        return ReadOutcome::Fallback;
+                    };
+                    offer.receive(mime.to_owned(), write_fd.as_fd());
+                    drop(write_fd);
+                    return ReadOutcome::Pipe(read_fd);
+                }
+            }
         }
 
         if self.has_data_control && !seat.focused {
@@ -471,7 +603,7 @@ fn run_worker(
     display: SendDisplay,
     commands_rx: channel::Channel<Command>,
     stop_source: PingSource,
-    ready_tx: mpsc::SyncSender<Result<bool, String>>,
+    ready_tx: mpsc::SyncSender<Result<Capabilities, String>>,
 ) {
     // SAFETY: `display.0` is a live `*mut wl_display` owned by winit's active
     // event loop, and `DataDevice::drop` joins this thread before `Client.window`
@@ -498,6 +630,11 @@ fn run_worker(
             }
         };
 
+    let primary_manager = globals
+        .bind::<primary_manager::ZwpPrimarySelectionDeviceManagerV1, _, _>(&handle, 1..=1, ())
+        .ok();
+    let has_primary_selection = primary_manager.is_some();
+
     let has_data_control = globals.contents().with_list(|list| {
         list.iter().any(|global| {
             global.interface == "ext_data_control_manager_v1"
@@ -509,6 +646,7 @@ fn run_worker(
         connection: connection.clone(),
         handle,
         manager,
+        primary_manager,
         seats: HashMap::new(),
         active_seat: None,
         has_data_control,
@@ -570,7 +708,13 @@ fn run_worker(
         return;
     }
 
-    if ready_tx.send(Ok(has_data_control)).is_err() {
+    if ready_tx
+        .send(Ok(Capabilities {
+            has_data_control,
+            has_primary_selection,
+        }))
+        .is_err()
+    {
         state.cleanup();
         return;
     }
@@ -605,6 +749,7 @@ impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for WorkerState {
 }
 
 delegate_noop!(WorkerState: ignore wl_data_device_manager::WlDataDeviceManager);
+delegate_noop!(WorkerState: ignore primary_manager::ZwpPrimarySelectionDeviceManagerV1);
 
 impl Dispatch<wl_seat::WlSeat, u32> for WorkerState {
     fn event(
@@ -760,22 +905,96 @@ impl Dispatch<wl_data_device::WlDataDevice, u32> for WorkerState {
     ]);
 }
 
-trait ReplaceOffer {
-    fn replace_if_different(
-        &mut self,
-        next: Option<wl_data_offer::WlDataOffer>,
-    ) -> Option<wl_data_offer::WlDataOffer>;
+trait ReplaceOffer<T> {
+    fn replace_if_different(&mut self, next: Option<T>) -> Option<T>;
 }
 
-impl ReplaceOffer for Option<wl_data_offer::WlDataOffer> {
-    fn replace_if_different(
-        &mut self,
-        next: Option<wl_data_offer::WlDataOffer>,
-    ) -> Option<wl_data_offer::WlDataOffer> {
+impl<T: Proxy> ReplaceOffer<T> for Option<T> {
+    fn replace_if_different(&mut self, next: Option<T>) -> Option<T> {
         if self.as_ref().map(Proxy::id) == next.as_ref().map(Proxy::id) {
             return None;
         }
         std::mem::replace(self, next)
+    }
+}
+
+impl Dispatch<primary_device::ZwpPrimarySelectionDeviceV1, u32> for WorkerState {
+    fn event(
+        state: &mut Self,
+        _: &primary_device::ZwpPrimarySelectionDeviceV1,
+        event: primary_device::Event,
+        seat_name: &u32,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let Some(seat) = state.seats.get_mut(seat_name) else {
+            return;
+        };
+        if let primary_device::Event::Selection { id } = event
+            && let Some(previous) = seat.primary_offer.replace_if_different(id)
+        {
+            previous.destroy();
+        }
+    }
+
+    event_created_child!(WorkerState, primary_device::ZwpPrimarySelectionDeviceV1, [
+        primary_device::EVT_DATA_OFFER_OPCODE => (primary_offer::ZwpPrimarySelectionOfferV1, OfferMimes::default()),
+    ]);
+}
+
+impl Dispatch<primary_offer::ZwpPrimarySelectionOfferV1, OfferMimes> for WorkerState {
+    fn event(
+        _: &mut Self,
+        _: &primary_offer::ZwpPrimarySelectionOfferV1,
+        event: primary_offer::Event,
+        mimes: &OfferMimes,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let primary_offer::Event::Offer { mime_type } = event
+            && let Ok(mut list) = mimes.lock()
+        {
+            list.push(mime_type);
+        }
+    }
+}
+
+impl Dispatch<primary_source::ZwpPrimarySelectionSourceV1, SourceData> for WorkerState {
+    fn event(
+        state: &mut Self,
+        source: &primary_source::ZwpPrimarySelectionSourceV1,
+        event: primary_source::Event,
+        data: &SourceData,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            primary_source::Event::Cancelled => {
+                if let Some(seat) = state.seats.get_mut(&data.seat_name)
+                    && seat
+                        .active_primary_source
+                        .as_ref()
+                        .is_some_and(|(active, _)| active.id() == source.id())
+                {
+                    seat.active_primary_source = None;
+                }
+                source.destroy();
+            }
+            primary_source::Event::Send { mime_type, fd }
+                if is_offered_text_mime(&mime_type)
+                    && Arc::strong_count(&state.transfers) <= MAX_TRANSFERS =>
+            {
+                let text = data.text.clone();
+                let permit = state.transfers.clone();
+                let _ = thread::Builder::new()
+                    .name("lune-clipboard-send".into())
+                    .spawn(move || {
+                        let _permit = permit;
+                        let _ = transfer(fd, text.as_bytes());
+                    });
+            }
+            _ => {}
+        }
     }
 }
 

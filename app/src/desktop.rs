@@ -1,4 +1,34 @@
 mod app_menu;
+pub mod bench {
+    use std::ops::Range;
+
+    use lune_terminal::{ScreenBuffer, ScreenView};
+
+    use super::{blocks, search};
+
+    pub fn search_scrollback(
+        view: ScreenView<'_>,
+        columns: usize,
+        viewport: Range<usize>,
+        query: &str,
+        case_sensitive: bool,
+        regex_mode: bool,
+    ) -> usize {
+        let saved = search::SavedSearch {
+            query: query.to_owned(),
+            direction: super::vi::Direction::Forward,
+            case_sensitive,
+            regex_mode,
+        };
+        let bar =
+            search::SearchBar::open(Some(saved), ScreenBuffer::Primary, view, columns, viewport);
+        bar.matches.len()
+    }
+
+    pub fn discover_viewport_blocks(view: ScreenView<'_>, visible_rows: Range<usize>) -> usize {
+        blocks::blocks_in_viewport(view, visible_rows).len()
+    }
+}
 mod bg_image;
 mod blocks;
 mod box_drawing;
@@ -297,12 +327,29 @@ impl ApplicationHandler<Event> for App {
             Event::PtyError(error) => Err(error.into()),
             Event::PasteReady(id, result) => {
                 let confirm_paste = client.confirm_paste;
+                let broadcast_result = result.as_ref().ok().cloned();
+                let broadcast = client.tabs[client.active].broadcast_input
+                    && client.tabs[client.active].panes.len() > 1
+                    && client.tabs[client.active].focused == id;
                 let pending_confirm = client
                     .pane_mut(id)
                     .and_then(|pane| pane.finish_paste(result, confirm_paste));
                 if let Some(text) = pending_confirm {
                     let message = confirm::format_paste(&text);
                     client.open_confirm(confirm::ConfirmTarget::Paste { pane: id, text }, message);
+                } else if broadcast
+                    && let Some(text) = broadcast_result
+                    && !text.is_empty()
+                {
+                    for pane in &mut client.tabs[client.active].panes {
+                        if pane.id != id
+                            && pane.vi.is_none()
+                            && pane.search.is_none()
+                            && pane.hints.is_none()
+                        {
+                            pane.commit_paste(text.clone());
+                        }
+                    }
                 }
                 Ok(())
             }
@@ -697,6 +744,7 @@ impl Client {
             multi_tab: self.tabs.len() > 1,
             multi_pane: tab.panes.len() > 1,
             pane_zoomed: tab.zoomed.is_some(),
+            broadcast_input: tab.broadcast_input,
             primary_screen: pane.session.screen().active_buffer()
                 == lune_terminal::ScreenBuffer::Primary,
             keymap_generation: self.keymap_generation,
@@ -855,6 +903,12 @@ impl Client {
                 }
                 if event.state.is_pressed() {
                     self.key(event_loop, &event);
+                } else if self.tabs[self.active].broadcast_input
+                    && self.tabs[self.active].panes.len() > 1
+                {
+                    for pane in &mut self.tabs[self.active].panes {
+                        pane.key_release(&event);
+                    }
                 } else {
                     self.tabs[self.active]
                         .focused_pane_mut()
@@ -897,6 +951,18 @@ impl Client {
                             self.window.request_redraw();
                         }
                         _ => {}
+                    }
+                } else if self.tabs[self.active].broadcast_input
+                    && self.tabs[self.active].panes.len() > 1
+                    && let Ime::Commit(text) = ime
+                {
+                    let focused_id = self.tabs[self.active].focused;
+                    for pane in &mut self.tabs[self.active].panes {
+                        if pane.id == focused_id
+                            || (pane.vi.is_none() && pane.search.is_none() && pane.hints.is_none())
+                        {
+                            pane.ime(Ime::Commit(text.clone()));
+                        }
                     }
                 } else {
                     self.tabs[self.active].focused_pane_mut().ime(ime);
@@ -1689,15 +1755,32 @@ impl Client {
                     || (self.tabs[self.active].panes.len() <= 1
                         && matches!(action, Action::FocusPane(_) | Action::ResizePane(_)));
                 if pass_through {
-                    if let Some(text) = self.tabs[self.active]
-                        .focused_pane_mut()
-                        .key(event, &mut self.copy_pending)
-                    {
-                        self.show_notice(NoticeKind::Success, text);
-                    }
+                    self.dispatch_pane_key(event);
                 } else {
                     self.run_shortcut(event_loop, action);
                 }
+            }
+        } else {
+            self.dispatch_pane_key(event);
+        }
+    }
+
+    fn dispatch_pane_key(&mut self, event: &KeyEvent) {
+        let broadcast = self.tabs[self.active].broadcast_input
+            && self.tabs[self.active].panes.len() > 1
+            && self.tabs[self.active].focused_pane().vi.is_none();
+        if broadcast {
+            let focused_id = self.tabs[self.active].focused;
+            let mut notice = None;
+            for pane in &mut self.tabs[self.active].panes {
+                let target = pane.id == focused_id
+                    || (pane.vi.is_none() && pane.search.is_none() && pane.hints.is_none());
+                if target && let Some(text) = pane.key(event, &mut self.copy_pending) {
+                    notice = Some(text);
+                }
+            }
+            if let Some(text) = notice {
+                self.show_notice(NoticeKind::Success, text);
             }
         } else if let Some(text) = self.tabs[self.active]
             .focused_pane_mut()
@@ -1888,6 +1971,7 @@ impl Client {
             Action::SelectLastTab => self.select_tab(self.tabs.len() - 1),
             Action::MoveTabLeft => self.move_tab(-1),
             Action::MoveTabRight => self.move_tab(1),
+            Action::RenameTab => self.open_rename_tab(self.active),
             Action::SplitPane(axis) => {
                 if let Err(error) = self.split_pane(axis) {
                     log::warn!("Could not split terminal pane: {error}");
@@ -1896,6 +1980,9 @@ impl Client {
             Action::FocusPane(direction) => self.focus_pane_direction(direction),
             Action::ResizePane(direction) => self.resize_pane_direction(direction),
             Action::TogglePaneZoom => self.toggle_pane_zoom(),
+            Action::SwapPane => self.swap_pane_next(),
+            Action::DetachPane => self.detach_pane_to_tab(),
+            Action::ToggleBroadcastInput => self.toggle_broadcast_input(),
         }
     }
 

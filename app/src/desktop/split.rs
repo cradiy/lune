@@ -297,6 +297,14 @@ impl SplitTree {
         let clamped = ratio.clamp(MIN_RATIO, MAX_RATIO);
         self.root.set_ratio(path, 0, clamped)
     }
+
+    pub(super) fn swap_panes(&mut self, first: PaneId, second: PaneId) -> bool {
+        if first == second || !self.contains(first) || !self.contains(second) {
+            return false;
+        }
+        self.root.swap_panes(first, second);
+        true
+    }
 }
 
 impl Node {
@@ -336,6 +344,22 @@ impl Node {
             Self::Leaf(_) => false,
             Self::Split { first, second, .. } => {
                 first.split(target, axis, new_id) || second.split(target, axis, new_id)
+            }
+        }
+    }
+
+    fn swap_panes(&mut self, a: PaneId, b: PaneId) {
+        match self {
+            Self::Leaf(id) => {
+                if *id == a {
+                    *id = b;
+                } else if *id == b {
+                    *id = a;
+                }
+            }
+            Self::Split { first, second, .. } => {
+                first.swap_panes(a, b);
+                second.swap_panes(a, b);
             }
         }
     }
@@ -641,6 +665,15 @@ mod tests {
         let after_kb = tree.layout(area, 2, None);
         assert_eq!(after_kb.rect_of(2).unwrap().size.height.get(), 360);
         assert_eq!(after_kb.rect_of(3).unwrap().size.height.get(), 240);
+
+        // Swapping two leaves exchanges their rectangles while preserving split ratios.
+        let before_1 = after_kb.rect_of(1);
+        let before_3 = after_kb.rect_of(3);
+        assert!(tree.swap_panes(1, 3));
+        let swapped = tree.layout(area, 2, None);
+        assert_eq!(swapped.rect_of(1), before_3);
+        assert_eq!(swapped.rect_of(3), before_1);
+        assert!(tree.swap_panes(1, 3));
 
         // Zoom collapses layout to a single full-area pane with no dividers.
         let zoomed = tree.layout(area, 2, Some(3));

@@ -131,10 +131,8 @@ fn read_text(
     limit: usize,
     strip_controls: bool,
 ) -> Result<String, String> {
-    if clipboard == ClipboardType::Regular
-        && let Some(dd) = data_device
-    {
-        match dd.read(deadline) {
+    if let Some(dd) = data_device {
+        match dd.read(clipboard, deadline) {
             ReadOutcome::Text(text) => {
                 if text.len() > limit {
                     return Err("Clipboard text exceeds the size limit".into());
