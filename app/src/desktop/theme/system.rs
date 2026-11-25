@@ -9,9 +9,12 @@ use winit::window::Theme;
 use zbus::zvariant::OwnedValue;
 
 use crate::desktop::Event;
+use crate::desktop::wayland_decorations::{WindowButtons, parse_button_layout};
 
 const APPEARANCE: &str = "org.freedesktop.appearance";
 const COLOR_SCHEME: &str = "color-scheme";
+const WM_PREFERENCES: &str = "org.gnome.desktop.wm.preferences";
+const BUTTON_LAYOUT: &str = "button-layout";
 
 pub(in crate::desktop) struct Watch(event_listener::Event);
 
@@ -52,13 +55,11 @@ async fn watch_portal(proxy: EventLoopProxy<Event>) -> zbus::Result<()> {
         "org.freedesktop.portal.Settings",
     )
     .await?;
-    let mut changes = settings
-        .receive_signal_with_args("SettingChanged", &[(0, APPEARANCE), (1, COLOR_SCHEME)])
-        .await?;
+    let mut changes = settings.receive_signal("SettingChanged").await?;
 
     type Settings = HashMap<String, HashMap<String, OwnedValue>>;
     match settings
-        .call::<_, _, Settings>("ReadAll", &([APPEARANCE].as_slice(),))
+        .call::<_, _, Settings>("ReadAll", &([APPEARANCE, WM_PREFERENCES].as_slice(),))
         .await
     {
         Ok(values) => {
@@ -71,17 +72,35 @@ async fn watch_portal(proxy: EventLoopProxy<Event>) -> zbus::Result<()> {
             {
                 return Ok(());
             }
+            if let Some(layout) = values
+                .get(WM_PREFERENCES)
+                .and_then(|keys| keys.get(BUTTON_LAYOUT))
+                .and_then(portal_buttons)
+                && proxy.send_event(Event::ButtonLayout(Some(layout))).is_err()
+            {
+                return Ok(());
+            }
         }
-        Err(error) => log::debug!("Could not read the system theme: {error}"),
+        Err(error) => log::debug!("Could not read portal settings: {error}"),
     }
 
     while let Some(signal) = changes.next().await {
-        let Ok((_, _, value)) = signal.body().deserialize::<(String, String, OwnedValue)>() else {
+        let Ok((namespace, key, value)) =
+            signal.body().deserialize::<(String, String, OwnedValue)>()
+        else {
             continue;
         };
-        if proxy
-            .send_event(Event::SystemTheme(color_scheme(Some(&value))))
-            .is_err()
+        if namespace == APPEARANCE && key == COLOR_SCHEME {
+            if proxy
+                .send_event(Event::SystemTheme(color_scheme(Some(&value))))
+                .is_err()
+            {
+                break;
+            }
+        } else if namespace == WM_PREFERENCES
+            && key == BUTTON_LAYOUT
+            && let Some(layout) = portal_buttons(&value)
+            && proxy.send_event(Event::ButtonLayout(Some(layout))).is_err()
         {
             break;
         }
@@ -94,4 +113,9 @@ fn color_scheme(value: Option<&OwnedValue>) -> Theme {
         Some(2) => Theme::Light,
         _ => Theme::Dark,
     }
+}
+
+fn portal_buttons(value: &OwnedValue) -> Option<WindowButtons> {
+    let raw = <&str>::try_from(value).ok()?;
+    Some(parse_button_layout(raw))
 }

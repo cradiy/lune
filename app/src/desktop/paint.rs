@@ -30,7 +30,7 @@ use super::selection::Selection;
 use super::split::Divider;
 use super::text::TextRenderer;
 use super::url::HoveredLink;
-use super::{PaneId, Result, tab_bar, vi};
+use super::{PaneId, Result, tab_bar, titlebar, vi};
 
 const RETRY_DELAY: Duration = Duration::from_millis(16);
 const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(530);
@@ -88,6 +88,7 @@ pub(super) struct WindowChrome<'a> {
     pub(super) confirm: Option<&'a confirm::Dialog>,
     pub(super) command_palette: Option<&'a CommandPalette>,
     pub(super) scale: f64,
+    pub(super) titlebar: Option<titlebar::View<'a>>,
     pub(super) tab_bar: tab_bar::View<'a>,
 }
 
@@ -111,6 +112,8 @@ pub(super) struct Painter {
     text: TextRenderer,
     pane_ranges: Vec<(PaneId, Range<u32>)>,
     chrome_range: Range<u32>,
+    titlebar_range: Range<u32>,
+    sidebar_range: Range<u32>,
     tab_bar_range: Range<u32>,
     modal_range: Range<u32>,
     cursor_pane: Option<PaneId>,
@@ -211,6 +214,8 @@ impl Painter {
             text,
             pane_ranges: Vec::new(),
             chrome_range: 0..0,
+            titlebar_range: 0..0,
+            sidebar_range: 0..0,
             tab_bar_range: 0..0,
             modal_range: 0..0,
             cursor_pane: None,
@@ -245,6 +250,10 @@ impl Painter {
 
     pub(super) fn size(&self) -> PhysicalSize<u32> {
         PhysicalSize::new(self.config.width, self.config.height)
+    }
+
+    pub(super) fn background_opacity(&self) -> f32 {
+        self.background_opacity
     }
 
     pub(super) fn measure(&mut self, size: f32, scale_factor: f64) -> FontMetrics {
@@ -458,10 +467,26 @@ impl Painter {
         } else {
             self.background_opacity
         };
+        let top_bar_height = chrome
+            .titlebar
+            .as_ref()
+            .map_or(0, |view| view.layout.height);
+        let titlebar_width = chrome
+            .titlebar
+            .as_ref()
+            .map_or(0, |view| view.layout.header_width);
+        let content_top_inset = chrome
+            .titlebar
+            .as_ref()
+            .map_or(0, |view| view.layout.content_top_inset);
+        let sidebar_width = chrome
+            .titlebar
+            .as_ref()
+            .map_or(0, |view| view.layout.sidebar_width);
         let indeterminate = panes
             .iter()
             .any(|pane| pane.progress == Progress::Indeterminate)
-            || (chrome.tab_bar.layout.height != 0
+            || ((chrome.tab_bar.layout.height != 0 || top_bar_height != 0)
                 && chrome
                     .tab_bar
                     .tabs
@@ -645,10 +670,21 @@ impl Painter {
                     chrome.dividers,
                     chrome.focused_rect,
                     chrome.notice,
+                    content_top_inset,
                 );
             } else {
                 self.chrome_range = 0..0;
             }
+            self.titlebar_range = match &chrome.titlebar {
+                Some(view) => self.text.prepare_titlebar(view, progress_phase),
+                None => 0..0,
+            };
+            self.sidebar_range = match &chrome.titlebar {
+                Some(view) if view.layout.sidebar_width != 0 => {
+                    self.text.prepare_sidebar(view, progress_phase)
+                }
+                _ => 0..0,
+            };
             self.tab_bar_range =
                 self.text
                     .prepare_tab_bar(&chrome.tab_bar, progress_phase, background_opacity);
@@ -794,6 +830,36 @@ impl Painter {
                 gpu.images.draw_frame(&mut pass, &gpu.backgrounds, |pass| {
                     self.text.draw_range(pass, range, is_moving)
                 });
+            }
+            if top_bar_height != 0 && titlebar_width != 0 && !self.titlebar_range.is_empty() {
+                pass.set_viewport(
+                    0.0,
+                    0.0,
+                    titlebar_width as f32,
+                    top_bar_height as f32,
+                    0.0,
+                    1.0,
+                );
+                pass.set_scissor_rect(0, 0, titlebar_width, top_bar_height);
+                self.text
+                    .draw_range(&mut pass, self.titlebar_range.clone(), false);
+            }
+            if sidebar_width != 0
+                && !self.sidebar_range.is_empty()
+                && self.config.height > top_bar_height
+            {
+                let sidebar_height = self.config.height - top_bar_height;
+                pass.set_viewport(
+                    0.0,
+                    top_bar_height as f32,
+                    sidebar_width as f32,
+                    sidebar_height as f32,
+                    0.0,
+                    1.0,
+                );
+                pass.set_scissor_rect(0, top_bar_height, sidebar_width, sidebar_height);
+                self.text
+                    .draw_range(&mut pass, self.sidebar_range.clone(), false);
             }
             if !self.chrome_range.is_empty() && content_height != 0 {
                 pass.set_viewport(

@@ -8,7 +8,7 @@ use winit::dpi::PhysicalPosition;
 
 use crate::PixelRect;
 
-use super::config::TerminalMode;
+use super::config::{TabPosition, TerminalMode, WindowControlsPolicy};
 use super::font::FontMetrics;
 use super::scrollbar::ScrollbarPolicy;
 use super::shortcuts::{Action, Keymap, Scroll, Zoom};
@@ -21,6 +21,9 @@ pub(super) const MAX_VISIBLE_ROWS: usize = 10;
 pub(super) enum PaletteAction {
     Shortcut(Action),
     SetMode(TerminalMode),
+    OpenTabPosition,
+    SetTabPosition(TabPosition),
+    ToggleWindowControls,
     ToggleCopyOnSelect,
     OpenThemes,
     ApplyTheme(String),
@@ -63,6 +66,8 @@ struct SavedMenu {
 pub(super) struct PaletteContext<'a> {
     pub(super) keymap: &'a Keymap,
     pub(super) mode: TerminalMode,
+    pub(super) tab_position: TabPosition,
+    pub(super) window_controls: WindowControlsPolicy,
     pub(super) scrollbar: ScrollbarPolicy,
     pub(super) copy_on_select: bool,
     pub(super) multi_tab: bool,
@@ -322,6 +327,28 @@ pub(super) fn build_scrollbar_entries(current: ScrollbarPolicy) -> (Vec<PaletteE
     (entries, selected)
 }
 
+pub(super) fn build_tab_position_entries(current: TabPosition) -> (Vec<PaletteEntry>, usize) {
+    let options = [
+        (TabPosition::Top, "Top tabs (Chrome bar)"),
+        (TabPosition::Left, "Left sidebar + Command bar"),
+    ];
+    let selected = options
+        .iter()
+        .position(|(pos, _)| *pos == current)
+        .unwrap_or(0);
+    let entries = options
+        .into_iter()
+        .map(|(pos, title)| {
+            PaletteEntry::new(
+                PaletteAction::SetTabPosition(pos),
+                title,
+                if pos == current { "Current" } else { "" },
+            )
+        })
+        .collect();
+    (entries, selected)
+}
+
 pub(super) fn build_command_history_entries(view: ScreenView<'_>) -> Vec<PaletteEntry> {
     let total = view.rows();
     let mut commands = Vec::new();
@@ -403,6 +430,23 @@ fn build_root_entries(ctx: &PaletteContext<'_>) -> Vec<PaletteEntry> {
             ScrollbarPolicy::Auto => "Auto >",
             ScrollbarPolicy::Always => "Always >",
             ScrollbarPolicy::Never => "Hidden >",
+        },
+    ));
+    entries.push(PaletteEntry::new(
+        PaletteAction::OpenTabPosition,
+        "Tab layout",
+        match ctx.tab_position {
+            TabPosition::Top => "Top tabs >",
+            TabPosition::Left => "Left sidebar >",
+        },
+    ));
+    entries.push(PaletteEntry::new(
+        PaletteAction::ToggleWindowControls,
+        "Window controls",
+        match ctx.window_controls {
+            WindowControlsPolicy::Auto => "Auto",
+            WindowControlsPolicy::Show => "Show",
+            WindowControlsPolicy::Hide => "Hide",
         },
     ));
     entries.push(PaletteEntry::new(
@@ -675,7 +719,7 @@ mod tests {
     use lune_terminal::PixelSize;
     use winit::dpi::PhysicalPosition;
 
-    use super::super::config::TerminalMode;
+    use super::super::config::{TabPosition, TerminalMode, WindowControlsPolicy};
     use super::super::font::FontMetrics;
     use super::super::scrollbar::ScrollbarPolicy;
     use super::super::shortcuts::Keymap;
@@ -697,6 +741,8 @@ mod tests {
         let ctx = PaletteContext {
             keymap: &keymap,
             mode: TerminalMode::Classic,
+            tab_position: TabPosition::Top,
+            window_controls: WindowControlsPolicy::Auto,
             scrollbar: ScrollbarPolicy::Auto,
             copy_on_select: false,
             multi_tab: true,

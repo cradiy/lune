@@ -72,6 +72,21 @@ fn fragment(input: Vertex) -> @location(0) vec4f {
         }
         return vec4f(input.color.rgb, input.color.a * cov);
     }
+    if input.sprite.x == 7u {
+        // Concave Chrome tab wing: quarter-ellipse cutout anchored at top-outer corner.
+        let w = max(f32(input.sprite.y & 0x3ffu), 1.0);
+        let h = max(f32((input.sprite.y >> 10u) & 0x3ffu), 1.0);
+        let right_side = (input.sprite.y >> 20u) & 1u;
+        let dx = select(input.uv.x, w - input.uv.x, right_side != 0u);
+        let dy = input.uv.y;
+        let nx = dx / w;
+        let ny = dy / h;
+        let r = length(vec2f(nx, ny));
+        let grad = length(vec2f(nx / w, ny / h)) / max(r, 1e-4);
+        let sd = (r - 1.0) / max(grad, 1e-4);
+        let cov = clamp(sd + 0.5, 0.0, 1.0);
+        return vec4f(input.color.rgb, input.color.a * cov);
+    }
     let glyph = textureLoad(atlas, vec2i(input.uv), i32(input.sprite.y), 0);
     let color = select(input.color.rgb, glyph.rgb, input.sprite.x == 2u);
     return vec4f(color, glyph.a * input.color.a);

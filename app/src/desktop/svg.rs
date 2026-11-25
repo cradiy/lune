@@ -19,6 +19,7 @@ pub(super) mod icons {
     pub(in crate::desktop) const MAXIMIZE: &str = include_str!("icons/maximize.svg");
     pub(in crate::desktop) const RESTORE: &str = include_str!("icons/restore.svg");
     pub(in crate::desktop) const TERMINAL: &str = include_str!("icons/terminal.svg");
+    pub(in crate::desktop) const SIDEBAR: &str = include_str!("icons/sidebar.svg");
     pub(in crate::desktop) const COPY: &str = include_str!("icons/copy.svg");
 }
 
@@ -211,6 +212,7 @@ mod tests {
             icons::MAXIMIZE,
             icons::RESTORE,
             icons::TERMINAL,
+            icons::SIDEBAR,
             icons::COPY,
         ] {
             let raster = cache.rasterize(svg, 24, 24, SvgMode::Mask).unwrap();

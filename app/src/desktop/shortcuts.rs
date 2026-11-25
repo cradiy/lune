@@ -21,6 +21,7 @@ pub(super) enum Action {
     Hints,
     CommandPalette,
     ToggleMode,
+    ToggleTabSidebar,
     PreviousPrompt,
     NextPrompt,
     CopyLastOutput,
@@ -369,6 +370,7 @@ const WAYLAND_BINDINGS: &[Binding] = &[
     Binding::new(Action::Hints, CTRL_SHIFT, letter("s")),
     Binding::new(Action::CommandPalette, CTRL_SHIFT, letter("p")),
     Binding::new(Action::ToggleMode, CTRL_SHIFT, letter("m")),
+    Binding::new(Action::ToggleTabSidebar, CTRL_SHIFT, letter("b")),
     Binding::new(Action::PreviousPrompt, CTRL_SHIFT, Named(NamedKey::ArrowUp))
         .primary_screen()
         .repeating(),
@@ -606,6 +608,7 @@ fn parse_action(name: &str) -> Result<KeybindAction, &'static str> {
         "hints" | "quick_select" => Action::Hints,
         "command_palette" | "palette" => Action::CommandPalette,
         "toggle_mode" => Action::ToggleMode,
+        "toggle_sidebar" | "toggle_tab_sidebar" => Action::ToggleTabSidebar,
         "previous_prompt" => Action::PreviousPrompt,
         "next_prompt" => Action::NextPrompt,
         "copy_last_output" => Action::CopyLastOutput,

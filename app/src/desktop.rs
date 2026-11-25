@@ -27,8 +27,10 @@ mod tab;
 mod tab_bar;
 mod text;
 mod theme;
+mod titlebar;
 mod url;
 mod vi;
+mod wayland_decorations;
 
 use std::ffi::OsString;
 use std::io;
@@ -49,7 +51,7 @@ use winit::event::{Ime, KeyEvent, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::platform::wayland::{EventLoopBuilderExtWayland, WindowAttributesExtWayland};
-use winit::window::{CursorIcon, Fullscreen, ImePurpose, Theme, Window, WindowId};
+use winit::window::{CursorIcon, Fullscreen, ImePurpose, ResizeDirection, Theme, Window, WindowId};
 
 use crate::{GridGeometry, PixelRect, SessionReady};
 
@@ -57,7 +59,7 @@ use cli::LaunchOptions;
 use clipboard::ClipboardType;
 use config::{
     ClipboardPolicy, Config, ConfigSource, MAX_FONT_SIZE, MIN_FONT_SIZE, NotificationPolicy,
-    TerminalMode,
+    TabPosition, TerminalMode, WindowControlsPolicy,
 };
 use font::{Font, physical_font_size};
 use notify::Notifier;
@@ -68,6 +70,10 @@ use scrollbar::ScrollbarPolicy;
 use shortcuts::{Action, Keymap, Scroll, Zoom};
 use split::{Axis, Direction as SplitDirection, Divider, SplitTree};
 use tab::{Pane, PaneConfig, Tab};
+use titlebar::{SidebarResizeDrag, TabAnimator, TabDrag, TitlebarAction};
+use wayland_decorations::{
+    CompositorDecorations, WindowButtons, probe_wayland_decorations, resolve_window_buttons,
+};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -96,6 +102,7 @@ enum Event {
     DirectoryOpened(io::Result<()>),
     HyperlinkOpened(io::Result<()>),
     SystemTheme(Theme),
+    ButtonLayout(Option<WindowButtons>),
     ConfigReload(bool),
 }
 
@@ -145,6 +152,7 @@ pub fn run(mut options: LaunchOptions) -> Result<()> {
         client: None,
         error: None,
         system_theme: Theme::Dark,
+        portal_buttons: None,
         _theme_watch: None,
         _config_watch: config_watch,
     };
@@ -162,13 +170,16 @@ struct App {
     client: Option<Client>,
     error: Option<Box<dyn std::error::Error>>,
     system_theme: Theme,
+    portal_buttons: Option<WindowButtons>,
     _theme_watch: Option<theme::system::Watch>,
     _config_watch: Option<config::watch::Watch>,
 }
 
 impl App {
     fn sync_theme_watch(&mut self) {
-        if matches!(self.config.theme, theme::Preference::System) {
+        if matches!(self.config.theme, theme::Preference::System)
+            || self.config.window_controls == WindowControlsPolicy::Auto
+        {
             if self._theme_watch.is_none() {
                 match theme::system::Watch::start(self.proxy.clone()) {
                     Ok(watch) => self._theme_watch = Some(watch),
@@ -227,12 +238,15 @@ impl ApplicationHandler<Event> for App {
             let custom_config = self.config_source.custom_path().map(PathBuf::from);
             match Client::new(
                 event_loop,
-                self.proxy.clone(),
-                &self.config,
-                self.system_theme,
-                launch,
-                custom_config,
-                self.startup_notice.take(),
+                ClientInit {
+                    proxy: self.proxy.clone(),
+                    config: &self.config,
+                    system_theme: self.system_theme,
+                    portal_buttons: self.portal_buttons,
+                    launch,
+                    custom_config,
+                    startup_notice: self.startup_notice.take(),
+                },
             ) {
                 Ok(client) => self.client = Some(client),
                 Err(error) => self.report(event_loop, Err(error)),
@@ -252,6 +266,16 @@ impl ApplicationHandler<Event> for App {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: Event) {
         if let Event::ConfigReload(force) = event {
             self.reload_config(force);
+            return;
+        }
+        if let Event::ButtonLayout(buttons) = event {
+            if self.portal_buttons == buttons {
+                return;
+            }
+            self.portal_buttons = buttons;
+            if let Some(client) = &mut self.client {
+                client.apply_portal_buttons(buttons);
+            }
             return;
         }
         if let Event::SystemTheme(theme) = event {
@@ -311,7 +335,7 @@ impl ApplicationHandler<Event> for App {
                 client.apply_system_theme(theme);
                 Ok(())
             }
-            Event::ConfigReload(_) => unreachable!(),
+            Event::ButtonLayout(_) | Event::ConfigReload(_) => unreachable!(),
         };
         self.report(event_loop, result);
     }
@@ -338,6 +362,16 @@ struct Client {
     system_theme: Theme,
     config_dir: Option<PathBuf>,
     bar: tab_bar::Layout,
+    titlebar: titlebar::Layout,
+    titlebar_hovered: Option<TitlebarAction>,
+    titlebar_pressed: Option<TitlebarAction>,
+    titlebar_last_click: Option<Instant>,
+    tab_animator: TabAnimator,
+    tab_drag: Option<TabDrag>,
+    sidebar_collapsed: bool,
+    sidebar_width_cells: Option<f64>,
+    sidebar_resize_drag: Option<SidebarResizeDrag>,
+    sidebar_divider_last_click: Option<Instant>,
     content_area: PixelRect,
     copy_pending: bool,
     directory_open_pending: bool,
@@ -369,6 +403,10 @@ struct Client {
     shell: Option<Vec<OsString>>,
     shell_integration: bool,
     mode: TerminalMode,
+    tab_position: TabPosition,
+    window_controls: WindowControlsPolicy,
+    compositor_decorations: Option<CompositorDecorations>,
+    portal_buttons: Option<WindowButtons>,
     scrollbar: ScrollbarPolicy,
     confirm_close: bool,
     confirm_paste: bool,
@@ -377,16 +415,28 @@ struct Client {
     command_palette: Option<CommandPalette>,
 }
 
+struct ClientInit<'a> {
+    proxy: EventLoopProxy<Event>,
+    config: &'a Config,
+    system_theme: Theme,
+    portal_buttons: Option<WindowButtons>,
+    launch: LaunchOptions,
+    custom_config: Option<PathBuf>,
+    startup_notice: Option<String>,
+}
+
 impl Client {
-    fn new(
-        event_loop: &ActiveEventLoop,
-        proxy: EventLoopProxy<Event>,
-        config: &Config,
-        system_theme: Theme,
-        launch: LaunchOptions,
-        custom_config: Option<PathBuf>,
-        startup_notice: Option<String>,
-    ) -> Result<Self> {
+    fn new(event_loop: &ActiveEventLoop, init: ClientInit<'_>) -> Result<Self> {
+        let ClientInit {
+            proxy,
+            config,
+            system_theme,
+            portal_buttons,
+            launch,
+            custom_config,
+            startup_notice,
+        } = init;
+        let compositor_decorations = probe_wayland_decorations();
         let selected_theme = config.theme.resolve(system_theme);
         let default_title = launch
             .title
@@ -400,6 +450,7 @@ impl Client {
                     .with_title(&default_title)
                     .with_name(app_id, "")
                     .with_theme(Some(selected_theme))
+                    .with_decorations(config.mode == TerminalMode::Classic)
                     .with_transparent(true)
                     .with_inner_size(LogicalSize::new(960, 600))
                     .with_min_inner_size(LogicalSize::new(180, 100)),
@@ -426,9 +477,32 @@ impl Client {
             log::warn!("{error}");
         }
         let bar = tab_bar::Layout::default();
+        let cell = painter.metrics().cell;
+        let top_bar_height = titlebar::Layout::height(
+            window.inner_size(),
+            cell,
+            scale,
+            config.mode == TerminalMode::Modern,
+        );
+        let left_bar_width = titlebar::Layout::compute_sidebar_width(
+            window.inner_size(),
+            cell,
+            scale,
+            config.mode == TerminalMode::Modern,
+            config.tab_position,
+            false,
+            None,
+        );
         let padding = physical_padding(config.window_padding, scale);
-        let content_area = content_rect(window.inner_size(), 0, padding, painter.metrics().cell)
-            .ok_or_else(|| io::Error::other("The terminal grid does not fit the Wayland window"))?;
+        let content_area = content_rect(
+            window.inner_size(),
+            left_bar_width,
+            top_bar_height,
+            0,
+            padding,
+            painter.metrics().cell,
+        )
+        .ok_or_else(|| io::Error::other("The terminal grid does not fit the Wayland window"))?;
         let grid = GridGeometry::fit(content_area.size, painter.metrics().cell)
             .ok_or_else(|| io::Error::other("The terminal grid does not fit the Wayland window"))?;
         let (palette, scheme) = config.theme.palette(selected_theme);
@@ -474,7 +548,7 @@ impl Client {
             .as_deref()
             .and_then(|path| path.parent().map(PathBuf::from))
             .or_else(Config::directory);
-        Ok(Self {
+        let mut client = Self {
             window,
             painter,
             readiness,
@@ -488,6 +562,16 @@ impl Client {
             system_theme,
             config_dir,
             bar,
+            titlebar: titlebar::Layout::default(),
+            titlebar_hovered: None,
+            titlebar_pressed: None,
+            titlebar_last_click: None,
+            tab_animator: TabAnimator::default(),
+            tab_drag: None,
+            sidebar_collapsed: false,
+            sidebar_width_cells: None,
+            sidebar_resize_drag: None,
+            sidebar_divider_last_click: None,
             content_area,
             copy_pending: false,
             directory_open_pending: false,
@@ -531,13 +615,19 @@ impl Client {
             shell: config.shell.clone(),
             shell_integration: config.shell_integration,
             mode: config.mode,
+            tab_position: config.tab_position,
+            window_controls: config.window_controls,
+            compositor_decorations,
+            portal_buttons,
             scrollbar: config.scrollbar,
             confirm_close: config.confirm_close,
             confirm_paste: config.confirm_paste,
             copy_on_select: config.copy_on_select,
             confirm: None,
             command_palette: None,
-        })
+        };
+        client.reflow_tab_bar();
+        Ok(client)
     }
 
     fn pane_config(&self) -> PaneConfig<'_> {
@@ -625,6 +715,11 @@ impl Client {
                     pane.update_ime_area();
                 } else {
                     self.dragging_divider = None;
+                    self.titlebar_pressed = None;
+                    self.sidebar_resize_drag = None;
+                    if self.tab_drag.take().is_some() {
+                        self.sync_tab_animator();
+                    }
                     self.painter.reset_cursor_motion();
                     self.modifiers = ModifiersState::empty();
                     for pane in &mut self.tabs[self.active].panes {
@@ -750,6 +845,80 @@ impl Client {
                     self.update_cursor_icon();
                     return Ok(());
                 }
+                if let Some(drag) = self.sidebar_resize_drag {
+                    let cell_w = f64::from(self.painter.metrics().cell.width.get().max(1));
+                    let m = self.titlebar.metrics;
+                    let next_px = (drag.start_width_px + (position.x - drag.start_x)).clamp(
+                        f64::from(m.sidebar_min_width),
+                        f64::from(m.sidebar_max_width),
+                    );
+                    let next_cells = next_px / cell_w;
+                    let prev_px = f64::from(self.titlebar.sidebar_width);
+                    if (next_px - prev_px).abs() >= 1.0 {
+                        self.sidebar_width_cells = Some(next_cells);
+                        self.resize_pending = true;
+                        self.apply_resize();
+                    }
+                    self.update_cursor_icon();
+                    return Ok(());
+                }
+                if let Some(mut drag) = self.tab_drag {
+                    let dist = ((position.x - drag.start_pos.x).powi(2)
+                        + (position.y - drag.start_pos.y).powi(2))
+                    .sqrt();
+                    if dist >= 4.0 {
+                        drag.moved = true;
+                    }
+                    if drag.moved {
+                        if drag.in_sidebar {
+                            let raw_y = position.y as f32 - drag.grab_offset;
+                            drag.current_coord = self.titlebar.clamp_sidebar_drag_y(raw_y);
+                            if let Some(old_index) =
+                                self.tabs.iter().position(|tab| tab.id == drag.tab_id)
+                            {
+                                let new_index = self
+                                    .titlebar
+                                    .insertion_index_sidebar(drag.current_coord, self.tabs.len());
+                                if old_index != new_index {
+                                    let tab = self.tabs.remove(old_index);
+                                    self.tabs.insert(new_index, tab);
+                                    self.active = new_index;
+                                    self.reflow_tab_bar_only();
+                                }
+                            }
+                        } else {
+                            let raw_x = position.x as f32 - drag.grab_offset;
+                            drag.current_coord = self.titlebar.clamp_top_drag_x(raw_x);
+                            if let Some(old_index) =
+                                self.tabs.iter().position(|tab| tab.id == drag.tab_id)
+                            {
+                                let new_index = self
+                                    .titlebar
+                                    .insertion_index_top(drag.current_coord, self.tabs.len());
+                                if old_index != new_index {
+                                    let tab = self.tabs.remove(old_index);
+                                    self.tabs.insert(new_index, tab);
+                                    self.active = new_index;
+                                    self.reflow_tab_bar_only();
+                                }
+                            }
+                        }
+                        self.tab_drag = Some(drag);
+                        self.sync_tab_animator();
+                        self.painter.invalidate_overlay();
+                        self.window.request_redraw();
+                    } else {
+                        self.tab_drag = Some(drag);
+                    }
+                    self.update_cursor_icon();
+                    return Ok(());
+                }
+                let hovered_titlebar = self.titlebar.hit(position);
+                if self.titlebar_hovered != hovered_titlebar {
+                    self.titlebar_hovered = hovered_titlebar;
+                    self.painter.invalidate_overlay();
+                    self.window.request_redraw();
+                }
                 let scrollbar = self.scrollbar;
                 let tab = &mut self.tabs[self.active];
                 let captured = tab
@@ -766,9 +935,10 @@ impl Client {
                         pane.pointer_moved(position, scrollbar);
                     }
                 } else {
-                    let hovered_id = (!self.bar.contains(position))
-                        .then(|| tab.layout.pane_at(position))
-                        .flatten();
+                    let hovered_id = (!self.bar.contains(position)
+                        && !self.titlebar.contains_any(position))
+                    .then(|| tab.layout.pane_at(position))
+                    .flatten();
                     for pane in &mut tab.panes {
                         if Some(pane.id) == hovered_id {
                             pane.modifiers = self.modifiers;
@@ -793,6 +963,10 @@ impl Client {
                 if let Some(cmd_palette) = &mut self.command_palette
                     && cmd_palette.hovered.take().is_some()
                 {
+                    self.painter.invalidate_overlay();
+                    self.window.request_redraw();
+                }
+                if self.titlebar_hovered.take().is_some() {
                     self.painter.invalidate_overlay();
                     self.window.request_redraw();
                 }
@@ -855,6 +1029,147 @@ impl Client {
                     && button == winit::event::MouseButton::Left
                     && self.dragging_divider.take().is_some()
                 {
+                    self.update_cursor_icon();
+                    return Ok(());
+                }
+                if !state.is_pressed()
+                    && button == winit::event::MouseButton::Left
+                    && self.sidebar_resize_drag.take().is_some()
+                {
+                    self.update_cursor_icon();
+                    return Ok(());
+                }
+                if !state.is_pressed()
+                    && button == winit::event::MouseButton::Left
+                    && let Some(drag) = self.tab_drag.take()
+                {
+                    if drag.moved {
+                        self.sync_tab_animator();
+                        self.painter.invalidate_overlay();
+                        self.window.request_redraw();
+                    }
+                    self.update_cursor_icon();
+                    return Ok(());
+                }
+                if !state.is_pressed()
+                    && button == winit::event::MouseButton::Left
+                    && let Some(pressed) = self.titlebar_pressed.take()
+                {
+                    if let Some(point) = self.pointer
+                        && self.titlebar.hit(point) == Some(pressed)
+                    {
+                        self.execute_titlebar_action(event_loop, pressed);
+                    }
+                    self.update_cursor_icon();
+                    return Ok(());
+                }
+                if state.is_pressed()
+                    && button == winit::event::MouseButton::Left
+                    && let Some(point) = self.pointer
+                    && self
+                        .titlebar
+                        .hit_sidebar_divider(point, self.window.scale_factor())
+                {
+                    let now = Instant::now();
+                    let double_click = self
+                        .sidebar_divider_last_click
+                        .is_some_and(|prev| now.duration_since(prev) <= Duration::from_millis(350));
+                    if double_click {
+                        self.sidebar_divider_last_click = None;
+                        self.sidebar_width_cells = None;
+                        self.resize_pending = true;
+                        self.apply_resize();
+                    } else {
+                        self.sidebar_divider_last_click = Some(now);
+                        self.sidebar_resize_drag = Some(SidebarResizeDrag {
+                            start_x: point.x,
+                            start_width_px: f64::from(self.titlebar.sidebar_width),
+                        });
+                    }
+                    self.update_cursor_icon();
+                    return Ok(());
+                }
+                if state.is_pressed()
+                    && button == winit::event::MouseButton::Left
+                    && let Some(point) = self.pointer
+                    && self.titlebar.hit(point).is_none()
+                    && let Some(dir) = self.borderless_resize_direction(point)
+                {
+                    let _ = self.window.drag_resize_window(dir);
+                    return Ok(());
+                }
+                if state.is_pressed()
+                    && let Some(point) = self.pointer
+                    && self.titlebar.contains_any(point)
+                {
+                    let hit = self.titlebar.hit(point);
+                    match button {
+                        winit::event::MouseButton::Left => match hit {
+                            Some(TitlebarAction::SelectTab(index)) => {
+                                self.titlebar_last_click = None;
+                                if index < self.tabs.len() {
+                                    self.select_tab(index);
+                                    if self.tabs.len() > 1 {
+                                        let in_sidebar = self.titlebar.sidebar_width > 0;
+                                        let slot = if in_sidebar {
+                                            self.titlebar.sidebar_tab_slot(index)
+                                        } else {
+                                            self.titlebar.top_tab_slot(index)
+                                        };
+                                        if let Some(slot) = slot {
+                                            let base = if in_sidebar {
+                                                slot.rect.origin.y as f32
+                                            } else {
+                                                slot.rect.origin.x as f32
+                                            };
+                                            let current = self.tab_animator.coord(slot.id, base);
+                                            let pointer_axis = if in_sidebar {
+                                                point.y as f32
+                                            } else {
+                                                point.x as f32
+                                            };
+                                            self.tab_drag = Some(TabDrag {
+                                                tab_id: slot.id,
+                                                grab_offset: pointer_axis - current,
+                                                start_pos: point,
+                                                current_coord: current,
+                                                moved: false,
+                                                in_sidebar,
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                            Some(action) => {
+                                self.titlebar_last_click = None;
+                                self.titlebar_pressed = Some(action);
+                            }
+                            None if self.titlebar.contains_titlebar(point) => {
+                                let now = Instant::now();
+                                let double_click = self.titlebar_last_click.is_some_and(|prev| {
+                                    now.duration_since(prev) <= Duration::from_millis(350)
+                                });
+                                if double_click {
+                                    self.titlebar_last_click = None;
+                                    self.window.set_maximized(!self.window.is_maximized());
+                                } else {
+                                    self.titlebar_last_click = Some(now);
+                                    let _ = self.window.drag_window();
+                                }
+                            }
+                            None => {}
+                        },
+                        winit::event::MouseButton::Middle => {
+                            if let Some(
+                                TitlebarAction::SelectTab(index) | TitlebarAction::CloseTab(index),
+                            ) = hit
+                                && index < self.tabs.len()
+                            {
+                                self.request_close_tab(event_loop, index);
+                            }
+                        }
+                        _ => {}
+                    }
                     self.update_cursor_icon();
                     return Ok(());
                 }
@@ -966,7 +1281,45 @@ impl Client {
                     }
                     return Ok(());
                 }
-                if self.pointer.is_some_and(|point| self.bar.contains(point)) {
+                if self
+                    .pointer
+                    .is_some_and(|point| self.titlebar.contains_sidebar(point))
+                {
+                    let (x, y) = match delta {
+                        winit::event::MouseScrollDelta::LineDelta(x, y) => {
+                            (f64::from(x), f64::from(y))
+                        }
+                        winit::event::MouseScrollDelta::PixelDelta(position) => {
+                            (position.x, position.y)
+                        }
+                    };
+                    let direction = if y != 0.0 { y } else { x };
+                    if self.tabs.len() > self.titlebar.sidebar_visible_rows.max(1) {
+                        let step = if direction > 0.0 {
+                            -1
+                        } else if direction < 0.0 {
+                            1
+                        } else {
+                            0
+                        };
+                        if step != 0 && self.titlebar.scroll_sidebar(step, self.tabs.len()) {
+                            self.reflow_tab_bar_only();
+                            self.sync_tab_animator();
+                            self.painter.invalidate_overlay();
+                            self.window.request_redraw();
+                        }
+                    } else if self.tabs.len() > 1 {
+                        if direction > 0.0 {
+                            self.select_tab(
+                                self.active.checked_sub(1).unwrap_or(self.tabs.len() - 1),
+                            );
+                        } else if direction < 0.0 {
+                            self.select_tab((self.active + 1) % self.tabs.len());
+                        }
+                    }
+                } else if self.pointer.is_some_and(|point| {
+                    self.bar.contains(point) || self.titlebar.contains_titlebar(point)
+                }) {
                     if self.tabs.len() > 1 {
                         let (x, y) = match delta {
                             winit::event::MouseScrollDelta::LineDelta(x, y) => {
@@ -1014,10 +1367,21 @@ impl Client {
             } else {
                 CursorIcon::Default
             }
+        } else if self.sidebar_resize_drag.is_some() {
+            CursorIcon::ColResize
         } else if let Some(divider) = self.dragging_divider {
             divider_cursor(divider.axis)
         } else if let Some(point) = self.pointer {
-            if self.bar.contains(point) {
+            if self
+                .titlebar
+                .hit_sidebar_divider(point, self.window.scale_factor())
+            {
+                CursorIcon::ColResize
+            } else if self.titlebar.hit(point).is_some() {
+                CursorIcon::Pointer
+            } else if let Some(dir) = self.borderless_resize_direction(point) {
+                resize_cursor(dir)
+            } else if self.bar.contains(point) || self.titlebar.contains_any(point) {
                 CursorIcon::Default
             } else {
                 let tab = &self.tabs[self.active];
@@ -1153,6 +1517,7 @@ impl Client {
             }
             Action::CommandPalette => self.open_palette(),
             Action::ToggleMode => self.set_mode(self.mode.toggle()),
+            Action::ToggleTabSidebar => self.toggle_tab_sidebar(),
             Action::PreviousPrompt => self.tabs[self.active].focused_pane_mut().jump_prompt(false),
             Action::NextPrompt => self.tabs[self.active].focused_pane_mut().jump_prompt(true),
             Action::CopyLastOutput => {
@@ -1385,11 +1750,34 @@ impl Client {
         let id = self.allocate_pane_id()?;
         let cwd = self.tabs[self.active].focused_pane().working_directory();
         let size = self.window.inner_size();
+        let scale = self.window.scale_factor();
         let metrics = self.painter.metrics();
-        let bar_height = tab_bar::Layout::height(size, metrics.cell, self.tabs.len() + 1);
+        let top_bar_height =
+            titlebar::Layout::height(size, metrics.cell, scale, self.mode == TerminalMode::Modern);
+        let left_bar_width = titlebar::Layout::compute_sidebar_width(
+            size,
+            metrics.cell,
+            scale,
+            self.mode == TerminalMode::Modern,
+            self.tab_position,
+            self.sidebar_collapsed,
+            self.sidebar_width_cells,
+        );
+        let bar_height = if self.mode == TerminalMode::Classic {
+            tab_bar::Layout::height(size, metrics.cell, self.tabs.len() + 1)
+        } else {
+            0
+        };
         let padding = self.physical_padding();
-        let area =
-            content_rect(size, bar_height, padding, metrics.cell).unwrap_or(self.content_area);
+        let area = content_rect(
+            size,
+            left_bar_width,
+            top_bar_height,
+            bar_height,
+            padding,
+            metrics.cell,
+        )
+        .unwrap_or(self.content_area);
         let grid = GridGeometry::fit(area.size, metrics.cell)
             .unwrap_or(self.tabs[self.active].focused_pane().target_grid);
         let mut pane = Pane::spawn(
@@ -1590,11 +1978,98 @@ impl Client {
             return;
         }
         self.mode = mode;
+        self.window.set_decorations(mode == TerminalMode::Classic);
+        self.titlebar_hovered = None;
+        self.titlebar_pressed = None;
+        self.tab_drag = None;
+        self.sidebar_resize_drag = None;
+        self.tab_animator.clear();
+        self.resize_pending = true;
+        self.apply_resize();
         let label = match mode {
             TerminalMode::Classic => "Mode: Classic",
             TerminalMode::Modern => "Mode: Modern",
         };
         self.show_notice(NoticeKind::Success, label.into());
+    }
+
+    fn set_tab_position(&mut self, position: TabPosition) {
+        if self.mode != TerminalMode::Modern {
+            self.mode = TerminalMode::Modern;
+            self.window.set_decorations(false);
+        }
+        self.tab_position = position;
+        self.sidebar_collapsed = false;
+        self.titlebar_hovered = None;
+        self.titlebar_pressed = None;
+        self.tab_drag = None;
+        self.sidebar_resize_drag = None;
+        self.tab_animator.clear();
+        self.resize_pending = true;
+        self.apply_resize();
+        let label = match position {
+            TabPosition::Top => "Tab layout: Top tabs",
+            TabPosition::Left => "Tab layout: Left sidebar",
+        };
+        self.show_notice(NoticeKind::Success, label.into());
+    }
+
+    fn toggle_tab_sidebar(&mut self) {
+        if self.mode != TerminalMode::Modern || self.tab_position != TabPosition::Left {
+            return;
+        }
+        self.sidebar_collapsed = !self.sidebar_collapsed;
+        self.titlebar_hovered = None;
+        self.titlebar_pressed = None;
+        self.tab_drag = None;
+        self.sidebar_resize_drag = None;
+        self.tab_animator.clear();
+        self.resize_pending = true;
+        self.apply_resize();
+    }
+
+    fn execute_titlebar_action(&mut self, event_loop: &ActiveEventLoop, action: TitlebarAction) {
+        match action {
+            TitlebarAction::CommandPalette | TitlebarAction::CommandBar => self.open_palette(),
+            TitlebarAction::ToggleSidebar => self.toggle_tab_sidebar(),
+            TitlebarAction::NewTab | TitlebarAction::SidebarNewTab => {
+                if let Err(error) = self.new_tab() {
+                    log::warn!("Could not open a terminal tab: {error}");
+                }
+            }
+            TitlebarAction::SelectTab(index) => {
+                if index < self.tabs.len() {
+                    self.select_tab(index);
+                }
+            }
+            TitlebarAction::CloseTab(index) => {
+                if index < self.tabs.len() {
+                    self.request_close_tab(event_loop, index);
+                }
+            }
+            TitlebarAction::Minimize => {
+                self.window.set_minimized(true);
+            }
+            TitlebarAction::Maximize => {
+                self.window.set_maximized(!self.window.is_maximized());
+            }
+            TitlebarAction::Close => {
+                if self.confirm_window_close() {
+                    log::debug!("Terminal window closed");
+                    event_loop.exit();
+                }
+            }
+        }
+    }
+
+    fn borderless_resize_direction(&self, pos: PhysicalPosition<f64>) -> Option<ResizeDirection> {
+        if self.mode != TerminalMode::Modern
+            || self.window.fullscreen().is_some()
+            || self.window.is_maximized()
+        {
+            return None;
+        }
+        titlebar::edge_resize_direction(pos, self.painter.size(), self.window.scale_factor())
     }
 
     fn palette_layout(&self) -> Option<(palette::Layout, usize)> {
@@ -1625,6 +2100,8 @@ impl Client {
         let ctx = PaletteContext {
             keymap: &self.keymap,
             mode: self.mode,
+            tab_position: self.tab_position,
+            window_controls: self.window_controls,
             scrollbar: self.scrollbar,
             copy_on_select: self.copy_on_select,
             multi_tab: self.tabs.len() > 1,
@@ -1876,6 +2353,30 @@ impl Client {
                 self.close_palette(true);
                 self.set_mode(mode);
             }
+            PaletteAction::OpenTabPosition => {
+                let (entries, selected) = palette::build_tab_position_entries(self.tab_position);
+                if let Some(cmd_palette) = &mut self.command_palette {
+                    cmd_palette.push_submenu("Tab layout", entries, selected);
+                }
+                self.painter.invalidate_overlay();
+                self.window.request_redraw();
+            }
+            PaletteAction::SetTabPosition(position) => {
+                self.close_palette(true);
+                self.set_tab_position(position);
+            }
+            PaletteAction::ToggleWindowControls => {
+                self.close_palette(true);
+                self.window_controls = self.window_controls.cycle();
+                self.resize_pending = true;
+                self.apply_resize();
+                let label = match self.window_controls {
+                    WindowControlsPolicy::Auto => "Window controls: Auto (Wayland)",
+                    WindowControlsPolicy::Show => "Window controls: Show",
+                    WindowControlsPolicy::Hide => "Window controls: Hide",
+                };
+                self.show_notice(NoticeKind::Success, label.into());
+            }
             PaletteAction::ToggleCopyOnSelect => {
                 self.close_palette(true);
                 self.copy_on_select = !self.copy_on_select;
@@ -1904,7 +2405,7 @@ impl Client {
             area,
             self.painter.metrics(),
             self.window.scale_factor(),
-            dialog.message_columns(),
+            dialog,
         )
     }
 
@@ -2108,8 +2609,29 @@ impl Client {
         if old.theme != new.theme {
             self.apply_theme_preference(new.theme.clone());
         }
+        let mut layout_changed = false;
         if old.mode != new.mode {
             self.mode = new.mode;
+            self.window
+                .set_decorations(self.mode == TerminalMode::Classic);
+            self.titlebar_hovered = None;
+            self.titlebar_pressed = None;
+            self.tab_drag = None;
+            self.sidebar_resize_drag = None;
+            self.tab_animator.clear();
+            layout_changed = true;
+        }
+        if old.tab_position != new.tab_position {
+            self.tab_position = new.tab_position;
+            self.sidebar_collapsed = false;
+            self.tab_drag = None;
+            self.sidebar_resize_drag = None;
+            self.tab_animator.clear();
+            layout_changed = true;
+        }
+        if old.window_controls != new.window_controls {
+            self.window_controls = new.window_controls;
+            layout_changed = true;
         }
         if old.scrollbar != new.scrollbar {
             self.scrollbar = new.scrollbar;
@@ -2125,7 +2647,6 @@ impl Client {
         if old.unfocused_split_opacity != new.unfocused_split_opacity {
             self.unfocused_split_opacity = new.unfocused_split_opacity;
         }
-        let mut layout_changed = false;
         if old.window_padding != new.window_padding {
             self.window_padding = new.window_padding;
             layout_changed = true;
@@ -2372,13 +2893,22 @@ impl Client {
             self.notice = None;
             self.painter.invalidate_overlay();
         }
-        if self.painter.tick(now) || blink || notice_expired {
+        let tabs_animating = self.tab_animator.tick(now);
+        if tabs_animating {
+            self.painter.invalidate_overlay();
+        }
+        if self.painter.tick(now) || blink || notice_expired || tabs_animating {
             self.window.request_redraw();
         }
+        let tab_deadline = self
+            .tab_animator
+            .moving()
+            .then(|| now + Duration::from_millis(8));
         deadline = deadline
             .into_iter()
             .chain(self.painter.deadline())
             .chain(self.notice.as_ref().map(|notice| notice.expires))
+            .chain(tab_deadline)
             .min();
         let flow = if immediate {
             ControlFlow::Poll
@@ -2402,9 +2932,31 @@ impl Client {
         } else {
             current
         };
-        let bar_height = tab_bar::Layout::height(size, metrics.cell, self.tabs.len());
+        let top_bar_height =
+            titlebar::Layout::height(size, metrics.cell, scale, self.mode == TerminalMode::Modern);
+        let left_bar_width = titlebar::Layout::compute_sidebar_width(
+            size,
+            metrics.cell,
+            scale,
+            self.mode == TerminalMode::Modern,
+            self.tab_position,
+            self.sidebar_collapsed,
+            self.sidebar_width_cells,
+        );
+        let bar_height = if self.mode == TerminalMode::Classic {
+            tab_bar::Layout::height(size, metrics.cell, self.tabs.len())
+        } else {
+            0
+        };
         let padding = self.physical_padding();
-        let Some(content_area) = content_rect(size, bar_height, padding, metrics.cell) else {
+        let Some(content_area) = content_rect(
+            size,
+            left_bar_width,
+            top_bar_height,
+            bar_height,
+            padding,
+            metrics.cell,
+        ) else {
             return;
         };
         if GridGeometry::fit(content_area.size, metrics.cell).is_none() {
@@ -2424,14 +2976,75 @@ impl Client {
         self.window.request_redraw();
     }
 
-    fn reflow_tab_bar(&mut self) {
+    fn resolved_window_buttons(&self) -> WindowButtons {
+        if self.window.fullscreen().is_some() {
+            return WindowButtons::NONE;
+        }
+        resolve_window_buttons(
+            self.window_controls,
+            self.compositor_decorations.as_ref(),
+            self.portal_buttons,
+        )
+    }
+
+    fn apply_portal_buttons(&mut self, buttons: Option<WindowButtons>) {
+        let before = self.resolved_window_buttons();
+        self.portal_buttons = buttons;
+        if self.resolved_window_buttons() != before {
+            self.resize_pending = true;
+            self.apply_resize();
+            self.painter.invalidate_overlay();
+            self.window.request_redraw();
+        }
+    }
+
+    fn reflow_tab_bar_only(&mut self) {
+        let size = self.painter.size();
+        let cell = self.painter.metrics().cell;
+        let scale = self.window.scale_factor();
+        let modern = self.mode == TerminalMode::Modern;
+        let window_buttons = self.resolved_window_buttons();
+        self.titlebar.reflow(
+            titlebar::ReflowParams {
+                size,
+                cell,
+                scale,
+                enabled: modern,
+                tab_position: self.tab_position,
+                sidebar_collapsed: self.sidebar_collapsed,
+                sidebar_width_cells: self.sidebar_width_cells,
+                window_buttons,
+                tabs: self.tabs.len(),
+                active: self.active,
+            },
+            |index| self.tabs[index].id,
+        );
         self.bar.reflow(
-            self.painter.size(),
-            self.painter.metrics().cell,
+            size,
+            cell,
             self.active,
-            self.tabs.len(),
+            if modern { 0 } else { self.tabs.len() },
             |index| self.tabs[index].label(),
         );
+    }
+
+    fn sync_tab_animator(&mut self) {
+        if self.mode != TerminalMode::Modern {
+            self.tab_animator.clear();
+            return;
+        }
+        let targets = self.titlebar.tab_targets();
+        let dragged = self
+            .tab_drag
+            .filter(|drag| drag.moved)
+            .map(|drag| (drag.tab_id, drag.current_coord));
+        self.tab_animator
+            .sync(self.tab_position, &targets, dragged, Instant::now());
+    }
+
+    fn reflow_tab_bar(&mut self) {
+        self.reflow_tab_bar_only();
+        self.sync_tab_animator();
     }
 
     fn draw(&mut self) -> Result<()> {
@@ -2504,6 +3117,14 @@ impl Client {
         let focused_rect = (active_tab.layout.panes.len() > 1)
             .then(|| active_tab.layout.rect_of(active_tab.focused))
             .flatten();
+        let palette_shortcut = self
+            .keymap
+            .shortcut_label(Action::CommandPalette)
+            .unwrap_or_default();
+        let new_tab_shortcut = self
+            .keymap
+            .shortcut_label(Action::NewTab)
+            .unwrap_or_default();
         self.painter.draw(
             &self.window,
             &draw_panes,
@@ -2519,6 +3140,23 @@ impl Client {
                 confirm: self.confirm.as_ref(),
                 command_palette: self.command_palette.as_ref(),
                 scale,
+                titlebar: (self.titlebar.height != 0).then(|| titlebar::View {
+                    layout: &self.titlebar,
+                    animator: &self.tab_animator,
+                    dragged_tab: self
+                        .tab_drag
+                        .filter(|drag| drag.moved)
+                        .map(|drag| drag.tab_id),
+                    tabs: &self.tabs,
+                    active: self.active,
+                    palette: &self.palette,
+                    hovered: self.titlebar_hovered,
+                    maximized: self.window.is_maximized(),
+                    background_opacity: self.painter.background_opacity(),
+                    palette_shortcut: &palette_shortcut,
+                    new_tab_shortcut: &new_tab_shortcut,
+                    scale,
+                }),
                 tab_bar: tab_bar::View {
                     layout: &self.bar,
                     tabs: &self.tabs,
@@ -2537,21 +3175,27 @@ fn physical_padding(logical: u32, scale: f64) -> u32 {
 
 fn content_rect(
     size: PhysicalSize<u32>,
-    bar_height: u32,
+    left_bar_width: u32,
+    top_bar_height: u32,
+    bottom_bar_height: u32,
     padding: u32,
     cell: PixelSize,
 ) -> Option<PixelRect> {
-    let available_height = size.height.saturating_sub(bar_height);
+    let available_width = size.width.saturating_sub(left_bar_width);
+    let available_height = size
+        .height
+        .saturating_sub(top_bar_height)
+        .saturating_sub(bottom_bar_height);
     if padding != 0 {
         let double = padding.saturating_mul(2);
         if let (Some(width), Some(height)) = (
-            NonZeroU32::new(size.width.saturating_sub(double)),
+            NonZeroU32::new(available_width.saturating_sub(double)),
             NonZeroU32::new(available_height.saturating_sub(double)),
         ) {
             let padded = PixelRect {
                 origin: PixelPosition {
-                    x: padding,
-                    y: padding,
+                    x: left_bar_width.saturating_add(padding),
+                    y: top_bar_height.saturating_add(padding),
                 },
                 size: PixelSize { width, height },
             };
@@ -2561,12 +3205,28 @@ fn content_rect(
         }
     }
     Some(PixelRect {
-        origin: PixelPosition { x: 0, y: 0 },
+        origin: PixelPosition {
+            x: left_bar_width,
+            y: top_bar_height,
+        },
         size: PixelSize {
-            width: NonZeroU32::new(size.width)?,
+            width: NonZeroU32::new(available_width)?,
             height: NonZeroU32::new(available_height)?,
         },
     })
+}
+
+fn resize_cursor(direction: ResizeDirection) -> CursorIcon {
+    match direction {
+        ResizeDirection::North => CursorIcon::NResize,
+        ResizeDirection::South => CursorIcon::SResize,
+        ResizeDirection::East => CursorIcon::EResize,
+        ResizeDirection::West => CursorIcon::WResize,
+        ResizeDirection::NorthEast => CursorIcon::NeResize,
+        ResizeDirection::NorthWest => CursorIcon::NwResize,
+        ResizeDirection::SouthEast => CursorIcon::SeResize,
+        ResizeDirection::SouthWest => CursorIcon::SwResize,
+    }
 }
 
 fn divider_cursor(axis: Axis) -> CursorIcon {

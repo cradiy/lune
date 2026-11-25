@@ -48,6 +48,7 @@ pub(super) struct DispatchContext<'a> {
 }
 
 pub(super) struct Tab {
+    pub(super) id: u64,
     pub(super) tree: SplitTree,
     pub(super) panes: Vec<Pane>,
     pub(super) focused: PaneId,
@@ -63,6 +64,7 @@ impl Tab {
             dividers: Vec::new(),
         };
         Self {
+            id: u64::from(id),
             tree: SplitTree::new(id),
             panes: vec![pane],
             focused: id,

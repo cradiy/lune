@@ -1,12 +1,16 @@
 use std::num::NonZeroU32;
 
 use lune_terminal::{PixelPosition, PixelSize};
+use lune_text::WidthPolicy;
+use unicode_segmentation::UnicodeSegmentation;
 use winit::dpi::PhysicalPosition;
 
 use crate::PixelRect;
 
 use super::PaneId;
 use super::font::FontMetrics;
+
+const MAX_MESSAGE_LINES: usize = 4;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum ConfirmTarget {
@@ -73,7 +77,7 @@ impl Dialog {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Layout {
     pub(super) card: PixelRect,
     pub(super) card_radius: u32,
@@ -81,6 +85,8 @@ pub(super) struct Layout {
     pub(super) title_origin: PixelPosition,
     pub(super) message_origin: PixelPosition,
     pub(super) message_max_w: u32,
+    pub(super) line_step: u32,
+    pub(super) lines: Vec<String>,
     pub(super) yes: PixelRect,
     pub(super) no: PixelRect,
     pub(super) radius: u32,
@@ -92,15 +98,17 @@ impl Layout {
         area: PixelSize,
         metrics: FontMetrics,
         scale: f64,
-        message_columns: usize,
+        dialog: &Dialog,
     ) -> Option<Self> {
         let scale = scale.max(1.0);
-        let cell_w = metrics.cell.width.get();
-        let cell_h = metrics.cell.height.get();
+        let cell_w = metrics.cell.width.get().max(1);
+        let cell_h = metrics.cell.height.get().max(1);
         let margin = (cell_w * 2).max(16);
         let card_pad_x = ((f64::from(cell_w) * 2.0).round() as u32).max(16);
         let card_pad_y = ((f64::from(cell_h) * 0.85).round() as u32).max(14);
         let title_gap = ((f64::from(cell_h) * 0.45).round() as u32).max(6);
+        let line_gap = ((f64::from(cell_h) * 0.2).round() as u32).max(3);
+        let line_step = cell_h.saturating_add(line_gap);
         let button_gap_y = ((f64::from(cell_h) * 0.95).round() as u32).max(12);
 
         let btn_pad_x = ((f64::from(cell_w) * 1.5).round() as u32).max(10);
@@ -116,12 +124,17 @@ impl Layout {
         let indicator_gap = (cell_w * 2 / 3).max(6);
         let indicator_h = (cell_h * 2 / 3).max(6).min(cell_h);
 
-        let max_card_w = area.width.get().saturating_sub(margin * 2).min(960).max(
-            buttons_w
-                .saturating_add(card_pad_x * 2)
-                .min(area.width.get()),
-        );
-        let content_est_w = (message_columns as u32)
+        let min_card_w = buttons_w
+            .saturating_add(card_pad_x * 2)
+            .min(area.width.get());
+        let preferred_max_w = cell_w.saturating_mul(54).saturating_add(card_pad_x * 2);
+        let max_card_w = area
+            .width
+            .get()
+            .saturating_sub(margin * 2)
+            .min(preferred_max_w)
+            .max(min_card_w);
+        let content_est_w = (dialog.message_columns() as u32)
             .saturating_mul(cell_w)
             .max(buttons_w)
             .max(cell_w.saturating_mul(28));
@@ -129,13 +142,26 @@ impl Layout {
             .saturating_add(card_pad_x * 2)
             .min(max_card_w)
             .min(area.width.get());
-        let card_h = card_pad_y
+        let message_max_w = card_w.saturating_sub(card_pad_x * 2);
+        let max_cols = (message_max_w / cell_w).max(1) as usize;
+
+        // Limit line count so the card still fits inside very short windows.
+        let fixed_h = card_pad_y
             .saturating_mul(2)
             .saturating_add(cell_h)
             .saturating_add(title_gap)
-            .saturating_add(cell_h)
             .saturating_add(button_gap_y)
-            .saturating_add(btn_h)
+            .saturating_add(btn_h);
+        let avail_msg_h = area.height.get().saturating_sub(fixed_h);
+        let fit_lines = ((avail_msg_h.saturating_add(line_gap)) / line_step.max(1))
+            .clamp(1, MAX_MESSAGE_LINES as u32) as usize;
+        let lines = wrap_message(&dialog.message, max_cols, fit_lines);
+        let line_count = lines.len().max(1) as u32;
+        let message_block_h = cell_h
+            .saturating_mul(line_count)
+            .saturating_add(line_gap.saturating_mul(line_count.saturating_sub(1)));
+        let card_h = fixed_h
+            .saturating_add(message_block_h)
             .min(area.height.get());
 
         let card_x = area.width.get().saturating_sub(card_w) / 2;
@@ -173,11 +199,10 @@ impl Layout {
             x: card_x.saturating_add(card_pad_x),
             y: title_y.saturating_add(cell_h).saturating_add(title_gap),
         };
-        let message_max_w = card_w.saturating_sub(card_pad_x * 2);
 
         let btn_y = message_origin
             .y
-            .saturating_add(cell_h)
+            .saturating_add(message_block_h)
             .saturating_add(button_gap_y);
         let btn_right = card_x.saturating_add(card_w).saturating_sub(card_pad_x);
         let no_x = btn_right.saturating_sub(no_w);
@@ -209,6 +234,8 @@ impl Layout {
             title_origin,
             message_origin,
             message_max_w,
+            line_step,
+            lines,
             yes,
             no,
             radius,
@@ -234,6 +261,114 @@ fn contains(rect: PixelRect, position: PhysicalPosition<f64>) -> bool {
         && position.x < x + f64::from(rect.size.width.get())
         && position.y >= y
         && position.y < y + f64::from(rect.size.height.get())
+}
+
+fn grapheme_width(text: &str) -> usize {
+    text.graphemes(true)
+        .map(|g| WidthPolicy::Narrow.columns(g))
+        .sum()
+}
+
+fn truncate_with_ellipsis(text: &str, max_cols: usize) -> String {
+    if grapheme_width(text) <= max_cols {
+        return text.to_string();
+    }
+    if max_cols == 0 {
+        return String::new();
+    }
+    if max_cols == 1 {
+        return "…".to_string();
+    }
+    let limit = max_cols - 1;
+    let mut out = String::new();
+    let mut used = 0;
+    for g in text.graphemes(true) {
+        let w = WidthPolicy::Narrow.columns(g);
+        if used + w > limit {
+            break;
+        }
+        out.push_str(g);
+        used += w;
+    }
+    while out.ends_with(' ') {
+        out.pop();
+    }
+    out.push('…');
+    out
+}
+
+/// Word-wraps a confirmation message into at most `max_lines` lines of `max_cols` cells.
+pub(super) fn wrap_message(message: &str, max_cols: usize, max_lines: usize) -> Vec<String> {
+    let max_cols = max_cols.max(1);
+    let max_lines = max_lines.max(1);
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut current_cols = 0usize;
+    let mut truncated = false;
+
+    for word in message.split_whitespace() {
+        let word_cols = grapheme_width(word);
+        let needed = if current.is_empty() {
+            word_cols
+        } else {
+            current_cols + 1 + word_cols
+        };
+
+        if needed <= max_cols {
+            if !current.is_empty() {
+                current.push(' ');
+                current_cols += 1;
+            }
+            current.push_str(word);
+            current_cols += word_cols;
+            continue;
+        }
+
+        if !current.is_empty() {
+            if lines.len() + 1 >= max_lines {
+                truncated = true;
+                break;
+            }
+            lines.push(std::mem::take(&mut current));
+            current_cols = 0;
+        }
+
+        if word_cols <= max_cols {
+            current.push_str(word);
+            current_cols = word_cols;
+        } else {
+            // Break overlong single tokens across lines by grapheme width.
+            for g in word.graphemes(true) {
+                let gw = WidthPolicy::Narrow.columns(g);
+                if current_cols + gw > max_cols && !current.is_empty() {
+                    if lines.len() + 1 >= max_lines {
+                        truncated = true;
+                        break;
+                    }
+                    lines.push(std::mem::take(&mut current));
+                    current_cols = 0;
+                }
+                current.push_str(g);
+                current_cols += gw;
+            }
+            if truncated {
+                break;
+            }
+        }
+    }
+
+    if !current.is_empty() || lines.is_empty() {
+        lines.push(current);
+    }
+    if truncated && let Some(last) = lines.last_mut() {
+        let with_ellipsis = format!("{last}…");
+        if grapheme_width(&with_ellipsis) <= max_cols {
+            *last = with_ellipsis;
+        } else {
+            *last = truncate_with_ellipsis(last, max_cols);
+        }
+    }
+    lines
 }
 
 pub(super) fn format_running(subject: &str, processes: &[String], fallback_count: usize) -> String {
@@ -304,13 +439,22 @@ mod tests {
             },
             baseline: 15,
         };
-        let layout = Layout::compute(area, metrics, 1.0, 40).unwrap();
+        let dialog = Dialog::new(
+            ConfirmTarget::CloseWindow,
+            format_running("window", &["nvim".into(), "cargo".into()], 2),
+        );
+        let layout = Layout::compute(area, metrics, 1.0, &dialog).unwrap();
+        assert!(layout.lines.len() >= 2);
         assert!(layout.card.origin.x < layout.yes.origin.x);
         assert!(layout.yes.origin.x < layout.no.origin.x);
         assert_eq!(layout.yes.origin.y, layout.no.origin.y);
         assert!(
             layout.no.origin.x + layout.no.size.width.get()
                 <= layout.card.origin.x + layout.card.size.width.get()
+        );
+        assert!(
+            layout.yes.origin.y
+                >= layout.message_origin.y + layout.line_step * (layout.lines.len() as u32 - 1)
         );
         assert_eq!(
             layout.hit(PhysicalPosition::new(
