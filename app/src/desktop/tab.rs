@@ -565,6 +565,15 @@ impl Pane {
         else {
             return None;
         };
+        self.run_block_action(prompt_row, action, copy_pending)
+    }
+
+    pub(super) fn run_block_action(
+        &mut self,
+        prompt_row: usize,
+        action: BlockAction,
+        copy_pending: &mut bool,
+    ) -> Option<String> {
         if action == BlockAction::JumpToPrompt {
             self.jump_to_row(prompt_row);
             self.hovered_block = None;
@@ -623,6 +632,80 @@ impl Pane {
                 Some(preview)
             }
         }
+    }
+
+    pub(super) fn context_menu_target_at(
+        &self,
+        point: PhysicalPosition<f64>,
+        command_blocks_enabled: bool,
+    ) -> (Option<String>, Option<(usize, bool, bool)>) {
+        let mut link_url = None;
+        let mut block_info = None;
+        let geometry = self.session.geometry();
+        let Some(pane_area) = geometry.text_area_pixels() else {
+            return (None, None);
+        };
+        let local_x = point.x - f64::from(self.origin.x);
+        let local_y = point.y - f64::from(self.origin.y);
+        if local_y < 0.0 || local_y >= f64::from(pane_area.height.get()) {
+            return (None, None);
+        }
+        let scale = self.window.scale_factor();
+        let gutter_allow = (16.0 * scale.max(1.0)).round();
+        if local_x < -gutter_allow || local_x >= f64::from(pane_area.width.get()) {
+            return (None, None);
+        }
+        let pixel = PixelPosition {
+            x: local_x.max(0.0) as u32,
+            y: local_y as u32,
+        };
+        let Some(cell) = geometry.cell_at(pixel) else {
+            return (None, None);
+        };
+        let screen = self.session.screen();
+        let view = screen.view();
+        let first_row = screen.viewport().range().start;
+        if local_x >= 0.0 {
+            if let Some(row) = screen.viewport().row(cell.row)
+                && let Some(style_id) = row.cells().get(cell.column).map(|c| c.style())
+                && let Some(style) = self.session.processor().styles().get(style_id)
+                && style.hyperlink != HyperlinkId(0)
+                && let Some(link) = self.session.processor().hyperlinks().get(style.hyperlink)
+            {
+                link_url = Some(link.uri().to_owned());
+            } else {
+                let abs_cell = CellPosition {
+                    row: first_row + cell.row,
+                    column: cell.column,
+                };
+                if let Some(detected) = url::detect_at(view, abs_cell) {
+                    link_url = Some(detected.uri);
+                }
+            }
+        }
+        if command_blocks_enabled
+            && screen.active_buffer() == ScreenBuffer::Primary
+            && let Some(block) = blocks::block_at_row(view, first_row + cell.row)
+        {
+            let has_cmd = blocks::has_command(view, &block);
+            let has_out = blocks::has_output(view, &block);
+            if has_cmd || has_out {
+                block_info = Some((block.prompt_row, has_cmd, has_out));
+            }
+        }
+        (link_url, block_info)
+    }
+
+    pub(super) fn allows_context_menu(&self, shift: bool) -> bool {
+        !self.mouse_reporting() || shift
+    }
+
+    pub(super) fn has_selection(&self) -> bool {
+        self.selection.is_some()
+    }
+
+    pub(super) fn open_uri_external(&self, uri: String, hyperlink_open_pending: &mut bool) {
+        self.open_uri(uri, hyperlink_open_pending);
     }
 
     pub(super) fn copy_last_command(&self, copy_pending: &mut bool) -> Option<String> {

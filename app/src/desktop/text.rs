@@ -14,6 +14,7 @@ use crate::{PixelRect, PresentationFrame, PresentationStyle, PresentedCursor};
 use super::blocks;
 use super::box_drawing;
 use super::confirm;
+use super::context_menu::{self, ContextMenu, MenuEntry};
 use super::contrast;
 use super::font::{Font, FontConfig, FontMetrics};
 use super::hints::HintMode;
@@ -2162,6 +2163,153 @@ impl TextRenderer {
                 border_alpha,
             );
             self.button_label(rect, accel, rest, accel_color, fg);
+        }
+        start..self.instances.len() as u32
+    }
+
+    pub(super) fn prepare_context_menu(
+        &mut self,
+        area: PixelSize,
+        palette: &lune_terminal::Palette,
+        menu: &ContextMenu,
+        scale: f64,
+        background_opacity: f32,
+    ) -> Range<u32> {
+        let start = self.instances.len() as u32;
+        self.area = area;
+        let ui_metrics = self.chrome_metrics;
+        let Some(layout) = context_menu::Layout::compute(area, ui_metrics, scale, menu) else {
+            return start..self.instances.len() as u32;
+        };
+
+        let bg = palette.color(PaletteEntry::Background);
+        let fg = palette.color(PaletteEntry::Foreground);
+        let accent = palette.color(PaletteEntry::Indexed(4));
+        let red = palette.color(PaletteEntry::Indexed(1));
+        let muted = mix_color(bg, fg, 130);
+        let sep_color = mix_color(bg, fg, 48);
+
+        let card_fill = mix_color(bg, fg, 22);
+        let card_border = mix_color(bg, fg, 68);
+        let card_alpha = if background_opacity < 1.0 { 0.96 } else { 0.98 };
+        self.floating_card(
+            layout.card,
+            layout.radius,
+            bg,
+            card_fill,
+            card_border,
+            card_alpha,
+        );
+
+        let ui_cell_h = ui_metrics.cell.height.get();
+        let scale_f = scale.max(1.0);
+        let floor = |logical: f64| (logical * scale_f).round().max(1.0) as u32;
+        let row_radius = floor(5.0).clamp(4, 8);
+        let shortcut_gap = floor(12.0);
+
+        for slot in &layout.rows {
+            let Some(entry) = menu.entries.get(slot.entry_index) else {
+                continue;
+            };
+            match entry {
+                MenuEntry::Separator => {
+                    let sep_x = slot.rect.origin.x.saturating_add(layout.pad_x / 2);
+                    let sep_w = slot.rect.size.width.get().saturating_sub(layout.pad_x);
+                    if let Some(w) = NonZeroU32::new(sep_w) {
+                        let sep_y = slot.rect.origin.y + slot.rect.size.height.get() / 2;
+                        self.rect(
+                            PixelRect {
+                                origin: PixelPosition { x: sep_x, y: sep_y },
+                                size: PixelSize {
+                                    width: w,
+                                    height: NonZeroU32::new(1).unwrap(),
+                                },
+                            },
+                            sep_color,
+                            0.55,
+                        );
+                    }
+                }
+                MenuEntry::Item {
+                    label,
+                    shortcut,
+                    danger,
+                    ..
+                } => {
+                    let hovered = menu.hovered == Some(slot.entry_index);
+                    if hovered {
+                        let hover_fill = if *danger {
+                            mix_color(bg, red, 62)
+                        } else {
+                            mix_color(bg, accent, 54)
+                        };
+                        self.rounded_rect(slot.rect, row_radius, 0, hover_fill, 0.92);
+                    }
+                    let text_y = slot.rect.origin.y
+                        + slot.rect.size.height.get().saturating_sub(ui_cell_h) / 2;
+                    let text_x = slot.rect.origin.x.saturating_add(layout.pad_x);
+                    let right_edge = slot
+                        .rect
+                        .origin
+                        .x
+                        .saturating_add(slot.rect.size.width.get())
+                        .saturating_sub(layout.pad_x);
+
+                    let mut shortcut_reserve = 0u32;
+                    if !shortcut.is_empty() {
+                        let sw = self.font.measure_text(ui_metrics, shortcut);
+                        if right_edge > text_x.saturating_add(sw + shortcut_gap)
+                            && let Some(sw_nz) = NonZeroU32::new(sw.min(ATLAS_SIDE as u32))
+                        {
+                            let sx = right_edge.saturating_sub(sw_nz.get());
+                            let sc = if hovered {
+                                mix_color(bg, fg, 215)
+                            } else {
+                                muted
+                            };
+                            self.glyph(
+                                PixelRect {
+                                    origin: PixelPosition { x: sx, y: text_y },
+                                    size: PixelSize {
+                                        width: sw_nz,
+                                        height: ui_metrics.cell.height,
+                                    },
+                                },
+                                shortcut,
+                                CHROME_LABEL_CACHE,
+                                sc,
+                                1.0,
+                            );
+                            shortcut_reserve = sw_nz.get().saturating_add(shortcut_gap);
+                        }
+                    }
+
+                    let label_max_w =
+                        right_edge.saturating_sub(text_x.saturating_add(shortcut_reserve));
+                    if label_max_w > 0 {
+                        let label_color = if *danger {
+                            if hovered {
+                                mix_color(fg, red, 215)
+                            } else {
+                                mix_color(bg, red, 210)
+                            }
+                        } else if hovered {
+                            fg
+                        } else {
+                            mix_color(bg, fg, 225)
+                        };
+                        self.clamped_chrome_text(
+                            PixelPosition {
+                                x: text_x,
+                                y: text_y,
+                            },
+                            label_max_w,
+                            label,
+                            label_color,
+                        );
+                    }
+                }
+            }
         }
         start..self.instances.len() as u32
     }

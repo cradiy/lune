@@ -20,6 +20,7 @@ use crate::{
 use super::bg_image::{BackgroundImageConfig, BackgroundImageRenderer};
 use super::blocks;
 use super::confirm;
+use super::context_menu::ContextMenu;
 use super::cursor::{CursorMotion, CursorTarget};
 use super::font::{Font, FontConfig, FontMetrics};
 use super::hints::HintMode;
@@ -94,6 +95,7 @@ pub(super) struct WindowChrome<'a> {
     pub(super) notice: Option<NoticeView<'a>>,
     pub(super) confirm: Option<&'a confirm::Dialog>,
     pub(super) command_palette: Option<&'a CommandPalette>,
+    pub(super) context_menu: Option<&'a ContextMenu>,
     pub(super) scale: f64,
     pub(super) titlebar: Option<titlebar::View<'a>>,
     pub(super) tab_bar: tab_bar::View<'a>,
@@ -761,6 +763,19 @@ impl Painter {
                     PixelSize { width, height },
                     chrome.palette,
                     cmd_palette,
+                    chrome.scale,
+                    background_opacity,
+                );
+            } else if let Some(menu) = chrome.context_menu
+                && let (Some(width), Some(height)) = (
+                    NonZeroU32::new(self.config.width),
+                    NonZeroU32::new(self.config.height),
+                )
+            {
+                self.modal_range = self.text.prepare_context_menu(
+                    PixelSize { width, height },
+                    chrome.palette,
+                    menu,
                     chrome.scale,
                     background_opacity,
                 );

@@ -5,6 +5,7 @@ pub mod cli;
 mod clipboard;
 mod config;
 mod confirm;
+mod context_menu;
 mod contrast;
 mod cursor;
 mod directory;
@@ -56,12 +57,14 @@ use winit::window::{CursorIcon, Fullscreen, ImePurpose, ResizeDirection, Theme, 
 
 use crate::{GridGeometry, PixelRect, SessionReady};
 
+use blocks::BlockAction;
 use cli::LaunchOptions;
 use clipboard::ClipboardType;
 use config::{
     ClipboardPolicy, Config, ConfigSource, MAX_FONT_SIZE, MIN_FONT_SIZE, NotificationPolicy,
     TabPosition, TerminalMode, WindowControlsPolicy,
 };
+use context_menu::{ContextMenu, MenuAction, MenuEntry};
 use font::{Font, physical_font_size};
 use notify::Notifier;
 use paint::{NoticeKind, NoticeView, Painter, PainterOptions};
@@ -415,6 +418,7 @@ struct Client {
     copy_on_select: bool,
     confirm: Option<confirm::Dialog>,
     command_palette: Option<CommandPalette>,
+    context_menu: Option<ContextMenu>,
 }
 
 struct ClientInit<'a> {
@@ -649,6 +653,7 @@ impl Client {
             copy_on_select: config.copy_on_select,
             confirm: None,
             command_palette: None,
+            context_menu: None,
         };
         client.reflow_tab_bar();
         Ok(client)
@@ -715,6 +720,7 @@ impl Client {
                 self.tabs[self.active].focused_pane_mut().drop_path(&path);
             }
             WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
+                self.close_context_menu();
                 self.resize_pending = true
             }
             WindowEvent::RedrawRequested => {
@@ -741,6 +747,7 @@ impl Client {
                     self.dragging_divider = None;
                     self.titlebar_pressed = None;
                     self.sidebar_resize_drag = None;
+                    self.context_menu = None;
                     if self.tab_drag.take().is_some() {
                         self.sync_tab_animator();
                     }
@@ -777,6 +784,12 @@ impl Client {
                 if self.command_palette.is_some() {
                     if event.state.is_pressed() {
                         self.handle_palette_key(event_loop, &event);
+                    }
+                    return Ok(());
+                }
+                if self.context_menu.is_some() {
+                    if event.state.is_pressed() {
+                        self.handle_context_menu_key(event_loop, &event);
                     }
                     return Ok(());
                 }
@@ -853,6 +866,20 @@ impl Client {
                         && cmd_palette.hovered != hovered
                     {
                         cmd_palette.hovered = hovered;
+                        self.painter.invalidate_overlay();
+                        self.window.request_redraw();
+                    }
+                    self.update_cursor_icon();
+                    return Ok(());
+                }
+                if self.context_menu.is_some() {
+                    let hovered = self
+                        .context_menu_layout()
+                        .and_then(|layout| layout.hit(position));
+                    if let Some(menu) = &mut self.context_menu
+                        && menu.hovered != hovered
+                    {
+                        menu.hovered = hovered;
                         self.painter.invalidate_overlay();
                         self.window.request_redraw();
                     }
@@ -1056,6 +1083,38 @@ impl Client {
                     }
                     return Ok(());
                 }
+                if self.context_menu.is_some() {
+                    if state.is_pressed() {
+                        if button == winit::event::MouseButton::Left
+                            && let Some(point) = self.pointer
+                            && let Some(layout) = self.context_menu_layout()
+                            && let Some(index) = layout.hit(point)
+                        {
+                            let action = self
+                                .context_menu
+                                .as_ref()
+                                .and_then(|menu| menu.action_at(index));
+                            self.close_context_menu();
+                            if let Some(action) = action {
+                                self.execute_context_menu_action(event_loop, action);
+                            }
+                            self.update_cursor_icon();
+                            return Ok(());
+                        }
+                        let right_outside = button == winit::event::MouseButton::Right
+                            && self.pointer.is_some_and(|point| {
+                                self.context_menu_layout()
+                                    .is_none_or(|layout| !layout.contains_card(point))
+                            });
+                        self.close_context_menu();
+                        self.update_cursor_icon();
+                        if !right_outside {
+                            return Ok(());
+                        }
+                    } else {
+                        return Ok(());
+                    }
+                }
                 if !state.is_pressed()
                     && button == winit::event::MouseButton::Left
                     && self.dragging_divider.take().is_some()
@@ -1199,6 +1258,17 @@ impl Client {
                                 self.request_close_tab(event_loop, index);
                             }
                         }
+                        winit::event::MouseButton::Right => {
+                            if let Some(
+                                TitlebarAction::SelectTab(index) | TitlebarAction::CloseTab(index),
+                            ) = hit
+                                && index < self.tabs.len()
+                            {
+                                self.open_tab_context_menu(point, index);
+                            } else {
+                                self.open_chrome_context_menu(point);
+                            }
+                        }
                         _ => {}
                     }
                     self.update_cursor_icon();
@@ -1206,13 +1276,17 @@ impl Client {
                 }
                 if state.is_pressed() && self.pointer.is_some_and(|point| self.bar.contains(point))
                 {
-                    if let Some(index) = self.bar.hit(self.pointer.unwrap())
+                    let point = self.pointer.unwrap();
+                    if let Some(index) = self.bar.hit(point)
                         && index < self.tabs.len()
                     {
                         match button {
                             winit::event::MouseButton::Left => self.select_tab(index),
                             winit::event::MouseButton::Middle => {
                                 self.request_close_tab(event_loop, index);
+                            }
+                            winit::event::MouseButton::Right => {
+                                self.open_tab_context_menu(point, index);
                             }
                             _ => {}
                         }
@@ -1227,6 +1301,20 @@ impl Client {
                     self.dragging_divider = Some(divider);
                     self.update_cursor_icon();
                 } else if state.is_pressed() {
+                    if button == winit::event::MouseButton::Right
+                        && let Some(point) = self.pointer
+                        && let Some(target_id) = self.tabs[self.active].layout.pane_at(point)
+                        && self.tabs[self.active].pane(target_id).is_some_and(|pane| {
+                            pane.allows_context_menu(self.modifiers.shift_key())
+                        })
+                    {
+                        if target_id != self.tabs[self.active].focused {
+                            self.focus_pane(target_id);
+                        }
+                        self.open_pane_context_menu(point, target_id);
+                        self.update_cursor_icon();
+                        return Ok(());
+                    }
                     if button == winit::event::MouseButton::Left
                         && self.command_blocks_enabled()
                         && let Some(point) = self.pointer
@@ -1422,6 +1510,12 @@ impl Client {
             }
         } else if let Some(cmd_palette) = &self.command_palette {
             if cmd_palette.hovered.is_some() {
+                CursorIcon::Pointer
+            } else {
+                CursorIcon::Default
+            }
+        } else if let Some(menu) = &self.context_menu {
+            if menu.hovered.is_some() {
                 CursorIcon::Pointer
             } else {
                 CursorIcon::Default
@@ -1841,8 +1935,12 @@ impl Client {
     }
 
     fn new_tab(&mut self) -> Result<()> {
-        let id = self.allocate_pane_id()?;
         let cwd = self.tabs[self.active].focused_pane().working_directory();
+        self.new_tab_with_cwd(cwd)
+    }
+
+    fn new_tab_with_cwd(&mut self, cwd: Option<PathBuf>) -> Result<()> {
+        let id = self.allocate_pane_id()?;
         let size = self.window.inner_size();
         let scale = self.window.scale_factor();
         let metrics = self.painter.metrics();
@@ -2540,6 +2638,312 @@ impl Client {
         }
     }
 
+    fn context_menu_layout(&self) -> Option<context_menu::Layout> {
+        let menu = self.context_menu.as_ref()?;
+        let size = self.painter.size();
+        let area = PixelSize {
+            width: NonZeroU32::new(size.width)?,
+            height: NonZeroU32::new(size.height)?,
+        };
+        context_menu::Layout::compute(
+            area,
+            self.painter.chrome_metrics(),
+            self.window.scale_factor(),
+            menu,
+        )
+    }
+
+    fn close_context_menu(&mut self) {
+        if self.context_menu.take().is_some() {
+            self.painter.invalidate_overlay();
+            self.window.request_redraw();
+        }
+    }
+
+    fn shortcut_hint(&self, action: Action) -> String {
+        self.keymap.shortcut_label(action).unwrap_or_default()
+    }
+
+    fn open_pane_context_menu(&mut self, point: PhysicalPosition<f64>, pane_id: PaneId) {
+        let blocks_enabled = self.command_blocks_enabled();
+        let Some(pane) = self.tabs[self.active].pane(pane_id) else {
+            return;
+        };
+        let has_selection = pane.has_selection();
+        let (link_url, block_info) = pane.context_menu_target_at(point, blocks_enabled);
+
+        let mut entries = Vec::new();
+        if let Some(uri) = link_url {
+            entries.push(MenuEntry::item(
+                MenuAction::OpenLink(uri.clone()),
+                "Open Link",
+                "",
+            ));
+            entries.push(MenuEntry::item(MenuAction::CopyLink(uri), "Copy Link", ""));
+            entries.push(MenuEntry::Separator);
+        }
+        if let Some((prompt_row, has_cmd, has_out)) = block_info {
+            if has_cmd {
+                entries.push(MenuEntry::item(
+                    MenuAction::BlockAction {
+                        pane_id,
+                        prompt_row,
+                        action: BlockAction::CopyCommand,
+                    },
+                    "Copy Command",
+                    "",
+                ));
+            }
+            if has_out {
+                entries.push(MenuEntry::item(
+                    MenuAction::BlockAction {
+                        pane_id,
+                        prompt_row,
+                        action: BlockAction::CopyOutput,
+                    },
+                    "Copy Output",
+                    "",
+                ));
+            }
+            if has_cmd {
+                entries.push(MenuEntry::item(
+                    MenuAction::BlockAction {
+                        pane_id,
+                        prompt_row,
+                        action: BlockAction::Rerun,
+                    },
+                    "Re-run Command",
+                    "",
+                ));
+            }
+            entries.push(MenuEntry::Separator);
+        }
+        if has_selection {
+            entries.push(MenuEntry::item(
+                MenuAction::Shortcut(Action::Copy),
+                "Copy",
+                self.shortcut_hint(Action::Copy),
+            ));
+        }
+        entries.push(MenuEntry::item(
+            MenuAction::Shortcut(Action::Paste),
+            "Paste",
+            self.shortcut_hint(Action::Paste),
+        ));
+        entries.push(MenuEntry::Separator);
+        entries.push(MenuEntry::item(
+            MenuAction::Shortcut(Action::SplitPane(Axis::Columns)),
+            "Split Right",
+            self.shortcut_hint(Action::SplitPane(Axis::Columns)),
+        ));
+        entries.push(MenuEntry::item(
+            MenuAction::Shortcut(Action::SplitPane(Axis::Rows)),
+            "Split Down",
+            self.shortcut_hint(Action::SplitPane(Axis::Rows)),
+        ));
+        entries.push(MenuEntry::Separator);
+        entries.push(MenuEntry::item(
+            MenuAction::Shortcut(Action::Search),
+            "Search",
+            self.shortcut_hint(Action::Search),
+        ));
+        entries.push(MenuEntry::item(
+            MenuAction::Shortcut(Action::CommandPalette),
+            "Command Palette",
+            self.shortcut_hint(Action::CommandPalette),
+        ));
+        entries.push(MenuEntry::item(
+            MenuAction::Shortcut(Action::OpenDirectory),
+            "Open Directory",
+            self.shortcut_hint(Action::OpenDirectory),
+        ));
+
+        let anchor = PixelPosition {
+            x: point.x.max(0.0) as u32,
+            y: point.y.max(0.0) as u32,
+        };
+        self.context_menu = ContextMenu::new(anchor, entries);
+        self.painter.invalidate_overlay();
+        self.window.request_redraw();
+    }
+
+    fn open_tab_context_menu(&mut self, point: PhysicalPosition<f64>, index: usize) {
+        let mut entries = vec![
+            MenuEntry::item(
+                MenuAction::Shortcut(Action::NewTab),
+                "New Tab",
+                self.shortcut_hint(Action::NewTab),
+            ),
+            MenuEntry::item(MenuAction::DuplicateTab(index), "Duplicate Tab", ""),
+            MenuEntry::Separator,
+            MenuEntry::danger(
+                MenuAction::CloseTabAt(index),
+                "Close Tab",
+                self.shortcut_hint(Action::CloseTab),
+            ),
+        ];
+        if self.tabs.len() > 1 {
+            entries.push(MenuEntry::danger(
+                MenuAction::CloseOtherTabs(index),
+                "Close Other Tabs",
+                "",
+            ));
+        }
+        if index + 1 < self.tabs.len() {
+            entries.push(MenuEntry::danger(
+                MenuAction::CloseTabsToRight(index),
+                "Close Tabs to Right",
+                "",
+            ));
+        }
+        let anchor = PixelPosition {
+            x: point.x.max(0.0) as u32,
+            y: point.y.max(0.0) as u32,
+        };
+        self.context_menu = ContextMenu::new(anchor, entries);
+        self.painter.invalidate_overlay();
+        self.window.request_redraw();
+    }
+
+    fn open_chrome_context_menu(&mut self, point: PhysicalPosition<f64>) {
+        let (next_pos, pos_label) = match self.tab_position {
+            TabPosition::Top => (TabPosition::Left, "Move Tabs to Sidebar"),
+            TabPosition::Left => (TabPosition::Top, "Move Tabs to Top"),
+        };
+        let entries = vec![
+            MenuEntry::item(
+                MenuAction::Shortcut(Action::NewTab),
+                "New Tab",
+                self.shortcut_hint(Action::NewTab),
+            ),
+            MenuEntry::item(MenuAction::SetTabPosition(next_pos), pos_label, ""),
+            MenuEntry::Separator,
+            MenuEntry::item(
+                MenuAction::Shortcut(Action::CommandPalette),
+                "Command Palette",
+                self.shortcut_hint(Action::CommandPalette),
+            ),
+        ];
+        let anchor = PixelPosition {
+            x: point.x.max(0.0) as u32,
+            y: point.y.max(0.0) as u32,
+        };
+        self.context_menu = ContextMenu::new(anchor, entries);
+        self.painter.invalidate_overlay();
+        self.window.request_redraw();
+    }
+
+    fn handle_context_menu_key(&mut self, event_loop: &ActiveEventLoop, event: &KeyEvent) {
+        match &event.logical_key {
+            Key::Named(NamedKey::Escape) => {
+                self.close_context_menu();
+                self.update_cursor_icon();
+            }
+            Key::Named(NamedKey::ArrowDown) => {
+                if self.context_menu.as_mut().is_some_and(|m| m.step(1)) {
+                    self.painter.invalidate_overlay();
+                    self.window.request_redraw();
+                }
+            }
+            Key::Named(NamedKey::ArrowUp) => {
+                if self.context_menu.as_mut().is_some_and(|m| m.step(-1)) {
+                    self.painter.invalidate_overlay();
+                    self.window.request_redraw();
+                }
+            }
+            Key::Named(NamedKey::Enter) => {
+                let action = self
+                    .context_menu
+                    .as_ref()
+                    .and_then(|menu| menu.hovered.and_then(|idx| menu.action_at(idx)));
+                self.close_context_menu();
+                if let Some(action) = action {
+                    self.execute_context_menu_action(event_loop, action);
+                }
+                self.update_cursor_icon();
+            }
+            _ => {
+                self.close_context_menu();
+                self.update_cursor_icon();
+            }
+        }
+    }
+
+    fn execute_context_menu_action(&mut self, event_loop: &ActiveEventLoop, action: MenuAction) {
+        match action {
+            MenuAction::Shortcut(shortcut) => self.run_shortcut(event_loop, shortcut),
+            MenuAction::OpenLink(uri) => {
+                self.tabs[self.active]
+                    .focused_pane()
+                    .open_uri_external(uri, &mut self.hyperlink_open_pending);
+            }
+            MenuAction::CopyLink(uri) => {
+                if !self.copy_pending {
+                    let preview = if uri.chars().count() > 40 {
+                        let short: String = uri.chars().take(40).collect();
+                        format!("Copied link: {short}...")
+                    } else {
+                        format!("Copied link: {uri}")
+                    };
+                    match clipboard::write(uri, self.proxy.clone()) {
+                        Ok(()) => {
+                            self.copy_pending = true;
+                            self.show_notice(NoticeKind::Success, preview);
+                        }
+                        Err(error) => {
+                            log::warn!("Failed to start the clipboard copy worker: {error}");
+                        }
+                    }
+                }
+            }
+            MenuAction::BlockAction {
+                pane_id,
+                prompt_row,
+                action,
+            } => {
+                if let Some(notice) = self.tabs[self.active].pane_mut(pane_id).and_then(|pane| {
+                    pane.run_block_action(prompt_row, action, &mut self.copy_pending)
+                }) {
+                    self.show_notice(NoticeKind::Success, notice);
+                }
+            }
+            MenuAction::DuplicateTab(index) => {
+                let cwd = self
+                    .tabs
+                    .get(index)
+                    .and_then(|tab| tab.focused_pane().working_directory());
+                if let Err(error) = self.new_tab_with_cwd(cwd) {
+                    log::warn!("Could not duplicate tab: {error}");
+                    self.show_notice(NoticeKind::Error, "Could not duplicate tab".into());
+                }
+            }
+            MenuAction::CloseTabAt(index) => {
+                if index < self.tabs.len() {
+                    self.request_close_tab(event_loop, index);
+                }
+            }
+            MenuAction::CloseOtherTabs(keep) => {
+                if keep < self.tabs.len() && self.tabs.len() > 1 {
+                    for idx in (0..self.tabs.len()).rev() {
+                        if idx != keep {
+                            self.close_tab(event_loop, idx);
+                        }
+                    }
+                }
+            }
+            MenuAction::CloseTabsToRight(index) => {
+                if index + 1 < self.tabs.len() {
+                    for idx in (index + 1..self.tabs.len()).rev() {
+                        self.close_tab(event_loop, idx);
+                    }
+                }
+            }
+            MenuAction::SetTabPosition(position) => {
+                self.set_tab_position(position);
+            }
+        }
+    }
+
     fn confirm_layout(&self) -> Option<confirm::Layout> {
         let dialog = self.confirm.as_ref()?;
         let size = self.painter.size();
@@ -2556,6 +2960,7 @@ impl Client {
     }
 
     fn open_confirm(&mut self, target: confirm::ConfirmTarget, message: String) {
+        self.context_menu = None;
         self.dragging_divider = None;
         let dialog = confirm::Dialog::new(target, message);
         self.confirm = Some(dialog);
@@ -3315,6 +3720,7 @@ impl Client {
                 }),
                 confirm: self.confirm.as_ref(),
                 command_palette: self.command_palette.as_ref(),
+                context_menu: self.context_menu.as_ref(),
                 scale,
                 titlebar: (self.titlebar.height != 0).then(|| titlebar::View {
                     layout: &self.titlebar,
