@@ -168,6 +168,7 @@ pub(super) struct Pane {
     pub(super) registration: Registration,
     window: Arc<Window>,
     proxy: EventLoopProxy<Event>,
+    clipboard: Option<clipboard::DataDeviceHandle>,
     pub(super) title: String,
     pub(super) title_changed: bool,
     pub(super) progress: Progress,
@@ -208,6 +209,7 @@ pub(super) struct PaneConfig<'a> {
     pub(super) cursor_blink: bool,
     pub(super) shell: Option<&'a [OsString]>,
     pub(super) shell_integration: bool,
+    pub(super) clipboard: Option<clipboard::DataDeviceHandle>,
 }
 
 impl Pane {
@@ -263,6 +265,7 @@ impl Pane {
             registration: Registration::default(),
             window,
             proxy,
+            clipboard: config.clipboard,
             title: String::new(),
             title_changed: false,
             progress: Progress::None,
@@ -634,7 +637,7 @@ impl Pane {
                 }
                 let text = blocks::extract_block_full(view, &block)?;
                 let notice = format_copied_summary(&text);
-                match clipboard::write(text, self.proxy.clone()) {
+                match clipboard::write(text, self.clipboard.clone(), self.proxy.clone()) {
                     Ok(()) => {
                         *copy_pending = true;
                         Some(notice)
@@ -651,7 +654,7 @@ impl Pane {
                 }
                 let cmd = blocks::extract_command(view, &block)?;
                 let notice = format_copied_preview(&cmd);
-                match clipboard::write(cmd, self.proxy.clone()) {
+                match clipboard::write(cmd, self.clipboard.clone(), self.proxy.clone()) {
                     Ok(()) => {
                         *copy_pending = true;
                         Some(notice)
@@ -668,7 +671,7 @@ impl Pane {
                 }
                 let output = blocks::extract_output(view, &block)?;
                 let notice = format_copied_summary(&output);
-                match clipboard::write(output, self.proxy.clone()) {
+                match clipboard::write(output, self.clipboard.clone(), self.proxy.clone()) {
                     Ok(()) => {
                         *copy_pending = true;
                         Some(notice)
@@ -786,7 +789,7 @@ impl Pane {
             .and_then(|block| blocks::extract_command(view, &block))
             .or_else(|| blocks::last_command_text(view))?;
         let notice = format_copied_preview(&cmd);
-        match clipboard::write(cmd, self.proxy.clone()) {
+        match clipboard::write(cmd, self.clipboard.clone(), self.proxy.clone()) {
             Ok(()) => {
                 *copy_pending = true;
                 Some(notice)
@@ -1095,7 +1098,7 @@ impl Pane {
         {
             let text = write.text.to_owned();
             if write.targets.clipboard && !*ctx.copy_pending {
-                match clipboard::write(text.clone(), self.proxy.clone()) {
+                match clipboard::write(text.clone(), self.clipboard.clone(), self.proxy.clone()) {
                     Ok(()) => *ctx.copy_pending = true,
                     Err(error) => {
                         log::warn!("Failed to start the OSC 52 copy worker: {error}");
@@ -1116,6 +1119,7 @@ impl Pane {
             };
             if let Err(error) = clipboard::read_osc52(
                 kind,
+                self.clipboard.clone(),
                 ctx.primary.as_ref(),
                 self.id,
                 query,
@@ -1551,7 +1555,11 @@ impl Pane {
                         }
                         publish_primary_text(text.clone(), primary);
                         if !*copy_pending {
-                            match clipboard::write(text.clone(), self.proxy.clone()) {
+                            match clipboard::write(
+                                text.clone(),
+                                self.clipboard.clone(),
+                                self.proxy.clone(),
+                            ) {
                                 Ok(()) => *copy_pending = true,
                                 Err(error) => {
                                     log::warn!(
@@ -2146,7 +2154,7 @@ impl Pane {
                 (!s.is_empty()).then_some(s)
             })?;
         let notice = format_copied_summary(&text);
-        match clipboard::write(text, self.proxy.clone()) {
+        match clipboard::write(text, self.clipboard.clone(), self.proxy.clone()) {
             Ok(()) => {
                 *copy_pending = true;
                 Some(notice)
@@ -2289,7 +2297,7 @@ impl Pane {
         }
         let text = self.selected_text()?;
         let notice = format_copied_summary(&text);
-        match clipboard::write(text, self.proxy.clone()) {
+        match clipboard::write(text, self.clipboard.clone(), self.proxy.clone()) {
             Ok(()) => {
                 *copy_pending = true;
                 Some(notice)
@@ -2317,7 +2325,13 @@ impl Pane {
         if self.paste_worker || self.inputs.len() >= INPUT_LIMIT {
             return;
         }
-        match clipboard::read(clipboard, primary, self.id, self.proxy.clone()) {
+        match clipboard::read(
+            clipboard,
+            self.clipboard.clone(),
+            primary,
+            self.id,
+            self.proxy.clone(),
+        ) {
             Ok(()) => {
                 self.follow_output();
                 self.push_input(Input::PendingPaste);

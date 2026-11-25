@@ -1,7 +1,5 @@
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::{self, Write};
-use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+use std::io;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Instant;
@@ -18,7 +16,7 @@ use wayland_protocols::ext::data_control::v1::client::{
     ext_data_control_offer_v1 as offer, ext_data_control_source_v1 as source,
 };
 
-use super::{PASTE_TIMEOUT, wait_fd};
+use super::transfer;
 
 const MIME_TYPES: &[&str] = &["text/plain;charset=utf-8", "text/plain", "UTF8_STRING"];
 const MAX_TRANSFERS: usize = 4;
@@ -326,28 +324,3 @@ impl Dispatch<wl_callback::WlCallback, u64> for Writer {
 delegate_noop!(Writer: ignore wl_seat::WlSeat);
 delegate_noop!(Writer: ignore manager::ExtDataControlManagerV1);
 delegate_noop!(Writer: ignore offer::ExtDataControlOfferV1);
-
-fn transfer(fd: OwnedFd, mut bytes: &[u8]) -> io::Result<()> {
-    let mut pipe = File::from(fd);
-    // SAFETY: The pipe owns the descriptor for both fcntl calls.
-    unsafe {
-        let flags = libc::fcntl(pipe.as_raw_fd(), libc::F_GETFL);
-        if flags < 0 || libc::fcntl(pipe.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
-            return Err(io::Error::last_os_error());
-        }
-    }
-    let deadline = Instant::now() + PASTE_TIMEOUT;
-    while !bytes.is_empty() && wait_fd(pipe.as_fd(), libc::POLLOUT, deadline)? {
-        match pipe.write(bytes) {
-            Ok(0) => break,
-            Ok(count) => bytes = &bytes[count..],
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
-                ) => {}
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(())
-}

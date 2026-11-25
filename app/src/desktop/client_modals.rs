@@ -692,7 +692,7 @@ impl Client {
                     } else {
                         format!("Copied link: {uri}")
                     };
-                    match clipboard::write(uri, self.proxy.clone()) {
+                    match clipboard::write(uri, self.clipboard_handle(), self.proxy.clone()) {
                         Ok(()) => {
                             self.copy_pending = true;
                             self.show_notice(NoticeKind::Success, preview);

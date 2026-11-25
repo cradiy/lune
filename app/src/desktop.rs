@@ -355,9 +355,11 @@ impl ApplicationHandler<Event> for App {
 }
 
 struct Client {
-    // Declared before `window` so `AppMenu` clears/destroys its Wayland proxy
-    // while `window`'s `wl_display` and `xdg_toplevel` are still live.
+    // Declared before `window` so guest Wayland queues (`AppMenu` and
+    // `DataDevice`) clean up and stop before `window`'s `wl_display` and
+    // `xdg_toplevel` are destroyed.
     app_menu: Option<app_menu::AppMenu>,
+    clipboard: Option<clipboard::DataDevice>,
     window: Arc<Window>,
     painter: Painter,
     readiness: Readiness,
@@ -535,6 +537,7 @@ impl Client {
         };
         let grid = GridGeometry::fit(initial_text_size, cell)
             .ok_or_else(|| io::Error::other("The terminal grid does not fit the Wayland window"))?;
+        let clipboard = clipboard::DataDevice::attach(&window);
         let (palette, scheme) = config.theme.palette(selected_theme);
         let history_limits = config.history_limits();
         let mut pane = Pane::spawn(
@@ -550,6 +553,7 @@ impl Client {
                 cursor_blink: config.cursor_blink,
                 shell: config.shell.as_deref(),
                 shell_integration: config.shell_integration,
+                clipboard: clipboard.as_ref().map(clipboard::DataDevice::handle),
             },
             launch.working_directory,
             launch.command.as_deref(),
@@ -583,6 +587,7 @@ impl Client {
             .or_else(Config::directory);
         let mut client = Self {
             app_menu: None,
+            clipboard,
             window,
             painter,
             readiness,
@@ -709,6 +714,10 @@ impl Client {
         }
     }
 
+    pub(super) fn clipboard_handle(&self) -> Option<clipboard::DataDeviceHandle> {
+        self.clipboard.as_ref().map(clipboard::DataDevice::handle)
+    }
+
     fn pane_config(&self) -> PaneConfig<'_> {
         PaneConfig {
             palette: &self.palette,
@@ -718,6 +727,7 @@ impl Client {
             cursor_blink: self.cursor_blink,
             shell: self.shell.as_deref(),
             shell_integration: self.shell_integration,
+            clipboard: self.clipboard_handle(),
         }
     }
 
