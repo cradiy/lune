@@ -15,6 +15,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use calloop::channel::{self, SyncSender};
+use calloop::ping::{Ping, PingSource, make_ping};
 use calloop_wayland_source::WaylandSource;
 use wayland_client::backend::Backend;
 use wayland_client::globals::{GlobalListContents, registry_queue_init};
@@ -62,7 +63,7 @@ unsafe impl Send for SendDisplay {}
 pub(in crate::desktop) struct DataDevice {
     commands: SyncSender<Command>,
     has_data_control: bool,
-    stop: Option<SyncSender<()>>,
+    stop: Ping,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -106,13 +107,19 @@ impl DataDevice {
         let display = SendDisplay(wayland_display.display.as_ptr());
 
         let (commands, commands_rx) = channel::sync_channel::<Command>(16);
-        let (stop_tx, stop_rx) = channel::sync_channel::<()>(1);
+        let (stop, stop_source) = match make_ping() {
+            Ok(ping) => ping,
+            Err(error) => {
+                log::warn!("Could not create Wayland clipboard worker wakeup: {error}");
+                return None;
+            }
+        };
         let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<bool, String>>(1);
 
         let thread = match thread::Builder::new()
             .name("lune-clipboard".into())
             .spawn(move || {
-                run_worker(display, commands_rx, stop_rx, ready_tx);
+                run_worker(display, commands_rx, stop_source, ready_tx);
             }) {
             Ok(thread) => thread,
             Err(error) => {
@@ -129,19 +136,18 @@ impl DataDevice {
                 Some(Self {
                     commands,
                     has_data_control,
-                    stop: Some(stop_tx),
+                    stop,
                     thread: Some(thread),
                 })
             }
             Ok(Err(error)) => {
                 log::debug!("Wayland wl_data_device_manager unavailable: {error}");
-                drop(stop_tx);
                 let _ = thread.join();
                 None
             }
             Err(_) => {
                 log::warn!("Timed out initializing Wayland wl_data_device_manager clipboard");
-                drop(stop_tx);
+                stop.ping();
                 let _ = thread.join();
                 None
             }
@@ -158,10 +164,9 @@ impl DataDevice {
 
 impl Drop for DataDevice {
     fn drop(&mut self) {
-        // Close the stop channel first so the worker wakes up and exits its
-        // event loop, then join it so the guest `Backend` is guaranteed to be
-        // dropped before `Client.window` releases `wl_display`.
-        self.stop.take();
+        // Wake the worker before joining it so the guest backend is dropped
+        // before the window releases wl_display.
+        self.stop.ping();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -465,7 +470,7 @@ impl WorkerState {
 fn run_worker(
     display: SendDisplay,
     commands_rx: channel::Channel<Command>,
-    stop_rx: channel::Channel<()>,
+    stop_source: PingSource,
     ready_tx: mpsc::SyncSender<Result<bool, String>>,
 ) {
     // SAFETY: `display.0` is a live `*mut wl_display` owned by winit's active
@@ -538,10 +543,8 @@ fn run_worker(
     if let Err(error) =
         event_loop
             .handle()
-            .insert_source(stop_rx, move |event, (), _: &mut WorkerState| {
-                if matches!(event, channel::Event::Closed) {
-                    signal.stop();
-                }
+            .insert_source(stop_source, move |(), (), _: &mut WorkerState| {
+                signal.stop();
             })
     {
         state.cleanup();
