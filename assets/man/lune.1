@@ -1,0 +1,92 @@
+.TH LUNE 1 "2026" "Lune" "User Commands"
+.SH NAME
+lune \- GPU-accelerated Wayland terminal emulator
+.SH SYNOPSIS
+.B lune
+[\fIOPTIONS\fR] [\fB\-\-\fR \fICOMMAND\fR [\fIARGS\fR...]]
+.br
+.B lune msg
+[\fB\-\-socket\fR \fIPATH\fR] \fIACTION\fR [\fIARGS\fR...]
+.SH DESCRIPTION
+.B lune
+is a modern, GPU-accelerated Wayland terminal emulator for Linux featuring
+Classic and Modern layouts, tabs and split panes, command blocks and bookmarks,
+Kitty graphics protocol support, scrollback search, Vi mode, Quick Select hints,
+built-in themes, and live configuration reloading.
+.SH OPTIONS
+.TP
+.BR \-d ", " \-\-working\-directory " " \fIDIR\fR
+Start the initial shell or command in \fIDIR\fR.
+.TP
+.BR \-T ", " \-\-title " " \fITITLE\fR
+Set the initial window title.
+.TP
+.BR \-\-class ", " \-\-app\-id " " \fIID\fR
+Set the Wayland application ID (default: \fBlune\fR).
+.TP
+.BR \-c ", " \-\-config " " \fIPATH\fR
+Load configuration from \fIPATH\fR instead of the default configuration file.
+.TP
+.BR \-e ", " \-\-command " " \fICMD\fR " [" \fIARGS\fR ...]
+Run \fICMD\fR with optional \fIARGS\fR instead of the default shell.
+.TP
+.BR \-h ", " \-\-help
+Print a help message and exit.
+.TP
+.BR \-V ", " \-\-version
+Print version information and exit.
+.SH SUBCOMMANDS
+.SS lune msg
+Send a command to a running Lune window over its local Unix socket. When
+\fB\-\-socket\fR is omitted, \fBlune msg\fR uses \fBLUNE_IPC_SOCKET\fR if set
+or selects the most recently active local socket.
+.TP
+.BR "new-tab" " [" \-d " " \fIDIR\fR "] [" \-T " " \fITITLE\fR "] [" \-e " " \fICMD\fR " ...]"
+Open a new tab in the target window.
+.TP
+.BR "split" " [" \-\-right | \-\-down | right | down "] [" \-d " " \fIDIR\fR "]"
+Split the focused pane (default: \fBright\fR).
+.TP
+.BR "set-theme" " " \fINAME\fR
+Switch the active color theme at runtime. Accepts \fBsystem\fR, \fBdark\fR,
+\fBlight\fR, any built-in preset (\fBcatppuccin-mocha\fR, \fBcatppuccin-latte\fR,
+\fBtokyo-night\fR, \fBtokyo-night-day\fR, \fBgruvbox-dark\fR,
+\fBgruvbox-light\fR, \fBnord\fR, \fBdracula\fR, \fBrose-pine\fR,
+\fBrose-pine-dawn\fR, \fBkanagawa\fR, \fBone-dark\fR), or a custom theme name.
+.TP
+.B reload-config
+Force-reload configuration from disk.
+.TP
+.B save-config
+Save current runtime settings into the active configuration file.
+.TP
+.B list
+Print active Lune IPC socket paths.
+.SH CONFIGURATION
+Lune reads \fI${XDG_CONFIG_HOME:-~/.config}/lune/lune.conf\fR and reloads
+automatically when saved. Custom color themes can be placed in
+\fI${XDG_CONFIG_HOME:-~/.config}/lune/themes/<name>.conf\fR.
+.SH ENVIRONMENT
+.TP
+.B XDG_CONFIG_HOME
+Base directory for user configuration (default: \fI~/.config\fR).
+.TP
+.B XDG_RUNTIME_DIR
+Directory used for per-user IPC sockets (\fI$XDG_RUNTIME_DIR/lune/\fR) and
+temporary shell integration scripts.
+.TP
+.B LUNE_IPC_SOCKET
+Exported automatically to shells launched by Lune, pointing to the current
+window's IPC socket.
+.TP
+.B SHELL
+Default interactive shell launched when \fBshell\fR is not configured.
+.SH FILES
+.TP
+.I ${XDG_CONFIG_HOME:-~/.config}/lune/lune.conf
+User configuration file.
+.TP
+.I ${XDG_CONFIG_HOME:-~/.config}/lune/themes/
+User custom color themes.
+.SH LICENSE
+MIT License.

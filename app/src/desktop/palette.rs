@@ -25,6 +25,7 @@ pub(super) enum PaletteAction {
     OpenTabPosition,
     SetTabPosition(TabPosition),
     ToggleWindowDecorations,
+    ToggleBackgroundBlur,
     ToggleWindowControls,
     ToggleCommandBlocks,
     ToggleCopyOnSelect,
@@ -74,6 +75,7 @@ pub(super) struct PaletteContext<'a> {
     pub(super) mode: TerminalMode,
     pub(super) tab_position: TabPosition,
     pub(super) window_decorations: bool,
+    pub(super) background_blur: bool,
     pub(super) window_controls: WindowControlsPolicy,
     pub(super) command_blocks: bool,
     pub(super) scrollbar: ScrollbarPolicy,
@@ -337,7 +339,13 @@ pub(super) fn build_theme_entries(names: Vec<String>) -> Vec<PaletteEntry> {
             let detail = match name.as_str() {
                 "system" => "Follow desktop",
                 "dark" | "light" => "Built-in",
-                _ => "Custom",
+                other => match super::theme::presets::find(other) {
+                    Some(preset) if preset.variant == winit::window::Theme::Light => {
+                        "Built-in light"
+                    }
+                    Some(_) => "Built-in dark",
+                    None => "Custom",
+                },
             };
             PaletteEntry::new(PaletteAction::ApplyTheme(name.clone()), name, detail)
         })
@@ -512,6 +520,11 @@ fn build_root_entries(ctx: &PaletteContext<'_>) -> Vec<PaletteEntry> {
             if ctx.window_decorations { "On" } else { "Off" },
         ));
     }
+    entries.push(PaletteEntry::new(
+        PaletteAction::ToggleBackgroundBlur,
+        "Background blur",
+        if ctx.background_blur { "On" } else { "Off" },
+    ));
     entries.push(PaletteEntry::new(
         PaletteAction::ToggleWindowControls,
         "Window controls",
@@ -880,6 +893,7 @@ mod tests {
             mode: TerminalMode::Classic,
             tab_position: TabPosition::Top,
             window_decorations: true,
+            background_blur: false,
             window_controls: WindowControlsPolicy::Auto,
             command_blocks: true,
             scrollbar: ScrollbarPolicy::Auto,

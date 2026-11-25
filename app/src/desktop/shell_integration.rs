@@ -1,4 +1,4 @@
-//! Built-in shell integration for bash, zsh, and fish.
+//! Built-in shell integration for bash, zsh, fish, and nushell.
 //!
 //! Automatically wires OSC 133 semantic prompt markers (prompt/input/output/exit)
 //! and OSC 7 working-directory reporting without modifying user dotfiles.
@@ -16,6 +16,7 @@ pub(super) enum ShellKind {
     Bash,
     Zsh,
     Fish,
+    Nushell,
 }
 
 const BASH_SCRIPT: &str = r#"# Lune shell integration for bash
@@ -230,6 +231,17 @@ if functions -q fish_prompt; and not functions -q __lune_orig_fish_prompt
 end
 "#;
 
+const NUSHELL_SCRIPT: &str = r#"# Lune shell integration for nushell
+if not ("LUNE_SHELL_INTEGRATION_LOADED" in $env) {
+    $env.LUNE_SHELL_INTEGRATION_LOADED = "1"
+    $env.config = ($env.config | default {} | upsert shell_integration (
+        ($env.config.shell_integration? | default {})
+        | upsert osc7 true
+        | upsert osc133 true
+    ))
+}
+"#;
+
 /// Detects a supported interactive shell from its executable path or name.
 pub(super) fn detect_shell(executable: &OsStr) -> Option<ShellKind> {
     let name = Path::new(executable).file_name()?.to_str()?;
@@ -238,6 +250,7 @@ pub(super) fn detect_shell(executable: &OsStr) -> Option<ShellKind> {
         "bash" => Some(ShellKind::Bash),
         "zsh" => Some(ShellKind::Zsh),
         "fish" => Some(ShellKind::Fish),
+        "nu" => Some(ShellKind::Nushell),
         _ => None,
     }
 }
@@ -287,6 +300,14 @@ fn should_inject(kind: ShellKind, args: &[OsString]) -> bool {
                     return false;
                 }
             }
+            ShellKind::Nushell => {
+                if matches!(
+                    text,
+                    "--commands" | "-n" | "--no-config-file" | "--config" | "--env-config"
+                ) {
+                    return false;
+                }
+            }
         }
     }
     true
@@ -324,16 +345,23 @@ fn apply(kind: ShellKind, args: &[OsString], root: &Path, command: &mut Command)
         }
         ShellKind::Fish => {
             command.args(args);
-            let fish_data = root.join("fish-data");
-            let mut joined = OsString::from(fish_data);
-            joined.push(":");
-            match env::var_os("XDG_DATA_DIRS") {
-                Some(existing) if !existing.is_empty() => joined.push(existing),
-                _ => joined.push("/usr/local/share:/usr/share"),
-            }
-            command.env("XDG_DATA_DIRS", joined);
+            prepend_xdg_data_dir(command, &root.join("fish-data"));
+        }
+        ShellKind::Nushell => {
+            command.args(args);
+            prepend_xdg_data_dir(command, &root.join("nushell-data"));
         }
     }
+}
+
+fn prepend_xdg_data_dir(command: &mut Command, dir: &Path) {
+    let mut joined = OsString::from(dir);
+    joined.push(":");
+    match env::var_os("XDG_DATA_DIRS") {
+        Some(existing) if !existing.is_empty() => joined.push(existing),
+        _ => joined.push("/usr/local/share:/usr/share"),
+    }
+    command.env("XDG_DATA_DIRS", joined);
 }
 
 fn script_root() -> PathBuf {
@@ -366,7 +394,12 @@ fn write_scripts_to(root: &Path) -> io::Result<()> {
     let bash_dir = root.join("bash");
     let zsh_dir = root.join("zsh");
     let fish_dir = root.join("fish-data").join("fish").join("vendor_conf.d");
-    for dir in [root, &bash_dir, &zsh_dir, &fish_dir] {
+    let nushell_dir = root
+        .join("nushell-data")
+        .join("nushell")
+        .join("vendor")
+        .join("autoload");
+    for dir in [root, &bash_dir, &zsh_dir, &fish_dir, &nushell_dir] {
         fs::create_dir_all(dir)?;
     }
     let _ = fs::set_permissions(root, fs::Permissions::from_mode(0o700));
@@ -377,6 +410,10 @@ fn write_scripts_to(root: &Path) -> io::Result<()> {
     write_if_changed(&zsh_dir.join(".zshrc"), ZSH_ZSHRC)?;
     write_if_changed(&zsh_dir.join(".zlogin"), ZSH_ZLOGIN)?;
     write_if_changed(&fish_dir.join("lune-shell-integration.fish"), FISH_SCRIPT)?;
+    write_if_changed(
+        &nushell_dir.join("lune-shell-integration.nu"),
+        NUSHELL_SCRIPT,
+    )?;
     Ok(())
 }
 
@@ -405,6 +442,10 @@ mod tests {
             Some(ShellKind::Zsh)
         );
         assert_eq!(detect_shell(OsStr::new("fish")), Some(ShellKind::Fish));
+        assert_eq!(
+            detect_shell(OsStr::new("/usr/bin/nu")),
+            Some(ShellKind::Nushell)
+        );
         assert_eq!(detect_shell(OsStr::new("-zsh")), Some(ShellKind::Zsh));
         assert_eq!(detect_shell(OsStr::new("/bin/sh")), None);
 
@@ -419,6 +460,11 @@ mod tests {
             ShellKind::Fish,
             &[OsString::from("--no-config")]
         ));
+        assert!(should_inject(ShellKind::Nushell, &[OsString::from("-l")]));
+        assert!(!should_inject(
+            ShellKind::Nushell,
+            &[OsString::from("--no-config-file")]
+        ));
     }
 
     #[test]
@@ -432,6 +478,10 @@ mod tests {
         assert!(dir.join("zsh/.zshrc").is_file());
         assert!(
             dir.join("fish-data/fish/vendor_conf.d/lune-shell-integration.fish")
+                .is_file()
+        );
+        assert!(
+            dir.join("nushell-data/nushell/vendor/autoload/lune-shell-integration.nu")
                 .is_file()
         );
 
@@ -465,6 +515,15 @@ mod tests {
             k == "XDG_DATA_DIRS"
                 && v.and_then(OsStr::to_str).is_some_and(|val| {
                     val.starts_with(&dir.join("fish-data").to_string_lossy().to_string())
+                })
+        }));
+
+        let mut nu_cmd = Command::new("/usr/bin/nu");
+        apply(ShellKind::Nushell, &[], &dir, &mut nu_cmd);
+        assert!(nu_cmd.get_envs().any(|(k, v)| {
+            k == "XDG_DATA_DIRS"
+                && v.and_then(OsStr::to_str).is_some_and(|val| {
+                    val.starts_with(&dir.join("nushell-data").to_string_lossy().to_string())
                 })
         }));
 

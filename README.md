@@ -4,12 +4,13 @@ A fast, modern Wayland terminal emulator for Linux.
 
 ## Features
 
-- **Smooth GPU Rendering**: Sharp text with ligatures and font fallback, inline images via the Kitty graphics protocol, optional background images, and smooth animated cursor.
-- **Classic & Modern Modes**: Switch anytime between a minimal classic window and a modern layout with an inline titlebar or collapsible left tab sidebar.
+- **Smooth GPU Rendering**: Sharp text with ligatures and font fallback, inline images via the Kitty graphics protocol, optional background images, translucent background blur, and smooth animated cursor.
+- **Built-in Themes**: Curated dark and light presets (Catppuccin, Tokyo Night, Gruvbox, Nord, Dracula, Rosé Pine, Kanagawa, One Dark) plus custom theme files with live preview in the Command Palette.
+- **Classic & Modern Modes**: Switch anytime between a minimal classic window (with optional native window decorations) and a modern layout with an inline titlebar or collapsible left tab sidebar.
 - **Tabs & Split Panes**: Split horizontally or vertically, drag or resize dividers, zoom a pane, swap panes, detach a pane into a new tab, broadcast input to all panes in a tab, and rename tabs inline.
-- **Command Blocks & Bookmarks**: Automatic shell integration (`bash`, `zsh`, `fish`) with clickable command blocks, sticky command headers while scrolling long output, bookmarks, quick jump to previous/failed commands, one-click copy command/output, and re-run.
+- **Command Blocks & Bookmarks**: Automatic shell integration (`bash`, `zsh`, `fish`, `nu`) with clickable command blocks, sticky command headers while scrolling long output, bookmarks, quick jump to previous/failed commands, one-click copy command/output, and re-run.
 - **Search, Vi Mode & Quick Select**: Literal and regex scrollback search (full history or inside a single command block), Vi navigation and visual selection, Quick Select hints for URLs and paths, fuzzy Command Palette with live theme preview, and right-click context menus.
-- **Clipboard & Integration**: Standard clipboard and middle-click paste, drag-and-drop file paths, desktop notifications, and live configuration reloading.
+- **Remote Control & Integration**: Control running windows from the CLI (`lune msg`), shell completions (`bash`, `zsh`, `fish`, `nushell`), standard clipboard and middle-click paste, drag-and-drop file paths, desktop notifications, and live configuration reloading.
 
 ## Building
 
@@ -37,6 +38,7 @@ just build-linux-all        # all formats
 
 ```text
 Usage: lune [OPTIONS] [-- COMMAND [ARGS...]]
+       lune msg [--socket <PATH>] <ACTION> [ARGS...]
 
 Options:
   -d, --working-directory <DIR>  Start the initial session in DIR
@@ -46,6 +48,14 @@ Options:
   -e, --command <CMD> [ARGS...]  Run CMD instead of the default shell
   -h, --help                     Print this help message and exit
   -V, --version                  Print version information and exit
+
+Remote control (`lune msg`):
+  new-tab [-d DIR] [-T TITLE] [-e CMD...]   Open a new tab
+  split [-d DIR] [right|down]               Split the focused pane
+  set-theme <THEME>                         Switch theme at runtime
+  reload-config                             Reload configuration from disk
+  save-config                               Save current settings to config
+  list                                      List active window sockets
 ```
 
 ## Configuration

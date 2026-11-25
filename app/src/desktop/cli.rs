@@ -3,8 +3,12 @@ use std::ffi::OsString;
 use std::fmt;
 use std::path::PathBuf;
 
+use super::ipc::IpcCommand;
+use super::split::Axis;
+
 pub const HELP_TEXT: &str = "\
 Usage: lune [OPTIONS] [-- COMMAND [ARGS...]]
+       lune msg [--socket <PATH>] <SUBCOMMAND>
 
 Options:
   -d, --working-directory <DIR>  Start the initial session in DIR
@@ -14,6 +18,14 @@ Options:
   -e, --command <CMD> [ARGS...]  Run CMD instead of the default shell
   -h, --help                     Print this help message and exit
   -V, --version                  Print version information and exit
+
+IPC Subcommands (lune msg):
+  new-tab [-d <DIR>] [-T <TITLE>] [-- <CMD>...]  Open a tab in a running window
+  split [--right|--down] [-d <DIR>]              Split the active pane
+  set-theme <NAME>                               Switch theme in a running window
+  reload-config                                  Reload configuration
+  save-config                                    Save current settings to config
+  list                                           List active Lune IPC sockets
 ";
 
 pub const VERSION_TEXT: &str = concat!("lune ", env!("CARGO_PKG_VERSION"));
@@ -28,8 +40,18 @@ pub struct LaunchOptions {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MsgAction {
+    List,
+    Send {
+        socket: Option<PathBuf>,
+        command: IpcCommand,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CliAction {
     Run(LaunchOptions),
+    Msg(MsgAction),
     Help,
     Version,
 }
@@ -63,7 +85,11 @@ pub fn parse<I>(args: I) -> Result<CliAction, CliError>
 where
     I: IntoIterator<Item = OsString>,
 {
-    let mut iter = args.into_iter();
+    let mut iter = args.into_iter().peekable();
+    if iter.peek().and_then(|arg| arg.to_str()) == Some("msg") {
+        iter.next();
+        return parse_msg(iter);
+    }
     let mut options = LaunchOptions::default();
 
     while let Some(arg) = iter.next() {
@@ -132,6 +158,205 @@ where
     }
 
     Ok(CliAction::Run(options))
+}
+
+fn parse_msg(mut iter: impl Iterator<Item = OsString>) -> Result<CliAction, CliError> {
+    let mut socket: Option<PathBuf> = None;
+    let subcommand = loop {
+        let Some(arg) = iter.next() else {
+            return Err(CliError::new("msg requires a subcommand"));
+        };
+        let Some(text) = arg.to_str() else {
+            return Err(CliError::new("msg subcommand must be valid UTF-8"));
+        };
+        match text {
+            "-h" | "--help" => return Ok(CliAction::Help),
+            "--socket" => {
+                socket = Some(PathBuf::from(next_value(&mut iter, text)?));
+            }
+            _ => {
+                if let Some(value) = text.strip_prefix("--socket=") {
+                    if value.is_empty() {
+                        return Err(CliError::new("--socket requires a value"));
+                    }
+                    socket = Some(PathBuf::from(value));
+                } else {
+                    break text.to_owned();
+                }
+            }
+        }
+    };
+
+    let command = match subcommand.as_str() {
+        "list" => {
+            if iter.next().is_some() {
+                return Err(CliError::new("msg list takes no arguments"));
+            }
+            return Ok(CliAction::Msg(MsgAction::List));
+        }
+        "reload-config" => {
+            parse_trailing_socket_only(&mut iter, &mut socket, "reload-config")?;
+            IpcCommand::ReloadConfig
+        }
+        "save-config" => {
+            parse_trailing_socket_only(&mut iter, &mut socket, "save-config")?;
+            IpcCommand::SaveConfig
+        }
+        "set-theme" => {
+            let mut name: Option<String> = None;
+            while let Some(arg) = iter.next() {
+                let Some(text) = arg.to_str() else {
+                    return Err(CliError::new(
+                        "unexpected non-UTF-8 argument in msg set-theme",
+                    ));
+                };
+                if consume_socket_arg(text, &mut iter, &mut socket)? {
+                    continue;
+                }
+                if text.starts_with('-') {
+                    return Err(CliError::new(format!("unknown option: {text}")));
+                }
+                if name.is_some() {
+                    return Err(CliError::new("msg set-theme takes a single theme name"));
+                }
+                if text.is_empty() {
+                    return Err(CliError::new("set-theme requires a value"));
+                }
+                name = Some(text.to_owned());
+            }
+            let Some(name) = name else {
+                return Err(CliError::new("set-theme requires a value"));
+            };
+            IpcCommand::SetTheme(name)
+        }
+        "new-tab" => {
+            let mut working_directory = None;
+            let mut title = None;
+            let mut command = None;
+            while let Some(arg) = iter.next() {
+                let Some(text) = arg.to_str() else {
+                    return Err(CliError::new(
+                        "unexpected non-UTF-8 argument in msg new-tab",
+                    ));
+                };
+                if consume_socket_arg(text, &mut iter, &mut socket)? {
+                    continue;
+                }
+                match text {
+                    "-d" | "--working-directory" => {
+                        working_directory = Some(PathBuf::from(next_value(&mut iter, text)?));
+                    }
+                    "-T" | "--title" => {
+                        title = Some(sanitize_title(&next_string(&mut iter, text)?));
+                    }
+                    "-e" | "--command" | "--" => {
+                        let cmd: Vec<OsString> = iter.collect();
+                        if cmd.is_empty() {
+                            return Err(CliError::new(format!("{text} requires a command")));
+                        }
+                        command = Some(cmd);
+                        break;
+                    }
+                    _ => {
+                        if let Some((flag, value)) = split_long_option(text) {
+                            match flag {
+                                "--working-directory" => {
+                                    working_directory = Some(PathBuf::from(value));
+                                }
+                                "--title" => {
+                                    title = Some(sanitize_title(value));
+                                }
+                                _ => {
+                                    return Err(CliError::new(format!("unknown option: {flag}")));
+                                }
+                            }
+                        } else {
+                            return Err(CliError::new(format!("unknown option: {text}")));
+                        }
+                    }
+                }
+            }
+            IpcCommand::NewTab {
+                working_directory,
+                title,
+                command,
+            }
+        }
+        "split" => {
+            let mut axis = Axis::Columns;
+            let mut working_directory = None;
+            while let Some(arg) = iter.next() {
+                let Some(text) = arg.to_str() else {
+                    return Err(CliError::new("unexpected non-UTF-8 argument in msg split"));
+                };
+                if consume_socket_arg(text, &mut iter, &mut socket)? {
+                    continue;
+                }
+                match text {
+                    "--right" | "--columns" | "right" | "vertical" => axis = Axis::Columns,
+                    "--down" | "--rows" | "down" | "horizontal" => axis = Axis::Rows,
+                    "-d" | "--working-directory" => {
+                        working_directory = Some(PathBuf::from(next_value(&mut iter, text)?));
+                    }
+                    _ => {
+                        if let Some(value) = text.strip_prefix("--working-directory=") {
+                            working_directory = Some(PathBuf::from(value));
+                        } else {
+                            return Err(CliError::new(format!("unknown option: {text}")));
+                        }
+                    }
+                }
+            }
+            IpcCommand::Split {
+                axis,
+                working_directory,
+            }
+        }
+        other => {
+            return Err(CliError::new(format!("unknown msg subcommand: {other}")));
+        }
+    };
+
+    Ok(CliAction::Msg(MsgAction::Send { socket, command }))
+}
+
+fn consume_socket_arg(
+    text: &str,
+    iter: &mut impl Iterator<Item = OsString>,
+    socket: &mut Option<PathBuf>,
+) -> Result<bool, CliError> {
+    if text == "--socket" {
+        *socket = Some(PathBuf::from(next_value(iter, text)?));
+        return Ok(true);
+    }
+    if let Some(value) = text.strip_prefix("--socket=") {
+        if value.is_empty() {
+            return Err(CliError::new("--socket requires a value"));
+        }
+        *socket = Some(PathBuf::from(value));
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn parse_trailing_socket_only(
+    iter: &mut impl Iterator<Item = OsString>,
+    socket: &mut Option<PathBuf>,
+    subcommand: &str,
+) -> Result<(), CliError> {
+    while let Some(arg) = iter.next() {
+        let Some(text) = arg.to_str() else {
+            return Err(CliError::new(format!(
+                "msg {subcommand} takes no arguments"
+            )));
+        };
+        if !consume_socket_arg(text, iter, socket)? {
+            return Err(CliError::new(format!(
+                "msg {subcommand} takes no arguments"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn split_long_option(text: &str) -> Option<(&str, &str)> {
@@ -236,5 +461,57 @@ mod tests {
         ] {
             assert!(parse(os(bad)).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn parses_msg_subcommands() {
+        let action = parse(os(&[
+            "msg",
+            "--socket=/tmp/lune.sock",
+            "new-tab",
+            "-d",
+            "/tmp",
+            "-T",
+            "Logs",
+            "--",
+            "tail",
+            "-f",
+        ]))
+        .unwrap();
+        assert_eq!(
+            action,
+            CliAction::Msg(super::MsgAction::Send {
+                socket: Some(PathBuf::from("/tmp/lune.sock")),
+                command: super::IpcCommand::NewTab {
+                    working_directory: Some(PathBuf::from("/tmp")),
+                    title: Some("Logs".into()),
+                    command: Some(os(&["tail", "-f"])),
+                },
+            })
+        );
+
+        let split = parse(os(&["msg", "split", "--down", "-d", "/var"])).unwrap();
+        assert_eq!(
+            split,
+            CliAction::Msg(super::MsgAction::Send {
+                socket: None,
+                command: super::IpcCommand::Split {
+                    axis: super::Axis::Rows,
+                    working_directory: Some(PathBuf::from("/var")),
+                },
+            })
+        );
+
+        assert_eq!(
+            parse(os(&["msg", "set-theme", "nord"])).unwrap(),
+            CliAction::Msg(super::MsgAction::Send {
+                socket: None,
+                command: super::IpcCommand::SetTheme("nord".into()),
+            })
+        );
+        assert_eq!(
+            parse(os(&["msg", "list"])).unwrap(),
+            CliAction::Msg(super::MsgAction::List)
+        );
     }
 }

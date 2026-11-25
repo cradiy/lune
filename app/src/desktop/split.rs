@@ -11,7 +11,7 @@ const MIN_RATIO: f32 = 0.15;
 const MAX_RATIO: f32 = 0.85;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Axis {
+pub enum Axis {
     /// Side-by-side panes separated by a vertical divider.
     Columns,
     /// Stacked panes separated by a horizontal divider.

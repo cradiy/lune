@@ -46,6 +46,7 @@ mod font;
 mod hints;
 mod ime;
 mod input;
+pub mod ipc;
 mod ligature;
 mod notify;
 mod paint;
@@ -65,6 +66,7 @@ mod theme;
 mod titlebar;
 mod url;
 mod vi;
+mod wayland_blur;
 mod wayland_decorations;
 
 use std::ffi::OsString;
@@ -136,6 +138,7 @@ enum Event {
     ButtonLayout(Option<WindowButtons>),
     ConfigReload(bool),
     ConfigSave,
+    IpcCommand(ipc::IpcCommand),
     AppMenuAction(Action),
 }
 
@@ -292,6 +295,63 @@ impl App {
         }
     }
 
+    fn handle_ipc_command(&mut self, command: ipc::IpcCommand) {
+        match command {
+            ipc::IpcCommand::ReloadConfig => self.reload_config(true),
+            ipc::IpcCommand::SaveConfig => self.save_config(),
+            ipc::IpcCommand::NewTab {
+                working_directory,
+                title,
+                command,
+            } => {
+                if let Some(client) = &mut self.client {
+                    let cwd = working_directory.filter(|dir| dir.is_dir()).or_else(|| {
+                        client.tabs[client.active]
+                            .focused_pane()
+                            .working_directory()
+                    });
+                    if let Err(error) = client.new_tab_with_options(cwd, title, command.as_deref())
+                    {
+                        log::warn!("IPC new-tab failed: {error}");
+                    }
+                }
+            }
+            ipc::IpcCommand::Split {
+                axis,
+                working_directory,
+            } => {
+                if let Some(client) = &mut self.client {
+                    let cwd = working_directory.filter(|dir| dir.is_dir()).or_else(|| {
+                        client.tabs[client.active]
+                            .focused_pane()
+                            .working_directory()
+                    });
+                    if let Err(error) = client.split_pane_with_cwd(axis, cwd) {
+                        log::warn!("IPC split failed: {error}");
+                    }
+                }
+            }
+            ipc::IpcCommand::SetTheme(name) => {
+                if let Some(client) = &mut self.client {
+                    let dir = client
+                        .config_dir
+                        .as_deref()
+                        .unwrap_or(std::path::Path::new(""));
+                    let mut errors = Vec::new();
+                    match theme::Preference::load(dir, &name, &mut errors) {
+                        Ok(pref) => {
+                            client.apply_theme_preference(pref);
+                            client.show_notice(NoticeKind::Success, format!("Theme: {name}"));
+                        }
+                        Err(error) => {
+                            client.show_notice(NoticeKind::Warning, error.into());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn report(&mut self, event_loop: &ActiveEventLoop, result: Result<()>) {
         if let Err(error) = result {
             self.error = Some(error);
@@ -339,6 +399,10 @@ impl ApplicationHandler<Event> for App {
         }
         if let Event::ConfigSave = event {
             self.save_config();
+            return;
+        }
+        if let Event::IpcCommand(command) = event {
+            self.handle_ipc_command(command);
             return;
         }
         if let Event::ButtonLayout(buttons) = event {
@@ -429,7 +493,10 @@ impl ApplicationHandler<Event> for App {
                 client.run_shortcut(event_loop, action);
                 Ok(())
             }
-            Event::ButtonLayout(_) | Event::ConfigReload(_) | Event::ConfigSave => unreachable!(),
+            Event::ButtonLayout(_)
+            | Event::ConfigReload(_)
+            | Event::ConfigSave
+            | Event::IpcCommand(_) => unreachable!(),
         };
         self.report(event_loop, result);
     }
@@ -443,11 +510,13 @@ impl ApplicationHandler<Event> for App {
 }
 
 struct Client {
-    // Declared before `window` so guest Wayland queues (`AppMenu` and
-    // `DataDevice`) clean up and stop before `window`'s `wl_display` and
+    // Declared before `window` so guest Wayland queues (`AppMenu`, `BackgroundBlur`,
+    // and `DataDevice`) clean up and stop before `window`'s `wl_display` and
     // `xdg_toplevel` are destroyed.
     app_menu: Option<app_menu::AppMenu>,
+    blur: Option<wayland_blur::BackgroundBlur>,
     clipboard: Option<clipboard::DataDevice>,
+    ipc: Option<ipc::IpcServer>,
     window: Arc<Window>,
     painter: Painter,
     readiness: Readiness,
@@ -505,6 +574,7 @@ struct Client {
     mode: TerminalMode,
     tab_position: TabPosition,
     window_decorations: bool,
+    background_blur: bool,
     window_controls: WindowControlsPolicy,
     command_blocks: bool,
     compositor_decorations: Option<CompositorDecorations>,
@@ -554,7 +624,10 @@ impl Client {
                     .with_name(app_id, "")
                     .with_theme(Some(selected_theme))
                     .with_decorations(
-                        config.mode == TerminalMode::Classic && config.window_decorations,
+                        (config.mode == TerminalMode::Classic && config.window_decorations)
+                            || compositor_decorations
+                                .as_ref()
+                                .is_some_and(CompositorDecorations::uses_frameless_ssd),
                     )
                     .with_transparent(true)
                     .with_inner_size(LogicalSize::new(960, 600))
@@ -628,7 +701,9 @@ impl Client {
         };
         let grid = GridGeometry::fit(initial_text_size, cell)
             .ok_or_else(|| io::Error::other("The terminal grid does not fit the Wayland window"))?;
+        let blur = wayland_blur::BackgroundBlur::attach(&window);
         let clipboard = clipboard::DataDevice::attach(&window);
+        let ipc = ipc::IpcServer::start(proxy.clone());
         let (palette, scheme) = config.theme.palette(selected_theme);
         let history_limits = config.history_limits();
         let mut pane = Pane::spawn(
@@ -645,6 +720,7 @@ impl Client {
                 shell: config.shell.as_deref(),
                 shell_integration: config.shell_integration,
                 clipboard: clipboard.as_ref().map(clipboard::DataDevice::handle),
+                ipc_socket: ipc.as_ref().map(ipc::IpcServer::socket_path),
             },
             launch.working_directory,
             launch.command.as_deref(),
@@ -678,7 +754,9 @@ impl Client {
             .or_else(Config::directory);
         let mut client = Self {
             app_menu: None,
+            blur,
             clipboard,
+            ipc,
             window,
             painter,
             readiness,
@@ -748,6 +826,7 @@ impl Client {
             mode: config.mode,
             tab_position: config.tab_position,
             window_decorations: config.window_decorations,
+            background_blur: config.background_blur,
             window_controls: config.window_controls,
             command_blocks: config.command_blocks,
             compositor_decorations,
@@ -761,6 +840,7 @@ impl Client {
             context_menu: None,
         };
         client.reflow_tab_bar();
+        client.sync_background_blur();
         if client
             .compositor_decorations
             .as_ref()
@@ -784,6 +864,7 @@ impl Client {
             mode: self.mode,
             tab_position: self.tab_position,
             window_decorations: self.window_decorations,
+            background_blur: self.background_blur,
             sidebar_collapsed: self.sidebar_collapsed,
             fullscreen: self.window.fullscreen().is_some(),
             vi_mode: pane.vi.is_some(),
@@ -817,6 +898,7 @@ impl Client {
             mode: self.mode,
             tab_position: self.tab_position,
             window_decorations: self.window_decorations,
+            background_blur: self.background_blur,
             window_controls: self.window_controls,
             command_blocks: self.command_blocks,
             scrollbar: self.scrollbar,
@@ -836,6 +918,7 @@ impl Client {
             shell: self.shell.as_deref(),
             shell_integration: self.shell_integration,
             clipboard: self.clipboard_handle(),
+            ipc_socket: self.ipc.as_ref().map(ipc::IpcServer::socket_path),
         }
     }
 
@@ -1877,6 +1960,7 @@ impl Client {
             Action::ToggleMode => self.set_mode(self.mode.toggle()),
             Action::ToggleTabSidebar => self.toggle_tab_sidebar(),
             Action::ToggleWindowDecorations => self.toggle_window_decorations(),
+            Action::ToggleBackgroundBlur => self.toggle_background_blur(),
             Action::PreviousPrompt => self.tabs[self.active].focused_pane_mut().jump_prompt(false),
             Action::NextPrompt => self.tabs[self.active].focused_pane_mut().jump_prompt(true),
             Action::PreviousFailedPrompt => {
@@ -2106,6 +2190,14 @@ impl Client {
         }
         if old.background_opacity != new.background_opacity {
             self.painter.set_background_opacity(new.background_opacity);
+        }
+        if old.background_blur != new.background_blur {
+            self.background_blur = new.background_blur;
+        }
+        if old.background_blur != new.background_blur
+            || old.background_opacity != new.background_opacity
+        {
+            self.sync_background_blur();
         }
         if old.unfocused_split_opacity != new.unfocused_split_opacity {
             self.unfocused_split_opacity = new.unfocused_split_opacity;
@@ -2390,6 +2482,7 @@ impl Client {
         }
         let size = self.window.inner_size();
         let scale = self.window.scale_factor();
+        self.sync_background_blur();
         let physical_font = physical_font_size(self.font_size_points, scale);
         let current = self.painter.metrics();
         let (metrics, chrome_metrics) = if current.size != physical_font {

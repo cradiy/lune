@@ -216,6 +216,7 @@ pub(super) struct PaneConfig<'a> {
     pub(super) shell: Option<&'a [OsString]>,
     pub(super) shell_integration: bool,
     pub(super) clipboard: Option<clipboard::DataDeviceHandle>,
+    pub(super) ipc_socket: Option<&'a Path>,
 }
 
 impl Pane {
@@ -253,6 +254,9 @@ impl Pane {
             .env("TERM", "xterm-256color")
             .env("COLORTERM", "truecolor")
             .env("TERM_PROGRAM", "Lune");
+        if let Some(socket) = config.ipc_socket {
+            command.env("LUNE_IPC_SOCKET", socket);
+        }
         let pty_size = grid.pty_size();
         log::debug!(
             "Starting PTY session with {} columns and {} rows",

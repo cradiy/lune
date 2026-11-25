@@ -164,6 +164,13 @@ populate_usr_tree() {
     install -Dm0755 "${STAGED_BIN}" "${prefix_root}/bin/${PKG_NAME}"
     install -Dm0644 "${ROOT_DIR}/assets/lune.desktop" "${prefix_root}/share/applications/lune.desktop"
     install -Dm0644 "${ROOT_DIR}/assets/lune.svg" "${prefix_root}/share/icons/hicolor/scalable/apps/lune.svg"
+    install -Dm0644 "${ROOT_DIR}/assets/completions/lune.bash" "${prefix_root}/share/bash-completion/completions/lune"
+    install -Dm0644 "${ROOT_DIR}/assets/completions/_lune" "${prefix_root}/share/zsh/site-functions/_lune"
+    install -Dm0644 "${ROOT_DIR}/assets/completions/lune.fish" "${prefix_root}/share/fish/vendor_completions.d/lune.fish"
+    install -Dm0644 "${ROOT_DIR}/assets/completions/lune.nu" "${prefix_root}/share/nushell/vendor/autoload/lune.nu"
+    install -d "${prefix_root}/share/man/man1"
+    gzip -n -9 -c "${ROOT_DIR}/assets/man/lune.1" > "${prefix_root}/share/man/man1/lune.1.gz"
+    chmod 0644 "${prefix_root}/share/man/man1/lune.1.gz"
     install -Dm0644 "${ROOT_DIR}/LICENSE" "${prefix_root}/share/licenses/${PKG_NAME}/LICENSE"
 }
 
@@ -185,6 +192,11 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 install -Dm0755 "${DIR}/bin/lune" "${PREFIX}/bin/lune"
 install -Dm0644 "${DIR}/share/applications/lune.desktop" "${PREFIX}/share/applications/lune.desktop"
 install -Dm0644 "${DIR}/share/icons/hicolor/scalable/apps/lune.svg" "${PREFIX}/share/icons/hicolor/scalable/apps/lune.svg"
+install -Dm0644 "${DIR}/share/bash-completion/completions/lune" "${PREFIX}/share/bash-completion/completions/lune"
+install -Dm0644 "${DIR}/share/zsh/site-functions/_lune" "${PREFIX}/share/zsh/site-functions/_lune"
+install -Dm0644 "${DIR}/share/fish/vendor_completions.d/lune.fish" "${PREFIX}/share/fish/vendor_completions.d/lune.fish"
+install -Dm0644 "${DIR}/share/nushell/vendor/autoload/lune.nu" "${PREFIX}/share/nushell/vendor/autoload/lune.nu"
+install -Dm0644 "${DIR}/share/man/man1/lune.1.gz" "${PREFIX}/share/man/man1/lune.1.gz"
 install -Dm0644 "${DIR}/share/licenses/lune/LICENSE" "${PREFIX}/share/licenses/lune/LICENSE"
 echo "Installed lune to ${PREFIX}"
 EOF
@@ -264,6 +276,11 @@ build_rpm() {
     cp "${STAGED_BIN}" "${topdir}/SOURCES/${PKG_NAME}"
     cp "${ROOT_DIR}/assets/lune.desktop" "${topdir}/SOURCES/lune.desktop"
     cp "${ROOT_DIR}/assets/lune.svg" "${topdir}/SOURCES/lune.svg"
+    cp "${ROOT_DIR}/assets/completions/lune.bash" "${topdir}/SOURCES/lune.bash"
+    cp "${ROOT_DIR}/assets/completions/_lune" "${topdir}/SOURCES/_lune"
+    cp "${ROOT_DIR}/assets/completions/lune.fish" "${topdir}/SOURCES/lune.fish"
+    cp "${ROOT_DIR}/assets/completions/lune.nu" "${topdir}/SOURCES/lune.nu"
+    cp "${ROOT_DIR}/assets/man/lune.1" "${topdir}/SOURCES/lune.1"
     cp "${ROOT_DIR}/LICENSE" "${topdir}/SOURCES/LICENSE"
 
     local rpm_requires=""
@@ -294,6 +311,11 @@ Lune is a GPU-accelerated Wayland terminal emulator written in Rust.
 install -Dm0755 %{_sourcedir}/${PKG_NAME} %{buildroot}%{_bindir}/${PKG_NAME}
 install -Dm0644 %{_sourcedir}/lune.desktop %{buildroot}%{_datadir}/applications/lune.desktop
 install -Dm0644 %{_sourcedir}/lune.svg %{buildroot}%{_datadir}/icons/hicolor/scalable/apps/lune.svg
+install -Dm0644 %{_sourcedir}/lune.bash %{buildroot}%{_datadir}/bash-completion/completions/lune
+install -Dm0644 %{_sourcedir}/_lune %{buildroot}%{_datadir}/zsh/site-functions/_lune
+install -Dm0644 %{_sourcedir}/lune.fish %{buildroot}%{_datadir}/fish/vendor_completions.d/lune.fish
+install -Dm0644 %{_sourcedir}/lune.nu %{buildroot}%{_datadir}/nushell/vendor/autoload/lune.nu
+install -Dm0644 %{_sourcedir}/lune.1 %{buildroot}%{_mandir}/man1/lune.1
 install -Dm0644 %{_sourcedir}/LICENSE %{buildroot}%{_licensedir}/${PKG_NAME}/LICENSE
 
 %files
@@ -301,6 +323,11 @@ install -Dm0644 %{_sourcedir}/LICENSE %{buildroot}%{_licensedir}/${PKG_NAME}/LIC
 %attr(0755,root,root) %{_bindir}/${PKG_NAME}
 %attr(0644,root,root) %{_datadir}/applications/lune.desktop
 %attr(0644,root,root) %{_datadir}/icons/hicolor/scalable/apps/lune.svg
+%attr(0644,root,root) %{_datadir}/bash-completion/completions/lune
+%attr(0644,root,root) %{_datadir}/zsh/site-functions/_lune
+%attr(0644,root,root) %{_datadir}/fish/vendor_completions.d/lune.fish
+%attr(0644,root,root) %{_datadir}/nushell/vendor/autoload/lune.nu
+%attr(0644,root,root) %{_mandir}/man1/lune.1*
 EOF
 
     log "Creating RPM package (${RPM_ARCH})..."

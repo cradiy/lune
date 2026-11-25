@@ -27,6 +27,11 @@ use super::{
 
 impl Client {
     pub(super) fn split_pane(&mut self, axis: Axis) -> Result<()> {
+        let cwd = self.tabs[self.active].focused_pane().working_directory();
+        self.split_pane_with_cwd(axis, cwd)
+    }
+
+    pub(super) fn split_pane_with_cwd(&mut self, axis: Axis, cwd: Option<PathBuf>) -> Result<()> {
         let cell = self.painter.metrics().cell;
         let divider = self.divider_thickness();
         let gutter = self.block_gutter();
@@ -67,7 +72,6 @@ impl Client {
         if pty.columns < MIN_SPLIT_COLUMNS || pty.rows < MIN_SPLIT_ROWS {
             return Ok(());
         }
-        let cwd = tab.focused_pane().working_directory();
         let new_id = self.allocate_pane_id()?;
         let mut pane = Pane::spawn(
             new_id,
@@ -274,6 +278,15 @@ impl Client {
     }
 
     pub(super) fn new_tab_with_cwd(&mut self, cwd: Option<PathBuf>) -> Result<()> {
+        self.new_tab_with_options(cwd, None, None)
+    }
+
+    pub(super) fn new_tab_with_options(
+        &mut self,
+        cwd: Option<PathBuf>,
+        custom_title: Option<String>,
+        program: Option<&[std::ffi::OsString]>,
+    ) -> Result<()> {
         let id = self.allocate_pane_id()?;
         let size = self.window.inner_size();
         let scale = self.window.scale_factor();
@@ -326,7 +339,7 @@ impl Client {
             grid,
             self.pane_config(),
             cwd,
-            None,
+            program,
         )?;
         pane.origin = PixelPosition {
             x: area.origin.x + inset,
@@ -334,7 +347,9 @@ impl Client {
         };
         self.readiness
             .arm(id, &mut pane.registration, pane.session.interests())?;
-        self.tabs.push(Tab::new(pane, area));
+        let mut tab = Tab::new(pane, area);
+        tab.custom_title = custom_title.filter(|title| !title.trim().is_empty());
+        self.tabs.push(tab);
         self.resize_pending = true;
         self.apply_resize();
         self.select_tab(self.tabs.len() - 1);
@@ -543,7 +558,11 @@ impl Client {
     }
 
     pub(super) fn native_decorations_enabled(&self) -> bool {
-        self.mode == TerminalMode::Classic && self.window_decorations
+        (self.mode == TerminalMode::Classic && self.window_decorations)
+            || self
+                .compositor_decorations
+                .as_ref()
+                .is_some_and(super::wayland_decorations::CompositorDecorations::uses_frameless_ssd)
     }
 
     pub(super) fn toggle_window_decorations(&mut self) {
@@ -555,6 +574,35 @@ impl Client {
             "Window decorations: On"
         } else {
             "Window decorations: Off"
+        };
+        self.show_notice(NoticeKind::Success, label.into());
+    }
+
+    pub(super) fn sync_background_blur(&mut self) {
+        let Some(blur) = &mut self.blur else {
+            return;
+        };
+        let logical = self
+            .window
+            .inner_size()
+            .to_logical::<u32>(self.window.scale_factor().max(1.0));
+        let active = self.background_blur && self.painter.background_opacity() < 1.0;
+        if blur.sync(active, logical) {
+            self.window.request_redraw();
+        }
+    }
+
+    pub(super) fn toggle_background_blur(&mut self) {
+        self.background_blur = !self.background_blur;
+        self.sync_background_blur();
+        let label = if !self.background_blur {
+            "Background blur: Off"
+        } else if self.blur.is_none() {
+            "Background blur: On (unsupported by compositor)"
+        } else if self.painter.background_opacity() >= 1.0 {
+            "Background blur: On (requires background-opacity < 1.0)"
+        } else {
+            "Background blur: On"
         };
         self.show_notice(NoticeKind::Success, label.into());
     }
@@ -583,7 +631,8 @@ impl Client {
     pub(super) fn set_tab_position(&mut self, position: TabPosition) {
         if self.mode != TerminalMode::Modern {
             self.mode = TerminalMode::Modern;
-            self.window.set_decorations(false);
+            self.window
+                .set_decorations(self.native_decorations_enabled());
         }
         self.tab_position = position;
         self.sidebar_collapsed = false;

@@ -2,6 +2,25 @@
 fn main() -> std::process::ExitCode {
     let options = match lune::parse_cli() {
         Ok(lune::CliAction::Run(options)) => options,
+        Ok(lune::CliAction::Msg(action)) => {
+            return match action {
+                lune::MsgAction::List => {
+                    for socket in lune::list_ipc_sockets() {
+                        println!("{}", socket.display());
+                    }
+                    std::process::ExitCode::SUCCESS
+                }
+                lune::MsgAction::Send { socket, command } => {
+                    match lune::send_ipc_command(socket.as_deref(), &command) {
+                        Ok(()) => std::process::ExitCode::SUCCESS,
+                        Err(error) => {
+                            eprintln!("lune msg: {error}");
+                            std::process::ExitCode::FAILURE
+                        }
+                    }
+                }
+            };
+        }
         Ok(lune::CliAction::Help) => {
             print!("{}", lune::HELP_TEXT);
             return std::process::ExitCode::SUCCESS;

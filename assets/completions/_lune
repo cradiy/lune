@@ -1,0 +1,111 @@
+#compdef lune
+
+_lune_themes() {
+    local -a themes
+    themes=(
+        'system:Follow desktop light/dark preference'
+        'dark:Built-in default dark theme'
+        'light:Built-in default light theme'
+        'catppuccin-mocha:Built-in dark theme'
+        'catppuccin-latte:Built-in light theme'
+        'tokyo-night:Built-in dark theme'
+        'tokyo-night-day:Built-in light theme'
+        'gruvbox-dark:Built-in dark theme'
+        'gruvbox-light:Built-in light theme'
+        'nord:Built-in dark theme'
+        'dracula:Built-in dark theme'
+        'rose-pine:Built-in dark theme'
+        'rose-pine-dawn:Built-in light theme'
+        'kanagawa:Built-in dark theme'
+        'one-dark:Built-in dark theme'
+    )
+    local dir="${XDG_CONFIG_HOME:-$HOME/.config}/lune/themes"
+    if [[ -d "$dir" ]]; then
+        local file
+        for file in "$dir"/*.conf(N); do
+            themes+=("${file:t:r}:Custom theme")
+        done
+    fi
+    _describe -t themes 'theme' themes
+}
+
+_lune_msg() {
+    local curcontext="$curcontext" state line
+    typeset -A opt_args
+
+    _arguments -C \
+        '--socket=[Target IPC socket path]:socket:_files' \
+        '(-h --help)'{-h,--help}'[Print help message and exit]' \
+        '1:subcommand:->subcmd' \
+        '*::args:->args'
+
+    case "$state" in
+        subcmd)
+            local -a subcmds
+            subcmds=(
+                'new-tab:Open a new tab in a running Lune window'
+                'split:Split the focused pane in a running Lune window'
+                'set-theme:Switch the active theme at runtime'
+                'reload-config:Reload configuration in a running Lune window'
+                'save-config:Save current settings to the configuration file'
+                'list:List active Lune IPC sockets'
+            )
+            _describe -t commands 'msg subcommand' subcmds
+            ;;
+        args)
+            case "$words[1]" in
+                new-tab)
+                    _arguments \
+                        '--socket=[Target IPC socket path]:socket:_files' \
+                        '(-d --working-directory)'{-d,--working-directory=}'[Start the new tab in DIR]:directory:_files -/' \
+                        '(-T --title)'{-T,--title=}'[Set a custom tab title]:title:' \
+                        '(-e --command)'{-e,--command}'[Run CMD instead of the default shell]:command:_command_names -e' \
+                        '*::command args:_normal'
+                    ;;
+                split)
+                    _arguments \
+                        '--socket=[Target IPC socket path]:socket:_files' \
+                        '--right[Split into side-by-side columns]' \
+                        '--down[Split into stacked rows]' \
+                        '(-d --working-directory)'{-d,--working-directory=}'[Start the split pane in DIR]:directory:_files -/' \
+                        '1:direction:(right down vertical horizontal)'
+                    ;;
+                set-theme)
+                    _arguments \
+                        '--socket=[Target IPC socket path]:socket:_files' \
+                        '1:theme:_lune_themes'
+                    ;;
+                reload-config|save-config|list)
+                    _arguments \
+                        '--socket=[Target IPC socket path]:socket:_files'
+                    ;;
+            esac
+            ;;
+    esac
+}
+
+_lune() {
+    local curcontext="$curcontext" state line
+    typeset -A opt_args
+
+    if [[ "${words[2]:-}" == "msg" ]]; then
+        shift words
+        (( CURRENT-- ))
+        _lune_msg
+        return
+    fi
+
+    _arguments -C \
+        '(-d --working-directory)'{-d,--working-directory=}'[Start the initial session in DIR]:directory:_files -/' \
+        '(-T --title)'{-T,--title=}'[Set the initial window title]:title:' \
+        '--class=[Set the Wayland application ID]:app id:' \
+        '--app-id=[Set the Wayland application ID]:app id:' \
+        '(-c --config)'{-c,--config=}'[Load configuration from PATH]:config file:_files' \
+        '(-e --command)'{-e,--command}'[Run CMD instead of the default shell]:command:_command_names -e' \
+        '(-h --help)'{-h,--help}'[Print help message and exit]' \
+        '(-V --version)'{-V,--version}'[Print version information and exit]' \
+        '1:subcommand:((msg\:"Control a running Lune window"))' \
+        '*::command args:_normal'
+}
+
+_lune "$@"

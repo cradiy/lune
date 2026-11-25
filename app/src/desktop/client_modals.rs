@@ -57,6 +57,7 @@ impl Client {
             mode: self.mode,
             tab_position: self.tab_position,
             window_decorations: self.window_decorations,
+            background_blur: self.background_blur,
             window_controls: self.window_controls,
             command_blocks: self.command_blocks,
             scrollbar: self.scrollbar,
@@ -382,6 +383,10 @@ impl Client {
             PaletteAction::ToggleWindowDecorations => {
                 self.close_palette(true);
                 self.toggle_window_decorations();
+            }
+            PaletteAction::ToggleBackgroundBlur => {
+                self.close_palette(true);
+                self.toggle_background_blur();
             }
             PaletteAction::ToggleWindowControls => {
                 self.close_palette(true);

@@ -19,10 +19,16 @@ scrollbar = auto
 window-padding = 0
 
 # Theme and appearance
-# theme: system | dark | light | <name in themes directory or path>
+# theme: system | dark | light | <built-in preset> | <name in themes directory or path>
+# Built-in presets:
+#   catppuccin-mocha, catppuccin-latte, tokyo-night, tokyo-night-day,
+#   gruvbox-dark, gruvbox-light, nord, dracula,
+#   rose-pine, rose-pine-dawn, kanagawa, one-dark
 theme = system
 # background-opacity: 0.0..=1.0
 background-opacity = 1.0
+# background-blur: true | false (applies when background-opacity < 1.0 and supported by the compositor)
+background-blur = false
 # unfocused-split-opacity: 0.15..=1.0
 unfocused-split-opacity = 0.75
 # minimum-contrast: 1.0 (disabled) ..= 21.0
@@ -84,7 +90,7 @@ notifications = unfocused
 #   zoom_in, zoom_out, zoom_reset,
 #   scroll_oldest, scroll_live, scroll_page_up, scroll_page_down,
 #   toggle_vi, search, hints, command_palette,
-#   toggle_mode, toggle_sidebar, toggle_window_decorations,
+#   toggle_mode, toggle_sidebar, toggle_window_decorations, toggle_background_blur,
 #   previous_prompt, next_prompt, previous_failed_prompt,
 #   copy_last_output, copy_last_command, select_last_output,
 #   toggle_block_bookmark, previous_bookmark, next_bookmark, search_bookmarks,

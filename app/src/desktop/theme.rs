@@ -6,6 +6,7 @@ use winit::window::Theme;
 
 use super::config::parse_settings;
 
+pub(super) mod presets;
 pub(super) mod system;
 
 #[derive(Clone, PartialEq, Eq)]
@@ -28,6 +29,9 @@ pub(super) struct Colors {
 impl Preference {
     pub(super) fn list_available(directory: Option<&Path>) -> Vec<String> {
         let mut names = vec!["system".to_owned(), "dark".to_owned(), "light".to_owned()];
+        for preset in presets::BUILTIN_PRESETS {
+            names.push(preset.name.to_owned());
+        }
         let Some(directory) = directory else {
             return names;
         };
@@ -44,7 +48,7 @@ impl Preference {
                 continue;
             };
             if !stem.is_empty()
-                && !matches!(stem, "system" | "dark" | "light")
+                && !names.iter().any(|existing| existing == stem)
                 && stem
                     .bytes()
                     .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
@@ -72,12 +76,21 @@ impl Preference {
                     .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')) =>
             {
                 let file = format!("{name}.conf");
-                let text =
-                    fs::read_to_string(directory.join("themes").join(&file)).map_err(|error| {
+                let theme_path = directory.join("themes").join(&file);
+                match fs::read_to_string(&theme_path) {
+                    Ok(text) => Ok(Self::parse(name, &file, &text, errors)),
+                    Err(error) => {
+                        if let Some(preset) = presets::find(name) {
+                            return Ok(Self::Custom(
+                                preset.name.to_owned(),
+                                preset.variant,
+                                Box::new(preset.to_colors()),
+                            ));
+                        }
                         log::debug!("Could not read {file}: {error}");
-                        "could not read the selected theme file"
-                    })?;
-                Ok(Self::parse(name, &file, &text, errors))
+                        Err("could not read the selected theme file")
+                    }
+                }
             }
             _ => Err("theme names must contain only letters, digits, hyphens, or underscores"),
         }
@@ -261,5 +274,22 @@ mod tests {
             light.color(PaletteEntry::Indexed(6))
         );
         assert_eq!(palette.graphics_color(251), light.graphics_color(251));
+    }
+
+    #[test]
+    fn builtin_theme_presets_load_and_resolve_variants() {
+        let mut errors = Vec::new();
+        let names = Preference::list_available(None);
+        assert!(names.contains(&"catppuccin-mocha".to_owned()));
+        assert!(names.contains(&"tokyo-night".to_owned()));
+        assert!(names.contains(&"gruvbox-light".to_owned()));
+
+        let mocha = Preference::load(Path::new(""), "catppuccin-mocha", &mut errors).unwrap();
+        assert!(errors.is_empty());
+        assert_eq!(mocha.config_name(), "catppuccin-mocha");
+        assert_eq!(mocha.resolve(Theme::Light), Theme::Dark);
+
+        let latte = Preference::load(Path::new(""), "catppuccin-latte", &mut errors).unwrap();
+        assert_eq!(latte.resolve(Theme::Dark), Theme::Light);
     }
 }

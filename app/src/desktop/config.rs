@@ -116,6 +116,7 @@ pub(super) struct SavedSettings {
     pub(super) mode: TerminalMode,
     pub(super) tab_position: TabPosition,
     pub(super) window_decorations: bool,
+    pub(super) background_blur: bool,
     pub(super) window_controls: WindowControlsPolicy,
     pub(super) command_blocks: bool,
     pub(super) scrollbar: ScrollbarPolicy,
@@ -158,6 +159,11 @@ impl SavedSettings {
                 "window-decorations",
                 self.window_decorations.to_string(),
                 self.window_decorations == defaults.window_decorations,
+            ),
+            (
+                "background-blur",
+                self.background_blur.to_string(),
+                self.background_blur == defaults.background_blur,
             ),
             (
                 "window-controls",
@@ -360,6 +366,7 @@ pub(super) struct Config {
     pub(super) minimum_contrast: f32,
     pub(super) theme: Preference,
     pub(super) background_opacity: f32,
+    pub(super) background_blur: bool,
     pub(super) background_image: Option<PathBuf>,
     pub(super) background_image_opacity: f32,
     pub(super) background_image_fit: BackgroundImageFit,
@@ -404,6 +411,7 @@ impl Default for Config {
             minimum_contrast: MIN_CONTRAST,
             theme: Preference::System,
             background_opacity: 1.0,
+            background_blur: false,
             background_image: None,
             background_image_opacity: DEFAULT_BACKGROUND_IMAGE_OPACITY,
             background_image_fit: BackgroundImageFit::Cover,
@@ -633,6 +641,11 @@ impl Config {
                     .ok()
                     .filter(|value| value.is_finite() && (0.0..=1.0).contains(value))
                     .ok_or("background-opacity must be between 0.0 and 1.0")?;
+            }
+            "background-blur" => {
+                self.background_blur = value
+                    .parse()
+                    .map_err(|_| "background-blur must be true or false")?;
             }
             "background-image-opacity" => {
                 self.background_image_opacity = value
@@ -941,6 +954,7 @@ mod tests {
              background-image-fit = contain\r\nbackground-image-fit = zoom\r\n\
              background-image-position = top-right\r\nbackground-image-position = diagonal\r\n\
              background-opacity = 0.85\r\nbackground-opacity = 1.5\r\nbackground-opacity = NaN\r\n\
+             background-blur = true\r\nbackground-blur = nope\r\n\
              unfocused-split-opacity = 0.6\r\nunfocused-split-opacity = 0.05\r\n\
              window-padding = 12\r\nwindow-padding = 999\r\n\
              scrollback-lines = 50000\r\nscrollback-lines = -1\r\n\
@@ -995,6 +1009,7 @@ mod tests {
         );
         assert_eq!(config.font_size_points, 19.5);
         assert_eq!(config.background_opacity, 0.85);
+        assert!(config.background_blur);
         assert_eq!(config.unfocused_split_opacity, 0.6);
         assert_eq!(config.window_padding, 12);
         assert_eq!(config.scrollback_lines, 50_000);
@@ -1019,10 +1034,10 @@ mod tests {
         assert_eq!(config.clipboard_write, super::ClipboardPolicy::Deny);
         assert_eq!(config.clipboard_read, super::ClipboardPolicy::Allow);
         assert_eq!(config.notifications, super::NotificationPolicy::Always);
-        assert_eq!(loaded.errors.len(), 34);
+        assert_eq!(loaded.errors.len(), 35);
         assert_eq!(
             format_errors(&loaded.errors).as_deref(),
-            Some("Config error: lune.conf:5: mode must be classic or modern (+33 more)")
+            Some("Config error: lune.conf:5: mode must be classic or modern (+34 more)")
         );
     }
 
@@ -1037,6 +1052,7 @@ keybind = ctrl+shift+k=unbind\n\
             mode: super::TerminalMode::Modern,
             tab_position: super::TabPosition::Left,
             window_decorations: false,
+            background_blur: true,
             window_controls: super::WindowControlsPolicy::Auto,
             command_blocks: true,
             scrollbar: super::ScrollbarPolicy::Always,
@@ -1045,13 +1061,14 @@ keybind = ctrl+shift+k=unbind\n\
             theme_name: "dark".into(),
         };
         let (merged, changed) = super::merge_config_text(existing, &settings.entries());
-        assert_eq!(changed, 7);
+        assert_eq!(changed, 8);
         assert!(merged.contains("# User config\n"));
         assert!(merged.contains("keybind = ctrl+shift+k=unbind\n"));
         assert!(merged.contains("# End\n"));
         assert!(merged.contains("mode = modern\n"));
         assert!(merged.contains("tab-position = left\n"));
         assert!(merged.contains("window-decorations = false\n"));
+        assert!(merged.contains("background-blur = true\n"));
         assert!(!merged.contains("window-controls ="));
 
         let reparsed = Config::parse("lune.conf", &merged, Path::new(""));
@@ -1059,6 +1076,7 @@ keybind = ctrl+shift+k=unbind\n\
         assert_eq!(reparsed.config.mode, super::TerminalMode::Modern);
         assert_eq!(reparsed.config.tab_position, super::TabPosition::Left);
         assert!(!reparsed.config.window_decorations);
+        assert!(reparsed.config.background_blur);
         assert_eq!(reparsed.config.scrollbar, super::ScrollbarPolicy::Always);
         assert!(reparsed.config.copy_on_select);
         assert_eq!(reparsed.config.font_size_points, 16.0);

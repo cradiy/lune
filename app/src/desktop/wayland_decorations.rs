@@ -12,6 +12,8 @@
 //! Also parses `org.gnome.desktop.wm.preferences` `button-layout` values
 //! received from `org.freedesktop.portal.Settings`.
 
+use std::env;
+
 use wayland_client::globals::{GlobalListContents, registry_queue_init};
 use wayland_client::protocol::{wl_compositor, wl_registry, wl_surface};
 use wayland_client::{Connection, Dispatch, QueueHandle, WEnum, delegate_noop};
@@ -67,6 +69,35 @@ pub(super) struct CompositorDecorations {
     pub(super) wm_capabilities: Option<WmCapabilities>,
     pub(super) initially_tiled: bool,
     pub(super) has_afar_appmenu: bool,
+}
+
+impl CompositorDecorations {
+    /// Returns `true` on compositors (such as Niri and Hyprland) where
+    /// `xdg-decoration` `ServerSide` mode is frameless and never draws a native
+    /// titlebar. Keeping `ServerSide` mode on these compositors prevents
+    /// switching to `ClientSide` in Modern/frameless modes, which causes
+    /// compositors like Niri to draw an opaque border backdrop behind
+    /// translucent windows (`draw-border-with-background`).
+    pub(super) fn uses_frameless_ssd(&self) -> bool {
+        self.decoration_mode.is_some() && is_frameless_ssd_compositor()
+    }
+}
+
+fn is_frameless_ssd_compositor() -> bool {
+    if env::var_os("NIRI_SOCKET").is_some() || env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some()
+    {
+        return true;
+    }
+    env::var("XDG_CURRENT_DESKTOP")
+        .ok()
+        .is_some_and(|desktop| desktop_list_is_frameless_ssd(&desktop))
+}
+
+fn desktop_list_is_frameless_ssd(desktop: &str) -> bool {
+    desktop.split(':').any(|entry| {
+        let name = entry.trim();
+        name.eq_ignore_ascii_case("niri") || name.eq_ignore_ascii_case("hyprland")
+    })
 }
 
 /// Resolves which inline titlebar window control buttons should be rendered.
@@ -290,8 +321,8 @@ impl Dispatch<zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1, ()> for Pro
 #[cfg(test)]
 mod tests {
     use super::{
-        CompositorDecorations, DecorationMode, WindowButtons, WmCapabilities, parse_button_layout,
-        resolve_window_buttons,
+        CompositorDecorations, DecorationMode, WindowButtons, WmCapabilities,
+        desktop_list_is_frameless_ssd, parse_button_layout, resolve_window_buttons,
     };
     use crate::desktop::config::WindowControlsPolicy;
 
@@ -387,5 +418,14 @@ mod tests {
             resolve_window_buttons(WindowControlsPolicy::Hide, Some(&floating_de), None),
             WindowButtons::NONE
         );
+    }
+
+    #[test]
+    fn identifies_frameless_ssd_desktop_entries() {
+        assert!(desktop_list_is_frameless_ssd("niri"));
+        assert!(desktop_list_is_frameless_ssd("wlroots:Hyprland"));
+        assert!(!desktop_list_is_frameless_ssd("KDE"));
+        assert!(!desktop_list_is_frameless_ssd("sway"));
+        assert!(!desktop_list_is_frameless_ssd(""));
     }
 }

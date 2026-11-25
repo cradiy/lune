@@ -14,7 +14,11 @@ mod session;
 pub use desktop::bench as desktop_bench;
 #[cfg(all(target_os = "linux", feature = "desktop"))]
 pub use desktop::{
-    cli::{CliAction, CliError, HELP_TEXT, LaunchOptions, VERSION_TEXT, parse_env as parse_cli},
+    cli::{
+        CliAction, CliError, HELP_TEXT, LaunchOptions, MsgAction, VERSION_TEXT,
+        parse_env as parse_cli,
+    },
+    ipc::{IpcCommand, list_sockets as list_ipc_sockets, send_command as send_ipc_command},
     run as run_desktop,
 };
 #[cfg(target_os = "linux")]
