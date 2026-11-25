@@ -56,6 +56,7 @@ impl Client {
             keymap: &self.keymap,
             mode: self.mode,
             tab_position: self.tab_position,
+            window_decorations: self.window_decorations,
             window_controls: self.window_controls,
             command_blocks: self.command_blocks,
             scrollbar: self.scrollbar,
@@ -377,6 +378,10 @@ impl Client {
             PaletteAction::SetTabPosition(position) => {
                 self.close_palette(true);
                 self.set_tab_position(position);
+            }
+            PaletteAction::ToggleWindowDecorations => {
+                self.close_palette(true);
+                self.toggle_window_decorations();
             }
             PaletteAction::ToggleWindowControls => {
                 self.close_palette(true);

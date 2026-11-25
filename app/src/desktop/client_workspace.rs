@@ -542,12 +542,30 @@ impl Client {
         }
     }
 
+    pub(super) fn native_decorations_enabled(&self) -> bool {
+        self.mode == TerminalMode::Classic && self.window_decorations
+    }
+
+    pub(super) fn toggle_window_decorations(&mut self) {
+        self.window_decorations = !self.window_decorations;
+        self.window
+            .set_decorations(self.native_decorations_enabled());
+        self.update_cursor_icon();
+        let label = if self.window_decorations {
+            "Window decorations: On"
+        } else {
+            "Window decorations: Off"
+        };
+        self.show_notice(NoticeKind::Success, label.into());
+    }
+
     pub(super) fn set_mode(&mut self, mode: TerminalMode) {
         if self.mode == mode {
             return;
         }
         self.mode = mode;
-        self.window.set_decorations(mode == TerminalMode::Classic);
+        self.window
+            .set_decorations(self.native_decorations_enabled());
         self.titlebar_hovered = None;
         self.titlebar_pressed = None;
         self.tab_drag = None;
@@ -639,7 +657,7 @@ impl Client {
         &self,
         pos: PhysicalPosition<f64>,
     ) -> Option<ResizeDirection> {
-        if self.mode != TerminalMode::Modern
+        if self.native_decorations_enabled()
             || self.window.fullscreen().is_some()
             || self.window.is_maximized()
         {

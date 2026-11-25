@@ -7,6 +7,8 @@
 mode = classic
 # tab-position (modern mode): top | left
 tab-position = top
+# window-decorations (native window decorations in classic mode): true | false | none
+window-decorations = true
 # window-controls: auto | show | hide
 window-controls = auto
 # command-blocks (modern mode OSC 133 gutter and headers): true | false
@@ -82,11 +84,11 @@ notifications = unfocused
 #   zoom_in, zoom_out, zoom_reset,
 #   scroll_oldest, scroll_live, scroll_page_up, scroll_page_down,
 #   toggle_vi, search, hints, command_palette,
-#   toggle_mode, toggle_sidebar,
+#   toggle_mode, toggle_sidebar, toggle_window_decorations,
 #   previous_prompt, next_prompt, previous_failed_prompt,
 #   copy_last_output, copy_last_command, select_last_output,
 #   toggle_block_bookmark, previous_bookmark, next_bookmark, search_bookmarks,
-#   rerun_last_command, reload_config,
+#   rerun_last_command, reload_config, save_config,
 #   new_window, new_tab, close_tab, next_tab, previous_tab,
 #   select_tab_1..select_tab_9, move_tab_left, move_tab_right, rename_tab,
 #   split_right, split_down,

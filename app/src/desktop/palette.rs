@@ -24,6 +24,7 @@ pub(super) enum PaletteAction {
     SetMode(TerminalMode),
     OpenTabPosition,
     SetTabPosition(TabPosition),
+    ToggleWindowDecorations,
     ToggleWindowControls,
     ToggleCommandBlocks,
     ToggleCopyOnSelect,
@@ -72,6 +73,7 @@ pub(super) struct PaletteContext<'a> {
     pub(super) keymap: &'a Keymap,
     pub(super) mode: TerminalMode,
     pub(super) tab_position: TabPosition,
+    pub(super) window_decorations: bool,
     pub(super) window_controls: WindowControlsPolicy,
     pub(super) command_blocks: bool,
     pub(super) scrollbar: ScrollbarPolicy,
@@ -503,6 +505,13 @@ fn build_root_entries(ctx: &PaletteContext<'_>) -> Vec<PaletteEntry> {
             TabPosition::Left => "Left sidebar >",
         },
     ));
+    if ctx.mode == TerminalMode::Classic {
+        entries.push(PaletteEntry::new(
+            PaletteAction::ToggleWindowDecorations,
+            "Window decorations",
+            if ctx.window_decorations { "On" } else { "Off" },
+        ));
+    }
     entries.push(PaletteEntry::new(
         PaletteAction::ToggleWindowControls,
         "Window controls",
@@ -646,6 +655,7 @@ fn build_root_entries(ctx: &PaletteContext<'_>) -> Vec<PaletteEntry> {
             ctx.primary_screen,
         ),
         (Action::ToggleFullscreen, "Toggle fullscreen", true),
+        (Action::SaveConfig, "Save settings to config", true),
         (Action::ReloadConfig, "Reload configuration", true),
     ];
 
@@ -869,6 +879,7 @@ mod tests {
             keymap: &keymap,
             mode: TerminalMode::Classic,
             tab_position: TabPosition::Top,
+            window_decorations: true,
             window_controls: WindowControlsPolicy::Auto,
             command_blocks: true,
             scrollbar: ScrollbarPolicy::Auto,

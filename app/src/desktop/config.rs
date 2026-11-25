@@ -66,6 +66,189 @@ impl ConfigSource {
             Self::File(path) => Some(path.as_path()),
         }
     }
+
+    pub(super) fn target_path(&self) -> Option<PathBuf> {
+        match self {
+            Self::Default => Config::directory().map(|dir| dir.join("lune.conf")),
+            Self::File(path) => Some(path.clone()),
+        }
+    }
+
+    /// Persists runtime settings to the active configuration file atomically,
+    /// preserving existing comments, formatting, and unrelated keys.
+    pub(super) fn save(&self, settings: &SavedSettings) -> std::io::Result<(PathBuf, usize)> {
+        let path = self.target_path().ok_or_else(|| {
+            std::io::Error::new(
+                ErrorKind::NotFound,
+                "could not resolve configuration directory",
+            )
+        })?;
+        let (existing, existed) = match fs::read_to_string(&path) {
+            Ok(text) => (text, true),
+            Err(error) if error.kind() == ErrorKind::NotFound => (String::new(), false),
+            Err(error) => return Err(error),
+        };
+        let entries = settings.entries();
+        let (merged, changed) = merge_config_text(&existing, &entries);
+        if existed && changed == 0 {
+            return Ok((path, 0));
+        }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent)?;
+        }
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("lune.conf");
+        let tmp = path.with_file_name(format!(".{file_name}.tmp.{}", std::process::id()));
+        fs::write(&tmp, merged)?;
+        if let Err(error) = fs::rename(&tmp, &path) {
+            let _ = fs::remove_file(&tmp);
+            return Err(error);
+        }
+        Ok((path, changed))
+    }
+}
+
+pub(super) struct SavedSettings {
+    pub(super) mode: TerminalMode,
+    pub(super) tab_position: TabPosition,
+    pub(super) window_decorations: bool,
+    pub(super) window_controls: WindowControlsPolicy,
+    pub(super) command_blocks: bool,
+    pub(super) scrollbar: ScrollbarPolicy,
+    pub(super) copy_on_select: bool,
+    pub(super) font_size_points: f32,
+    pub(super) theme_name: String,
+}
+
+impl SavedSettings {
+    fn entries(&self) -> Vec<(&'static str, String, bool)> {
+        let defaults = Config::default();
+        let mode_str = match self.mode {
+            TerminalMode::Classic => "classic",
+            TerminalMode::Modern => "modern",
+        };
+        let tab_pos_str = match self.tab_position {
+            TabPosition::Top => "top",
+            TabPosition::Left => "left",
+        };
+        let controls_str = match self.window_controls {
+            WindowControlsPolicy::Auto => "auto",
+            WindowControlsPolicy::Show => "show",
+            WindowControlsPolicy::Hide => "hide",
+        };
+        let scrollbar_str = match self.scrollbar {
+            ScrollbarPolicy::Auto => "auto",
+            ScrollbarPolicy::Always => "always",
+            ScrollbarPolicy::Never => "never",
+        };
+        let font_size_str = format_points(self.font_size_points);
+        let default_font_size = (self.font_size_points - defaults.font_size_points).abs() < 0.01;
+        vec![
+            ("mode", mode_str.to_owned(), self.mode == defaults.mode),
+            (
+                "tab-position",
+                tab_pos_str.to_owned(),
+                self.tab_position == defaults.tab_position,
+            ),
+            (
+                "window-decorations",
+                self.window_decorations.to_string(),
+                self.window_decorations == defaults.window_decorations,
+            ),
+            (
+                "window-controls",
+                controls_str.to_owned(),
+                self.window_controls == defaults.window_controls,
+            ),
+            (
+                "command-blocks",
+                self.command_blocks.to_string(),
+                self.command_blocks == defaults.command_blocks,
+            ),
+            (
+                "scrollbar",
+                scrollbar_str.to_owned(),
+                self.scrollbar == defaults.scrollbar,
+            ),
+            (
+                "copy-on-select",
+                self.copy_on_select.to_string(),
+                self.copy_on_select == defaults.copy_on_select,
+            ),
+            ("font-size", font_size_str, default_font_size),
+            (
+                "theme",
+                self.theme_name.clone(),
+                self.theme_name == defaults.theme.config_name(),
+            ),
+        ]
+    }
+}
+
+fn format_points(points: f32) -> String {
+    let rounded = (points * 10.0).round() / 10.0;
+    if (rounded.fract()).abs() < 0.01 {
+        format!("{}", rounded as i32)
+    } else {
+        format!("{rounded:.1}")
+    }
+}
+
+fn merge_config_text(existing: &str, entries: &[(&str, String, bool)]) -> (String, usize) {
+    let mut lines: Vec<String> = existing
+        .lines()
+        .map(|line| line.strip_suffix('\r').unwrap_or(line).to_owned())
+        .collect();
+
+    // Find the last occurrence of each managed key so duplicate declarations
+    // still resolve to the newly saved value.
+    let mut last_line_for_key: Vec<Option<usize>> = vec![None; entries.len()];
+    for (line_idx, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let Some((raw_key, _)) = trimmed.split_once('=') else {
+            continue;
+        };
+        let key = raw_key.trim();
+        if let Some(entry_idx) = entries.iter().position(|(name, _, _)| *name == key) {
+            last_line_for_key[entry_idx] = Some(line_idx);
+        }
+    }
+
+    let mut changed = 0usize;
+    let mut to_append = Vec::new();
+    for (entry_idx, (key, value, is_default)) in entries.iter().enumerate() {
+        let replacement = format!("{key} = {value}");
+        if let Some(line_idx) = last_line_for_key[entry_idx] {
+            let current_val = lines[line_idx]
+                .split_once('=')
+                .map(|(_, rhs)| rhs.trim())
+                .unwrap_or("");
+            if current_val != value.as_str() {
+                lines[line_idx] = replacement;
+                changed += 1;
+            }
+        } else if !is_default {
+            to_append.push(replacement);
+            changed += 1;
+        }
+    }
+
+    if !to_append.is_empty() {
+        lines.extend(to_append);
+    }
+
+    let mut out = lines.join("\n");
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    (out, changed)
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -159,6 +342,7 @@ pub(super) enum NotificationPolicy {
 pub(super) struct Config {
     pub(super) mode: TerminalMode,
     pub(super) tab_position: TabPosition,
+    pub(super) window_decorations: bool,
     pub(super) window_controls: WindowControlsPolicy,
     pub(super) command_blocks: bool,
     pub(super) scrollbar: ScrollbarPolicy,
@@ -202,6 +386,7 @@ impl Default for Config {
         Self {
             mode: TerminalMode::Classic,
             tab_position: TabPosition::Top,
+            window_decorations: true,
             window_controls: WindowControlsPolicy::Auto,
             command_blocks: true,
             scrollbar: ScrollbarPolicy::Auto,
@@ -373,6 +558,9 @@ impl Config {
             }
             "tab-position" => {
                 self.tab_position = TabPosition::parse(value)?;
+            }
+            "window-decorations" => {
+                self.window_decorations = parse_window_decorations(value)?;
             }
             "window-controls" => {
                 self.window_controls = WindowControlsPolicy::parse(value)?;
@@ -556,6 +744,14 @@ fn resolve_image_path(directory: &Path, value: &str) -> Result<Option<PathBuf>, 
     }
 }
 
+fn parse_window_decorations(value: &str) -> Result<bool, &'static str> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "on" | "yes" | "show" | "auto" => Ok(true),
+        "false" | "off" | "no" | "none" | "hide" => Ok(false),
+        _ => Err("window-decorations must be true or false (or none)"),
+    }
+}
+
 fn parse_font_family(value: &str) -> Result<Option<String>, &'static str> {
     if value.is_empty() || value.chars().any(char::is_control) {
         return Err("font-family must be a font family name");
@@ -728,6 +924,7 @@ mod tests {
             "# Font settings\r\nfont-family = Fixture Mono\r\nfont-size=19.5\r\n\
              mode = modern\r\nmode = futuristic\r\n\
              tab-position = left\r\ntab-position = bottom\r\n\
+             window-decorations = none\r\nwindow-decorations = bogus\r\n\
              window-controls = false\r\nwindow-controls = nope\r\n\
              command-blocks = false\r\ncommand-blocks = maybe\r\n\
              scrollbar = always\r\nscrollbar = maybe\r\n\
@@ -763,6 +960,7 @@ mod tests {
         let config = loaded.config;
         assert_eq!(config.mode, super::TerminalMode::Modern);
         assert_eq!(config.tab_position, super::TabPosition::Left);
+        assert!(!config.window_decorations);
         assert_eq!(config.window_controls, super::WindowControlsPolicy::Hide);
         assert!(!config.command_blocks);
         assert_eq!(config.scrollbar, super::ScrollbarPolicy::Always);
@@ -821,10 +1019,53 @@ mod tests {
         assert_eq!(config.clipboard_write, super::ClipboardPolicy::Deny);
         assert_eq!(config.clipboard_read, super::ClipboardPolicy::Allow);
         assert_eq!(config.notifications, super::NotificationPolicy::Always);
-        assert_eq!(loaded.errors.len(), 33);
+        assert_eq!(loaded.errors.len(), 34);
         assert_eq!(
             format_errors(&loaded.errors).as_deref(),
-            Some("Config error: lune.conf:5: mode must be classic or modern (+32 more)")
+            Some("Config error: lune.conf:5: mode must be classic or modern (+33 more)")
         );
+    }
+
+    #[test]
+    fn merge_and_save_preserves_comments_and_roundtrips_settings() {
+        let existing = "\
+# User config\n\
+mode = classic\n\
+keybind = ctrl+shift+k=unbind\n\
+# End\n";
+        let settings = super::SavedSettings {
+            mode: super::TerminalMode::Modern,
+            tab_position: super::TabPosition::Left,
+            window_decorations: false,
+            window_controls: super::WindowControlsPolicy::Auto,
+            command_blocks: true,
+            scrollbar: super::ScrollbarPolicy::Always,
+            copy_on_select: true,
+            font_size_points: 16.0,
+            theme_name: "dark".into(),
+        };
+        let (merged, changed) = super::merge_config_text(existing, &settings.entries());
+        assert_eq!(changed, 7);
+        assert!(merged.contains("# User config\n"));
+        assert!(merged.contains("keybind = ctrl+shift+k=unbind\n"));
+        assert!(merged.contains("# End\n"));
+        assert!(merged.contains("mode = modern\n"));
+        assert!(merged.contains("tab-position = left\n"));
+        assert!(merged.contains("window-decorations = false\n"));
+        assert!(!merged.contains("window-controls ="));
+
+        let reparsed = Config::parse("lune.conf", &merged, Path::new(""));
+        assert!(reparsed.errors.is_empty(), "{:?}", reparsed.errors);
+        assert_eq!(reparsed.config.mode, super::TerminalMode::Modern);
+        assert_eq!(reparsed.config.tab_position, super::TabPosition::Left);
+        assert!(!reparsed.config.window_decorations);
+        assert_eq!(reparsed.config.scrollbar, super::ScrollbarPolicy::Always);
+        assert!(reparsed.config.copy_on_select);
+        assert_eq!(reparsed.config.font_size_points, 16.0);
+        assert_eq!(reparsed.config.theme.config_name(), "dark");
+
+        // Second merge with identical settings produces zero changes.
+        let (_, second_changed) = super::merge_config_text(&merged, &settings.entries());
+        assert_eq!(second_changed, 0);
     }
 }

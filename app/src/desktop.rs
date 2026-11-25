@@ -135,6 +135,7 @@ enum Event {
     SystemTheme(Theme),
     ButtonLayout(Option<WindowButtons>),
     ConfigReload(bool),
+    ConfigSave,
     AppMenuAction(Action),
 }
 
@@ -255,6 +256,42 @@ impl App {
         log::info!("Reloaded configuration");
     }
 
+    fn save_config(&mut self) {
+        let Some(client) = &mut self.client else {
+            return;
+        };
+        let settings = client.saved_settings();
+        match self.config_source.save(&settings) {
+            Ok((path, changed)) => {
+                client.base_font_size_points = client.font_size_points;
+                if let Ok(loaded) = Config::load_checked(&self.config_source) {
+                    self.config = loaded.config;
+                    self.sync_theme_watch();
+                }
+                let notice = if changed == 0 {
+                    "Configuration already up to date".to_owned()
+                } else {
+                    let name = path
+                        .file_name()
+                        .and_then(|file| file.to_str())
+                        .unwrap_or("lune.conf");
+                    format!("Saved settings to {name}")
+                };
+                if let Some(client) = &mut self.client {
+                    client.show_notice(NoticeKind::Success, notice);
+                }
+                log::info!("Saved configuration to {}", path.display());
+            }
+            Err(error) => {
+                log::warn!("Could not save configuration: {error}");
+                if let Some(client) = &mut self.client {
+                    client
+                        .show_notice(NoticeKind::Error, format!("Could not save config: {error}"));
+                }
+            }
+        }
+    }
+
     fn report(&mut self, event_loop: &ActiveEventLoop, result: Result<()>) {
         if let Err(error) = result {
             self.error = Some(error);
@@ -298,6 +335,10 @@ impl ApplicationHandler<Event> for App {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: Event) {
         if let Event::ConfigReload(force) = event {
             self.reload_config(force);
+            return;
+        }
+        if let Event::ConfigSave = event {
+            self.save_config();
             return;
         }
         if let Event::ButtonLayout(buttons) = event {
@@ -388,7 +429,7 @@ impl ApplicationHandler<Event> for App {
                 client.run_shortcut(event_loop, action);
                 Ok(())
             }
-            Event::ButtonLayout(_) | Event::ConfigReload(_) => unreachable!(),
+            Event::ButtonLayout(_) | Event::ConfigReload(_) | Event::ConfigSave => unreachable!(),
         };
         self.report(event_loop, result);
     }
@@ -463,6 +504,7 @@ struct Client {
     shell_integration: bool,
     mode: TerminalMode,
     tab_position: TabPosition,
+    window_decorations: bool,
     window_controls: WindowControlsPolicy,
     command_blocks: bool,
     compositor_decorations: Option<CompositorDecorations>,
@@ -511,7 +553,9 @@ impl Client {
                     .with_title(&default_title)
                     .with_name(app_id, "")
                     .with_theme(Some(selected_theme))
-                    .with_decorations(config.mode == TerminalMode::Classic)
+                    .with_decorations(
+                        config.mode == TerminalMode::Classic && config.window_decorations,
+                    )
                     .with_transparent(true)
                     .with_inner_size(LogicalSize::new(960, 600))
                     .with_min_inner_size(LogicalSize::new(180, 100)),
@@ -703,6 +747,7 @@ impl Client {
             shell_integration: config.shell_integration,
             mode: config.mode,
             tab_position: config.tab_position,
+            window_decorations: config.window_decorations,
             window_controls: config.window_controls,
             command_blocks: config.command_blocks,
             compositor_decorations,
@@ -738,6 +783,7 @@ impl Client {
         app_menu::MenuState {
             mode: self.mode,
             tab_position: self.tab_position,
+            window_decorations: self.window_decorations,
             sidebar_collapsed: self.sidebar_collapsed,
             fullscreen: self.window.fullscreen().is_some(),
             vi_mode: pane.vi.is_some(),
@@ -764,6 +810,20 @@ impl Client {
 
     pub(super) fn clipboard_handle(&self) -> Option<clipboard::DataDeviceHandle> {
         self.clipboard.as_ref().map(clipboard::DataDevice::handle)
+    }
+
+    fn saved_settings(&self) -> config::SavedSettings {
+        config::SavedSettings {
+            mode: self.mode,
+            tab_position: self.tab_position,
+            window_decorations: self.window_decorations,
+            window_controls: self.window_controls,
+            command_blocks: self.command_blocks,
+            scrollbar: self.scrollbar,
+            copy_on_select: self.copy_on_select,
+            font_size_points: self.font_size_points,
+            theme_name: self.theme_preference.config_name().to_owned(),
+        }
     }
 
     fn pane_config(&self) -> PaneConfig<'_> {
@@ -1816,6 +1876,7 @@ impl Client {
             Action::CommandPalette => self.open_palette(),
             Action::ToggleMode => self.set_mode(self.mode.toggle()),
             Action::ToggleTabSidebar => self.toggle_tab_sidebar(),
+            Action::ToggleWindowDecorations => self.toggle_window_decorations(),
             Action::PreviousPrompt => self.tabs[self.active].focused_pane_mut().jump_prompt(false),
             Action::NextPrompt => self.tabs[self.active].focused_pane_mut().jump_prompt(true),
             Action::PreviousFailedPrompt => {
@@ -1911,6 +1972,9 @@ impl Client {
             Action::ReloadConfig => {
                 let _ = self.proxy.send_event(Event::ConfigReload(true));
             }
+            Action::SaveConfig => {
+                let _ = self.proxy.send_event(Event::ConfigSave);
+            }
             Action::NewWindow => self.spawn_new_window(),
             Action::OpenDirectory => {
                 if !self.directory_open_pending {
@@ -1995,13 +2059,19 @@ impl Client {
         if old.mode != new.mode {
             self.mode = new.mode;
             self.window
-                .set_decorations(self.mode == TerminalMode::Classic);
+                .set_decorations(self.native_decorations_enabled());
             self.titlebar_hovered = None;
             self.titlebar_pressed = None;
             self.tab_drag = None;
             self.sidebar_resize_drag = None;
             self.tab_animator.clear();
             layout_changed = true;
+        }
+        if old.window_decorations != new.window_decorations {
+            self.window_decorations = new.window_decorations;
+            self.window
+                .set_decorations(self.native_decorations_enabled());
+            self.update_cursor_icon();
         }
         if old.tab_position != new.tab_position {
             self.tab_position = new.tab_position;

@@ -92,6 +92,7 @@ impl PresentationTracker {
 pub(super) struct MenuState {
     pub(super) mode: TerminalMode,
     pub(super) tab_position: TabPosition,
+    pub(super) window_decorations: bool,
     pub(super) sidebar_collapsed: bool,
     pub(super) fullscreen: bool,
     pub(super) vi_mode: bool,
@@ -808,6 +809,14 @@ impl MenuModel {
                     keymap,
                 ),
                 MenuNode::item(
+                    312,
+                    "Window Decorations",
+                    Action::ToggleWindowDecorations,
+                    state.mode == TerminalMode::Classic,
+                    Some(state.mode == TerminalMode::Classic && state.window_decorations),
+                    keymap,
+                ),
+                MenuNode::item(
                     306,
                     "Show Tab Sidebar",
                     Action::ToggleTabSidebar,
@@ -980,6 +989,14 @@ impl MenuModel {
                 ),
                 MenuNode::separator(505),
                 MenuNode::item(
+                    511,
+                    "Save Configuration",
+                    Action::SaveConfig,
+                    true,
+                    None,
+                    keymap,
+                ),
+                MenuNode::item(
                     506,
                     "Reload Configuration",
                     Action::ReloadConfig,
@@ -1054,6 +1071,7 @@ mod tests {
         MenuState {
             mode: TerminalMode::Modern,
             tab_position: TabPosition::Left,
+            window_decorations: true,
             sidebar_collapsed: false,
             fullscreen: false,
             vi_mode: false,

@@ -12,7 +12,7 @@ pub(super) mod system;
 pub(super) enum Preference {
     System,
     Fixed(Theme),
-    Custom(Theme, Box<Colors>),
+    Custom(String, Theme, Box<Colors>),
 }
 
 #[derive(Clone, Default, PartialEq, Eq)]
@@ -77,27 +77,36 @@ impl Preference {
                         log::debug!("Could not read {file}: {error}");
                         "could not read the selected theme file"
                     })?;
-                Ok(Self::parse(&file, &text, errors))
+                Ok(Self::parse(name, &file, &text, errors))
             }
             _ => Err("theme names must contain only letters, digits, hyphens, or underscores"),
+        }
+    }
+
+    pub(super) fn config_name(&self) -> &str {
+        match self {
+            Self::System => "system",
+            Self::Fixed(Theme::Dark) => "dark",
+            Self::Fixed(Theme::Light) => "light",
+            Self::Custom(name, _, _) => name.as_str(),
         }
     }
 
     pub(super) fn resolve(&self, system: Theme) -> Theme {
         match self {
             Self::System => system,
-            Self::Fixed(theme) | Self::Custom(theme, _) => *theme,
+            Self::Fixed(theme) | Self::Custom(_, theme, _) => *theme,
         }
     }
 
     pub(super) fn palette(&self, selected: Theme) -> (Palette, ColorScheme) {
         match self {
-            Self::Custom(_, colors) => make_palette(selected, Some(colors)),
+            Self::Custom(_, _, colors) => make_palette(selected, Some(colors)),
             _ => palette(selected),
         }
     }
 
-    fn parse(file: &str, text: &str, errors: &mut Vec<String>) -> Self {
+    fn parse(name: &str, file: &str, text: &str, errors: &mut Vec<String>) -> Self {
         let mut variant = Theme::Dark;
         let mut colors = Colors::default();
         parse_settings(file, text, errors, |key, value| {
@@ -112,7 +121,7 @@ impl Preference {
             }
             Ok(())
         });
-        Self::Custom(variant, Box::new(colors))
+        Self::Custom(name.to_owned(), variant, Box::new(colors))
     }
 }
 
@@ -236,6 +245,7 @@ mod tests {
     fn custom_theme_inherits_the_variant_and_keeps_valid_color_overrides() {
         let mut errors = Vec::new();
         let preference = Preference::parse(
+            "fixture",
             "fixture.conf",
             "# Theme fixture\nbackground = #d0e0f0\ncolor1 = #A123b4\ncolor1 = #+12345\nvariant = light\n",
             &mut errors,
