@@ -46,7 +46,7 @@ impl SavedSearch {
             return None;
         }
         let regex = compile_regex(&self.query, self.case_sensitive, self.regex_mode)?;
-        let (matches, _) = collect_matches(view, columns, &regex);
+        let (matches, _) = collect_matches(view, columns, &regex, None);
         if matches.is_empty() {
             return None;
         }
@@ -99,6 +99,7 @@ pub(super) struct SearchBar {
     pub(super) matches: Vec<SearchMatch>,
     pub(super) current: Option<usize>,
     pub(super) buffer: ScreenBuffer,
+    pub(super) row_scope: Option<Range<usize>>,
     truncated: bool,
 }
 
@@ -110,6 +111,29 @@ impl SearchBar {
         view: ScreenView<'_>,
         columns: usize,
         viewport: Range<usize>,
+    ) -> Self {
+        Self::open_with_scope(saved, buffer, view, columns, viewport, None)
+    }
+
+    /// Opens the unified search bar restricted to `row_scope` (e.g. a single command block).
+    pub(super) fn open_scoped(
+        saved: Option<SavedSearch>,
+        buffer: ScreenBuffer,
+        view: ScreenView<'_>,
+        columns: usize,
+        viewport: Range<usize>,
+        row_scope: Range<usize>,
+    ) -> Self {
+        Self::open_with_scope(saved, buffer, view, columns, viewport, Some(row_scope))
+    }
+
+    fn open_with_scope(
+        saved: Option<SavedSearch>,
+        buffer: ScreenBuffer,
+        view: ScreenView<'_>,
+        columns: usize,
+        viewport: Range<usize>,
+        row_scope: Option<Range<usize>>,
     ) -> Self {
         let saved = saved.unwrap_or_default();
         let mut bar = Self {
@@ -123,6 +147,7 @@ impl SearchBar {
             matches: Vec::new(),
             current: None,
             buffer,
+            row_scope,
             truncated: false,
         };
         bar.recompute(view, columns, viewport);
@@ -149,6 +174,7 @@ impl SearchBar {
             matches: Vec::new(),
             current: None,
             buffer,
+            row_scope: None,
             truncated: false,
         }
     }
@@ -243,7 +269,7 @@ impl SearchBar {
             return;
         };
 
-        let (matches, truncated) = collect_matches(view, columns, &regex);
+        let (matches, truncated) = collect_matches(view, columns, &regex, self.row_scope.as_ref());
         self.matches = matches;
         self.truncated = truncated;
         if self.matches.is_empty() {
@@ -350,12 +376,21 @@ fn collect_matches(
     view: ScreenView<'_>,
     columns: usize,
     regex: &Regex,
+    row_scope: Option<&Range<usize>>,
 ) -> (Vec<SearchMatch>, bool) {
     let mut matches = Vec::new();
     let mut truncated = false;
     let mut line = LogicalText::default();
     for logical in view.logical_lines() {
         let rows = logical.range();
+        if let Some(scope) = row_scope {
+            if rows.end <= scope.start {
+                continue;
+            }
+            if rows.start >= scope.end {
+                break;
+            }
+        }
         line.read(view, rows, columns);
         if line.text.is_empty() {
             continue;

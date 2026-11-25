@@ -39,6 +39,14 @@ use super::{Event, PASTE_TIMEOUT, PaneId, Result, selection, vi};
 
 const INPUT_LIMIT: usize = 1024;
 
+#[derive(Clone, Copy, Debug)]
+pub(super) struct ContextMenuBlockTarget {
+    pub(super) prompt_row: usize,
+    pub(super) has_command: bool,
+    pub(super) has_output: bool,
+    pub(super) bookmarked: bool,
+}
+
 pub(super) struct DispatchContext<'a> {
     pub(super) focused: bool,
     pub(super) copy_pending: &'a mut bool,
@@ -536,16 +544,20 @@ impl Pane {
             .saturating_sub(first_row)
             .min(rows.saturating_sub(1));
         let anchor_y = geometry.row_rect(vis_start, 0..1).map_or(0, |r| r.origin.y);
-        let hovered_action = blocks::BlockToolbarLayout::compute(
-            pane_area,
-            anchor_y,
-            ui_cell,
-            scale,
-            scrollbar_reserve,
-            has_command,
-            has_output,
-        )
-        .and_then(|toolbar| toolbar.hit(local_x, local_y));
+        let hovered_action = if local_x < 0.0 && has_output {
+            Some(BlockAction::SelectOutput)
+        } else {
+            blocks::BlockToolbarLayout::compute(
+                pane_area,
+                anchor_y,
+                ui_cell,
+                scale,
+                scrollbar_reserve,
+                has_command,
+                has_output,
+            )
+            .and_then(|toolbar| toolbar.hit(local_x, local_y))
+        };
         Some(HoveredBlock {
             prompt_row: block.prompt_row,
             hovered_action,
@@ -580,10 +592,59 @@ impl Pane {
             self.invalidate_overlay();
             return None;
         }
+        if action == BlockAction::ToggleBookmark {
+            let bookmarked = self.session.toggle_prompt_bookmark(prompt_row)?;
+            self.invalidate_overlay();
+            return Some(if bookmarked {
+                "Bookmarked command block".to_owned()
+            } else {
+                "Removed bookmark".to_owned()
+            });
+        }
         let view = self.session.screen().view();
         let block = blocks::block_at_row(view, prompt_row)?;
         match action {
-            BlockAction::JumpToPrompt => unreachable!(),
+            BlockAction::JumpToPrompt | BlockAction::ToggleBookmark => unreachable!(),
+            BlockAction::SearchInBlock => {
+                let scope = block.prompt_row..block.end_row;
+                self.open_block_search(scope);
+                None
+            }
+            BlockAction::SelectOutput => {
+                let bounds = blocks::output_selection_range(view, &block)?;
+                let lines = bounds.end.row.saturating_sub(bounds.start.row) + 1;
+                self.selection = Some(selection::Selection::new(
+                    view,
+                    bounds,
+                    selection::SelectionKind::Stream,
+                    None,
+                ));
+                self.selection_click = None;
+                self.selection_drag = None;
+                self.invalidate_overlay();
+                Some(if lines == 1 {
+                    "Selected output (1 line)".to_owned()
+                } else {
+                    format!("Selected output ({lines} lines)")
+                })
+            }
+            BlockAction::CopyFull => {
+                if *copy_pending {
+                    return None;
+                }
+                let text = blocks::extract_block_full(view, &block)?;
+                let notice = format_copied_summary(&text);
+                match clipboard::write(text, self.proxy.clone()) {
+                    Ok(()) => {
+                        *copy_pending = true;
+                        Some(notice)
+                    }
+                    Err(error) => {
+                        log::warn!("Failed to start the clipboard copy worker: {error}");
+                        None
+                    }
+                }
+            }
             BlockAction::CopyCommand => {
                 if *copy_pending {
                     return None;
@@ -638,7 +699,7 @@ impl Pane {
         &self,
         point: PhysicalPosition<f64>,
         command_blocks_enabled: bool,
-    ) -> (Option<String>, Option<(usize, bool, bool)>) {
+    ) -> (Option<String>, Option<ContextMenuBlockTarget>) {
         let mut link_url = None;
         let mut block_info = None;
         let geometry = self.session.geometry();
@@ -690,7 +751,12 @@ impl Pane {
             let has_cmd = blocks::has_command(view, &block);
             let has_out = blocks::has_output(view, &block);
             if has_cmd || has_out {
-                block_info = Some((block.prompt_row, has_cmd, has_out));
+                block_info = Some(ContextMenuBlockTarget {
+                    prompt_row: block.prompt_row,
+                    has_command: has_cmd,
+                    has_output: has_out,
+                    bookmarked: block.bookmarked,
+                });
             }
         }
         (link_url, block_info)
@@ -753,6 +819,93 @@ impl Pane {
         self.push_input(Input::Text(format!("{cmd}\r")));
         let _ = self.flush_input(Instant::now());
         Some(preview)
+    }
+
+    pub(super) fn select_last_output(&mut self) -> Option<String> {
+        let screen = self.session.screen();
+        if screen.active_buffer() != ScreenBuffer::Primary {
+            return None;
+        }
+        let view = screen.view();
+        let first_row = screen.viewport().range().start;
+        let offset = screen.viewport_offset();
+        let prompt_row = blocks::active_target_block(view, first_row, offset)?.prompt_row;
+        let mut dummy = false;
+        self.run_block_action(prompt_row, BlockAction::SelectOutput, &mut dummy)
+    }
+
+    pub(super) fn toggle_active_block_bookmark(&mut self) -> Option<String> {
+        let screen = self.session.screen();
+        if screen.active_buffer() != ScreenBuffer::Primary {
+            return None;
+        }
+        let view = screen.view();
+        let first_row = screen.viewport().range().start;
+        let offset = screen.viewport_offset();
+        let prompt_row = blocks::active_target_block(view, first_row, offset)?.prompt_row;
+        let mut dummy = false;
+        self.run_block_action(prompt_row, BlockAction::ToggleBookmark, &mut dummy)
+    }
+
+    pub(super) fn open_block_search(&mut self, scope: std::ops::Range<usize>) {
+        if self.vi.is_some() {
+            self.toggle_vi();
+        }
+        let columns = usize::from(self.session.geometry().pty_size().columns);
+        let screen = self.session.screen();
+        let buffer = screen.active_buffer();
+        let view = screen.view();
+        let viewport = screen.viewport().range();
+        let bar = search::SearchBar::open_scoped(
+            self.search_saved.take(),
+            buffer,
+            view,
+            columns,
+            viewport,
+            scope,
+        );
+        let target = bar.current_match();
+        self.search = Some(bar);
+        self.hovered_block = None;
+        if let Some(pos) = target {
+            self.reveal_search_row(pos.row);
+        }
+        self.set_ime_allowed();
+        self.update_ime_area();
+        self.invalidate_overlay();
+    }
+
+    pub(super) fn jump_bookmark(&mut self, forward: bool) -> bool {
+        let screen = self.session.screen();
+        if screen.active_buffer() != ScreenBuffer::Primary {
+            return false;
+        }
+        let view = screen.view();
+        let history = view.history_rows();
+        let viewport = screen.viewport();
+        let current_offset = screen.viewport_offset();
+        let target = if forward {
+            if current_offset == 0 {
+                return false;
+            }
+            blocks::next_bookmarked_prompt(view, viewport.range().start)
+        } else {
+            let anchor = if current_offset == 0 {
+                view.rows()
+            } else {
+                viewport.range().start
+            };
+            blocks::previous_bookmarked_prompt(view, anchor)
+        };
+        let Some(row) = target else {
+            return false;
+        };
+        let desired_offset = history.saturating_sub(row);
+        let delta = desired_offset as isize - current_offset as isize;
+        if delta != 0 {
+            self.scroll_history(delta);
+        }
+        true
     }
 
     pub(super) fn jump_previous_failed_prompt(&mut self) -> bool {

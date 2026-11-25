@@ -27,6 +27,11 @@ pub(super) enum Action {
     PreviousFailedPrompt,
     CopyLastOutput,
     CopyLastCommand,
+    SelectLastOutput,
+    ToggleBlockBookmark,
+    PreviousBookmark,
+    NextBookmark,
+    SearchBookmarks,
     RerunLastCommand,
     ReloadConfig,
     NewWindow,
@@ -53,6 +58,11 @@ impl Action {
             | Self::PreviousFailedPrompt
             | Self::CopyLastOutput
             | Self::CopyLastCommand
+            | Self::SelectLastOutput
+            | Self::ToggleBlockBookmark
+            | Self::PreviousBookmark
+            | Self::NextBookmark
+            | Self::SearchBookmarks
             | Self::RerunLastCommand => Context::PrimaryScreen,
             _ => Context::Window,
         }
@@ -66,6 +76,8 @@ impl Action {
                 | Self::PreviousPrompt
                 | Self::NextPrompt
                 | Self::PreviousFailedPrompt
+                | Self::PreviousBookmark
+                | Self::NextBookmark
                 | Self::ResizePane(_)
         )
     }
@@ -390,6 +402,15 @@ const WAYLAND_BINDINGS: &[Binding] = &[
         .repeating(),
     Binding::new(Action::CopyLastOutput, CTRL_SHIFT, letter("g")).primary_screen(),
     Binding::new(Action::CopyLastCommand, CTRL_SHIFT, letter("y")).primary_screen(),
+    Binding::new(Action::SelectLastOutput, CTRL_SHIFT, letter("a")).primary_screen(),
+    Binding::new(Action::ToggleBlockBookmark, CTRL_SHIFT, letter("b")).primary_screen(),
+    Binding::new(Action::PreviousBookmark, CTRL_SHIFT, letter("k"))
+        .primary_screen()
+        .repeating(),
+    Binding::new(Action::NextBookmark, CTRL_SHIFT, letter("j"))
+        .primary_screen()
+        .repeating(),
+    Binding::new(Action::SearchBookmarks, CTRL_ALT_SHIFT, letter("b")).primary_screen(),
     Binding::new(Action::RerunLastCommand, CTRL_SHIFT, letter("r")).primary_screen(),
     Binding::new(Action::ReloadConfig, CTRL_SHIFT, symbol(",")),
     Binding::new(Action::ReloadConfig, CTRL_SHIFT, symbol("<")),
@@ -627,6 +648,11 @@ fn parse_action(name: &str) -> Result<KeybindAction, &'static str> {
         "previous_failed_prompt" => Action::PreviousFailedPrompt,
         "copy_last_output" => Action::CopyLastOutput,
         "copy_last_command" => Action::CopyLastCommand,
+        "select_last_output" => Action::SelectLastOutput,
+        "toggle_block_bookmark" => Action::ToggleBlockBookmark,
+        "previous_bookmark" => Action::PreviousBookmark,
+        "next_bookmark" => Action::NextBookmark,
+        "search_bookmarks" => Action::SearchBookmarks,
         "rerun_last_command" => Action::RerunLastCommand,
         "reload_config" => Action::ReloadConfig,
         "new_window" => Action::NewWindow,

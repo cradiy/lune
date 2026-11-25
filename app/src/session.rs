@@ -432,6 +432,10 @@ impl<T: Read + Write> Session<T> {
         &self.screen
     }
 
+    pub fn toggle_prompt_bookmark(&mut self, chronological_row: usize) -> Option<bool> {
+        self.screen.toggle_prompt_bookmark(chronological_row)
+    }
+
     pub fn geometry(&self) -> GridGeometry {
         self.geometry
     }

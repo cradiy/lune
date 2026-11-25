@@ -11,6 +11,10 @@ use crate::PixelRect;
 pub(super) enum BlockAction {
     CopyCommand,
     CopyOutput,
+    CopyFull,
+    SelectOutput,
+    ToggleBookmark,
+    SearchInBlock,
     Rerun,
     JumpToPrompt,
 }
@@ -36,6 +40,8 @@ pub(super) struct CommandBlock {
     pub(super) exit_code: Option<u8>,
     /// Recorded command runtime in milliseconds.
     pub(super) duration_ms: Option<u32>,
+    /// Whether the user bookmarked this command block.
+    pub(super) bookmarked: bool,
 }
 
 impl CommandBlock {
@@ -49,6 +55,11 @@ impl CommandBlock {
 
     pub(super) fn is_error(&self) -> bool {
         self.exit_code.is_some_and(|code| code != 0)
+    }
+
+    pub(super) fn output_line_count(&self) -> usize {
+        self.output_row
+            .map_or(0, |start| self.end_row.saturating_sub(start))
     }
 }
 
@@ -385,6 +396,36 @@ pub(super) fn previous_failed_prompt(view: ScreenView<'_>, before_row: usize) ->
     None
 }
 
+/// Finds the nearest earlier `OSC 133;A` prompt row that is bookmarked.
+pub(super) fn previous_bookmarked_prompt(view: ScreenView<'_>, before_row: usize) -> Option<usize> {
+    let mut cursor = before_row;
+    while let Some(prompt_row) = view.previous_prompt(cursor) {
+        if view
+            .row(prompt_row)
+            .is_some_and(|r| r.semantic().bookmarked)
+        {
+            return Some(prompt_row);
+        }
+        cursor = prompt_row;
+    }
+    None
+}
+
+/// Finds the nearest later `OSC 133;A` prompt row that is bookmarked.
+pub(super) fn next_bookmarked_prompt(view: ScreenView<'_>, after_row: usize) -> Option<usize> {
+    let mut cursor = after_row;
+    while let Some(prompt_row) = view.next_prompt(cursor) {
+        if view
+            .row(prompt_row)
+            .is_some_and(|r| r.semantic().bookmarked)
+        {
+            return Some(prompt_row);
+        }
+        cursor = prompt_row;
+    }
+    None
+}
+
 /// Resolves the command block targeted by keyboard block actions:
 /// when scrolled into history, prefers the block currently anchored at `first_row`;
 /// otherwise returns the most recent block with command input or output.
@@ -544,6 +585,7 @@ fn build_block(
         input_start_col,
         exit_code: semantic.exit_code,
         duration_ms: semantic.duration_ms,
+        bookmarked: semantic.bookmarked,
     }
 }
 
@@ -642,15 +684,18 @@ pub(super) fn extract_command(view: ScreenView<'_>, block: &CommandBlock) -> Opt
     (!trimmed.is_empty()).then(|| trimmed.to_owned())
 }
 
-/// Extracts the command output text (`OSC 133;C` .. next `OSC 133;A`) for a block.
-pub(super) fn extract_output(view: ScreenView<'_>, block: &CommandBlock) -> Option<String> {
+/// Returns the tight cell selection range covering a block's non-empty output rows.
+pub(super) fn output_selection_range(
+    view: ScreenView<'_>,
+    block: &CommandBlock,
+) -> Option<Range<CellPosition>> {
     let start_row = block.output_row?;
     if block.end_row <= start_row {
         return None;
     }
     let end_row = (block.end_row - 1).min(view.rows().saturating_sub(1));
     let end_col = view.row(end_row)?.cells().len();
-    let bounds = view.selection_bounds(
+    view.selection_bounds(
         CellPosition {
             row: start_row,
             column: 0,
@@ -658,9 +703,26 @@ pub(super) fn extract_output(view: ScreenView<'_>, block: &CommandBlock) -> Opti
             row: end_row,
             column: end_col,
         },
-    )?;
+    )
+}
+
+/// Extracts the command output text (`OSC 133;C` .. next `OSC 133;A`) for a block.
+pub(super) fn extract_output(view: ScreenView<'_>, block: &CommandBlock) -> Option<String> {
+    let bounds = output_selection_range(view, block)?;
     let text = view.selection_text(bounds).ok()?.to_string();
     (!text.trim().is_empty()).then_some(text)
+}
+
+/// Extracts a formatted transcript (`$ <command>\n<output>`) for a command block.
+pub(super) fn extract_block_full(view: ScreenView<'_>, block: &CommandBlock) -> Option<String> {
+    let cmd = extract_command(view, block);
+    let output = extract_output(view, block);
+    match (cmd, output) {
+        (Some(cmd), Some(out)) => Some(format!("$ {cmd}\n{out}")),
+        (Some(cmd), None) => Some(format!("$ {cmd}")),
+        (None, Some(out)) => Some(out),
+        (None, None) => None,
+    }
 }
 
 /// Formats command runtime concisely for the block status pill.
@@ -686,26 +748,40 @@ pub(super) fn format_duration(ms: u32) -> String {
     }
 }
 
-/// Formats a compact status badge (`✓`, `✓ 1.4s`, `✗ 1`, `● Running`) for a command block.
+/// Formats a compact status badge (`✓`, `✓ 1.4s · 42L`, `✗ 1`, `● Running`, `★ ...`) for a command block.
 pub(super) fn format_status_badge(block: &CommandBlock) -> Option<String> {
+    let prefix = if block.bookmarked { "★ " } else { "" };
     if block.is_running() {
-        return Some("● Running".to_owned());
+        return Some(format!("{prefix}● Running"));
     }
-    let code = block.exit_code?;
+    let Some(code) = block.exit_code else {
+        return block.bookmarked.then(|| "★".to_owned());
+    };
+    let lines = block.output_line_count();
+    let line_suffix = if lines >= 10 {
+        format!(" · {lines}L")
+    } else {
+        String::new()
+    };
     if code == 0 {
         if let Some(ms) = block.duration_ms
             && ms >= 10
         {
-            Some(format!("✓ {}", format_duration(ms)))
+            Some(format!("{prefix}✓ {}{line_suffix}", format_duration(ms)))
+        } else if !line_suffix.is_empty() {
+            Some(format!("{prefix}✓{line_suffix}"))
         } else {
-            Some("✓".to_owned())
+            Some(format!("{prefix}✓"))
         }
     } else if let Some(ms) = block.duration_ms
         && ms >= 10
     {
-        Some(format!("✗ {code} · {}", format_duration(ms)))
+        Some(format!(
+            "{prefix}✗ {code} · {}{line_suffix}",
+            format_duration(ms)
+        ))
     } else {
-        Some(format!("✗ {code}"))
+        Some(format!("{prefix}✗ {code}{line_suffix}"))
     }
 }
 
@@ -717,8 +793,9 @@ mod tests {
 
     use super::{
         BlockAction, BlockToolbarLayout, StickyHeaderLayout, active_target_block, block_at_row,
-        blocks_in_viewport, extract_command, extract_output, format_duration, last_command_text,
-        previous_failed_prompt, sticky_block,
+        blocks_in_viewport, extract_block_full, extract_command, extract_output, format_duration,
+        format_status_badge, last_command_text, next_bookmarked_prompt, output_selection_range,
+        previous_bookmarked_prompt, previous_failed_prompt, sticky_block,
     };
 
     fn make_screen() -> Screen {
@@ -861,5 +938,29 @@ mod tests {
             active_target_block(view, 0, 2).unwrap().prompt_row,
             blocks[0].prompt_row
         );
+
+        assert_eq!(
+            extract_block_full(view, &blocks[1]).as_deref(),
+            Some("$ false\nboom\nerr")
+        );
+        let sel = output_selection_range(view, &blocks[1]).unwrap();
+        assert_eq!(sel.start.row, 3);
+        assert_eq!(sel.end.row, 4);
+
+        let mut screen = make_screen();
+        assert_eq!(screen.toggle_prompt_bookmark(0), Some(true));
+        assert_eq!(screen.toggle_prompt_bookmark(2), Some(true));
+        let bookmarked = block_at_row(screen.view(), 2).unwrap();
+        assert!(bookmarked.bookmarked);
+        assert_eq!(format_status_badge(&bookmarked).as_deref(), Some("★ ✗ 1"));
+        assert_eq!(
+            previous_bookmarked_prompt(screen.view(), screen.view().rows()),
+            Some(2)
+        );
+        assert_eq!(previous_bookmarked_prompt(screen.view(), 2), Some(0));
+        assert_eq!(previous_bookmarked_prompt(screen.view(), 0), None);
+        assert_eq!(next_bookmarked_prompt(screen.view(), 0), Some(2));
+        assert_eq!(next_bookmarked_prompt(screen.view(), 2), None);
+        assert_eq!(screen.toggle_prompt_bookmark(2), Some(false));
     }
 }

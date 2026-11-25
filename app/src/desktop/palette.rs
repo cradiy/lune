@@ -30,6 +30,7 @@ pub(super) enum PaletteAction {
     OpenThemes,
     ApplyTheme(String),
     OpenCommands,
+    OpenBookmarks,
     JumpToRow(usize),
     OpenScrollbar,
     SetScrollbar(ScrollbarPolicy),
@@ -353,6 +354,14 @@ pub(super) fn build_tab_position_entries(current: TabPosition) -> (Vec<PaletteEn
 }
 
 pub(super) fn build_command_history_entries(view: ScreenView<'_>) -> Vec<PaletteEntry> {
+    build_prompt_entries(view, false)
+}
+
+pub(super) fn build_bookmarked_command_entries(view: ScreenView<'_>) -> Vec<PaletteEntry> {
+    build_prompt_entries(view, true)
+}
+
+fn build_prompt_entries(view: ScreenView<'_>, only_bookmarked: bool) -> Vec<PaletteEntry> {
     let total = view.rows();
     let mut commands = Vec::new();
     for row_idx in (0..total).rev() {
@@ -360,7 +369,7 @@ pub(super) fn build_command_history_entries(view: ScreenView<'_>) -> Vec<Palette
             continue;
         };
         let semantic = row.semantic();
-        if !semantic.prompt_start {
+        if !semantic.prompt_start || (only_bookmarked && !semantic.bookmarked) {
             continue;
         }
         let block = blocks::block_at_row(view, row_idx);
@@ -431,6 +440,15 @@ fn build_root_entries(ctx: &PaletteContext<'_>) -> Vec<PaletteEntry> {
             "Jump to command in scrollback",
             ">",
         ));
+        let bookmark_hint = ctx
+            .keymap
+            .shortcut_label(Action::SearchBookmarks)
+            .map_or_else(|| ">".to_owned(), |label| format!("{label} >"));
+        entries.push(PaletteEntry::new(
+            PaletteAction::OpenBookmarks,
+            "Bookmarked commands",
+            bookmark_hint,
+        ));
     }
     entries.push(PaletteEntry::new(
         PaletteAction::OpenScrollbar,
@@ -490,6 +508,26 @@ fn build_root_entries(ctx: &PaletteContext<'_>) -> Vec<PaletteEntry> {
         (
             Action::CopyLastOutput,
             "Copy last command output",
+            ctx.primary_screen,
+        ),
+        (
+            Action::SelectLastOutput,
+            "Select last command output",
+            ctx.primary_screen,
+        ),
+        (
+            Action::ToggleBlockBookmark,
+            "Bookmark / unbookmark command block",
+            ctx.primary_screen,
+        ),
+        (
+            Action::PreviousBookmark,
+            "Jump to previous bookmark",
+            ctx.primary_screen,
+        ),
+        (
+            Action::NextBookmark,
+            "Jump to next bookmark",
             ctx.primary_screen,
         ),
         (

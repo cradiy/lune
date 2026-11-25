@@ -349,6 +349,7 @@ impl TextRenderer {
         });
         let green = frame.palette.color(PaletteEntry::Indexed(2));
         let red = frame.palette.color(PaletteEntry::Indexed(1));
+        let gold = frame.palette.color(PaletteEntry::Indexed(3));
         let accent = frame.palette.color(PaletteEntry::Indexed(4));
         let scale_f = overlay.scale.max(1.0);
         let rail_w = (3.0 * scale_f).round().clamp(2.0, 4.0) as u32;
@@ -407,9 +408,10 @@ impl TextRenderer {
                 );
             }
 
-            // Soft backdrop surface behind hovered or failed blocks (never washes out Powerline!).
-            let show_surface =
-                block.is_error() || (hovered && (block.is_finished() || block.is_running()));
+            // Soft backdrop surface behind hovered, failed, or bookmarked blocks (never washes out Powerline!).
+            let show_surface = block.is_error()
+                || block.bookmarked
+                || (hovered && (block.is_finished() || block.is_running()));
             if show_surface
                 && block_h >= 4
                 && let (Some(cw), Some(ch)) = (
@@ -439,6 +441,17 @@ impl TextRenderer {
                     if hovered {
                         self.rounded_rect(surface_rect, r, 1, mix_color(pane_bg, red, 130), 0.55);
                     }
+                } else if block.bookmarked {
+                    self.rounded_rect(
+                        surface_rect,
+                        r,
+                        0,
+                        mix_color(pane_bg, gold, 18),
+                        if hovered { 0.42 } else { 0.24 },
+                    );
+                    if hovered {
+                        self.rounded_rect(surface_rect, r, 1, mix_color(pane_bg, gold, 135), 0.55);
+                    }
                 } else {
                     self.rounded_rect(surface_rect, r, 0, mix_color(pane_bg, pane_fg, 13), 0.54);
                     self.rounded_rect(surface_rect, r, 1, mix_color(pane_bg, accent, 110), 0.42);
@@ -446,23 +459,35 @@ impl TextRenderer {
             }
 
             // Dedicated left gutter status rail (cleanly outside column 0 text!).
-            if block.is_finished() || block.is_running() {
+            let gutter_hovered = overlay.hovered_block.is_some_and(|h| {
+                h.prompt_row == block.prompt_row
+                    && h.hovered_action == Some(blocks::BlockAction::SelectOutput)
+            });
+            if block.is_finished() || block.is_running() || block.bookmarked {
                 let rail_inset_y = (3.0 * scale_f).round() as u32;
                 let rail_h = block_h.saturating_sub(rail_inset_y * 2).max(4);
-                if let (Some(rw), Some(rh)) = (NonZeroU32::new(rail_w), NonZeroU32::new(rail_h)) {
-                    let (rail_color, rail_alpha) = if block.is_error() {
-                        (red, if hovered { 1.0 } else { 0.90 })
+                let draw_w = if gutter_hovered { rail_w + 1 } else { rail_w };
+                let draw_x = if gutter > draw_w {
+                    (gutter - draw_w) / 2
+                } else {
+                    rail_x
+                };
+                if let (Some(rw), Some(rh)) = (NonZeroU32::new(draw_w), NonZeroU32::new(rail_h)) {
+                    let (rail_color, rail_alpha) = if block.bookmarked {
+                        (gold, if hovered || gutter_hovered { 1.0 } else { 0.92 })
+                    } else if block.is_error() {
+                        (red, if hovered || gutter_hovered { 1.0 } else { 0.90 })
                     } else if block.is_running() {
                         (accent, 0.92)
-                    } else if hovered {
-                        (green, 0.95)
+                    } else if hovered || gutter_hovered {
+                        (green, 0.98)
                     } else {
                         (mix_color(pane_bg, green, 145), 0.62)
                     };
                     self.rounded_rect(
                         PixelRect {
                             origin: PixelPosition {
-                                x: rail_x,
+                                x: draw_x,
                                 y: block_top.saturating_add(rail_inset_y),
                             },
                             size: PixelSize {
@@ -470,7 +495,7 @@ impl TextRenderer {
                                 height: rh,
                             },
                         },
-                        rail_w / 2,
+                        draw_w / 2,
                         0,
                         rail_color,
                         rail_alpha,
@@ -1081,6 +1106,7 @@ impl TextRenderer {
         });
         let green = frame.palette.color(PaletteEntry::Indexed(2));
         let red = frame.palette.color(PaletteEntry::Indexed(1));
+        let gold = frame.palette.color(PaletteEntry::Indexed(3));
         let accent = frame.palette.color(PaletteEntry::Indexed(4));
 
         // Sticky Command Header: pinned glass strip when a long block's prompt scrolled off-screen.
@@ -1103,7 +1129,9 @@ impl TextRenderer {
                     .and_then(|h| h.hovered_action);
                 let body_hovered = sticky_hover == Some(blocks::BlockAction::JumpToPrompt);
 
-                let status_color = if sticky.is_error() {
+                let status_color = if sticky.bookmarked {
+                    gold
+                } else if sticky.is_error() {
                     red
                 } else if sticky.is_running() {
                     accent
@@ -1152,7 +1180,13 @@ impl TextRenderer {
                                 height: bh,
                             },
                         };
-                        let (b_fill, b_border, b_fg) = if sticky.is_error() {
+                        let (b_fill, b_border, b_fg) = if sticky.bookmarked {
+                            (
+                                mix_color(bg, gold, 44),
+                                mix_color(bg, gold, 165),
+                                mix_color(fg, gold, 200),
+                            )
+                        } else if sticky.is_error() {
                             (
                                 mix_color(bg, red, 48),
                                 mix_color(bg, red, 165),
@@ -1232,12 +1266,10 @@ impl TextRenderer {
                         self.rounded_rect(button.rect, btn_r, 0, mix_color(bg, accent, 58), 0.92);
                     }
                     let icon = match button.action {
-                        blocks::BlockAction::CopyCommand | blocks::BlockAction::CopyOutput => {
-                            svg::icons::COPY
-                        }
-                        blocks::BlockAction::Rerun | blocks::BlockAction::JumpToPrompt => {
-                            svg::icons::PLAY
-                        }
+                        blocks::BlockAction::CopyCommand
+                        | blocks::BlockAction::CopyOutput
+                        | blocks::BlockAction::CopyFull => svg::icons::COPY,
+                        _ => svg::icons::PLAY,
                     };
                     let icon_color = if btn_hovered {
                         if button.action == blocks::BlockAction::Rerun {
@@ -1333,12 +1365,10 @@ impl TextRenderer {
                             );
                         }
                         let icon = match button.action {
-                            blocks::BlockAction::CopyCommand | blocks::BlockAction::CopyOutput => {
-                                svg::icons::COPY
-                            }
-                            blocks::BlockAction::Rerun | blocks::BlockAction::JumpToPrompt => {
-                                svg::icons::PLAY
-                            }
+                            blocks::BlockAction::CopyCommand
+                            | blocks::BlockAction::CopyOutput
+                            | blocks::BlockAction::CopyFull => svg::icons::COPY,
+                            _ => svg::icons::PLAY,
                         };
                         let icon_color = if btn_hovered {
                             if button.action == blocks::BlockAction::Rerun {
@@ -1447,7 +1477,14 @@ impl TextRenderer {
                         height: bh,
                     },
                 };
-                let (fill, border, text_color, alpha) = if block.is_error() {
+                let (fill, border, text_color, alpha) = if block.bookmarked {
+                    (
+                        mix_color(bg, gold, 44),
+                        mix_color(bg, gold, 165),
+                        mix_color(fg, gold, 200),
+                        0.92,
+                    )
+                } else if block.is_error() {
                     (
                         mix_color(bg, red, 48),
                         mix_color(bg, red, 175),
@@ -1818,6 +1855,51 @@ impl TextRenderer {
                     1.0,
                 );
                 inner_left = inner_left.saturating_add(width.get() + badge_gap);
+            }
+        } else if search.row_scope.is_some() {
+            let scope_label = "Block";
+            let scope_w = self.font.measure_text(self.metrics, scope_label);
+            let scope_pad = (cell_w / 2).max(4);
+            let pill_w = scope_w.saturating_add(scope_pad * 2);
+            if cursor_right.saturating_sub(inner_left) > pill_w + cell_w * 4
+                && let (Some(pw), Some(ph)) = (NonZeroU32::new(pill_w), NonZeroU32::new(cell_h))
+            {
+                let pill_rect = PixelRect {
+                    origin: PixelPosition {
+                        x: inner_left,
+                        y: text_y,
+                    },
+                    size: PixelSize {
+                        width: pw,
+                        height: ph,
+                    },
+                };
+                self.rounded_rect(
+                    pill_rect,
+                    (cell_h / 4).clamp(3, 6),
+                    0,
+                    mix_color(bg, accent, 52),
+                    0.92,
+                );
+                if let Some(tw) = NonZeroU32::new(scope_w.min(ATLAS_SIDE as u32)) {
+                    self.glyph(
+                        PixelRect {
+                            origin: PixelPosition {
+                                x: inner_left + scope_pad,
+                                y: text_y,
+                            },
+                            size: PixelSize {
+                                width: tw,
+                                height: self.metrics.cell.height,
+                            },
+                        },
+                        scope_label,
+                        LABEL_CACHE,
+                        accent,
+                        1.0,
+                    );
+                }
+                inner_left = inner_left.saturating_add(pill_w + badge_gap);
             }
         } else {
             let icon_size = (cell_h * 3 / 4).clamp(10, cell_h);

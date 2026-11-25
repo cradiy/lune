@@ -56,6 +56,7 @@ pub struct SemanticRow {
     pub input_start_col: Option<u16>,
     pub exit_code: Option<u8>,
     pub duration_ms: Option<u32>,
+    pub bookmarked: bool,
 }
 
 /// An owned display row with read-only cell and text access.

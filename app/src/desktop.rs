@@ -1703,6 +1703,58 @@ impl Client {
                     self.show_notice(NoticeKind::Warning, "No command found".into());
                 }
             }
+            Action::SelectLastOutput => {
+                if let Some(text) = self.tabs[self.active]
+                    .focused_pane_mut()
+                    .select_last_output()
+                {
+                    self.show_notice(NoticeKind::Success, text);
+                } else {
+                    self.show_notice(NoticeKind::Warning, "No command output found".into());
+                }
+            }
+            Action::ToggleBlockBookmark => {
+                if let Some(text) = self.tabs[self.active]
+                    .focused_pane_mut()
+                    .toggle_active_block_bookmark()
+                {
+                    self.show_notice(NoticeKind::Success, text);
+                } else {
+                    self.show_notice(NoticeKind::Warning, "No command block found".into());
+                }
+            }
+            Action::PreviousBookmark => {
+                if !self.tabs[self.active]
+                    .focused_pane_mut()
+                    .jump_bookmark(false)
+                {
+                    self.show_notice(NoticeKind::Warning, "No earlier bookmark found".into());
+                }
+            }
+            Action::NextBookmark => {
+                if !self.tabs[self.active]
+                    .focused_pane_mut()
+                    .jump_bookmark(true)
+                {
+                    self.show_notice(NoticeKind::Warning, "No later bookmark found".into());
+                }
+            }
+            Action::SearchBookmarks => {
+                let entries = {
+                    let screen = self.tabs[self.active].focused_pane().session.screen();
+                    palette::build_bookmarked_command_entries(screen.view())
+                };
+                if entries.is_empty() {
+                    self.show_notice(NoticeKind::Warning, "No bookmarked commands in pane".into());
+                } else {
+                    self.open_palette();
+                    if let Some(cmd_palette) = &mut self.command_palette {
+                        cmd_palette.push_submenu("Bookmarks", entries, 0);
+                    }
+                    self.painter.invalidate_overlay();
+                    self.window.request_redraw();
+                }
+            }
             Action::RerunLastCommand => {
                 if let Some(text) = self.tabs[self.active]
                     .focused_pane_mut()
@@ -2545,6 +2597,22 @@ impl Client {
                 self.painter.invalidate_overlay();
                 self.window.request_redraw();
             }
+            PaletteAction::OpenBookmarks => {
+                let entries = {
+                    let screen = self.tabs[self.active].focused_pane().session.screen();
+                    palette::build_bookmarked_command_entries(screen.view())
+                };
+                if entries.is_empty() {
+                    self.close_palette(true);
+                    self.show_notice(NoticeKind::Warning, "No bookmarked commands in pane".into());
+                    return;
+                }
+                if let Some(cmd_palette) = &mut self.command_palette {
+                    cmd_palette.push_submenu("Bookmarks", entries, 0);
+                }
+                self.painter.invalidate_overlay();
+                self.window.request_redraw();
+            }
             PaletteAction::JumpToRow(row) => {
                 self.close_palette(true);
                 self.tabs[self.active].focused_pane_mut().jump_to_row(row);
@@ -2682,7 +2750,11 @@ impl Client {
             entries.push(MenuEntry::item(MenuAction::CopyLink(uri), "Copy Link", ""));
             entries.push(MenuEntry::Separator);
         }
-        if let Some((prompt_row, has_cmd, has_out)) = block_info {
+        if let Some(target) = block_info {
+            let prompt_row = target.prompt_row;
+            let has_cmd = target.has_command;
+            let has_out = target.has_output;
+            let bookmarked = target.bookmarked;
             if has_cmd {
                 entries.push(MenuEntry::item(
                     MenuAction::BlockAction {
@@ -2704,7 +2776,49 @@ impl Client {
                     "Copy Output",
                     "",
                 ));
+                entries.push(MenuEntry::item(
+                    MenuAction::BlockAction {
+                        pane_id,
+                        prompt_row,
+                        action: BlockAction::SelectOutput,
+                    },
+                    "Select Output",
+                    "",
+                ));
             }
+            if has_cmd && has_out {
+                entries.push(MenuEntry::item(
+                    MenuAction::BlockAction {
+                        pane_id,
+                        prompt_row,
+                        action: BlockAction::CopyFull,
+                    },
+                    "Copy Command & Output",
+                    "",
+                ));
+            }
+            entries.push(MenuEntry::item(
+                MenuAction::BlockAction {
+                    pane_id,
+                    prompt_row,
+                    action: BlockAction::SearchInBlock,
+                },
+                "Search in Block",
+                "",
+            ));
+            entries.push(MenuEntry::item(
+                MenuAction::BlockAction {
+                    pane_id,
+                    prompt_row,
+                    action: BlockAction::ToggleBookmark,
+                },
+                if bookmarked {
+                    "Remove Bookmark"
+                } else {
+                    "Bookmark Block"
+                },
+                "",
+            ));
             if has_cmd {
                 entries.push(MenuEntry::item(
                     MenuAction::BlockAction {

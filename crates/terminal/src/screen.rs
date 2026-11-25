@@ -1725,6 +1725,7 @@ impl Screen {
                     semantic.input_start_col = None;
                     semantic.exit_code = None;
                     semantic.duration_ms = None;
+                    semantic.bookmarked = false;
                     row.invalidate_revision();
                 }
             }
@@ -1778,6 +1779,28 @@ impl Screen {
                 }
             }
         }
+    }
+
+    /// Toggles the user bookmark flag on an `OSC 133;A` prompt row identified by
+    /// chronological `ScreenView` row index. Returns the new bookmark state if
+    /// `chronological_row` refers to a valid primary-screen prompt boundary.
+    pub fn toggle_prompt_bookmark(&mut self, chronological_row: usize) -> Option<bool> {
+        if self.active_buffer() != ScreenBuffer::Primary {
+            return None;
+        }
+        let history_len = self.history.len();
+        let row = if chronological_row < history_len {
+            self.history.row_mut(chronological_row)?
+        } else {
+            self.grid.row_mut(chronological_row - history_len).ok()?
+        };
+        if !row.semantic().prompt_start {
+            return None;
+        }
+        let next = !row.semantic().bookmarked;
+        row.semantic_mut().bookmarked = next;
+        row.invalidate_revision();
+        Some(next)
     }
 
     /// Scrolls the entire active region upward, discarding rows at its top and
