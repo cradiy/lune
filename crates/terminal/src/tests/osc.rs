@@ -980,7 +980,10 @@ fn osc133_tracks_prompts_exit_codes_across_history_and_reflow() {
     assert_eq!(view.next_prompt(7), None);
 
     assert_eq!(view.row(0).unwrap().semantic().exit_code, Some(0));
+    assert_eq!(view.row(0).unwrap().semantic().input_start_col, Some(2));
+    assert!(view.row(0).unwrap().semantic().duration_ms.is_some());
     assert_eq!(view.row(3).unwrap().semantic().exit_code, Some(1));
+    assert_eq!(view.row(3).unwrap().semantic().input_start_col, Some(2));
     assert_eq!(view.row(7).unwrap().semantic().exit_code, None);
 
     let output_range = view.last_command_output().unwrap();

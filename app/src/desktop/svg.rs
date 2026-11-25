@@ -21,6 +21,7 @@ pub(super) mod icons {
     pub(in crate::desktop) const TERMINAL: &str = include_str!("icons/terminal.svg");
     pub(in crate::desktop) const SIDEBAR: &str = include_str!("icons/sidebar.svg");
     pub(in crate::desktop) const COPY: &str = include_str!("icons/copy.svg");
+    pub(in crate::desktop) const PLAY: &str = include_str!("icons/play.svg");
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -214,6 +215,7 @@ mod tests {
             icons::TERMINAL,
             icons::SIDEBAR,
             icons::COPY,
+            icons::PLAY,
         ] {
             let raster = cache.rasterize(svg, 24, 24, SvgMode::Mask).unwrap();
             assert!(raster.rgba.as_chunks::<4>().0.iter().any(|px| px[3] > 0));

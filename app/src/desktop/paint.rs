@@ -18,6 +18,7 @@ use crate::{
 };
 
 use super::bg_image::{BackgroundImageConfig, BackgroundImageRenderer};
+use super::blocks;
 use super::confirm;
 use super::cursor::CursorMotion;
 use super::font::{Font, FontConfig, FontMetrics};
@@ -46,12 +47,16 @@ pub(super) struct PaneOverlay<'a> {
     pub(super) hints: Option<&'a HintMode>,
     pub(super) zoomed: bool,
     pub(super) scrollbar: Option<ScrollbarView>,
+    pub(super) command_blocks: bool,
+    pub(super) hovered_block: Option<blocks::HoveredBlock>,
+    pub(super) scale: f64,
     pub(super) dim_alpha: f32,
 }
 
 pub(super) struct PaneDraw<'a> {
     pub(super) id: PaneId,
     pub(super) rect: PixelRect,
+    pub(super) text_origin: PixelPosition,
     pub(super) frame: PresentationFrame<'a>,
     pub(super) selection: Option<&'a Selection>,
     pub(super) hovered_link: Option<&'a HoveredLink>,
@@ -63,6 +68,8 @@ pub(super) struct PaneDraw<'a> {
     pub(super) focused: bool,
     pub(super) zoomed: bool,
     pub(super) scrollbar: Option<ScrollbarView>,
+    pub(super) command_blocks: bool,
+    pub(super) hovered_block: Option<blocks::HoveredBlock>,
     pub(super) dim_alpha: f32,
 }
 
@@ -110,6 +117,7 @@ pub(super) struct Painter {
     trackers: Vec<(PaneId, PresentationTracker)>,
     background_image: BackgroundImageRenderer,
     text: TextRenderer,
+    pane_bg_ranges: Vec<(PaneId, Range<u32>)>,
     pane_ranges: Vec<(PaneId, Range<u32>)>,
     chrome_range: Range<u32>,
     titlebar_range: Range<u32>,
@@ -212,6 +220,7 @@ impl Painter {
             trackers: Vec::new(),
             background_image,
             text,
+            pane_bg_ranges: Vec::new(),
             pane_ranges: Vec::new(),
             chrome_range: 0..0,
             titlebar_range: 0..0,
@@ -512,8 +521,8 @@ impl Painter {
         let content_height = self.config.height.saturating_sub(bar_height);
         for pane in panes {
             let area = pane.frame.geometry.text_area_pixels().unwrap();
-            if pane.rect.origin.x + area.width.get() > self.config.width
-                || pane.rect.origin.y + area.height.get() > content_height
+            if pane.text_origin.x + area.width.get() > self.config.width
+                || pane.text_origin.y + area.height.get() > content_height
             {
                 return Ok(());
             }
@@ -644,6 +653,7 @@ impl Painter {
 
         if text_changed {
             self.text.begin_frame();
+            self.pane_bg_ranges.clear();
             self.pane_ranges.clear();
             for (index, pane) in panes.iter().enumerate() {
                 let cursor = updates[index].1;
@@ -659,8 +669,18 @@ impl Painter {
                     hints: pane.hints,
                     zoomed: pane.zoomed,
                     scrollbar: pane.scrollbar,
+                    command_blocks: pane.command_blocks,
+                    hovered_block: pane.hovered_block,
+                    scale: chrome.scale,
                     dim_alpha: pane.dim_alpha,
                 };
+                let bg_range = self.text.prepare_pane_blocks_bg(
+                    pane.rect,
+                    pane.text_origin,
+                    &pane.frame,
+                    &overlay,
+                );
+                self.pane_bg_ranges.push((pane.id, bg_range));
                 let range = self.text.prepare_pane(
                     &pane.frame,
                     cursor.filter(|_| !pane_moving),
@@ -828,9 +848,19 @@ impl Painter {
                 let Some(gpu) = self.gpus.get(&pane.id) else {
                     continue;
                 };
+                let bg_range = self.pane_bg_ranges[index].1.clone();
+                if !bg_range.is_empty() {
+                    let bx = pane.rect.origin.x;
+                    let by = pane.rect.origin.y;
+                    let bw = pane.rect.size.width.get();
+                    let bh = pane.rect.size.height.get();
+                    pass.set_viewport(bx as f32, by as f32, bw as f32, bh as f32, 0.0, 1.0);
+                    pass.set_scissor_rect(bx, by, bw, bh);
+                    self.text.draw_range(&mut pass, bg_range, false);
+                }
                 let range = self.pane_ranges[index].1.clone();
                 let area = pane.frame.geometry.text_area_pixels().unwrap();
-                let (x, y) = (pane.rect.origin.x, pane.rect.origin.y);
+                let (x, y) = (pane.text_origin.x, pane.text_origin.y);
                 let (width, height) = (area.width.get(), area.height.get());
                 let is_moving = draw_moving_cursor && focused_index == Some(index);
                 pass.set_viewport(x as f32, y as f32, width as f32, height as f32, 0.0, 1.0);

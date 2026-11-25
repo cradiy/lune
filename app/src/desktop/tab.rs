@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::io;
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -19,6 +20,7 @@ use winit::window::{UserAttentionType, Window};
 
 use crate::{GridGeometry, MAX_INPUT_BYTES, PixelRect, Session, SessionReady, WaitOutcome};
 
+use super::blocks::{self, BlockAction, HoveredBlock};
 use super::clipboard::{self, ClipboardType};
 use super::config::{ClipboardPolicy, NotificationPolicy};
 use super::confirm;
@@ -120,14 +122,24 @@ impl Tab {
         area: PixelRect,
         divider: u32,
         cell: PixelSize,
+        gutter: u32,
         tab_active: bool,
     ) {
         let zoomed = self.zoomed.filter(|_| self.panes.len() > 1);
         self.layout = self.tree.layout(area, divider, zoomed);
         for pane in &mut self.panes {
             if let Some(rect) = self.layout.rect_of(pane.id) {
-                pane.origin = rect.origin;
-                if let Some(grid) = GridGeometry::fit(rect.size, cell) {
+                let inset = gutter.min(rect.size.width.get().saturating_sub(cell.width.get()));
+                pane.origin = PixelPosition {
+                    x: rect.origin.x.saturating_add(inset),
+                    y: rect.origin.y,
+                };
+                let text_size = PixelSize {
+                    width: NonZeroU32::new(rect.size.width.get().saturating_sub(inset))
+                        .unwrap_or(cell.width),
+                    height: rect.size.height,
+                };
+                if let Some(grid) = GridGeometry::fit(text_size, cell) {
                     pane.target_grid = grid;
                 }
                 pane.visible = tab_active;
@@ -171,6 +183,7 @@ pub(super) struct Pane {
     pub(super) selection: Option<selection::Selection>,
     pub(super) scrollbar_drag: Option<f64>,
     pub(super) scrollbar_hovered: bool,
+    pub(super) hovered_block: Option<HoveredBlock>,
     pub(super) hovered_link: Option<HoveredLink>,
     hyperlink_click: Option<HyperlinkId>,
     pub(super) vi: Option<vi::Mode>,
@@ -265,6 +278,7 @@ impl Pane {
             selection: None,
             scrollbar_drag: None,
             scrollbar_hovered: false,
+            hovered_block: None,
             hovered_link: None,
             hyperlink_click: None,
             vi: None,
@@ -424,6 +438,174 @@ impl Pane {
         }
         self.update_scrollbar_hover(scrollbar_policy);
         self.update_hovered_hyperlink();
+    }
+
+    pub(super) fn update_hovered_block(
+        &mut self,
+        enabled: bool,
+        ui_cell: PixelSize,
+        scrollbar_policy: ScrollbarPolicy,
+    ) {
+        let active_hover = enabled
+            && self.visible
+            && self.vi.is_none()
+            && self.search.is_none()
+            && self.hints.is_none()
+            && self.selection_drag.is_none()
+            && self.scrollbar_drag.is_none()
+            && !self.scrollbar_hovered
+            && !self.mouse_reporting()
+            && self.session.screen().active_buffer() == ScreenBuffer::Primary;
+
+        let next = if active_hover {
+            self.block_hover_at_pointer(ui_cell, scrollbar_policy)
+        } else {
+            None
+        };
+        if self.hovered_block != next {
+            self.hovered_block = next;
+            self.invalidate_overlay();
+        }
+    }
+
+    fn block_hover_at_pointer(
+        &self,
+        ui_cell: PixelSize,
+        scrollbar_policy: ScrollbarPolicy,
+    ) -> Option<HoveredBlock> {
+        let pos = self.pointer?;
+        let geometry = self.session.geometry();
+        let pane_area = geometry.text_area_pixels()?;
+        let scale = self.window.scale_factor();
+        let gutter_allow = (16.0 * scale.max(1.0)).round();
+        let local_x = pos.x - f64::from(self.origin.x);
+        let local_y = pos.y - f64::from(self.origin.y);
+        if local_x < -gutter_allow
+            || local_y < 0.0
+            || local_x >= f64::from(pane_area.width.get())
+            || local_y >= f64::from(pane_area.height.get())
+        {
+            return None;
+        }
+        let pixel = PixelPosition {
+            x: local_x.max(0.0) as u32,
+            y: local_y as u32,
+        };
+        let cell = geometry.cell_at(pixel)?;
+        let screen = self.session.screen();
+        let first_row = screen.viewport().range().start;
+        let rows = usize::from(geometry.pty_size().rows);
+        let view = screen.view();
+        let block = blocks::block_at_row(view, first_row + cell.row)?;
+        let has_command = blocks::extract_command(view, &block).is_some();
+        let has_output = blocks::extract_output(view, &block).is_some();
+        if !has_command && !has_output {
+            return None;
+        }
+        let scrollbar_reserve = self
+            .scrollbar_view(scale, scrollbar_policy)
+            .map_or(0, |sb| sb.track.size.width.get() + 6);
+        let vis_start = block
+            .prompt_row
+            .saturating_sub(first_row)
+            .min(rows.saturating_sub(1));
+        let anchor_y = geometry.row_rect(vis_start, 0..1).map_or(0, |r| r.origin.y);
+        let hovered_action = blocks::BlockToolbarLayout::compute(
+            pane_area,
+            anchor_y,
+            ui_cell,
+            scale,
+            scrollbar_reserve,
+            has_command,
+            has_output,
+        )
+        .and_then(|toolbar| toolbar.hit(local_x, local_y));
+        Some(HoveredBlock {
+            prompt_row: block.prompt_row,
+            hovered_action,
+        })
+    }
+
+    pub(super) fn trigger_hovered_block_action(
+        &mut self,
+        copy_pending: &mut bool,
+    ) -> Option<String> {
+        let HoveredBlock {
+            prompt_row,
+            hovered_action: Some(action),
+        } = self.hovered_block?
+        else {
+            return None;
+        };
+        let view = self.session.screen().view();
+        let block = blocks::block_at_row(view, prompt_row)?;
+        match action {
+            BlockAction::CopyCommand => {
+                if *copy_pending {
+                    return None;
+                }
+                let cmd = blocks::extract_command(view, &block)?;
+                let notice = format_copied_preview(&cmd);
+                match clipboard::write(cmd, self.proxy.clone()) {
+                    Ok(()) => {
+                        *copy_pending = true;
+                        Some(notice)
+                    }
+                    Err(error) => {
+                        log::warn!("Failed to start the clipboard copy worker: {error}");
+                        None
+                    }
+                }
+            }
+            BlockAction::CopyOutput => {
+                if *copy_pending {
+                    return None;
+                }
+                let output = blocks::extract_output(view, &block)?;
+                let notice = format_copied_summary(&output);
+                match clipboard::write(output, self.proxy.clone()) {
+                    Ok(()) => {
+                        *copy_pending = true;
+                        Some(notice)
+                    }
+                    Err(error) => {
+                        log::warn!("Failed to start the clipboard copy worker: {error}");
+                        None
+                    }
+                }
+            }
+            BlockAction::Rerun => {
+                let cmd = blocks::extract_command(view, &block)?;
+                let preview = if cmd.chars().count() > 36 {
+                    let short: String = cmd.chars().take(36).collect();
+                    format!("Re-running: {short}...")
+                } else {
+                    format!("Re-running: {cmd}")
+                };
+                self.follow_output();
+                self.push_input(Input::Text(format!("{cmd}\r")));
+                let _ = self.flush_input(Instant::now());
+                Some(preview)
+            }
+        }
+    }
+
+    pub(super) fn copy_last_command(&self, copy_pending: &mut bool) -> Option<String> {
+        if *copy_pending {
+            return None;
+        }
+        let cmd = blocks::last_command_text(self.session.screen().view())?;
+        let notice = format_copied_preview(&cmd);
+        match clipboard::write(cmd, self.proxy.clone()) {
+            Ok(()) => {
+                *copy_pending = true;
+                Some(notice)
+            }
+            Err(error) => {
+                log::warn!("Failed to start the clipboard copy worker: {error}");
+                None
+            }
+        }
     }
 
     pub(super) fn update_hovered_hyperlink(&mut self) {

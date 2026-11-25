@@ -2,6 +2,7 @@ use std::{
     num::NonZeroU32,
     ops::Range,
     sync::{Arc, Weak},
+    time::Instant,
 };
 
 use lune_kitty_graphics::{
@@ -98,6 +99,7 @@ pub struct Screen {
     sized_budget: Option<Arc<SizedBudget>>,
     // The physical cursor stays in the last column with automatic wrapping off.
     sized_right_edge: Option<Weak<SizedBlock>>,
+    command_started: Option<Instant>,
 }
 
 #[derive(Debug)]
@@ -370,6 +372,7 @@ impl Screen {
             reverse_video: false,
             sized_budget: None,
             sized_right_edge: None,
+            command_started: None,
         })
     }
 
@@ -601,6 +604,7 @@ impl Screen {
         self.insert_mode = false;
         self.cursor_appearance = CursorAppearance::default();
         self.reverse_video = false;
+        self.command_started = None;
         self.update_history_capture();
     }
 
@@ -1713,20 +1717,27 @@ impl Screen {
         use crate::{PromptZone, SemanticPrompt};
         match event {
             SemanticPrompt::PromptStart => {
+                self.command_started = None;
                 if let Ok(row) = self.grid.row_mut(self.cursor.row) {
                     let semantic = row.semantic_mut();
                     semantic.zone = PromptZone::Prompt;
                     semantic.prompt_start = true;
+                    semantic.input_start_col = None;
                     semantic.exit_code = None;
+                    semantic.duration_ms = None;
                     row.invalidate_revision();
                 }
             }
             SemanticPrompt::InputStart => {
+                let col = self.cursor.column.min(u16::MAX as usize) as u16;
                 if let Ok(row) = self.grid.row_mut(self.cursor.row) {
-                    row.semantic_mut().zone = PromptZone::Input;
+                    let semantic = row.semantic_mut();
+                    semantic.zone = PromptZone::Input;
+                    semantic.input_start_col = Some(col);
                 }
             }
             SemanticPrompt::OutputStart => {
+                self.command_started = Some(Instant::now());
                 if let Ok(row) = self.grid.row_mut(self.cursor.row) {
                     let semantic = row.semantic_mut();
                     semantic.zone = PromptZone::Output;
@@ -1734,6 +1745,10 @@ impl Screen {
                 }
             }
             SemanticPrompt::CommandEnd(code) => {
+                let duration_ms = self
+                    .command_started
+                    .take()
+                    .map(|started| started.elapsed().as_millis().min(u32::MAX as u128) as u32);
                 let Some(code) = code else {
                     return;
                 };
@@ -1741,7 +1756,9 @@ impl Screen {
                     if let Ok(row) = self.grid.row_mut(index)
                         && row.semantic().prompt_start
                     {
-                        row.semantic_mut().exit_code = Some(code);
+                        let semantic = row.semantic_mut();
+                        semantic.exit_code = Some(code);
+                        semantic.duration_ms = duration_ms;
                         row.invalidate_revision();
                         return;
                     }
@@ -1751,7 +1768,9 @@ impl Screen {
                         if let Some(row) = self.history.row_mut(index)
                             && row.semantic().prompt_start
                         {
-                            row.semantic_mut().exit_code = Some(code);
+                            let semantic = row.semantic_mut();
+                            semantic.exit_code = Some(code);
+                            semantic.duration_ms = duration_ms;
                             row.invalidate_revision();
                             return;
                         }

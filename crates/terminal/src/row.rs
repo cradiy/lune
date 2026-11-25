@@ -53,7 +53,9 @@ pub struct SemanticRow {
     pub zone: PromptZone,
     pub prompt_start: bool,
     pub output_start: bool,
+    pub input_start_col: Option<u16>,
     pub exit_code: Option<u8>,
+    pub duration_ms: Option<u32>,
 }
 
 /// An owned display row with read-only cell and text access.

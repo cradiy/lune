@@ -11,6 +11,7 @@ use lune_terminal::{
 use crate::gpu::{create_quad_pipeline, linear_colors, write_instances};
 use crate::{PixelRect, PresentationFrame, PresentationStyle, PresentedCursor};
 
+use super::blocks;
 use super::box_drawing;
 use super::confirm;
 use super::contrast;
@@ -290,6 +291,199 @@ impl TextRenderer {
         self.instances.clear();
     }
 
+    /// Prepares the Modern-mode command block backdrop and dedicated left gutter rail
+    /// in full pane coordinates, rendered behind terminal cell backgrounds and glyphs.
+    pub(super) fn prepare_pane_blocks_bg(
+        &mut self,
+        pane_rect: PixelRect,
+        text_origin: PixelPosition,
+        frame: &PresentationFrame<'_>,
+        overlay: &PaneOverlay<'_>,
+    ) -> Range<u32> {
+        let start = self.instances.len() as u32;
+        if !overlay.command_blocks {
+            return start..start;
+        }
+        let first_row = frame.viewport.range().start;
+        let rows = usize::from(frame.geometry.pty_size().rows);
+        let blocks =
+            blocks::blocks_in_viewport(frame.viewport.source(), first_row..first_row + rows);
+        if blocks.is_empty() {
+            return start..start;
+        }
+
+        let prev_area = std::mem::replace(&mut self.area, pane_rect.size);
+        let gutter = text_origin.x.saturating_sub(pane_rect.origin.x);
+        let pane_w = pane_rect.size.width.get();
+        let pane_bg = frame.palette.color(if frame.reverse_video {
+            PaletteEntry::Foreground
+        } else {
+            PaletteEntry::Background
+        });
+        let pane_fg = frame.palette.color(if frame.reverse_video {
+            PaletteEntry::Background
+        } else {
+            PaletteEntry::Foreground
+        });
+        let green = frame.palette.color(PaletteEntry::Indexed(2));
+        let red = frame.palette.color(PaletteEntry::Indexed(1));
+        let accent = frame.palette.color(PaletteEntry::Indexed(4));
+        let scale_f = overlay.scale.max(1.0);
+        let rail_w = (3.0 * scale_f).round().clamp(2.0, 4.0) as u32;
+        let card_radius = (8.0 * scale_f).round().clamp(6.0, 11.0) as u32;
+        let scrollbar_reserve = overlay
+            .scrollbar
+            .map_or(0, |sb| sb.track.size.width.get() + 6);
+        let rail_x = if gutter > rail_w {
+            (gutter - rail_w) / 2
+        } else {
+            1
+        };
+        let card_x = (rail_x / 2).max(1);
+        let card_w = pane_w.saturating_sub(scrollbar_reserve.saturating_add(card_x + 4));
+
+        for block in &blocks {
+            let hovered = overlay
+                .hovered_block
+                .is_some_and(|h| h.prompt_row == block.prompt_row);
+            let vis_start = block.prompt_row.saturating_sub(first_row);
+            let vis_end = block.end_row.saturating_sub(first_row).min(rows);
+            if vis_start >= vis_end || card_w < rail_w * 4 {
+                continue;
+            }
+            let (Some(top_r), Some(bot_r)) = (
+                frame.geometry.row_rect(vis_start, 0..1),
+                frame.geometry.row_rect(vis_end - 1, 0..1),
+            ) else {
+                continue;
+            };
+            let block_top = top_r.origin.y;
+            let block_bottom = bot_r.origin.y.saturating_add(bot_r.size.height.get());
+            let block_h = block_bottom.saturating_sub(block_top);
+
+            // Whisper-clean top divider between blocks (drawn behind Powerline & glyphs).
+            if block.prompt_row > 0
+                && block.prompt_row >= first_row
+                && let Some(dw) = NonZeroU32::new(
+                    pane_w
+                        .saturating_sub(gutter.saturating_add(scrollbar_reserve).saturating_add(8)),
+                )
+            {
+                self.rect(
+                    PixelRect {
+                        origin: PixelPosition {
+                            x: gutter,
+                            y: block_top,
+                        },
+                        size: PixelSize {
+                            width: dw,
+                            height: NonZeroU32::new(1).unwrap(),
+                        },
+                    },
+                    mix_color(pane_bg, pane_fg, 36),
+                    0.35,
+                );
+            }
+
+            // Soft backdrop surface behind hovered or failed blocks (never washes out Powerline!).
+            let show_surface =
+                block.is_error() || (hovered && (block.is_finished() || block.is_running()));
+            if show_surface
+                && block_h >= 4
+                && let (Some(cw), Some(ch)) = (
+                    NonZeroU32::new(card_w),
+                    NonZeroU32::new(block_h.saturating_sub(2)),
+                )
+            {
+                let surface_rect = PixelRect {
+                    origin: PixelPosition {
+                        x: card_x,
+                        y: block_top.saturating_add(1),
+                    },
+                    size: PixelSize {
+                        width: cw,
+                        height: ch,
+                    },
+                };
+                let r = card_radius.min(ch.get() / 2);
+                if block.is_error() {
+                    self.rounded_rect(
+                        surface_rect,
+                        r,
+                        0,
+                        mix_color(pane_bg, red, 20),
+                        if hovered { 0.42 } else { 0.26 },
+                    );
+                    if hovered {
+                        self.rounded_rect(surface_rect, r, 1, mix_color(pane_bg, red, 130), 0.55);
+                    }
+                } else {
+                    self.rounded_rect(surface_rect, r, 0, mix_color(pane_bg, pane_fg, 13), 0.54);
+                    self.rounded_rect(surface_rect, r, 1, mix_color(pane_bg, accent, 110), 0.42);
+                }
+            }
+
+            // Dedicated left gutter status rail (cleanly outside column 0 text!).
+            if block.is_finished() || block.is_running() {
+                let rail_inset_y = (3.0 * scale_f).round() as u32;
+                let rail_h = block_h.saturating_sub(rail_inset_y * 2).max(4);
+                if let (Some(rw), Some(rh)) = (NonZeroU32::new(rail_w), NonZeroU32::new(rail_h)) {
+                    let (rail_color, rail_alpha) = if block.is_error() {
+                        (red, if hovered { 1.0 } else { 0.90 })
+                    } else if block.is_running() {
+                        (accent, 0.92)
+                    } else if hovered {
+                        (green, 0.95)
+                    } else {
+                        (mix_color(pane_bg, green, 145), 0.62)
+                    };
+                    self.rounded_rect(
+                        PixelRect {
+                            origin: PixelPosition {
+                                x: rail_x,
+                                y: block_top.saturating_add(rail_inset_y),
+                            },
+                            size: PixelSize {
+                                width: rw,
+                                height: rh,
+                            },
+                        },
+                        rail_w / 2,
+                        0,
+                        rail_color,
+                        rail_alpha,
+                    );
+                }
+            } else if block.prompt_row >= first_row {
+                // Active idle prompt: sleek subtle accent pill in the left gutter.
+                let row_h = top_r.size.height.get();
+                let pill_h = (row_h.saturating_mul(55) / 100).max(6);
+                let pill_y = block_top + row_h.saturating_sub(pill_h) / 2;
+                if let (Some(rw), Some(rh)) = (NonZeroU32::new(rail_w), NonZeroU32::new(pill_h)) {
+                    self.rounded_rect(
+                        PixelRect {
+                            origin: PixelPosition {
+                                x: rail_x,
+                                y: pill_y,
+                            },
+                            size: PixelSize {
+                                width: rw,
+                                height: rh,
+                            },
+                        },
+                        rail_w / 2,
+                        0,
+                        accent,
+                        0.78,
+                    );
+                }
+            }
+        }
+
+        self.area = prev_area;
+        start..self.instances.len() as u32
+    }
+
     pub(super) fn prepare_pane(
         &mut self,
         frame: &PresentationFrame<'_>,
@@ -307,6 +501,9 @@ impl TextRenderer {
             hints,
             zoomed,
             scrollbar,
+            command_blocks,
+            hovered_block,
+            scale,
             dim_alpha,
         } = *overlay;
         let hovered_hyperlink = match hovered_link {
@@ -349,9 +546,16 @@ impl TextRenderer {
                 .sized_text_at(pos.column)
                 .map(|part| (cursor, part))
         });
+        let primary_blocks = if command_blocks {
+            let rows = usize::from(frame.geometry.pty_size().rows);
+            blocks::blocks_in_viewport(frame.viewport.source(), first_row..first_row + rows)
+        } else {
+            Vec::new()
+        };
         for (row, source) in frame.viewport.iter_rows().enumerate() {
             let semantic = source.semantic();
-            if semantic.prompt_start
+            if !command_blocks
+                && semantic.prompt_start
                 && semantic.exit_code.is_some_and(|code| code != 0)
                 && let Some(mut rect) = frame.geometry.row_rect(row, 0..1)
             {
@@ -501,20 +705,14 @@ impl TextRenderer {
                             .row_rect(row, unit.column..unit.column + unit.cell.width())
                         {
                             if let Some(icon) = icon_character(unit) {
-                                let next = unit.column + 1;
-                                let can_extend = next < visible_end
-                                    && cursor_column != Some(unit.column)
-                                    && cursor_column != Some(next)
-                                    && source.sized_text_at(next).is_none()
-                                    && source.cells().get(next).is_some_and(|cell| {
-                                        (cell.is_erased()
-                                            || (cell.character() == Some(' ')
-                                                && !cell.has_extended_text()))
-                                            && frame.resolve_style(cell.style()).is_some_and(
-                                                |next| next.background == style.background,
-                                            )
-                                    });
-                                self.icon(rect, icon, style.style, color, alpha, can_extend);
+                                let can_extend = icon_can_extend(
+                                    frame,
+                                    source,
+                                    visible_end,
+                                    unit.column,
+                                    style.background,
+                                );
+                                self.icon(rect, icon, style.style, color, alpha, can_extend, None);
                             } else {
                                 self.unit(rect, unit, style.style, color, alpha);
                             }
@@ -693,11 +891,101 @@ impl TextRenderer {
             self.rect(paint.rect, paint.color, 1.0);
             if let Some(glyph) = paint.glyph {
                 if let Some(icon) = icon_character(glyph.unit) {
-                    self.icon(paint.rect, icon, glyph.style, glyph.color, 1.0, false);
+                    let can_extend = frame
+                        .viewport
+                        .row(cursor.position.row)
+                        .zip(frame.resolve_style(glyph.unit.cell.style()))
+                        .is_some_and(|(source, style)| {
+                            let visible_end = source
+                                .wrap_end()
+                                .unwrap_or(source.cells().len())
+                                .min(columns);
+                            icon_can_extend(
+                                frame,
+                                source,
+                                visible_end,
+                                glyph.unit.column,
+                                style.background,
+                            )
+                        });
+                    self.icon(
+                        paint.rect,
+                        icon,
+                        glyph.style,
+                        glyph.color,
+                        1.0,
+                        can_extend,
+                        Some(0..paint.rect.size.width.get()),
+                    );
                 } else {
                     self.unit(paint.rect, glyph.unit, glyph.style, glyph.color, 1.0);
                 }
+            } else if cursor.appearance.shape == CursorShape::Block
+                && cursor.position.column > 0
+                && let Some(source) = frame.viewport.row(cursor.position.row)
+            {
+                let prev_col = cursor.position.column - 1;
+                let visible_end = source
+                    .wrap_end()
+                    .unwrap_or(source.cells().len())
+                    .min(columns);
+                if let Some(prev_cell) = source.cells().get(prev_col).copied()
+                    && !prev_cell.is_erased()
+                    && !prev_cell.is_continuation()
+                    && !prev_cell.has_extended_text()
+                    && let Some(ch) = prev_cell.character()
+                    && let Some(icon) = icon_character(DisplayUnit {
+                        column: prev_col,
+                        cell: prev_cell,
+                        text: CellText::Scalar(ch),
+                    })
+                    && let Some(prev_style) = frame.resolve_style(prev_cell.style())
+                    && !prev_style.style.hidden
+                    && icon_can_extend(frame, source, visible_end, prev_col, prev_style.background)
+                    && let Some(prev_rect) = frame
+                        .geometry
+                        .row_rect(cursor.position.row, prev_col..prev_col + 1)
+                {
+                    let cell_w = prev_rect.size.width.get();
+                    let slice_end = cell_w.saturating_add(paint.rect.size.width.get());
+                    let overflow_fg = if prev_style.background != paint.color {
+                        prev_style.background
+                    } else if prev_style.foreground != paint.color {
+                        prev_style.foreground
+                    } else if luminance(paint.color) >= 128 {
+                        Rgb {
+                            red: 0,
+                            green: 0,
+                            blue: 0,
+                        }
+                    } else {
+                        Rgb {
+                            red: 255,
+                            green: 255,
+                            blue: 255,
+                        }
+                    };
+                    self.icon(
+                        prev_rect,
+                        icon,
+                        prev_style.style,
+                        overflow_fg,
+                        1.0,
+                        true,
+                        Some(cell_w..slice_end),
+                    );
+                }
             }
+        }
+        if !primary_blocks.is_empty() && search.is_none() && vi.is_none() && hints.is_none() {
+            let scrollbar_reserve = scrollbar.map_or(0, |sb| sb.track.size.width.get() + 6);
+            self.command_block_overlays(
+                frame,
+                &primary_blocks,
+                hovered_block,
+                scrollbar_reserve,
+                scale,
+            );
         }
         if let Some(hints) = hints {
             self.hints_overlay(frame, hints);
@@ -746,6 +1034,244 @@ impl TextRenderer {
             );
         }
         Ok(instance_start..self.instances.len() as u32)
+    }
+
+    fn command_block_overlays(
+        &mut self,
+        frame: &PresentationFrame<'_>,
+        blocks: &[blocks::CommandBlock],
+        hovered_block: Option<blocks::HoveredBlock>,
+        scrollbar_reserve: u32,
+        scale: f64,
+    ) {
+        let source = frame.viewport.source();
+        let first_row = frame.viewport.range().start;
+        let rows = usize::from(frame.geometry.pty_size().rows);
+        let ui_metrics = self.chrome_metrics;
+        let ui_cell_h = ui_metrics.cell.height.get();
+        let scale_f = scale.max(1.0);
+        let floor = |logical: f64| (logical * scale_f).round().max(1.0) as u32;
+
+        let bg = frame.palette.color(if frame.reverse_video {
+            PaletteEntry::Foreground
+        } else {
+            PaletteEntry::Background
+        });
+        let fg = frame.palette.color(if frame.reverse_video {
+            PaletteEntry::Background
+        } else {
+            PaletteEntry::Foreground
+        });
+        let green = frame.palette.color(PaletteEntry::Indexed(2));
+        let red = frame.palette.color(PaletteEntry::Indexed(1));
+        let accent = frame.palette.color(PaletteEntry::Indexed(4));
+
+        for block in blocks {
+            let is_hovered = hovered_block.is_some_and(|h| h.prompt_row == block.prompt_row);
+            if is_hovered {
+                let has_command = blocks::extract_command(source, block).is_some();
+                let has_output = blocks::extract_output(source, block).is_some();
+                let vis_start = block.prompt_row.saturating_sub(first_row).min(rows - 1);
+                let anchor_y = frame
+                    .geometry
+                    .row_rect(vis_start, 0..1)
+                    .map_or(0, |r| r.origin.y);
+                if let Some(toolbar) = blocks::BlockToolbarLayout::compute(
+                    self.area,
+                    anchor_y,
+                    ui_metrics.cell,
+                    scale,
+                    scrollbar_reserve,
+                    has_command,
+                    has_output,
+                ) {
+                    let pill_fill = mix_color(bg, fg, 26);
+                    let pill_border = mix_color(bg, accent, 140);
+                    self.floating_card(
+                        toolbar.pill,
+                        toolbar.radius,
+                        bg,
+                        pill_fill,
+                        pill_border,
+                        0.97,
+                    );
+
+                    let hovered_action = hovered_block.and_then(|h| h.hovered_action);
+                    let icon_size = (ui_cell_h.saturating_mul(7) / 10).max(floor(11.0));
+                    let icon_gap = (ui_metrics.cell.width.get() / 2).max(floor(4.0));
+                    let btn_pad_x = (ui_metrics.cell.width.get() * 3 / 4).max(floor(6.0));
+                    let idle_label = mix_color(bg, fg, 210);
+
+                    for button in &toolbar.buttons {
+                        let btn_hovered = hovered_action == Some(button.action);
+                        let btn_h = button.rect.size.height.get();
+                        let btn_r = (btn_h / 3).clamp(floor(4.0), btn_h / 2);
+                        if btn_hovered {
+                            self.rounded_rect(
+                                button.rect,
+                                btn_r,
+                                0,
+                                mix_color(bg, accent, 58),
+                                0.92,
+                            );
+                        }
+                        let icon = match button.action {
+                            blocks::BlockAction::CopyCommand | blocks::BlockAction::CopyOutput => {
+                                svg::icons::COPY
+                            }
+                            blocks::BlockAction::Rerun => svg::icons::PLAY,
+                        };
+                        let icon_color = if btn_hovered {
+                            if button.action == blocks::BlockAction::Rerun {
+                                green
+                            } else {
+                                accent
+                            }
+                        } else if button.action == blocks::BlockAction::Rerun {
+                            mix_color(bg, green, 200)
+                        } else {
+                            mix_color(bg, accent, 200)
+                        };
+                        let ix = button.rect.origin.x + btn_pad_x;
+                        let iy = button.rect.origin.y + btn_h.saturating_sub(icon_size) / 2;
+                        self.svg_mask(
+                            PixelPosition { x: ix, y: iy },
+                            icon_size,
+                            icon,
+                            icon_color,
+                            0.98,
+                        );
+                        let lx = ix + icon_size + icon_gap;
+                        let ly = button.rect.origin.y + btn_h.saturating_sub(ui_cell_h) / 2;
+                        let avail = button
+                            .rect
+                            .origin
+                            .x
+                            .saturating_add(button.rect.size.width.get())
+                            .saturating_sub(lx + btn_pad_x / 2);
+                        if avail > 0 {
+                            self.clamped_chrome_text(
+                                PixelPosition { x: lx, y: ly },
+                                avail,
+                                button.label,
+                                if btn_hovered { fg } else { idle_label },
+                            );
+                        }
+                    }
+                    continue;
+                }
+            }
+
+            // Compact right-aligned status pill on finished/running visible prompt rows.
+            if (!block.is_finished() && !block.is_running()) || block.prompt_row < first_row {
+                continue;
+            }
+            let vis_row = block.prompt_row - first_row;
+            if vis_row >= rows {
+                continue;
+            }
+            let Some(badge) = blocks::format_status_badge(block) else {
+                continue;
+            };
+            let Some(row_rect) = frame.geometry.row_rect(vis_row, 0..1) else {
+                continue;
+            };
+            let text_w = self.font.measure_text(ui_metrics, &badge);
+            let pad_x = (ui_metrics.cell.width.get() * 3 / 4).max(floor(7.0));
+            let badge_w = text_w.saturating_add(pad_x * 2);
+            let badge_h = ui_cell_h
+                .saturating_add(floor(2.0))
+                .min(row_rect.size.height.get());
+            let margin = floor(10.0);
+            let right_edge = self
+                .area
+                .width
+                .get()
+                .saturating_sub(scrollbar_reserve.saturating_add(margin));
+            if right_edge <= badge_w + margin {
+                continue;
+            }
+            let badge_x = right_edge - badge_w;
+
+            // Avoid overlapping prompt/command text on the right side of the prompt row.
+            let text_end_x = source
+                .row(block.prompt_row)
+                .and_then(|row| {
+                    let end = row.wrap_end().unwrap_or(row.cells().len());
+                    source.selection_bounds(
+                        CellPosition {
+                            row: block.prompt_row,
+                            column: 0,
+                        }..CellPosition {
+                            row: block.prompt_row,
+                            column: end,
+                        },
+                    )
+                })
+                .filter(|bounds| bounds.end.column > 0)
+                .and_then(|bounds| frame.geometry.row_rect(vis_row, 0..bounds.end.column))
+                .map_or(0, |r| r.origin.x.saturating_add(r.size.width.get()));
+            if text_end_x.saturating_add(margin) > badge_x {
+                continue;
+            }
+
+            let badge_y =
+                row_rect.origin.y + row_rect.size.height.get().saturating_sub(badge_h) / 2;
+            if let (Some(bw), Some(bh)) = (NonZeroU32::new(badge_w), NonZeroU32::new(badge_h)) {
+                let badge_rect = PixelRect {
+                    origin: PixelPosition {
+                        x: badge_x,
+                        y: badge_y,
+                    },
+                    size: PixelSize {
+                        width: bw,
+                        height: bh,
+                    },
+                };
+                let (fill, border, text_color, alpha) = if block.is_error() {
+                    (
+                        mix_color(bg, red, 48),
+                        mix_color(bg, red, 175),
+                        mix_color(fg, red, 200),
+                        0.92,
+                    )
+                } else if block.is_running() {
+                    (
+                        mix_color(bg, accent, 38),
+                        mix_color(bg, accent, 150),
+                        mix_color(fg, accent, 195),
+                        0.90,
+                    )
+                } else {
+                    (
+                        mix_color(bg, green, 32),
+                        mix_color(bg, green, 125),
+                        mix_color(fg, green, 190),
+                        0.86,
+                    )
+                };
+                self.rounded_rect(badge_rect, bh.get() / 2, 0, fill, alpha);
+                self.rounded_rect(badge_rect, bh.get() / 2, 1, border, 0.72);
+                if let Some(tw) = NonZeroU32::new(text_w.min(ATLAS_SIDE as u32)) {
+                    self.glyph(
+                        PixelRect {
+                            origin: PixelPosition {
+                                x: badge_x + pad_x,
+                                y: badge_y + bh.get().saturating_sub(ui_cell_h) / 2,
+                            },
+                            size: PixelSize {
+                                width: tw,
+                                height: ui_metrics.cell.height,
+                            },
+                        },
+                        &badge,
+                        CHROME_LABEL_CACHE,
+                        text_color,
+                        0.96,
+                    );
+                }
+            }
+        }
     }
 
     fn ime_preedit(
@@ -3535,6 +4061,7 @@ impl TextRenderer {
         true
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn icon(
         &mut self,
         mut rect: PixelRect,
@@ -3543,6 +4070,7 @@ impl TextRenderer {
         color: Rgb,
         alpha: f32,
         can_extend: bool,
+        slice: Option<Range<u32>>,
     ) {
         let mut bytes = [0; 4];
         let text = icon.encode_utf8(&mut bytes);
@@ -3576,19 +4104,25 @@ impl TextRenderer {
         let scale = draw_width as f32 / width as f32;
         let draw_height = (height as f32 * scale).round().max(1.0) as u32;
         let top = (self.metrics.baseline as f32 * (1.0 - scale)).round() as u32;
+        let (slice_start, slice_end) = match slice {
+            Some(range) => (range.start.min(draw_width), range.end.min(draw_width)),
+            None => (0, draw_width),
+        };
+        let Some(visible_width) = NonZeroU32::new(slice_end.saturating_sub(slice_start)) else {
+            return;
+        };
+        let inv_draw = width as f32 / draw_width as f32;
+        let uv_x = native.min.x as f32 + slice_start as f32 * inv_draw;
+        let uv_w = visible_width.get() as f32 * inv_draw;
+        rect.origin.x += slice_start;
         rect.origin.y += top.min(height - draw_height);
-        rect.size.width = NonZeroU32::new(draw_width).unwrap();
+        rect.size.width = visible_width;
         rect.size.height = NonZeroU32::new(draw_height).unwrap();
         self.quad(
             rect,
             color,
             alpha,
-            [
-                native.min.x as f32,
-                native.min.y as f32,
-                width as f32,
-                height as f32,
-            ],
+            [uv_x, native.min.y as f32, uv_w, height as f32],
             [if sprite.colored { 2 } else { 1 }, sprite.layer as u32],
         );
     }
@@ -3955,6 +4489,24 @@ impl TextRenderer {
         self.instances
             .push(Quad::new(self.area, rect, color, alpha, uv, sprite));
     }
+}
+
+fn icon_can_extend(
+    frame: &PresentationFrame<'_>,
+    source: &lune_terminal::Row,
+    visible_end: usize,
+    column: usize,
+    background: Rgb,
+) -> bool {
+    let next = column + 1;
+    next < visible_end
+        && source.sized_text_at(next).is_none()
+        && source.cells().get(next).is_some_and(|cell| {
+            (cell.is_erased() || (cell.character() == Some(' ') && !cell.has_extended_text()))
+                && frame
+                    .resolve_style(cell.style())
+                    .is_some_and(|next| next.background == background)
+        })
 }
 
 fn icon_character(unit: DisplayUnit<'_>) -> Option<char> {

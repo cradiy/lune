@@ -1,4 +1,5 @@
 mod bg_image;
+mod blocks;
 mod box_drawing;
 pub mod cli;
 mod clipboard;
@@ -405,6 +406,7 @@ struct Client {
     mode: TerminalMode,
     tab_position: TabPosition,
     window_controls: WindowControlsPolicy,
+    command_blocks: bool,
     compositor_decorations: Option<CompositorDecorations>,
     portal_buttons: Option<WindowButtons>,
     scrollbar: ScrollbarPolicy,
@@ -503,7 +505,25 @@ impl Client {
             painter.metrics().cell,
         )
         .ok_or_else(|| io::Error::other("The terminal grid does not fit the Wayland window"))?;
-        let grid = GridGeometry::fit(content_area.size, painter.metrics().cell)
+        let initial_gutter = if config.mode == TerminalMode::Modern && config.command_blocks {
+            (14.0 * scale.max(1.0)).round() as u32
+        } else {
+            0
+        };
+        let cell = painter.metrics().cell;
+        let initial_inset = initial_gutter.min(
+            content_area
+                .size
+                .width
+                .get()
+                .saturating_sub(cell.width.get()),
+        );
+        let initial_text_size = PixelSize {
+            width: NonZeroU32::new(content_area.size.width.get().saturating_sub(initial_inset))
+                .unwrap_or(cell.width),
+            height: content_area.size.height,
+        };
+        let grid = GridGeometry::fit(initial_text_size, cell)
             .ok_or_else(|| io::Error::other("The terminal grid does not fit the Wayland window"))?;
         let (palette, scheme) = config.theme.palette(selected_theme);
         let history_limits = config.history_limits();
@@ -526,7 +546,10 @@ impl Client {
         )?;
         let readiness = Readiness::new(proxy.clone())?;
         readiness.arm(pane.id, &mut pane.registration, pane.session.interests())?;
-        pane.origin = content_area.origin;
+        pane.origin = PixelPosition {
+            x: content_area.origin.x.saturating_add(initial_inset),
+            y: content_area.origin.y,
+        };
         pane.visible = true;
         pane.active = true;
         let tab = Tab::new(pane, content_area);
@@ -617,6 +640,7 @@ impl Client {
             mode: config.mode,
             tab_position: config.tab_position,
             window_controls: config.window_controls,
+            command_blocks: config.command_blocks,
             compositor_decorations,
             portal_buttons,
             scrollbar: config.scrollbar,
@@ -920,6 +944,8 @@ impl Client {
                     self.window.request_redraw();
                 }
                 let scrollbar = self.scrollbar;
+                let blocks_enabled = self.command_blocks_enabled();
+                let ui_cell = self.painter.chrome_metrics().cell;
                 let tab = &mut self.tabs[self.active];
                 let captured = tab
                     .panes
@@ -933,6 +959,7 @@ impl Client {
                 if let Some(id) = captured {
                     if let Some(pane) = tab.pane_mut(id) {
                         pane.pointer_moved(position, scrollbar);
+                        pane.update_hovered_block(false, ui_cell, scrollbar);
                     }
                 } else {
                     let hovered_id = (!self.bar.contains(position)
@@ -943,10 +970,12 @@ impl Client {
                         if Some(pane.id) == hovered_id {
                             pane.modifiers = self.modifiers;
                             pane.pointer_moved(position, scrollbar);
-                        } else if pane.pointer.is_some() {
+                            pane.update_hovered_block(blocks_enabled, ui_cell, scrollbar);
+                        } else if pane.pointer.is_some() || pane.hovered_block.is_some() {
                             pane.pointer = None;
                             pane.update_scrollbar_hover(scrollbar);
                             pane.update_hovered_hyperlink();
+                            pane.update_hovered_block(false, ui_cell, scrollbar);
                         }
                     }
                 }
@@ -971,6 +1000,7 @@ impl Client {
                     self.window.request_redraw();
                 }
                 let scrollbar = self.scrollbar;
+                let ui_cell = self.painter.chrome_metrics().cell;
                 for pane in &mut self.tabs[self.active].panes {
                     if pane.pressed.is_none()
                         && pane.selection_drag.is_none()
@@ -980,6 +1010,7 @@ impl Client {
                     }
                     pane.update_scrollbar_hover(scrollbar);
                     pane.update_hovered_hyperlink();
+                    pane.update_hovered_block(false, ui_cell, scrollbar);
                 }
                 self.update_cursor_icon();
             }
@@ -1196,6 +1227,28 @@ impl Client {
                     self.dragging_divider = Some(divider);
                     self.update_cursor_icon();
                 } else if state.is_pressed() {
+                    if button == winit::event::MouseButton::Left
+                        && self.command_blocks_enabled()
+                        && let Some(point) = self.pointer
+                        && let Some(target_id) = self.tabs[self.active].layout.pane_at(point)
+                        && self.tabs[self.active].pane(target_id).is_some_and(|pane| {
+                            pane.hovered_block
+                                .is_some_and(|hovered| hovered.hovered_action.is_some())
+                        })
+                    {
+                        if target_id != self.tabs[self.active].focused {
+                            self.focus_pane(target_id);
+                        }
+                        if let Some(notice) =
+                            self.tabs[self.active].pane_mut(target_id).and_then(|pane| {
+                                pane.trigger_hovered_block_action(&mut self.copy_pending)
+                            })
+                        {
+                            self.show_notice(NoticeKind::Success, notice);
+                        }
+                        self.update_cursor_icon();
+                        return Ok(());
+                    }
                     let copied_notice = if let Some(point) = self.pointer
                         && let Some(target_id) = self.tabs[self.active].layout.pane_at(point)
                     {
@@ -1343,8 +1396,12 @@ impl Client {
                         .pointer
                         .and_then(|point| self.tabs[self.active].layout.pane_at(point))
                         .unwrap_or(self.tabs[self.active].focused);
+                    let blocks_enabled = self.command_blocks_enabled();
+                    let ui_cell = self.painter.chrome_metrics().cell;
+                    let scrollbar = self.scrollbar;
                     if let Some(pane) = self.tabs[self.active].pane_mut(target_id) {
                         pane.scroll(delta);
+                        pane.update_hovered_block(blocks_enabled, ui_cell, scrollbar);
                     }
                     self.update_cursor_icon();
                 }
@@ -1400,11 +1457,13 @@ impl Client {
                     .any(|pane| pane.visible && pane.scrollbar_hovered)
                 {
                     CursorIcon::Default
-                } else if tab
-                    .panes
-                    .iter()
-                    .any(|pane| pane.visible && pane.hovered_link.is_some())
-                {
+                } else if tab.panes.iter().any(|pane| {
+                    pane.visible
+                        && (pane.hovered_link.is_some()
+                            || pane
+                                .hovered_block
+                                .is_some_and(|block| block.hovered_action.is_some()))
+                }) {
                     CursorIcon::Pointer
                 } else {
                     CursorIcon::Default
@@ -1605,9 +1664,10 @@ impl Client {
     fn split_pane(&mut self, axis: Axis) -> Result<()> {
         let cell = self.painter.metrics().cell;
         let divider = self.divider_thickness();
+        let gutter = self.block_gutter();
         let tab = &mut self.tabs[self.active];
         if tab.zoomed.take().is_some() {
-            tab.reflow(self.content_area, divider, cell, true);
+            tab.reflow(self.content_area, divider, cell, gutter, true);
         }
         let target_id = tab.focused;
         let Some(target_rect) = tab.layout.rect_of(target_id) else {
@@ -1685,9 +1745,10 @@ impl Client {
         }
         let cell = self.painter.metrics().cell;
         let divider = self.divider_thickness();
+        let gutter = self.block_gutter();
         let tab = &mut self.tabs[self.active];
         if tab.zoomed.take().is_some() {
-            tab.reflow(self.content_area, divider, cell, true);
+            tab.reflow(self.content_area, divider, cell, gutter, true);
         }
         if let Some(next_id) = SplitTree::focus_neighbor(tab.focused, direction, &tab.layout) {
             self.focus_pane(next_id);
@@ -1728,7 +1789,8 @@ impl Client {
     fn reflow_active_tab(&mut self) {
         let cell = self.painter.metrics().cell;
         let divider = self.divider_thickness();
-        self.tabs[self.active].reflow(self.content_area, divider, cell, true);
+        let gutter = self.block_gutter();
+        self.tabs[self.active].reflow(self.content_area, divider, cell, gutter, true);
         self.tabs[self.active].focused_pane_mut().update_ime_area();
     }
 
@@ -1779,7 +1841,19 @@ impl Client {
             metrics.cell,
         )
         .unwrap_or(self.content_area);
-        let grid = GridGeometry::fit(area.size, metrics.cell)
+        let gutter = self.block_gutter();
+        let inset = gutter.min(
+            area.size
+                .width
+                .get()
+                .saturating_sub(metrics.cell.width.get()),
+        );
+        let text_size = PixelSize {
+            width: NonZeroU32::new(area.size.width.get().saturating_sub(inset))
+                .unwrap_or(area.size.width),
+            height: area.size.height,
+        };
+        let grid = GridGeometry::fit(text_size, metrics.cell)
             .unwrap_or(self.tabs[self.active].focused_pane().target_grid);
         let mut pane = Pane::spawn(
             id,
@@ -1790,7 +1864,10 @@ impl Client {
             cwd,
             None,
         )?;
-        pane.origin = area.origin;
+        pane.origin = PixelPosition {
+            x: area.origin.x + inset,
+            y: area.origin.y,
+        };
         self.readiness
             .arm(id, &mut pane.registration, pane.session.interests())?;
         self.tabs.push(Tab::new(pane, area));
@@ -1820,7 +1897,8 @@ impl Client {
     fn activate_tab(&mut self) {
         let cell = self.painter.metrics().cell;
         let divider = self.divider_thickness();
-        self.tabs[self.active].reflow(self.content_area, divider, cell, true);
+        let gutter = self.block_gutter();
+        self.tabs[self.active].reflow(self.content_area, divider, cell, gutter, true);
         self.activate_focused_pane();
         self.painter.switch_session();
         self.window.request_redraw();
@@ -1873,8 +1951,9 @@ impl Client {
         }
         let cell = self.painter.metrics().cell;
         let divider = self.divider_thickness();
+        let gutter = self.block_gutter();
         let is_active = tab_index == self.active;
-        self.tabs[tab_index].reflow(self.content_area, divider, cell, is_active);
+        self.tabs[tab_index].reflow(self.content_area, divider, cell, gutter, is_active);
         if is_active {
             self.dragging_divider = None;
             self.activate_focused_pane();
@@ -1972,6 +2051,18 @@ impl Client {
         }
         self.painter.invalidate_overlay();
         self.window.request_redraw();
+    }
+
+    fn command_blocks_enabled(&self) -> bool {
+        self.mode == TerminalMode::Modern && self.command_blocks
+    }
+
+    fn block_gutter(&self) -> u32 {
+        if self.command_blocks_enabled() {
+            (14.0 * self.window.scale_factor().max(1.0)).round() as u32
+        } else {
+            0
+        }
     }
 
     fn set_mode(&mut self, mode: TerminalMode) {
@@ -2103,6 +2194,7 @@ impl Client {
             mode: self.mode,
             tab_position: self.tab_position,
             window_controls: self.window_controls,
+            command_blocks: self.command_blocks,
             scrollbar: self.scrollbar,
             copy_on_select: self.copy_on_select,
             multi_tab: self.tabs.len() > 1,
@@ -2378,6 +2470,38 @@ impl Client {
                 };
                 self.show_notice(NoticeKind::Success, label.into());
             }
+            PaletteAction::ToggleCommandBlocks => {
+                self.close_palette(true);
+                self.command_blocks = !self.command_blocks;
+                if !self.command_blocks {
+                    for tab in &mut self.tabs {
+                        for pane in &mut tab.panes {
+                            pane.hovered_block = None;
+                        }
+                    }
+                }
+                self.resize_pending = true;
+                self.apply_resize();
+                self.painter.invalidate_overlay();
+                self.window.request_redraw();
+                let label = if self.command_blocks {
+                    "Command blocks: On"
+                } else {
+                    "Command blocks: Off"
+                };
+                self.show_notice(NoticeKind::Success, label.into());
+            }
+            PaletteAction::CopyLastCommand => {
+                self.close_palette(true);
+                if let Some(notice) = self.tabs[self.active]
+                    .focused_pane()
+                    .copy_last_command(&mut self.copy_pending)
+                {
+                    self.show_notice(NoticeKind::Success, notice);
+                } else {
+                    self.show_notice(NoticeKind::Warning, "No command found".into());
+                }
+            }
             PaletteAction::ToggleCopyOnSelect => {
                 self.close_palette(true);
                 self.copy_on_select = !self.copy_on_select;
@@ -2632,6 +2756,17 @@ impl Client {
         }
         if old.window_controls != new.window_controls {
             self.window_controls = new.window_controls;
+            layout_changed = true;
+        }
+        if old.command_blocks != new.command_blocks {
+            self.command_blocks = new.command_blocks;
+            if !self.command_blocks {
+                for tab in &mut self.tabs {
+                    for pane in &mut tab.panes {
+                        pane.hovered_block = None;
+                    }
+                }
+            }
             layout_changed = true;
         }
         if old.scrollbar != new.scrollbar {
@@ -2973,8 +3108,15 @@ impl Client {
         self.painter.set_metrics(metrics);
         self.painter.resize(size);
         let divider = self.divider_thickness();
+        let gutter = self.block_gutter();
         for (index, tab) in self.tabs.iter_mut().enumerate() {
-            tab.reflow(content_area, divider, metrics.cell, index == self.active);
+            tab.reflow(
+                content_area,
+                divider,
+                metrics.cell,
+                gutter,
+                index == self.active,
+            );
         }
         self.reflow_tab_bar();
         let pane = self.tabs[self.active].focused_pane_mut();
@@ -3104,6 +3246,7 @@ impl Client {
             draw_panes.push(paint::PaneDraw {
                 id: pane.id,
                 rect: layout_pane.rect,
+                text_origin: pane.origin,
                 frame,
                 selection: pane.selection.as_ref(),
                 hovered_link: pane.hovered_link.as_ref(),
@@ -3119,6 +3262,10 @@ impl Client {
                 focused,
                 zoomed: zoomed && pane.id == active_tab.focused,
                 scrollbar: pane.scrollbar_view(scale, self.scrollbar),
+                command_blocks: self.command_blocks_enabled()
+                    && pane.session.screen().active_buffer()
+                        == lune_terminal::ScreenBuffer::Primary,
+                hovered_block: pane.hovered_block,
                 dim_alpha,
             });
         }

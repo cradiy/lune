@@ -160,6 +160,7 @@ pub(super) struct Config {
     pub(super) mode: TerminalMode,
     pub(super) tab_position: TabPosition,
     pub(super) window_controls: WindowControlsPolicy,
+    pub(super) command_blocks: bool,
     pub(super) scrollbar: ScrollbarPolicy,
     pub(super) font_family: Option<String>,
     pub(super) font_family_bold: Option<String>,
@@ -202,6 +203,7 @@ impl Default for Config {
             mode: TerminalMode::Classic,
             tab_position: TabPosition::Top,
             window_controls: WindowControlsPolicy::Auto,
+            command_blocks: true,
             scrollbar: ScrollbarPolicy::Auto,
             font_family: None,
             font_family_bold: None,
@@ -374,6 +376,11 @@ impl Config {
             }
             "window-controls" => {
                 self.window_controls = WindowControlsPolicy::parse(value)?;
+            }
+            "command-blocks" => {
+                self.command_blocks = value
+                    .parse()
+                    .map_err(|_| "command-blocks must be true or false")?;
             }
             "scrollbar" => {
                 self.scrollbar = ScrollbarPolicy::parse(value)?;
@@ -722,6 +729,7 @@ mod tests {
              mode = modern\r\nmode = futuristic\r\n\
              tab-position = left\r\ntab-position = bottom\r\n\
              window-controls = false\r\nwindow-controls = nope\r\n\
+             command-blocks = false\r\ncommand-blocks = maybe\r\n\
              scrollbar = always\r\nscrollbar = maybe\r\n\
              font-family-bold = Fixture Bold\r\nfont-family-italic = Fixture Italic\r\n\
              font-family-bold-italic = Fixture Bold Italic\r\n\
@@ -756,6 +764,7 @@ mod tests {
         assert_eq!(config.mode, super::TerminalMode::Modern);
         assert_eq!(config.tab_position, super::TabPosition::Left);
         assert_eq!(config.window_controls, super::WindowControlsPolicy::Hide);
+        assert!(!config.command_blocks);
         assert_eq!(config.scrollbar, super::ScrollbarPolicy::Always);
         assert_eq!(config.font_family.as_deref(), Some("Fixture Mono"));
         assert_eq!(config.font_family_bold.as_deref(), Some("Fixture Bold"));
@@ -812,10 +821,10 @@ mod tests {
         assert_eq!(config.clipboard_write, super::ClipboardPolicy::Deny);
         assert_eq!(config.clipboard_read, super::ClipboardPolicy::Allow);
         assert_eq!(config.notifications, super::NotificationPolicy::Always);
-        assert_eq!(loaded.errors.len(), 32);
+        assert_eq!(loaded.errors.len(), 33);
         assert_eq!(
             format_errors(&loaded.errors).as_deref(),
-            Some("Config error: lune.conf:5: mode must be classic or modern (+31 more)")
+            Some("Config error: lune.conf:5: mode must be classic or modern (+32 more)")
         );
     }
 }

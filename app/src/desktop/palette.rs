@@ -24,6 +24,8 @@ pub(super) enum PaletteAction {
     OpenTabPosition,
     SetTabPosition(TabPosition),
     ToggleWindowControls,
+    ToggleCommandBlocks,
+    CopyLastCommand,
     ToggleCopyOnSelect,
     OpenThemes,
     ApplyTheme(String),
@@ -68,6 +70,7 @@ pub(super) struct PaletteContext<'a> {
     pub(super) mode: TerminalMode,
     pub(super) tab_position: TabPosition,
     pub(super) window_controls: WindowControlsPolicy,
+    pub(super) command_blocks: bool,
     pub(super) scrollbar: ScrollbarPolicy,
     pub(super) copy_on_select: bool,
     pub(super) multi_tab: bool,
@@ -449,6 +452,20 @@ fn build_root_entries(ctx: &PaletteContext<'_>) -> Vec<PaletteEntry> {
             WindowControlsPolicy::Hide => "Hide",
         },
     ));
+    if ctx.mode == TerminalMode::Modern {
+        entries.push(PaletteEntry::new(
+            PaletteAction::ToggleCommandBlocks,
+            "Command blocks",
+            if ctx.command_blocks { "On" } else { "Off" },
+        ));
+    }
+    if ctx.primary_screen {
+        entries.push(PaletteEntry::new(
+            PaletteAction::CopyLastCommand,
+            "Copy last command",
+            "",
+        ));
+    }
     entries.push(PaletteEntry::new(
         PaletteAction::ToggleCopyOnSelect,
         "Copy on select",
@@ -748,6 +765,7 @@ mod tests {
             mode: TerminalMode::Classic,
             tab_position: TabPosition::Top,
             window_controls: WindowControlsPolicy::Auto,
+            command_blocks: true,
             scrollbar: ScrollbarPolicy::Auto,
             copy_on_select: false,
             multi_tab: true,
