@@ -370,7 +370,7 @@ const WAYLAND_BINDINGS: &[Binding] = &[
     Binding::new(Action::Hints, CTRL_SHIFT, letter("s")),
     Binding::new(Action::CommandPalette, CTRL_SHIFT, letter("p")),
     Binding::new(Action::ToggleMode, CTRL_SHIFT, letter("m")),
-    Binding::new(Action::ToggleTabSidebar, CTRL_SHIFT, letter("b")),
+    Binding::new(Action::ToggleTabSidebar, CTRL_ALT, letter("b")),
     Binding::new(Action::PreviousPrompt, CTRL_SHIFT, Named(NamedKey::ArrowUp))
         .primary_screen()
         .repeating(),

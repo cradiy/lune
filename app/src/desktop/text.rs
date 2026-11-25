@@ -32,8 +32,10 @@ use super::vi;
 
 const ATLAS_SIDE: i32 = 1024;
 const MAX_ATLAS_LAYERS: u32 = 32;
+const CHROME_FONT_SCALE: f32 = 0.82;
 const LABEL_CACHE: usize = 8;
-const ICON_CACHE: usize = 9;
+const CHROME_LABEL_CACHE: usize = 9;
+const ICON_CACHE: usize = 10;
 const TAB_LABEL_CACHE: usize = ICON_CACHE + 4;
 const LIGATURE_CACHE: usize = TAB_LABEL_CACHE + 1;
 
@@ -164,6 +166,7 @@ pub(super) struct TextRenderer {
     svg_sprites: HashMap<SvgSpriteKey, Sprite>,
     font: Font,
     metrics: FontMetrics,
+    chrome_metrics: FontMetrics,
     minimum_contrast: f32,
     generation: u64,
     evicted: bool,
@@ -179,10 +182,11 @@ impl TextRenderer {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         format: wgpu::TextureFormat,
-        font: Font,
+        mut font: Font,
         metrics: FontMetrics,
         minimum_contrast: f32,
     ) -> Self {
+        let chrome_metrics = measure_chrome_metrics(&mut font, metrics);
         let atlas = atlas_texture(device, 1);
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Terminal foreground"),
@@ -215,6 +219,7 @@ impl TextRenderer {
             svg_sprites: HashMap::new(),
             font,
             metrics,
+            chrome_metrics,
             minimum_contrast,
             generation: 0,
             evicted: false,
@@ -230,14 +235,23 @@ impl TextRenderer {
         self.metrics
     }
 
+    pub(super) fn chrome_metrics(&self) -> FontMetrics {
+        self.chrome_metrics
+    }
+
     pub(super) fn measure(&mut self, size: f32, scale_factor: f64) -> FontMetrics {
         self.font.measure(size, scale_factor)
+    }
+
+    pub(super) fn measure_chrome(&mut self, base: FontMetrics) -> FontMetrics {
+        measure_chrome_metrics(&mut self.font, base)
     }
 
     pub(super) fn set_font(&mut self, config: &FontConfig) -> bool {
         if !self.font.reconfigure(config) {
             return false;
         }
+        self.chrome_metrics = measure_chrome_metrics(&mut self.font, self.metrics);
         self.clear_glyph_cache();
         true
     }
@@ -255,6 +269,7 @@ impl TextRenderer {
             return;
         }
         self.metrics = metrics;
+        self.chrome_metrics = measure_chrome_metrics(&mut self.font, metrics);
         self.clear_glyph_cache();
     }
 
@@ -1829,29 +1844,38 @@ impl TextRenderer {
         self.rounded_rect(rect, radius, 1, border, 0.95);
     }
 
-    fn truncate_to_width<'a>(
+    fn truncate_to_width_with<'a>(
         &mut self,
+        metrics: FontMetrics,
         text: &'a str,
         max_w: u32,
     ) -> (std::borrow::Cow<'a, str>, u32) {
-        let measured = self.font.measure_text(self.metrics, text);
+        let measured = self.font.measure_text(metrics, text);
         if measured <= max_w {
             return (std::borrow::Cow::Borrowed(text), measured);
         }
         let ellipsis = "...";
-        let ellipsis_w = self.font.measure_text(self.metrics, ellipsis);
+        let ellipsis_w = self.font.measure_text(metrics, ellipsis);
         let budget = max_w.saturating_sub(ellipsis_w);
         let mut end = 0;
         for (idx, ch) in text.char_indices() {
             let next = idx + ch.len_utf8();
-            if self.font.measure_text(self.metrics, &text[..next]) > budget {
+            if self.font.measure_text(metrics, &text[..next]) > budget {
                 break;
             }
             end = next;
         }
         let truncated = format!("{}{ellipsis}", text[..end].trim_end());
-        let width = self.font.measure_text(self.metrics, &truncated).min(max_w);
+        let width = self.font.measure_text(metrics, &truncated).min(max_w);
         (std::borrow::Cow::Owned(truncated), width)
+    }
+
+    fn truncate_to_width<'a>(
+        &mut self,
+        text: &'a str,
+        max_w: u32,
+    ) -> (std::borrow::Cow<'a, str>, u32) {
+        self.truncate_to_width_with(self.metrics, text, max_w)
     }
 
     fn clamped_text(&mut self, origin: PixelPosition, max_w: u32, text: &str, color: Rgb) {
@@ -1871,6 +1895,30 @@ impl TextRenderer {
                 },
                 &display,
                 LABEL_CACHE,
+                color,
+                1.0,
+            );
+        }
+    }
+
+    fn clamped_chrome_text(&mut self, origin: PixelPosition, max_w: u32, text: &str, color: Rgb) {
+        let limit = max_w.min(ATLAS_SIDE as u32);
+        if limit == 0 {
+            return;
+        }
+        let metrics = self.chrome_metrics;
+        let (display, text_w) = self.truncate_to_width_with(metrics, text, limit);
+        if let Some(width) = NonZeroU32::new(text_w.min(limit)) {
+            self.glyph(
+                PixelRect {
+                    origin,
+                    size: PixelSize {
+                        width,
+                        height: metrics.cell.height,
+                    },
+                },
+                &display,
+                CHROME_LABEL_CACHE,
                 color,
                 1.0,
             );
@@ -2051,10 +2099,11 @@ impl TextRenderer {
                 if bar_hovered { 0.95 } else { 0.8 },
             );
 
-            let cell_h = self.metrics.cell.height.get();
+            let ui_metrics = self.chrome_metrics;
+            let cell_h = ui_metrics.cell.height.get();
             let mut right_edge = bar_rect.origin.x + bar_w.saturating_sub(pad_x);
             if !view.palette_shortcut.is_empty() {
-                let key_w = self.font.measure_text(self.metrics, view.palette_shortcut);
+                let key_w = self.font.measure_text(ui_metrics, view.palette_shortcut);
                 let key_pad_x = m.item_gap.max(5);
                 let key_pad_y = (bar_h.saturating_sub(cell_h) / 4).max(2);
                 let pill_w = key_w.saturating_add(key_pad_x * 2);
@@ -2094,11 +2143,11 @@ impl TextRenderer {
                                 },
                                 size: PixelSize {
                                     width: kw,
-                                    height: self.metrics.cell.height,
+                                    height: ui_metrics.cell.height,
                                 },
                             },
                             view.palette_shortcut,
-                            LABEL_CACHE,
+                            CHROME_LABEL_CACHE,
                             if bar_hovered { fg } else { muted },
                             0.85,
                         );
@@ -2111,7 +2160,7 @@ impl TextRenderer {
             let prompt_y = bar_rect.origin.y + bar_h.saturating_sub(cell_h) / 2;
             let prompt_avail = right_edge.saturating_sub(prompt_x);
             if prompt_avail > 0 {
-                self.clamped_text(
+                self.clamped_chrome_text(
                     PixelPosition {
                         x: prompt_x,
                         y: prompt_y,
@@ -2130,7 +2179,7 @@ impl TextRenderer {
         let wing_h = m.wing_height;
         let term_icon_size = m.tab_icon_size;
         let close_icon_size = m.close_icon_size;
-        let cell_h = self.metrics.cell.height.get();
+        let cell_h = self.chrome_metrics.cell.height.get();
         let active_tab_fill = mix_color(bg, fg, 20);
 
         let mut draw_order: Vec<usize> = (0..layout.top_tabs.len()).collect();
@@ -2321,7 +2370,7 @@ impl TextRenderer {
             let title_avail = right_edge.saturating_sub(title_x);
             if title_avail > 0 {
                 let text_color = if active || dragged { fg } else { muted };
-                self.clamped_text(
+                self.clamped_chrome_text(
                     PixelPosition {
                         x: title_x,
                         y: title_y,
@@ -2530,11 +2579,12 @@ impl TextRenderer {
         );
 
         let m = layout.metrics;
+        let ui_metrics = self.chrome_metrics;
         let row_radius = m.sidebar_row_radius;
         let icon_size = m.tab_icon_size;
         let close_icon_size = m.close_icon_size;
-        let cell_h = self.metrics.cell.height.get();
-        let cell_w = self.metrics.cell.width.get().max(1);
+        let cell_h = ui_metrics.cell.height.get();
+        let cell_w = ui_metrics.cell.width.get().max(1);
         let indicator_w = (m.sidebar_pad_x / 2).clamp(3, 4);
 
         // Sidebar top section header: "TABS" label, tab count pill, and `+` button.
@@ -2544,7 +2594,7 @@ impl TextRenderer {
             let text_y = header_y + header_h.saturating_sub(cell_h) / 2;
             let label = "TABS";
             let label_x = header_abs.origin.x + m.item_gap;
-            let label_w = self.font.measure_text(self.metrics, label);
+            let label_w = self.font.measure_text(ui_metrics, label);
             if let Some(lw) = NonZeroU32::new(label_w.min(header_abs.size.width.get())) {
                 self.glyph(
                     PixelRect {
@@ -2554,17 +2604,17 @@ impl TextRenderer {
                         },
                         size: PixelSize {
                             width: lw,
-                            height: self.metrics.cell.height,
+                            height: ui_metrics.cell.height,
                         },
                     },
                     label,
-                    LABEL_CACHE,
+                    CHROME_LABEL_CACHE,
                     mix_color(bg, fg, 125),
                     0.9,
                 );
             }
             let count_str = view.tabs.len().to_string();
-            let count_w = self.font.measure_text(self.metrics, &count_str);
+            let count_w = self.font.measure_text(ui_metrics, &count_str);
             let badge_pad_x = m.item_gap.max(5);
             let badge_w = count_w.saturating_add(badge_pad_x * 2);
             let badge_h = cell_h.saturating_add(2).min(header_h);
@@ -2598,11 +2648,11 @@ impl TextRenderer {
                             },
                             size: PixelSize {
                                 width: cw,
-                                height: self.metrics.cell.height,
+                                height: ui_metrics.cell.height,
                             },
                         },
                         &count_str,
-                        LABEL_CACHE,
+                        CHROME_LABEL_CACHE,
                         muted,
                         0.9,
                     );
@@ -2744,7 +2794,7 @@ impl TextRenderer {
             if title_avail > 0 {
                 let max_cells = title_avail / cell_w;
                 let tail = titlebar::title_tail(tab.label(), max_cells);
-                self.clamped_text(
+                self.clamped_chrome_text(
                     PixelPosition {
                         x: title_x,
                         y: title_y,
@@ -2853,8 +2903,8 @@ impl TextRenderer {
             let label_x = px_left + picon + m.item_gap;
             let label_y = footer_rect.origin.y + fh.saturating_sub(cell_h) / 2;
             if !view.new_tab_shortcut.is_empty() {
-                let hint_w = self.font.measure_text(self.metrics, view.new_tab_shortcut);
-                let min_label_w = self.font.measure_text(self.metrics, "New Tab");
+                let hint_w = self.font.measure_text(ui_metrics, view.new_tab_shortcut);
+                let min_label_w = self.font.measure_text(ui_metrics, "New Tab");
                 if footer_right > label_x + min_label_w + hint_w + m.edge_padding
                     && let Some(hw) = NonZeroU32::new(hint_w.min(ATLAS_SIDE as u32))
                 {
@@ -2864,11 +2914,11 @@ impl TextRenderer {
                             origin: PixelPosition { x: hx, y: label_y },
                             size: PixelSize {
                                 width: hw,
-                                height: self.metrics.cell.height,
+                                height: ui_metrics.cell.height,
                             },
                         },
                         view.new_tab_shortcut,
-                        LABEL_CACHE,
+                        CHROME_LABEL_CACHE,
                         mix_color(bg, fg, 115),
                         0.85,
                     );
@@ -2877,7 +2927,7 @@ impl TextRenderer {
             }
             let label_avail = footer_right.saturating_sub(label_x);
             if label_avail > 0 {
-                self.clamped_text(
+                self.clamped_chrome_text(
                     PixelPosition {
                         x: label_x,
                         y: label_y,
@@ -3405,12 +3455,15 @@ impl TextRenderer {
         alpha: f32,
     ) -> bool {
         let width = rect.size.width.get();
+        let height = rect.size.height.get();
         let cache = &mut self.glyphs[cache_index];
-        if matches!(cache_index, LABEL_CACHE | TAB_LABEL_CACHE)
-            && cache
-                .get(text)
-                .is_some_and(|sprite| sprite.allocation.rectangle.width() != width as i32)
-        {
+        if matches!(
+            cache_index,
+            LABEL_CACHE | CHROME_LABEL_CACHE | TAB_LABEL_CACHE
+        ) && cache.get(text).is_some_and(|sprite| {
+            sprite.allocation.rectangle.width() != width as i32
+                || sprite.allocation.rectangle.height() != height as i32
+        }) {
             let sprite = cache.remove(text).unwrap();
             self.layers[sprite.layer].deallocate(sprite.allocation.id);
         }
@@ -3423,11 +3476,15 @@ impl TextRenderer {
                 cache_index - LIGATURE_CACHE
             } else {
                 match cache_index {
-                    TAB_LABEL_CACHE => 0,
+                    CHROME_LABEL_CACHE | TAB_LABEL_CACHE => 0,
                     _ => cache_index & 3,
                 }
             };
-            let height = rect.size.height.get();
+            let raster_metrics = if cache_index == CHROME_LABEL_CACHE {
+                self.chrome_metrics
+            } else {
+                self.metrics
+            };
             let procedural = if cache_index < LABEL_CACHE {
                 let mut chars = text.chars();
                 chars
@@ -3444,7 +3501,7 @@ impl TextRenderer {
                 Some(false) => return true,
                 None => {
                     let Some(colored) = self.font.rasterize(
-                        self.metrics,
+                        raster_metrics,
                         text,
                         rendition,
                         width,
@@ -4015,6 +4072,11 @@ fn atlas_binding(
             resource: wgpu::BindingResource::TextureView(&view),
         }],
     })
+}
+
+fn measure_chrome_metrics(font: &mut Font, base: FontMetrics) -> FontMetrics {
+    let size = (base.size * CHROME_FONT_SCALE).max(10.0).min(base.size);
+    font.measure(size, 1.0)
 }
 
 fn horizontal(rect: PixelRect, y: u32, height: u32) -> PixelRect {

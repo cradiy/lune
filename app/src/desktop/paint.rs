@@ -248,6 +248,10 @@ impl Painter {
         self.text.metrics()
     }
 
+    pub(super) fn chrome_metrics(&self) -> FontMetrics {
+        self.text.chrome_metrics()
+    }
+
     pub(super) fn size(&self) -> PhysicalSize<u32> {
         PhysicalSize::new(self.config.width, self.config.height)
     }
@@ -258,6 +262,10 @@ impl Painter {
 
     pub(super) fn measure(&mut self, size: f32, scale_factor: f64) -> FontMetrics {
         self.text.measure(size, scale_factor)
+    }
+
+    pub(super) fn measure_chrome(&mut self, base: FontMetrics) -> FontMetrics {
+        self.text.measure_chrome(base)
     }
 
     pub(super) fn set_font(&mut self, config: &FontConfig, size: f32, scale_factor: f64) -> bool {

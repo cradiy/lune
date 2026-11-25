@@ -456,6 +456,11 @@ fn build_root_entries(ctx: &PaletteContext<'_>) -> Vec<PaletteEntry> {
     ));
 
     let actions: &[(Action, &str, bool)] = &[
+        (
+            Action::ToggleTabSidebar,
+            "Toggle sidebar",
+            ctx.mode == TerminalMode::Modern && ctx.tab_position == TabPosition::Left,
+        ),
         (Action::Search, "Search terminal", true),
         (Action::Hints, "Quick select (Hints)", true),
         (Action::ToggleVi, "Toggle Vi mode", true),

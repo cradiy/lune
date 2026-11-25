@@ -477,16 +477,16 @@ impl Client {
             log::warn!("{error}");
         }
         let bar = tab_bar::Layout::default();
-        let cell = painter.metrics().cell;
+        let chrome_cell = painter.chrome_metrics().cell;
         let top_bar_height = titlebar::Layout::height(
             window.inner_size(),
-            cell,
+            chrome_cell,
             scale,
             config.mode == TerminalMode::Modern,
         );
         let left_bar_width = titlebar::Layout::compute_sidebar_width(
             window.inner_size(),
-            cell,
+            chrome_cell,
             scale,
             config.mode == TerminalMode::Modern,
             config.tab_position,
@@ -846,7 +846,7 @@ impl Client {
                     return Ok(());
                 }
                 if let Some(drag) = self.sidebar_resize_drag {
-                    let cell_w = f64::from(self.painter.metrics().cell.width.get().max(1));
+                    let cell_w = f64::from(self.painter.chrome_metrics().cell.width.get().max(1));
                     let m = self.titlebar.metrics;
                     let next_px = (drag.start_width_px + (position.x - drag.start_x)).clamp(
                         f64::from(m.sidebar_min_width),
@@ -1752,11 +1752,12 @@ impl Client {
         let size = self.window.inner_size();
         let scale = self.window.scale_factor();
         let metrics = self.painter.metrics();
+        let chrome_cell = self.painter.chrome_metrics().cell;
         let top_bar_height =
-            titlebar::Layout::height(size, metrics.cell, scale, self.mode == TerminalMode::Modern);
+            titlebar::Layout::height(size, chrome_cell, scale, self.mode == TerminalMode::Modern);
         let left_bar_width = titlebar::Layout::compute_sidebar_width(
             size,
-            metrics.cell,
+            chrome_cell,
             scale,
             self.mode == TerminalMode::Modern,
             self.tab_position,
@@ -2927,16 +2928,22 @@ impl Client {
         let scale = self.window.scale_factor();
         let physical_font = physical_font_size(self.font_size_points, scale);
         let current = self.painter.metrics();
-        let metrics = if current.size != physical_font {
-            self.painter.measure(physical_font, scale)
+        let (metrics, chrome_metrics) = if current.size != physical_font {
+            let next = self.painter.measure(physical_font, scale);
+            let next_chrome = self.painter.measure_chrome(next);
+            (next, next_chrome)
         } else {
-            current
+            (current, self.painter.chrome_metrics())
         };
-        let top_bar_height =
-            titlebar::Layout::height(size, metrics.cell, scale, self.mode == TerminalMode::Modern);
+        let top_bar_height = titlebar::Layout::height(
+            size,
+            chrome_metrics.cell,
+            scale,
+            self.mode == TerminalMode::Modern,
+        );
         let left_bar_width = titlebar::Layout::compute_sidebar_width(
             size,
-            metrics.cell,
+            chrome_metrics.cell,
             scale,
             self.mode == TerminalMode::Modern,
             self.tab_position,
@@ -3001,13 +3008,14 @@ impl Client {
     fn reflow_tab_bar_only(&mut self) {
         let size = self.painter.size();
         let cell = self.painter.metrics().cell;
+        let chrome_cell = self.painter.chrome_metrics().cell;
         let scale = self.window.scale_factor();
         let modern = self.mode == TerminalMode::Modern;
         let window_buttons = self.resolved_window_buttons();
         self.titlebar.reflow(
             titlebar::ReflowParams {
                 size,
-                cell,
+                cell: chrome_cell,
                 scale,
                 enabled: modern,
                 tab_position: self.tab_position,
