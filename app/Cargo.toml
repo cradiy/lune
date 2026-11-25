@@ -2,6 +2,7 @@
 name = "lune"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 publish = false
 
 [features]
@@ -18,6 +19,11 @@ wgpu-renderer = ["dep:bytemuck", "dep:wgpu"]
 [[bin]]
 name = "lune"
 path = "src/main.rs"
+required-features = ["desktop"]
+
+[[bench]]
+name = "desktop_hotpaths"
+harness = false
 required-features = ["desktop"]
 
 [dependencies]

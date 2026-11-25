@@ -468,6 +468,7 @@ struct LogicalText {
     text: String,
     first_row: usize,
     row_starts: Vec<usize>,
+    row_ascii_1to1: Vec<bool>,
 }
 
 impl LogicalText {
@@ -475,15 +476,80 @@ impl LogicalText {
         self.text.clear();
         self.first_row = rows.start;
         self.row_starts.clear();
+        self.row_ascii_1to1.clear();
         for index in rows {
-            self.row_starts.push(self.text.len());
-            let Some(row) = view.row(index) else { continue };
-            visit_row(row, columns, |_, _, text| match text {
-                CellText::Scalar(character) => self.text.push(character),
-                CellText::Extended(text) => self.text.push_str(text),
-                CellText::Continuation => unreachable!(),
-            });
+            let row_start = self.text.len();
+            self.row_starts.push(row_start);
+            let Some(row) = view.row(index) else {
+                self.row_ascii_1to1.push(true);
+                continue;
+            };
+            if self.try_read_ascii_row(row, columns) {
+                self.row_ascii_1to1.push(true);
+            } else {
+                self.text.truncate(row_start);
+                self.row_ascii_1to1.push(false);
+                visit_row(row, columns, |_, _, text| match text {
+                    CellText::Scalar(character) => self.text.push(character),
+                    CellText::Extended(text) => self.text.push_str(text),
+                    CellText::Continuation => unreachable!(),
+                });
+            }
         }
+    }
+
+    /// Fast path for ordinary single-width ASCII rows without sized text or
+    /// extended grapheme clusters: maps `byte - row_start == column` 1:1.
+    fn try_read_ascii_row(&mut self, row: &Row, columns: usize) -> bool {
+        if row.sized_text_rows().next().is_some() {
+            return false;
+        }
+        let limit = row.cells().len().min(columns);
+        let end = if let Some(wrap) = row.wrap_end() {
+            wrap.min(limit)
+        } else {
+            row.cells()[..limit]
+                .iter()
+                .rposition(|cell| !cell.is_erased())
+                .map_or(0, |last| last + 1)
+        };
+        if end == 0 {
+            return true;
+        }
+        let cells = &row.cells()[..end];
+        let mut buf = [0u8; 256];
+        let mut filled = 0usize;
+        for cell in cells {
+            if cell.has_extended_text() || cell.is_continuation() || cell.width() != 1 {
+                return false;
+            }
+            let byte = if cell.is_erased() {
+                b' '
+            } else {
+                let Some(ch) = cell.character() else {
+                    return false;
+                };
+                if !ch.is_ascii() {
+                    return false;
+                }
+                ch as u8
+            };
+            buf[filled] = byte;
+            filled += 1;
+            if filled == buf.len() {
+                // Every byte written to `buf` is verified ASCII (< 0x80), so UTF-8 is guaranteed.
+                if let Ok(chunk) = std::str::from_utf8(&buf[..filled]) {
+                    self.text.push_str(chunk);
+                }
+                filled = 0;
+            }
+        }
+        if filled > 0
+            && let Ok(chunk) = std::str::from_utf8(&buf[..filled])
+        {
+            self.text.push_str(chunk);
+        }
+        true
     }
 
     fn span(
@@ -507,14 +573,29 @@ impl LogicalText {
         exclusive_end: bool,
     ) -> Option<CellPosition> {
         let byte = offset.min(self.text.len().checked_sub(1)?);
-        let index = self
-            .row_starts
-            .partition_point(|&start| start <= byte)
-            .checked_sub(1)?;
+        let index = if self.row_starts.len() == 1 {
+            0
+        } else {
+            self.row_starts
+                .partition_point(|&start| start <= byte)
+                .checked_sub(1)?
+        };
         let row_index = self.first_row + index;
-        let mut start = self.row_starts[index];
+        let row_start = self.row_starts[index];
+        if self.row_ascii_1to1[index] {
+            let col = byte - row_start;
+            return Some(CellPosition {
+                row: row_index,
+                column: if exclusive_end {
+                    (col + 1).min(columns)
+                } else {
+                    col
+                },
+            });
+        }
+        let mut start = row_start;
         let mut position = None;
-        visit_row(view.row(row_index)?, columns, |column, width, text| {
+        visit_row_until(view.row(row_index)?, columns, |column, width, text| {
             if start <= byte {
                 let col = if exclusive_end {
                     (column + width).min(columns)
@@ -525,8 +606,11 @@ impl LogicalText {
                     row: row_index,
                     column: col,
                 });
+                start += utf8_len(text);
+                start <= byte
+            } else {
+                false
             }
-            start += utf8_len(text);
         });
         position
     }
@@ -541,6 +625,17 @@ fn utf8_len(text: CellText<'_>) -> usize {
 }
 
 fn visit_row(row: &Row, columns: usize, mut visit: impl FnMut(usize, usize, CellText<'_>)) {
+    visit_row_until(row, columns, |col, width, text| {
+        visit(col, width, text);
+        true
+    });
+}
+
+fn visit_row_until(
+    row: &Row,
+    columns: usize,
+    mut visit: impl FnMut(usize, usize, CellText<'_>) -> bool,
+) {
     let end = if let Some(wrap) = row.wrap_end() {
         wrap.min(columns)
     } else {
@@ -557,23 +652,31 @@ fn visit_row(row: &Row, columns: usize, mut visit: impl FnMut(usize, usize, Cell
     let mut column = 0;
     for part in row.sized_text_rows().take_while(|part| part.column < end) {
         for unit in row.display_units(column..part.column) {
-            visit(unit.column, unit.cell.width(), unit.text);
+            if !visit(unit.column, unit.cell.width(), unit.text) {
+                return;
+            }
         }
         if part.row_offset == 0 {
-            visit(
+            if !visit(
                 part.column,
                 part.columns().len(),
                 CellText::Extended(part.text()),
-            );
+            ) {
+                return;
+            }
         } else {
             for col in part.column..part.columns().end.min(end) {
-                visit(col, 1, CellText::Scalar(' '));
+                if !visit(col, 1, CellText::Scalar(' ')) {
+                    return;
+                }
             }
         }
         column = part.columns().end;
     }
     for unit in row.display_units(column..end) {
-        visit(unit.column, unit.cell.width(), unit.text);
+        if !visit(unit.column, unit.cell.width(), unit.text) {
+            return;
+        }
     }
 }
 

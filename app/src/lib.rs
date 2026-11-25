@@ -10,6 +10,9 @@ mod raster;
 mod session;
 
 #[cfg(all(target_os = "linux", feature = "desktop"))]
+#[doc(hidden)]
+pub use desktop::bench as desktop_bench;
+#[cfg(all(target_os = "linux", feature = "desktop"))]
 pub use desktop::{
     cli::{CliAction, CliError, HELP_TEXT, LaunchOptions, VERSION_TEXT, parse_env as parse_cli},
     run as run_desktop,
