@@ -22,7 +22,7 @@ use crate::{GridGeometry, MAX_INPUT_BYTES, PixelRect, Session, SessionReady, Wai
 
 use super::blocks::{self, BlockAction, HoveredBlock};
 use super::clipboard::{self, ClipboardType};
-use super::config::{ClipboardPolicy, NotificationPolicy};
+use super::config::{ClipboardPolicy, EnvOverride, NotificationPolicy};
 use super::confirm;
 use super::directory;
 use super::hints::{self, HintKind, HintMode, HintResolution};
@@ -216,8 +216,8 @@ pub(super) struct PaneConfig<'a> {
     pub(super) shell: Option<&'a [OsString]>,
     pub(super) shell_integration: bool,
     pub(super) term: &'a str,
-    pub(super) term_program: &'a str,
-    pub(super) env: &'a [(String, String)],
+    pub(super) term_program: Option<&'a str>,
+    pub(super) env: &'a [EnvOverride],
     pub(super) clipboard: Option<clipboard::DataDeviceHandle>,
     pub(super) ipc_socket: Option<&'a Path>,
 }
@@ -255,13 +255,28 @@ impl Pane {
         }
         command
             .env("TERM", config.term)
-            .env("COLORTERM", "truecolor")
-            .env("TERM_PROGRAM", config.term_program);
+            .env("COLORTERM", "truecolor");
+        shell_integration::inject_terminfo(&mut command, config.term);
+        match config.term_program {
+            Some(program) => {
+                command.env("TERM_PROGRAM", program);
+            }
+            None => {
+                command.env_remove("TERM_PROGRAM");
+            }
+        }
         if let Some(socket) = config.ipc_socket {
             command.env("LUNE_IPC_SOCKET", socket);
         }
-        for (name, value) in config.env {
-            command.env(name, value);
+        for entry in config.env {
+            match entry {
+                EnvOverride::Set(name, value) => {
+                    command.env(name, value);
+                }
+                EnvOverride::Unset(name) => {
+                    command.env_remove(name);
+                }
+            }
         }
         let pty_size = grid.pty_size();
         log::debug!(

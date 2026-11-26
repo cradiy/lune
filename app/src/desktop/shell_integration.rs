@@ -11,6 +11,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+const XTERM_KITTY_TERMINFO: &[u8] = include_bytes!("../../../assets/terminfo/x/xterm-kitty");
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ShellKind {
     Bash,
@@ -94,6 +96,16 @@ fi
 
 if [ -z "$(trap -p DEBUG)" ]; then
     trap '__lune_preexec' DEBUG
+fi
+
+if [ "${LUNE_SSH_WRAPPER:-1}" != 0 ] && ! declare -F ssh >/dev/null 2>&1 && ! alias ssh >/dev/null 2>&1; then
+    ssh() {
+        if [ "${TERM:-}" = "xterm-kitty" ]; then
+            TERM=xterm-256color command ssh "$@"
+        else
+            command ssh "$@"
+        fi
+    }
 fi
 "#;
 
@@ -186,6 +198,16 @@ else
     precmd_functions+=(__lune_precmd)
     preexec_functions+=(__lune_preexec)
 fi
+
+if [[ "${LUNE_SSH_WRAPPER:-1}" != 0 ]] && (( ! $+functions[ssh] && ! $+aliases[ssh] )); then
+    ssh() {
+        if [[ "${TERM:-}" == "xterm-kitty" ]]; then
+            TERM=xterm-256color command ssh "$@"
+        else
+            command ssh "$@"
+        fi
+    }
+fi
 "#;
 
 const ZSH_ZLOGIN: &str = r#"# Lune shell integration zlogin forwarder
@@ -229,6 +251,16 @@ if functions -q fish_prompt; and not functions -q __lune_orig_fish_prompt
         printf '\033]133;B\033\\'
     end
 end
+
+if test "$LUNE_SSH_WRAPPER" != 0; and not functions -q ssh
+    function ssh --wraps=ssh
+        if test "$TERM" = "xterm-kitty"
+            TERM=xterm-256color command ssh $argv
+        else
+            command ssh $argv
+        end
+    end
+end
 "#;
 
 const NUSHELL_SCRIPT: &str = r#"# Lune shell integration for nushell
@@ -239,6 +271,14 @@ if not ("LUNE_SHELL_INTEGRATION_LOADED" in $env) {
         | upsert osc7 true
         | upsert osc133 true
     ))
+}
+
+def --wrapped ssh [...args] {
+    if ($env.LUNE_SSH_WRAPPER? != "0") and ($env.TERM? == "xterm-kitty") {
+        with-env { TERM: "xterm-256color" } { ^ssh ...$args }
+    } else {
+        ^ssh ...$args
+    }
 }
 "#;
 
@@ -364,24 +404,79 @@ fn prepend_xdg_data_dir(command: &mut Command, dir: &Path) {
     command.env("XDG_DATA_DIRS", joined);
 }
 
-fn script_root() -> PathBuf {
+/// Stages Lune's bundled `xterm-kitty` terminfo entry and appends its directory
+/// to `TERMINFO_DIRS` so ncurses utilities (`clear`, `tput`, `htop`, etc.) work
+/// out of the box even when the system lacks `kitty-terminfo`.
+pub(super) fn inject_terminfo(command: &mut Command, term: &str) {
+    if term != "xterm-kitty" {
+        return;
+    }
+    match ensure_terminfo() {
+        Ok(dir) => {
+            let existing = env::var_os("TERMINFO_DIRS");
+            let value = append_terminfo_dir(existing.as_deref(), &dir);
+            command.env("TERMINFO_DIRS", value);
+        }
+        Err(error) => {
+            log::warn!("Could not prepare bundled xterm-kitty terminfo: {error}");
+        }
+    }
+}
+
+fn append_terminfo_dir(existing: Option<&OsStr>, dir: &Path) -> OsString {
+    match existing {
+        Some(current) if !current.is_empty() => {
+            if env::split_paths(current).any(|entry| entry == dir) {
+                return current.to_os_string();
+            }
+            let mut joined = current.to_os_string();
+            joined.push(":");
+            joined.push(dir);
+            joined
+        }
+        _ => {
+            // Leading `:` preserves default system terminfo search paths first,
+            // falling back to Lune's bundled directory only when missing.
+            let mut joined = OsString::from(":");
+            joined.push(dir);
+            joined
+        }
+    }
+}
+
+fn runtime_base() -> PathBuf {
     if let Some(runtime) = env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
     {
-        return runtime.join("lune").join("shell-integration");
+        return runtime.join("lune");
     }
     if let Some(cache) = env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
     {
-        return cache.join("lune").join("shell-integration");
+        return cache.join("lune");
     }
     // SAFETY: `geteuid` is an infallible read-only POSIX syscall with no preconditions.
     let uid = unsafe { libc::geteuid() };
-    env::temp_dir()
-        .join(format!("lune-{uid}"))
-        .join("shell-integration")
+    env::temp_dir().join(format!("lune-{uid}"))
+}
+
+fn script_root() -> PathBuf {
+    runtime_base().join("shell-integration")
+}
+
+fn ensure_terminfo() -> io::Result<PathBuf> {
+    let root = runtime_base().join("terminfo");
+    write_terminfo_to(&root)?;
+    Ok(root)
+}
+
+fn write_terminfo_to(root: &Path) -> io::Result<()> {
+    let entry_dir = root.join("x");
+    fs::create_dir_all(&entry_dir)?;
+    let _ = fs::set_permissions(root, fs::Permissions::from_mode(0o700));
+    write_bytes_if_changed(&entry_dir.join("xterm-kitty"), XTERM_KITTY_TERMINFO)
 }
 
 fn ensure_scripts() -> io::Result<PathBuf> {
@@ -418,7 +513,11 @@ fn write_scripts_to(root: &Path) -> io::Result<()> {
 }
 
 fn write_if_changed(path: &Path, content: &str) -> io::Result<()> {
-    if let Ok(existing) = fs::read_to_string(path)
+    write_bytes_if_changed(path, content.as_bytes())
+}
+
+fn write_bytes_if_changed(path: &Path, content: &[u8]) -> io::Result<()> {
+    if let Ok(existing) = fs::read(path)
         && existing == content
     {
         return Ok(());
@@ -526,6 +625,38 @@ mod tests {
                     val.starts_with(&dir.join("nushell-data").to_string_lossy().to_string())
                 })
         }));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stages_bundled_xterm_kitty_terminfo_and_formats_terminfo_dirs() {
+        let dir = env::temp_dir().join(format!("lune-terminfo-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        write_terminfo_to(&dir).unwrap();
+        let entry = dir.join("x/xterm-kitty");
+        let bytes = fs::read(&entry).unwrap();
+        assert!(bytes.len() > 12);
+        let magic = u16::from_le_bytes([bytes[0], bytes[1]]);
+        assert!(
+            magic == 0x011a || magic == 0x021e,
+            "unexpected terminfo magic: {magic:#06x}"
+        );
+
+        assert_eq!(
+            append_terminfo_dir(None, &dir),
+            OsString::from(format!(":{}", dir.display()))
+        );
+        assert_eq!(
+            append_terminfo_dir(Some(OsStr::new("")), &dir),
+            OsString::from(format!(":{}", dir.display()))
+        );
+        assert_eq!(
+            append_terminfo_dir(Some(OsStr::new("/custom/ti:")), &dir),
+            OsString::from(format!("/custom/ti::{}", dir.display()))
+        );
+        let existing = OsString::from(format!(":{}", dir.display()));
+        assert_eq!(append_terminfo_dir(Some(&existing), &dir), existing);
 
         let _ = fs::remove_dir_all(&dir);
     }

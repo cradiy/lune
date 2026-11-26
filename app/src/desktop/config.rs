@@ -25,7 +25,7 @@ pub(super) const DEFAULT_UNFOCUSED_SPLIT_OPACITY: f32 = 0.75;
 pub(super) const MAX_WINDOW_PADDING: u32 = 64;
 pub(super) const DEFAULT_SCROLLBACK_LINES: usize = 10_000;
 pub(super) const MAX_SCROLLBACK_LINES: usize = 1_000_000;
-pub(super) const DEFAULT_TERM: &str = "xterm-256color";
+pub(super) const DEFAULT_TERM: &str = "xterm-kitty";
 pub(super) const DEFAULT_TERM_PROGRAM: &str = "Lune";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -346,6 +346,20 @@ pub(super) enum NotificationPolicy {
     Deny,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum EnvOverride {
+    Set(String, String),
+    Unset(String),
+}
+
+impl EnvOverride {
+    fn key(&self) -> &str {
+        match self {
+            Self::Set(name, _) | Self::Unset(name) => name,
+        }
+    }
+}
+
 #[derive(PartialEq)]
 pub(super) struct Config {
     pub(super) mode: TerminalMode,
@@ -382,8 +396,8 @@ pub(super) struct Config {
     pub(super) shell: Option<Vec<OsString>>,
     pub(super) shell_integration: bool,
     pub(super) term: String,
-    pub(super) term_program: String,
-    pub(super) env: Vec<(String, String)>,
+    pub(super) term_program: Option<String>,
+    pub(super) env: Vec<EnvOverride>,
     pub(super) confirm_close: bool,
     pub(super) confirm_paste: bool,
     pub(super) copy_on_select: bool,
@@ -430,7 +444,7 @@ impl Default for Config {
             shell: None,
             shell_integration: true,
             term: DEFAULT_TERM.to_owned(),
-            term_program: DEFAULT_TERM_PROGRAM.to_owned(),
+            term_program: Some(DEFAULT_TERM_PROGRAM.to_owned()),
             env: Vec::new(),
             confirm_close: true,
             confirm_paste: true,
@@ -722,11 +736,11 @@ impl Config {
                 if value.is_empty() {
                     self.env.clear();
                 } else {
-                    let (name, val) = parse_env_pair(value)?;
-                    if let Some((_, existing)) = self.env.iter_mut().find(|(k, _)| k == &name) {
-                        *existing = val;
+                    let entry = parse_env_override(value)?;
+                    if let Some(existing) = self.env.iter_mut().find(|e| e.key() == entry.key()) {
+                        *existing = entry;
                     } else {
-                        self.env.push((name, val));
+                        self.env.push(entry);
                     }
                 }
             }
@@ -888,29 +902,47 @@ fn parse_term_name(value: &str) -> Result<String, &'static str> {
     Ok(value.to_owned())
 }
 
-fn parse_term_program(value: &str) -> Result<String, &'static str> {
-    if value.is_empty() || value.chars().any(char::is_control) {
-        return Err("term-program must be a non-empty name without control characters");
+fn parse_term_program(value: &str) -> Result<Option<String>, &'static str> {
+    if value.chars().any(char::is_control) {
+        return Err("term-program must not contain control characters");
     }
-    Ok(value.to_owned())
+    let unquoted = value
+        .strip_prefix('\'')
+        .and_then(|s| s.strip_suffix('\''))
+        .or_else(|| value.strip_prefix('"').and_then(|s| s.strip_suffix('"')))
+        .unwrap_or(value);
+    if unquoted.is_empty() || value.eq_ignore_ascii_case("none") {
+        return Ok(None);
+    }
+    Ok(Some(unquoted.to_owned()))
 }
 
-fn parse_env_pair(value: &str) -> Result<(String, String), &'static str> {
-    let Some((raw_name, raw_val)) = value.split_once('=') else {
-        return Err("env must be formatted as KEY=VALUE");
-    };
-    let name = raw_name.trim();
-    if name.is_empty()
-        || name
+fn valid_env_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name
             .chars()
             .any(|ch| ch.is_control() || ch.is_whitespace() || ch == '=')
-    {
+}
+
+fn parse_env_override(value: &str) -> Result<EnvOverride, &'static str> {
+    if let Some(raw_name) = value.strip_prefix('-') {
+        let name = raw_name.trim();
+        if !valid_env_name(name) {
+            return Err("env unset name must be non-empty without whitespace");
+        }
+        return Ok(EnvOverride::Unset(name.to_owned()));
+    }
+    let Some((raw_name, raw_val)) = value.split_once('=') else {
+        return Err("env must be formatted as KEY=VALUE or -KEY");
+    };
+    let name = raw_name.trim();
+    if !valid_env_name(name) {
         return Err("env variable name must be non-empty without whitespace");
     }
     if raw_val.chars().any(char::is_control) {
         return Err("env variable value must not contain control characters");
     }
-    Ok((name.to_owned(), raw_val.to_owned()))
+    Ok(EnvOverride::Set(name.to_owned(), raw_val.to_owned()))
 }
 
 fn parse_cursor_style(value: &str) -> Result<CursorShape, &'static str> {
@@ -1152,38 +1184,58 @@ keybind = ctrl+shift+k=unbind\n\
     #[test]
     fn parses_term_term_program_and_custom_env_overrides() {
         let defaults = Config::default();
-        assert_eq!(defaults.term, super::DEFAULT_TERM);
-        assert_eq!(defaults.term_program, super::DEFAULT_TERM_PROGRAM);
+        assert_eq!(defaults.term, "xterm-kitty");
+        assert_eq!(
+            defaults.term_program.as_deref(),
+            Some(super::DEFAULT_TERM_PROGRAM)
+        );
         assert!(defaults.env.is_empty());
 
         let loaded = Config::parse(
             "lune.conf",
             "\
-term = xterm-kitty\n\
+term = xterm-256color\n\
 term = invalid term\n\
 term-program = CustomTerm\n\
-term-program =\n\
 env = FOO=old\n\
 env = BAR=1\n\
 env =\n\
 env = SNACKS_KITTY=true\n\
 env = LESS=-R --tabs=4\n\
 env = SNACKS_KITTY=false\n\
+env = -TERM_PROGRAM\n\
 env = EMPTY=\n\
 env = MISSING_EQUALS\n\
-env = BAD KEY=1\n",
+env = BAD KEY=1\n\
+env = -\n",
             Path::new(""),
         );
-        assert_eq!(loaded.config.term, "xterm-kitty");
-        assert_eq!(loaded.config.term_program, "CustomTerm");
+        assert_eq!(loaded.config.term, "xterm-256color");
+        assert_eq!(loaded.config.term_program.as_deref(), Some("CustomTerm"));
         assert_eq!(
             loaded.config.env,
             vec![
-                ("SNACKS_KITTY".to_owned(), "false".to_owned()),
-                ("LESS".to_owned(), "-R --tabs=4".to_owned()),
-                ("EMPTY".to_owned(), String::new()),
+                super::EnvOverride::Set("SNACKS_KITTY".to_owned(), "false".to_owned()),
+                super::EnvOverride::Set("LESS".to_owned(), "-R --tabs=4".to_owned()),
+                super::EnvOverride::Unset("TERM_PROGRAM".to_owned()),
+                super::EnvOverride::Set("EMPTY".to_owned(), String::new()),
             ]
         );
         assert_eq!(loaded.errors.len(), 4, "{:?}", loaded.errors);
+
+        for unset_line in [
+            "term-program =",
+            "term-program = ''",
+            "term-program = \"\"",
+            "term-program = none",
+        ] {
+            let parsed = Config::parse("lune.conf", unset_line, Path::new(""));
+            assert!(
+                parsed.errors.is_empty(),
+                "{unset_line}: {:?}",
+                parsed.errors
+            );
+            assert_eq!(parsed.config.term_program, None, "{unset_line}");
+        }
     }
 }

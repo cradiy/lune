@@ -71,10 +71,12 @@ scrollback-lines = 10000
 # shell = /bin/zsh -l
 shell-integration = true
 # Terminal identification and extra PTY environment variables
-term = xterm-256color
+term = xterm-kitty
+# Set term-program to empty, '', "", or none to unset TERM_PROGRAM
 term-program = Lune
-# env = KEY=VALUE (repeatable; use "env =" to clear earlier entries)
+# env = KEY=VALUE | -KEY (repeatable; use -KEY to unset, "env =" to clear earlier entries)
 # env = SNACKS_KITTY=true
+# env = -TERM_PROGRAM
 confirm-close = true
 confirm-paste = true
 copy-on-select = false
