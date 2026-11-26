@@ -1305,7 +1305,7 @@ fuzz_target!(|data: &[u8]| {
                 } else {
                     b"\x1b[0c"
                 });
-                replies.extend_from_slice(b"\x1b[?62;22c");
+                replies.extend_from_slice(b"\x1b[?62;22;52c");
                 None
             }
             58 => {

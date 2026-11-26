@@ -763,6 +763,57 @@ fn osc52_decodes_writes_queries_and_rejects_malformed_payloads_across_splits() {
     assert!(notifications.clipboard_write.is_none());
     assert!(notifications.clipboard_query.is_none());
     assert_eq!(processor.ignored_sequences(), 4);
+
+    // Consecutive OSC 52 writes with the same text merge their targets instead
+    // of dropping the earlier selection, while newer distinct text replaces it.
+    advance(
+        &mut processor,
+        &mut screen,
+        b"\x1b]52;c;aGVsbG8=\x07\x1b]52;p;aGVsbG8=\x07",
+    );
+    assert_eq!(
+        processor.take_notifications().clipboard_write,
+        Some(ClipboardWrite {
+            targets: ClipboardTargets {
+                clipboard: true,
+                primary: true,
+            },
+            text: "hello",
+        })
+    );
+    advance(
+        &mut processor,
+        &mut screen,
+        b"\x1b]52;c;\x07\x1b]52;c;d29ybGQ=\x07",
+    );
+    assert_eq!(
+        processor.take_notifications().clipboard_write,
+        Some(ClipboardWrite {
+            targets: ClipboardTargets {
+                clipboard: true,
+                primary: false,
+            },
+            text: "world",
+        })
+    );
+
+    // Base64 digit '9' (value 61 == b'=') must not collide with padding in any quantum slot:
+    // "wo=" -> d289 (slot 3), "wo}" -> d299 (slots 2 & 3), "wor" -> d29y (slot 2).
+    advance(
+        &mut processor,
+        &mut screen,
+        b"\x1b]52;c;d289d299L3Zhci93b3JsZA==\x07",
+    );
+    assert_eq!(
+        processor.take_notifications().clipboard_write,
+        Some(ClipboardWrite {
+            targets: ClipboardTargets {
+                clipboard: true,
+                primary: false,
+            },
+            text: "wo=wo}/var/world",
+        })
+    );
 }
 
 #[test]

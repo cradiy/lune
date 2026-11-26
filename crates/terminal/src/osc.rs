@@ -106,6 +106,8 @@ impl ClipboardQuery {
     }
 }
 
+const BASE64_PAD: u8 = u8::MAX;
+
 #[derive(Clone, Copy, Default)]
 struct Base64Decoder {
     quantum: [u8; 4],
@@ -129,7 +131,7 @@ impl Base64Decoder {
                     return false;
                 }
                 self.pad_seen = true;
-                self.quantum[usize::from(self.len)] = b'=';
+                self.quantum[usize::from(self.len)] = BASE64_PAD;
                 self.len += 1;
                 if self.len == 4 {
                     if !self.flush_quantum(out) {
@@ -182,13 +184,13 @@ impl Base64Decoder {
 
     fn flush_quantum(&self, out: &mut Vec<u8>) -> bool {
         let q = self.quantum;
-        if q[2] == b'=' {
-            if q[3] != b'=' {
+        if q[2] == BASE64_PAD {
+            if q[3] != BASE64_PAD {
                 return false;
             }
             let b0 = (q[0] << 2) | (q[1] >> 4);
             push_clipboard_bytes(out, &[b0])
-        } else if q[3] == b'=' {
+        } else if q[3] == BASE64_PAD {
             let b0 = (q[0] << 2) | (q[1] >> 4);
             let b1 = (q[1] << 4) | (q[2] >> 2);
             push_clipboard_bytes(out, &[b0, b1])
@@ -1174,8 +1176,18 @@ impl Osc {
             return Outcome::Ignored;
         }
         if targets.clipboard || targets.primary {
-            std::mem::swap(&mut self.clipboard_text, &mut self.clipboard_candidate);
-            self.clipboard_write = Some(targets);
+            let merged = if let Some(existing) = self.clipboard_write
+                && self.clipboard_candidate == self.clipboard_text
+            {
+                ClipboardTargets {
+                    clipboard: existing.clipboard || targets.clipboard,
+                    primary: existing.primary || targets.primary,
+                }
+            } else {
+                std::mem::swap(&mut self.clipboard_text, &mut self.clipboard_candidate);
+                targets
+            };
+            self.clipboard_write = Some(merged);
         }
         self.clipboard_candidate.clear();
         Outcome::Done
@@ -1711,11 +1723,11 @@ fn decode_base64_slice(input: &[u8], out: &mut [u8]) -> Option<usize> {
                 return None;
             }
             pad_seen = true;
-            quantum[qlen] = b'=';
+            quantum[qlen] = BASE64_PAD;
             qlen += 1;
             if qlen == 4 {
-                if quantum[2] == b'=' {
-                    if quantum[3] != b'=' {
+                if quantum[2] == BASE64_PAD {
+                    if quantum[3] != BASE64_PAD {
                         return None;
                     }
                     push_slice(&[(quantum[0] << 2) | (quantum[1] >> 4)])?;

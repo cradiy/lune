@@ -50,6 +50,7 @@ pub(super) struct ContextMenuBlockTarget {
 pub(super) struct DispatchContext<'a> {
     pub(super) focused: bool,
     pub(super) copy_pending: &'a mut bool,
+    pub(super) queued_copy: &'a mut Option<String>,
     pub(super) primary: &'a mut Option<clipboard::Primary>,
     pub(super) clipboard_write: ClipboardPolicy,
     pub(super) clipboard_read: ClipboardPolicy,
@@ -1128,11 +1129,16 @@ impl Pane {
             && ctx.clipboard_write == ClipboardPolicy::Allow
         {
             let text = write.text.to_owned();
-            if write.targets.clipboard && !*ctx.copy_pending {
-                match clipboard::write(text.clone(), self.clipboard.clone(), self.proxy.clone()) {
-                    Ok(()) => *ctx.copy_pending = true,
-                    Err(error) => {
-                        log::warn!("Failed to start the OSC 52 copy worker: {error}");
+            if write.targets.clipboard {
+                if *ctx.copy_pending {
+                    *ctx.queued_copy = Some(text.clone());
+                } else {
+                    match clipboard::write(text.clone(), self.clipboard.clone(), self.proxy.clone())
+                    {
+                        Ok(()) => *ctx.copy_pending = true,
+                        Err(error) => {
+                            log::warn!("Failed to start the OSC 52 copy worker: {error}");
+                        }
                     }
                 }
             }
@@ -2398,6 +2404,19 @@ fn format_copied_preview(text: &str) -> String {
     }
 }
 
+fn ensure_primary(primary: &mut Option<clipboard::Primary>) -> Option<clipboard::Primary> {
+    if primary.is_none() {
+        *primary = match clipboard::Primary::new() {
+            Ok(primary) => Some(primary),
+            Err(error) => {
+                log::warn!("Failed to start the primary selection worker: {error}");
+                return None;
+            }
+        };
+    }
+    primary.clone()
+}
+
 fn publish_primary_text(
     text: String,
     data_device: Option<&clipboard::DataDeviceHandle>,
@@ -2405,20 +2424,17 @@ fn publish_primary_text(
 ) {
     if let Some(dd) = data_device
         && dd.has_primary_selection()
-        && dd.publish_primary(text.clone())
     {
-        return;
-    }
-    if primary.is_none() {
-        *primary = match clipboard::Primary::new() {
-            Ok(primary) => Some(primary),
-            Err(error) => {
-                log::warn!("Failed to start the primary selection worker: {error}");
-                return;
-            }
+        let fallback = if dd.has_data_control() {
+            ensure_primary(primary)
+        } else {
+            None
         };
+        if dd.publish_primary(text.clone(), fallback) {
+            return;
+        }
     }
-    if let Some(primary) = primary {
+    if let Some(primary) = ensure_primary(primary) {
         primary.publish(text);
     }
 }

@@ -469,6 +469,18 @@ impl ApplicationHandler<Event> for App {
                 if let Err(error) = result {
                     log::warn!("Clipboard copy failed: {error}");
                 }
+                if let Some(next_text) = client.queued_copy.take() {
+                    match clipboard::write(
+                        next_text,
+                        client.clipboard_handle(),
+                        client.proxy.clone(),
+                    ) {
+                        Ok(()) => client.copy_pending = true,
+                        Err(error) => {
+                            log::warn!("Failed to start the queued clipboard copy worker: {error}");
+                        }
+                    }
+                }
                 Ok(())
             }
             Event::DirectoryOpened(result) => {
@@ -542,6 +554,7 @@ struct Client {
     sidebar_divider_last_click: Option<Instant>,
     content_area: PixelRect,
     copy_pending: bool,
+    queued_copy: Option<String>,
     directory_open_pending: bool,
     hyperlink_open_pending: bool,
     primary_selection: Option<clipboard::Primary>,
@@ -788,6 +801,7 @@ impl Client {
             sidebar_divider_last_click: None,
             content_area,
             copy_pending: false,
+            queued_copy: None,
             directory_open_pending: false,
             hyperlink_open_pending: false,
             primary_selection: None,
@@ -2343,6 +2357,7 @@ impl Client {
             tab::DispatchContext {
                 focused: is_focused,
                 copy_pending: &mut self.copy_pending,
+                queued_copy: &mut self.queued_copy,
                 primary: &mut self.primary_selection,
                 clipboard_write: self.clipboard_write,
                 clipboard_read: self.clipboard_read,
@@ -2399,6 +2414,9 @@ impl Client {
     }
 
     fn wait(&mut self, event_loop: &ActiveEventLoop) -> Result<()> {
+        if let Some(clipboard) = &self.clipboard {
+            clipboard.wake();
+        }
         let now = Instant::now();
         self.apply_resize();
         for pane in &mut self.tabs[self.active].panes {

@@ -283,7 +283,7 @@ impl Report {
             }
             Self::PrimaryDeviceAttributes => {
                 reply.clear();
-                reply.append(b"\x1b[?62;22c");
+                reply.append(b"\x1b[?62;22;52c");
             }
             Self::Version => reply.version(),
             Self::Position {

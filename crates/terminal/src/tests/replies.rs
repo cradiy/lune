@@ -191,7 +191,7 @@ fn primary_device_attributes_share_reply_order_and_preserve_screen_state() {
         let mut output = Vec::new();
         drive(&mut processor, &mut screen, &wire[..split], &mut output);
         drive(&mut processor, &mut screen, &wire[split..], &mut output);
-        assert_eq!(output, b"\x1b[?62;22c\x1b[3;8R\x1b[?62;22c");
+        assert_eq!(output, b"\x1b[?62;22;52c\x1b[3;8R\x1b[?62;22;52c");
         assert_eq!(processor.ignored_sequences(), 7);
         assert_eq!(processor.style_id(), style);
         assert_eq!(screen.cursor(), cursor);

@@ -1,8 +1,8 @@
 //! Core Wayland `wl_data_device_manager` and `zwp_primary_selection_v1`
 //! clipboard backend.
 //!
-//! Runs on a dedicated `calloop` worker thread attached as a guest queue to
-//! winit's `wl_display`, so regular clipboard and primary selection offers and
+//! Runs on a dedicated worker thread attached as a guest queue to winit's
+//! `wl_display`, so regular clipboard and primary selection offers and
 //! transfers work on every Wayland compositor (including compositors that do
 //! not advertise `ext_data_control_manager_v1` or `zwlr_data_control_manager_v1`)
 //! even while the terminal window is unfocused or idle.
@@ -10,19 +10,17 @@
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::io;
-use std::os::fd::{AsFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use calloop::channel::{self, SyncSender};
-use calloop::ping::{Ping, PingSource, make_ping};
-use calloop_wayland_source::WaylandSource;
-use wayland_client::backend::Backend;
+use wayland_client::backend::{Backend, WaylandError};
 use wayland_client::globals::{GlobalListContents, registry_queue_init};
 use wayland_client::protocol::{
-    wl_data_device, wl_data_device_manager, wl_data_offer, wl_data_source, wl_keyboard, wl_pointer,
-    wl_registry, wl_seat, wl_touch,
+    wl_callback, wl_data_device, wl_data_device_manager, wl_data_offer, wl_data_source,
+    wl_keyboard, wl_pointer, wl_registry, wl_seat, wl_touch,
 };
 use wayland_client::{
     Connection, Dispatch, Proxy, QueueHandle, WEnum, delegate_noop, event_created_child,
@@ -36,7 +34,7 @@ use wayland_protocols::wp::primary_selection::zv1::client::{
 use winit::raw_window_handle::{HasDisplayHandle, RawDisplayHandle};
 use winit::window::Window;
 
-use super::{ClipboardType, transfer};
+use super::{ClipboardType, Primary, transfer};
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_TRANSFERS: usize = 4;
@@ -68,16 +66,18 @@ struct SendDisplay(*mut c_void);
 unsafe impl Send for SendDisplay {}
 
 pub(in crate::desktop) struct DataDevice {
-    commands: SyncSender<Command>,
+    commands: mpsc::SyncSender<Command>,
+    wake: Arc<OwnedFd>,
     has_data_control: bool,
     has_primary_selection: bool,
-    stop: Ping,
+    stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
 
 #[derive(Clone)]
 pub(in crate::desktop) struct DataDeviceHandle {
-    commands: SyncSender<Command>,
+    commands: mpsc::SyncSender<Command>,
+    wake: Arc<OwnedFd>,
     has_data_control: bool,
     has_primary_selection: bool,
 }
@@ -101,10 +101,13 @@ pub(super) enum ReadOutcome {
 }
 
 enum Command {
-    Write {
-        clipboard: ClipboardType,
+    WriteRegular {
         text: String,
-        reply: Option<mpsc::SyncSender<WriteOutcome>>,
+        reply: mpsc::SyncSender<WriteOutcome>,
+    },
+    WritePrimary {
+        text: String,
+        fallback: Option<Primary>,
     },
     Read {
         clipboard: ClipboardType,
@@ -123,20 +126,23 @@ impl DataDevice {
         };
         let display = SendDisplay(wayland_display.display.as_ptr());
 
-        let (commands, commands_rx) = channel::sync_channel::<Command>(16);
-        let (stop, stop_source) = match make_ping() {
-            Ok(ping) => ping,
+        let (wake_read, wake_write) = match create_nonblocking_pipe() {
+            Ok(pipe) => pipe,
             Err(error) => {
                 log::warn!("Could not create Wayland clipboard worker wakeup: {error}");
                 return None;
             }
         };
+        let wake = Arc::new(wake_write);
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = stop.clone();
+        let (commands, commands_rx) = mpsc::sync_channel::<Command>(32);
         let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<Capabilities, String>>(1);
 
         let thread = match thread::Builder::new()
             .name("lune-clipboard".into())
             .spawn(move || {
-                run_worker(display, commands_rx, stop_source, ready_tx);
+                run_worker(display, commands_rx, wake_read, worker_stop, ready_tx);
             }) {
             Ok(thread) => thread,
             Err(error) => {
@@ -154,6 +160,7 @@ impl DataDevice {
                 );
                 Some(Self {
                     commands,
+                    wake,
                     has_data_control: caps.has_data_control,
                     has_primary_selection: caps.has_primary_selection,
                     stop,
@@ -167,16 +174,24 @@ impl DataDevice {
             }
             Err(_) => {
                 log::warn!("Timed out initializing Wayland wl_data_device_manager clipboard");
-                stop.ping();
+                stop.store(true, Ordering::Release);
+                signal_wake(&wake);
                 let _ = thread.join();
                 None
             }
         }
     }
 
+    /// Wakes the worker thread so it dispatches any guest queue events that
+    /// winit read off the shared Wayland display socket.
+    pub(in crate::desktop) fn wake(&self) {
+        signal_wake(&self.wake);
+    }
+
     pub(in crate::desktop) fn handle(&self) -> DataDeviceHandle {
         DataDeviceHandle {
             commands: self.commands.clone(),
+            wake: self.wake.clone(),
             has_data_control: self.has_data_control,
             has_primary_selection: self.has_primary_selection,
         }
@@ -187,7 +202,8 @@ impl Drop for DataDevice {
     fn drop(&mut self) {
         // Wake the worker before joining it so the guest backend is dropped
         // before the window releases wl_display.
-        self.stop.ping();
+        self.stop.store(true, Ordering::Release);
+        signal_wake(&self.wake);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -195,7 +211,7 @@ impl Drop for DataDevice {
 }
 
 impl DataDeviceHandle {
-    pub(super) fn has_data_control(&self) -> bool {
+    pub(in crate::desktop) fn has_data_control(&self) -> bool {
         self.has_data_control
     }
 
@@ -203,32 +219,39 @@ impl DataDeviceHandle {
         self.has_primary_selection
     }
 
-    pub(in crate::desktop) fn publish_primary(&self, text: String) -> bool {
+    pub(in crate::desktop) fn publish_primary(
+        &self,
+        text: String,
+        fallback: Option<Primary>,
+    ) -> bool {
         if !self.has_primary_selection {
             return false;
         }
-        self.commands
-            .try_send(Command::Write {
-                clipboard: ClipboardType::Primary,
-                text,
-                reply: None,
-            })
+        if self
+            .commands
+            .try_send(Command::WritePrimary { text, fallback })
             .is_ok()
+        {
+            signal_wake(&self.wake);
+            true
+        } else {
+            false
+        }
     }
 
     pub(super) fn write(&self, text: String, timeout: Duration) -> WriteOutcome {
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
         if self
             .commands
-            .send(Command::Write {
-                clipboard: ClipboardType::Regular,
+            .send(Command::WriteRegular {
                 text,
-                reply: Some(reply_tx),
+                reply: reply_tx,
             })
             .is_err()
         {
             return WriteOutcome::Fallback;
         }
+        signal_wake(&self.wake);
         reply_rx
             .recv_timeout(timeout)
             .unwrap_or(WriteOutcome::Fallback)
@@ -249,6 +272,7 @@ impl DataDeviceHandle {
         {
             return ReadOutcome::Fallback;
         }
+        signal_wake(&self.wake);
         let timeout = deadline.saturating_duration_since(Instant::now());
         if timeout.is_zero() {
             return ReadOutcome::Fallback;
@@ -263,7 +287,18 @@ type OfferMimes = Arc<Mutex<Vec<String>>>;
 
 struct SourceData {
     seat_name: u32,
+    write_id: u64,
     text: Arc<String>,
+}
+
+struct WriteSync(u64);
+
+enum PendingWrite {
+    Regular(mpsc::SyncSender<WriteOutcome>),
+    Primary {
+        text: Arc<String>,
+        fallback: Option<Primary>,
+    },
 }
 
 struct SeatState {
@@ -277,9 +312,13 @@ struct SeatState {
     last_serial: Option<u32>,
     selection_offer: Option<wl_data_offer::WlDataOffer>,
     dnd_offer: Option<wl_data_offer::WlDataOffer>,
-    active_source: Option<(wl_data_source::WlDataSource, Arc<String>)>,
+    active_source: Option<(wl_data_source::WlDataSource, Arc<String>, u64)>,
     primary_offer: Option<primary_offer::ZwpPrimarySelectionOfferV1>,
-    active_primary_source: Option<(primary_source::ZwpPrimarySelectionSourceV1, Arc<String>)>,
+    active_primary_source: Option<(
+        primary_source::ZwpPrimarySelectionSourceV1,
+        Arc<String>,
+        u64,
+    )>,
 }
 
 impl SeatState {
@@ -290,13 +329,13 @@ impl SeatState {
         if let Some(offer) = self.dnd_offer.take() {
             offer.destroy();
         }
-        if let Some((source, _)) = self.active_source.take() {
+        if let Some((source, _, _)) = self.active_source.take() {
             source.destroy();
         }
         if let Some(offer) = self.primary_offer.take() {
             offer.destroy();
         }
-        if let Some((source, _)) = self.active_primary_source.take() {
+        if let Some((source, _, _)) = self.active_primary_source.take() {
             source.destroy();
         }
         if let Some(primary) = self.primary_device.take() {
@@ -335,6 +374,8 @@ struct WorkerState {
     active_seat: Option<u32>,
     has_data_control: bool,
     pending_commands: VecDeque<Command>,
+    pending_writes: HashMap<u64, PendingWrite>,
+    next_write_id: u64,
     transfers: Arc<()>,
 }
 
@@ -380,6 +421,11 @@ impl WorkerState {
 
     fn cleanup(&mut self) {
         self.pending_commands.clear();
+        for (_, pending) in self.pending_writes.drain() {
+            if let PendingWrite::Regular(reply) = pending {
+                let _ = reply.send(WriteOutcome::Fallback);
+            }
+        }
         for (_, seat) in self.seats.drain() {
             seat.destroy_all();
         }
@@ -448,30 +494,26 @@ impl WorkerState {
             .or(self.active_seat)
     }
 
-    fn process_commands(&mut self) {
-        if self.pending_commands.is_empty() {
-            return;
-        }
-        // If libwayland has unread events already queued for our guest event
-        // queue (such as the wl_keyboard.key or wl_data_device.selection that
-        // triggered this command), let WaylandSource dispatch them first so
-        // `last_serial` and selection offers are completely up to date.
-        let Some(guard) = self.connection.prepare_read() else {
-            return;
-        };
-        drop(guard);
+    fn allocate_write_id(&mut self) -> u64 {
+        let id = self.next_write_id;
+        self.next_write_id = self.next_write_id.wrapping_add(1);
+        id
+    }
 
+    fn supersede_pending_write(&mut self, write_id: u64) {
+        if let Some(PendingWrite::Regular(reply)) = self.pending_writes.remove(&write_id) {
+            let _ = reply.send(WriteOutcome::Published);
+        }
+    }
+
+    fn process_commands(&mut self) {
         while let Some(command) = self.pending_commands.pop_front() {
             match command {
-                Command::Write {
-                    clipboard,
-                    text,
-                    reply,
-                } => {
-                    let outcome = self.handle_write(clipboard, text);
-                    if let Some(reply) = reply {
-                        let _ = reply.send(outcome);
-                    }
+                Command::WriteRegular { text, reply } => {
+                    self.handle_write_regular(text, reply);
+                }
+                Command::WritePrimary { text, fallback } => {
+                    self.handle_write_primary(text, fallback);
                 }
                 Command::Read { clipboard, reply } => {
                     let outcome = self.handle_read(clipboard);
@@ -479,56 +521,119 @@ impl WorkerState {
                 }
             }
         }
-        let _ = self.connection.flush();
     }
 
-    fn handle_write(&mut self, clipboard: ClipboardType, text: String) -> WriteOutcome {
+    fn handle_write_regular(&mut self, text: String, reply: mpsc::SyncSender<WriteOutcome>) {
         let Some(seat_name) = self.pick_write_seat() else {
-            return WriteOutcome::Fallback;
+            let _ = reply.send(WriteOutcome::Fallback);
+            return;
         };
-        let Some(seat) = self.seats.get_mut(&seat_name) else {
-            return WriteOutcome::Fallback;
+        let Some(serial) = self.seats.get(&seat_name).and_then(|seat| seat.last_serial) else {
+            let _ = reply.send(WriteOutcome::Fallback);
+            return;
         };
-        let Some(serial) = seat.last_serial else {
-            return WriteOutcome::Fallback;
-        };
+        let prev_write_id = self
+            .seats
+            .get(&seat_name)
+            .and_then(|seat| seat.active_source.as_ref().map(|(_, _, id)| *id));
+        if let Some(prev_id) = prev_write_id {
+            self.supersede_pending_write(prev_id);
+        }
+        let write_id = self.allocate_write_id();
         let text = Arc::new(text);
-        match clipboard {
-            ClipboardType::Regular => {
-                let source = self.manager.create_data_source(
-                    &self.handle,
-                    SourceData {
-                        seat_name,
-                        text: text.clone(),
-                    },
-                );
-                for mime in OFFERED_TEXT_MIMES {
-                    source.offer((*mime).into());
-                }
-                seat.device.set_selection(Some(&source), serial);
-                seat.active_source = Some((source, text));
-                WriteOutcome::Published
+        let source = self.manager.create_data_source(
+            &self.handle,
+            SourceData {
+                seat_name,
+                write_id,
+                text: text.clone(),
+            },
+        );
+        for mime in OFFERED_TEXT_MIMES {
+            source.offer((*mime).into());
+        }
+        let Some(seat) = self.seats.get_mut(&seat_name) else {
+            source.destroy();
+            let _ = reply.send(WriteOutcome::Fallback);
+            return;
+        };
+        seat.device.set_selection(Some(&source), serial);
+        seat.active_source = Some((source, text, write_id));
+        self.pending_writes
+            .insert(write_id, PendingWrite::Regular(reply));
+        // Confirm compositor acceptance: any immediate Cancelled from a rejected
+        // serial arrives on this queue before wl_display.sync completes.
+        self.connection
+            .display()
+            .sync(&self.handle, WriteSync(write_id));
+    }
+
+    fn handle_write_primary(&mut self, text: String, fallback: Option<Primary>) {
+        let Some(seat_name) = self.pick_write_seat() else {
+            if let Some(primary) = fallback {
+                primary.publish(text);
             }
-            ClipboardType::Primary => {
-                let (Some(manager), Some(device)) =
-                    (self.primary_manager.as_ref(), seat.primary_device.as_ref())
-                else {
-                    return WriteOutcome::Fallback;
-                };
-                let source = manager.create_source(
-                    &self.handle,
-                    SourceData {
-                        seat_name,
-                        text: text.clone(),
-                    },
-                );
-                for mime in OFFERED_TEXT_MIMES {
-                    source.offer((*mime).into());
-                }
-                device.set_selection(Some(&source), serial);
-                seat.active_primary_source = Some((source, text));
-                WriteOutcome::Published
+            return;
+        };
+        let has_primary = self.primary_manager.is_some()
+            && self
+                .seats
+                .get(&seat_name)
+                .is_some_and(|seat| seat.primary_device.is_some());
+        let serial = self.seats.get(&seat_name).and_then(|seat| seat.last_serial);
+        let (true, Some(serial)) = (has_primary, serial) else {
+            if let Some(primary) = fallback {
+                primary.publish(text);
             }
+            return;
+        };
+        let prev_write_id = self
+            .seats
+            .get(&seat_name)
+            .and_then(|seat| seat.active_primary_source.as_ref().map(|(_, _, id)| *id));
+        if let Some(prev_id) = prev_write_id {
+            self.supersede_pending_write(prev_id);
+        }
+        let write_id = self.allocate_write_id();
+        let text = Arc::new(text);
+        let Some(manager) = self.primary_manager.as_ref() else {
+            if let Some(primary) = fallback {
+                primary.publish(text.as_ref().clone());
+            }
+            return;
+        };
+        let source = manager.create_source(
+            &self.handle,
+            SourceData {
+                seat_name,
+                write_id,
+                text: text.clone(),
+            },
+        );
+        for mime in OFFERED_TEXT_MIMES {
+            source.offer((*mime).into());
+        }
+        let Some(device) = self
+            .seats
+            .get(&seat_name)
+            .and_then(|seat| seat.primary_device.as_ref())
+        else {
+            source.destroy();
+            if let Some(primary) = fallback {
+                primary.publish(text.as_ref().clone());
+            }
+            return;
+        };
+        device.set_selection(Some(&source), serial);
+        if let Some(seat) = self.seats.get_mut(&seat_name) {
+            seat.active_primary_source = Some((source, text.clone(), write_id));
+        }
+        if fallback.is_some() {
+            self.pending_writes
+                .insert(write_id, PendingWrite::Primary { text, fallback });
+            self.connection
+                .display()
+                .sync(&self.handle, WriteSync(write_id));
         }
     }
 
@@ -547,7 +652,7 @@ impl WorkerState {
         match clipboard {
             ClipboardType::Regular => {
                 // Self-paste: return owned selection text directly without a pipe roundtrip.
-                if let Some((_, text)) = &seat.active_source {
+                if let Some((_, text, _)) = &seat.active_source {
                     return ReadOutcome::Text(text.as_ref().clone());
                 }
                 if let Some(offer) = &seat.selection_offer {
@@ -570,7 +675,7 @@ impl WorkerState {
                 if self.primary_manager.is_none() {
                     return ReadOutcome::Fallback;
                 }
-                if let Some((_, text)) = &seat.active_primary_source {
+                if let Some((_, text, _)) = &seat.active_primary_source {
                     return ReadOutcome::Text(text.as_ref().clone());
                 }
                 if let Some(offer) = &seat.primary_offer {
@@ -601,8 +706,9 @@ impl WorkerState {
 
 fn run_worker(
     display: SendDisplay,
-    commands_rx: channel::Channel<Command>,
-    stop_source: PingSource,
+    commands_rx: mpsc::Receiver<Command>,
+    wake_read: OwnedFd,
+    stop: Arc<AtomicBool>,
     ready_tx: mpsc::SyncSender<Result<Capabilities, String>>,
 ) {
     // SAFETY: `display.0` is a live `*mut wl_display` owned by winit's active
@@ -651,6 +757,8 @@ fn run_worker(
         active_seat: None,
         has_data_control,
         pending_commands: VecDeque::new(),
+        pending_writes: HashMap::new(),
+        next_write_id: 1,
         transfers: Arc::new(()),
     };
 
@@ -669,45 +777,6 @@ fn run_worker(
         return;
     }
 
-    let mut event_loop = match calloop::EventLoop::<WorkerState>::try_new() {
-        Ok(event_loop) => event_loop,
-        Err(error) => {
-            state.cleanup();
-            let _ = ready_tx.send(Err(error.to_string()));
-            return;
-        }
-    };
-    let signal = event_loop.get_signal();
-    if let Err(error) =
-        event_loop
-            .handle()
-            .insert_source(stop_source, move |(), (), _: &mut WorkerState| {
-                signal.stop();
-            })
-    {
-        state.cleanup();
-        let _ = ready_tx.send(Err(error.to_string()));
-        return;
-    }
-    if let Err(error) =
-        event_loop
-            .handle()
-            .insert_source(commands_rx, |event, (), state: &mut WorkerState| {
-                if let channel::Event::Msg(command) = event {
-                    state.pending_commands.push_back(command);
-                }
-            })
-    {
-        state.cleanup();
-        let _ = ready_tx.send(Err(error.to_string()));
-        return;
-    }
-    if let Err(error) = WaylandSource::new(connection, queue).insert(event_loop.handle()) {
-        state.cleanup();
-        let _ = ready_tx.send(Err(error.to_string()));
-        return;
-    }
-
     if ready_tx
         .send(Ok(Capabilities {
             has_data_control,
@@ -719,8 +788,80 @@ fn run_worker(
         return;
     }
 
-    if let Err(error) = event_loop.run(None, &mut state, WorkerState::process_commands) {
-        log::debug!("Wayland data-device clipboard loop ended: {error}");
+    loop {
+        if stop.load(Ordering::Acquire) {
+            break;
+        }
+        // Dispatch all events already queued in our guest EventQueue (including
+        // input/selection/source events that winit read off the shared socket)
+        // before running clipboard commands so focus and serials are current.
+        if let Err(error) = queue.dispatch_pending(&mut state) {
+            log::debug!("Wayland data-device clipboard dispatch ended: {error}");
+            break;
+        }
+        while let Ok(command) = commands_rx.try_recv() {
+            state.pending_commands.push_back(command);
+        }
+        state.process_commands();
+
+        if let Err(error) = connection.flush() {
+            log::debug!("Wayland data-device clipboard flush ended: {error}");
+            break;
+        }
+        if stop.load(Ordering::Acquire) {
+            break;
+        }
+
+        // Prepare to read our guest queue (`wl_display_prepare_read_queue`). If
+        // `None`, more events arrived in our guest queue concurrently (e.g. from
+        // winit's main thread), so loop immediately to dispatch them.
+        let Some(read_guard) = queue.prepare_read() else {
+            continue;
+        };
+
+        let wl_fd = read_guard.connection_fd();
+        let mut fds = [
+            libc::pollfd {
+                fd: wl_fd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: wake_read.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        // SAFETY: `fds` holds two valid `pollfd` entries for live descriptors.
+        let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
+        if ready < 0 {
+            drop(read_guard);
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            log::debug!("Wayland data-device clipboard poll ended: {error}");
+            break;
+        }
+        if fds[0].revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+            drop(read_guard);
+            break;
+        }
+        if fds[0].revents & libc::POLLIN != 0 {
+            match read_guard.read() {
+                Ok(_) => {}
+                Err(WaylandError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) => {
+                    log::debug!("Wayland data-device clipboard read ended: {error}");
+                    break;
+                }
+            }
+        } else {
+            drop(read_guard);
+        }
+        if fds[1].revents & libc::POLLIN != 0 {
+            drain_wake(&wake_read);
+        }
     }
     state.cleanup();
 }
@@ -823,7 +964,11 @@ impl Dispatch<wl_keyboard::WlKeyboard, u32> for WorkerState {
             wl_keyboard::Event::Leave { .. } => {
                 seat.focused = false;
             }
-            wl_keyboard::Event::Key { serial, .. } => {
+            wl_keyboard::Event::Key {
+                serial,
+                state: key_state,
+                ..
+            } if is_key_activation(key_state) => {
                 seat.last_serial = Some(serial);
                 state.active_seat = Some(*seat_name);
             }
@@ -841,7 +986,12 @@ impl Dispatch<wl_pointer::WlPointer, u32> for WorkerState {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        if let wl_pointer::Event::Button { serial, .. } = event
+        if let wl_pointer::Event::Button {
+            serial,
+            state: button_state,
+            ..
+        } = event
+            && is_button_activation(button_state)
             && let Some(seat) = state.seats.get_mut(seat_name)
         {
             seat.last_serial = Some(serial);
@@ -974,9 +1124,16 @@ impl Dispatch<primary_source::ZwpPrimarySelectionSourceV1, SourceData> for Worke
                     && seat
                         .active_primary_source
                         .as_ref()
-                        .is_some_and(|(active, _)| active.id() == source.id())
+                        .is_some_and(|(active, _, _)| active.id() == source.id())
                 {
                     seat.active_primary_source = None;
+                }
+                if let Some(PendingWrite::Primary {
+                    text,
+                    fallback: Some(primary),
+                }) = state.pending_writes.remove(&data.write_id)
+                {
+                    primary.publish(text.as_ref().clone());
                 }
                 source.destroy();
             }
@@ -1030,9 +1187,14 @@ impl Dispatch<wl_data_source::WlDataSource, SourceData> for WorkerState {
                     && seat
                         .active_source
                         .as_ref()
-                        .is_some_and(|(active, _)| active.id() == source.id())
+                        .is_some_and(|(active, _, _)| active.id() == source.id())
                 {
                     seat.active_source = None;
+                }
+                if let Some(PendingWrite::Regular(reply)) =
+                    state.pending_writes.remove(&data.write_id)
+                {
+                    let _ = reply.send(WriteOutcome::Fallback);
                 }
                 source.destroy();
             }
@@ -1052,6 +1214,29 @@ impl Dispatch<wl_data_source::WlDataSource, SourceData> for WorkerState {
             _ => {}
         }
     }
+}
+
+impl Dispatch<wl_callback::WlCallback, WriteSync> for WorkerState {
+    fn event(
+        state: &mut Self,
+        _: &wl_callback::WlCallback,
+        _: wl_callback::Event,
+        sync: &WriteSync,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let Some(PendingWrite::Regular(reply)) = state.pending_writes.remove(&sync.0) {
+            let _ = reply.send(WriteOutcome::Published);
+        }
+    }
+}
+
+fn is_key_activation(state: WEnum<wl_keyboard::KeyState>) -> bool {
+    matches!(state, WEnum::Value(wl_keyboard::KeyState::Pressed))
+}
+
+fn is_button_activation(state: WEnum<wl_pointer::ButtonState>) -> bool {
+    matches!(state, WEnum::Value(wl_pointer::ButtonState::Pressed))
 }
 
 fn is_offered_text_mime(mime: &str) -> bool {
@@ -1103,12 +1288,62 @@ fn create_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
     Ok((read_fd, write_fd))
 }
 
+fn create_nonblocking_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
+    let mut fds = [-1; 2];
+    // SAFETY: `fds` points to a writable array of two `c_int` descriptors.
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `pipe2` succeeded and returned two newly created, uniquely owned
+    // file descriptors.
+    let read_fd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+    // SAFETY: Same as above for the write end of the pipe.
+    let write_fd = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+    Ok((read_fd, write_fd))
+}
+
+fn signal_wake(write_fd: &OwnedFd) {
+    let byte = 1u8;
+    // SAFETY: `write_fd` is a live non-blocking pipe descriptor; EAGAIN/EPIPE are ignored.
+    let _ = unsafe { libc::write(write_fd.as_raw_fd(), (&raw const byte).cast(), 1) };
+}
+
+fn drain_wake(read_fd: &OwnedFd) {
+    let mut buf = [0u8; 64];
+    loop {
+        // SAFETY: `read_fd` is a live non-blocking pipe descriptor and `buf` is writable.
+        let count = unsafe { libc::read(read_fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+        if count <= 0 {
+            break;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs::File;
 
     use super::*;
     use crate::desktop::clipboard::read_pipe_text;
+
+    #[test]
+    fn only_press_events_count_as_activation_serials() {
+        assert!(is_key_activation(WEnum::Value(
+            wl_keyboard::KeyState::Pressed
+        )));
+        assert!(!is_key_activation(WEnum::Value(
+            wl_keyboard::KeyState::Released
+        )));
+        assert!(!is_key_activation(WEnum::Value(
+            wl_keyboard::KeyState::Repeated
+        )));
+        assert!(is_button_activation(WEnum::Value(
+            wl_pointer::ButtonState::Pressed
+        )));
+        assert!(!is_button_activation(WEnum::Value(
+            wl_pointer::ButtonState::Released
+        )));
+    }
 
     #[test]
     fn select_text_mime_prefers_utf8_and_ignores_non_text() {

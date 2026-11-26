@@ -123,7 +123,7 @@ fn kitty_images_commit_after_the_last_chunk_and_keep_reply_order() {
             "\x1b_Gi=38,I=2;EINVAL:Invalid image data\x1b\\",
             "\x1b_Gi=7,p=18;OK\x1b\\",
             "\x1b_Gi=7;OK\x1b\\",
-            "\x1b_Gi=7;EINVAL:Invalid image data\x1b\\\x1b[?62;22c",
+            "\x1b_Gi=7;EINVAL:Invalid image data\x1b\\\x1b[?62;22;52c",
         )
         .as_bytes(),
     );
@@ -164,7 +164,7 @@ fn kitty_chunked_transfers_keep_their_quiet_setting_and_cancel_incomplete_upload
 
     assert_eq!(
         session.transport.written,
-        b"\x1b_Gi=4;OK\x1b\\\x1b_Gi=4,p=7;EINVAL:Invalid image data\x1b\\\x1b[?62;22c"
+        b"\x1b_Gi=4;OK\x1b\\\x1b_Gi=4,p=7;EINVAL:Invalid image data\x1b\\\x1b[?62;22;52c"
     );
     let mut scratch = Vec::new();
     let pixels = session
@@ -221,7 +221,7 @@ fn kitty_oversized_payloads_keep_replies_and_committed_images() {
             "\x1b_Gi=11;EBADF:Failed to read image file\x1b\\",
             "\x1b_Gi=1,p=7;EINVAL:Invalid image data\x1b\\",
             "\x1b_Gi=12,e=t;OK\x1b\\",
-            "\x1b_Gi=3;OK\x1b\\\x1b[?62;22c",
+            "\x1b_Gi=3;OK\x1b\\\x1b[?62;22;52c",
         )
         .as_bytes()
     );
@@ -891,7 +891,7 @@ fn kitty_delete_preserves_surviving_references_and_cancels_pending_uploads() {
     session.pump().unwrap();
     assert_eq!(
         session.transport.written,
-        b"\x1b_Gi=41,I=9,p=6;EINVAL:Invalid image data\x1b\\\x1b[?62;22c"
+        b"\x1b_Gi=41,I=9,p=6;EINVAL:Invalid image data\x1b\\\x1b[?62;22;52c"
     );
     session.transport.written.clear();
     assert!(session.graphics_image(40).is_none());

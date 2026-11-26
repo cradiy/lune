@@ -21,6 +21,7 @@ use super::transfer;
 const MIME_TYPES: &[&str] = &["text/plain;charset=utf-8", "text/plain", "UTF8_STRING"];
 const MAX_TRANSFERS: usize = 4;
 
+#[derive(Clone)]
 pub(in crate::desktop) struct Primary {
     commands: SyncSender<()>,
     queue: Arc<Publications>,
