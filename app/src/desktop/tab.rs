@@ -215,6 +215,9 @@ pub(super) struct PaneConfig<'a> {
     pub(super) cursor_blink: bool,
     pub(super) shell: Option<&'a [OsString]>,
     pub(super) shell_integration: bool,
+    pub(super) term: &'a str,
+    pub(super) term_program: &'a str,
+    pub(super) env: &'a [(String, String)],
     pub(super) clipboard: Option<clipboard::DataDeviceHandle>,
     pub(super) ipc_socket: Option<&'a Path>,
 }
@@ -251,11 +254,14 @@ impl Pane {
             command.current_dir(dir);
         }
         command
-            .env("TERM", "xterm-256color")
+            .env("TERM", config.term)
             .env("COLORTERM", "truecolor")
-            .env("TERM_PROGRAM", "Lune");
+            .env("TERM_PROGRAM", config.term_program);
         if let Some(socket) = config.ipc_socket {
             command.env("LUNE_IPC_SOCKET", socket);
+        }
+        for (name, value) in config.env {
+            command.env(name, value);
         }
         let pty_size = grid.pty_size();
         log::debug!(

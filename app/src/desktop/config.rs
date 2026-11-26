@@ -25,6 +25,8 @@ pub(super) const DEFAULT_UNFOCUSED_SPLIT_OPACITY: f32 = 0.75;
 pub(super) const MAX_WINDOW_PADDING: u32 = 64;
 pub(super) const DEFAULT_SCROLLBACK_LINES: usize = 10_000;
 pub(super) const MAX_SCROLLBACK_LINES: usize = 1_000_000;
+pub(super) const DEFAULT_TERM: &str = "xterm-256color";
+pub(super) const DEFAULT_TERM_PROGRAM: &str = "Lune";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum ConfigSource {
@@ -379,6 +381,9 @@ pub(super) struct Config {
     pub(super) cursor_animation: bool,
     pub(super) shell: Option<Vec<OsString>>,
     pub(super) shell_integration: bool,
+    pub(super) term: String,
+    pub(super) term_program: String,
+    pub(super) env: Vec<(String, String)>,
     pub(super) confirm_close: bool,
     pub(super) confirm_paste: bool,
     pub(super) copy_on_select: bool,
@@ -424,6 +429,9 @@ impl Default for Config {
             cursor_animation: true,
             shell: None,
             shell_integration: true,
+            term: DEFAULT_TERM.to_owned(),
+            term_program: DEFAULT_TERM_PROGRAM.to_owned(),
+            env: Vec::new(),
             confirm_close: true,
             confirm_paste: true,
             copy_on_select: false,
@@ -704,6 +712,24 @@ impl Config {
                     .parse()
                     .map_err(|_| "shell-integration must be true or false")?;
             }
+            "term" => {
+                self.term = parse_term_name(value)?;
+            }
+            "term-program" => {
+                self.term_program = parse_term_program(value)?;
+            }
+            "env" => {
+                if value.is_empty() {
+                    self.env.clear();
+                } else {
+                    let (name, val) = parse_env_pair(value)?;
+                    if let Some((_, existing)) = self.env.iter_mut().find(|(k, _)| k == &name) {
+                        *existing = val;
+                    } else {
+                        self.env.push((name, val));
+                    }
+                }
+            }
             "confirm-close" => {
                 self.confirm_close = value
                     .parse()
@@ -849,6 +875,42 @@ fn parse_command_words(value: &str) -> Result<Vec<OsString>, &'static str> {
         return Err("shell must be a command path or executable name");
     }
     Ok(words)
+}
+
+fn parse_term_name(value: &str) -> Result<String, &'static str> {
+    if value.is_empty()
+        || value
+            .chars()
+            .any(|ch| ch.is_control() || ch.is_whitespace())
+    {
+        return Err("term must be a non-empty terminal name without whitespace");
+    }
+    Ok(value.to_owned())
+}
+
+fn parse_term_program(value: &str) -> Result<String, &'static str> {
+    if value.is_empty() || value.chars().any(char::is_control) {
+        return Err("term-program must be a non-empty name without control characters");
+    }
+    Ok(value.to_owned())
+}
+
+fn parse_env_pair(value: &str) -> Result<(String, String), &'static str> {
+    let Some((raw_name, raw_val)) = value.split_once('=') else {
+        return Err("env must be formatted as KEY=VALUE");
+    };
+    let name = raw_name.trim();
+    if name.is_empty()
+        || name
+            .chars()
+            .any(|ch| ch.is_control() || ch.is_whitespace() || ch == '=')
+    {
+        return Err("env variable name must be non-empty without whitespace");
+    }
+    if raw_val.chars().any(char::is_control) {
+        return Err("env variable value must not contain control characters");
+    }
+    Ok((name.to_owned(), raw_val.to_owned()))
 }
 
 fn parse_cursor_style(value: &str) -> Result<CursorShape, &'static str> {
@@ -1085,5 +1147,43 @@ keybind = ctrl+shift+k=unbind\n\
         // Second merge with identical settings produces zero changes.
         let (_, second_changed) = super::merge_config_text(&merged, &settings.entries());
         assert_eq!(second_changed, 0);
+    }
+
+    #[test]
+    fn parses_term_term_program_and_custom_env_overrides() {
+        let defaults = Config::default();
+        assert_eq!(defaults.term, super::DEFAULT_TERM);
+        assert_eq!(defaults.term_program, super::DEFAULT_TERM_PROGRAM);
+        assert!(defaults.env.is_empty());
+
+        let loaded = Config::parse(
+            "lune.conf",
+            "\
+term = xterm-kitty\n\
+term = invalid term\n\
+term-program = CustomTerm\n\
+term-program =\n\
+env = FOO=old\n\
+env = BAR=1\n\
+env =\n\
+env = SNACKS_KITTY=true\n\
+env = LESS=-R --tabs=4\n\
+env = SNACKS_KITTY=false\n\
+env = EMPTY=\n\
+env = MISSING_EQUALS\n\
+env = BAD KEY=1\n",
+            Path::new(""),
+        );
+        assert_eq!(loaded.config.term, "xterm-kitty");
+        assert_eq!(loaded.config.term_program, "CustomTerm");
+        assert_eq!(
+            loaded.config.env,
+            vec![
+                ("SNACKS_KITTY".to_owned(), "false".to_owned()),
+                ("LESS".to_owned(), "-R --tabs=4".to_owned()),
+                ("EMPTY".to_owned(), String::new()),
+            ]
+        );
+        assert_eq!(loaded.errors.len(), 4, "{:?}", loaded.errors);
     }
 }

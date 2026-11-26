@@ -70,6 +70,11 @@ cursor-animation = true
 scrollback-lines = 10000
 # shell = /bin/zsh -l
 shell-integration = true
+# Terminal identification and extra PTY environment variables
+term = xterm-256color
+term-program = Lune
+# env = KEY=VALUE (repeatable; use "env =" to clear earlier entries)
+# env = SNACKS_KITTY=true
 confirm-close = true
 confirm-paste = true
 copy-on-select = false

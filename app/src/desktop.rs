@@ -571,6 +571,9 @@ struct Client {
     cursor_blink: bool,
     shell: Option<Vec<OsString>>,
     shell_integration: bool,
+    term: String,
+    term_program: String,
+    env: Vec<(String, String)>,
     mode: TerminalMode,
     tab_position: TabPosition,
     window_decorations: bool,
@@ -719,6 +722,9 @@ impl Client {
                 cursor_blink: config.cursor_blink,
                 shell: config.shell.as_deref(),
                 shell_integration: config.shell_integration,
+                term: &config.term,
+                term_program: &config.term_program,
+                env: &config.env,
                 clipboard: clipboard.as_ref().map(clipboard::DataDevice::handle),
                 ipc_socket: ipc.as_ref().map(ipc::IpcServer::socket_path),
             },
@@ -823,6 +829,9 @@ impl Client {
             cursor_blink: config.cursor_blink,
             shell: config.shell.clone(),
             shell_integration: config.shell_integration,
+            term: config.term.clone(),
+            term_program: config.term_program.clone(),
+            env: config.env.clone(),
             mode: config.mode,
             tab_position: config.tab_position,
             window_decorations: config.window_decorations,
@@ -917,6 +926,9 @@ impl Client {
             cursor_blink: self.cursor_blink,
             shell: self.shell.as_deref(),
             shell_integration: self.shell_integration,
+            term: &self.term,
+            term_program: &self.term_program,
+            env: &self.env,
             clipboard: self.clipboard_handle(),
             ipc_socket: self.ipc.as_ref().map(ipc::IpcServer::socket_path),
         }
@@ -2236,6 +2248,9 @@ impl Client {
         }
         self.shell = new.shell.clone();
         self.shell_integration = new.shell_integration;
+        self.term = new.term.clone();
+        self.term_program = new.term_program.clone();
+        self.env = new.env.clone();
         self.confirm_close = new.confirm_close;
         self.confirm_paste = new.confirm_paste;
         self.copy_on_select = new.copy_on_select;
