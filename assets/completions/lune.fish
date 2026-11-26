@@ -53,6 +53,11 @@ function __lune_msg_subcmd
     return 1
 end
 
+function __lune_msg_subcmd_is
+    set -l sub (__lune_msg_subcmd); or return 1
+    test "$sub" = "$argv[1]"
+end
+
 # Top-level options and subcommand
 complete -c lune -n "not __lune_is_msg" -s d -l working-directory -r -a "(__fish_complete_directories)" -d "Start the initial session in DIR"
 complete -c lune -n "not __lune_is_msg" -s T -l title -r -d "Set the initial window title"
@@ -74,15 +79,15 @@ complete -c lune -n "__lune_is_msg; and not __lune_msg_subcmd >/dev/null" -f -a 
 complete -c lune -n "__lune_is_msg; and not __lune_msg_subcmd >/dev/null" -f -a "list" -d "List active IPC sockets"
 
 # `lune msg new-tab`
-complete -c lune -n "__lune_is_msg; and test (__lune_msg_subcmd) = new-tab" -s d -l working-directory -r -a "(__fish_complete_directories)" -d "Start the new tab in DIR"
-complete -c lune -n "__lune_is_msg; and test (__lune_msg_subcmd) = new-tab" -s T -l title -r -d "Set a custom tab title"
-complete -c lune -n "__lune_is_msg; and test (__lune_msg_subcmd) = new-tab" -s e -l command -r -d "Run CMD instead of the default shell"
+complete -c lune -n "__lune_is_msg; and __lune_msg_subcmd_is new-tab" -s d -l working-directory -r -a "(__fish_complete_directories)" -d "Start the new tab in DIR"
+complete -c lune -n "__lune_is_msg; and __lune_msg_subcmd_is new-tab" -s T -l title -r -d "Set a custom tab title"
+complete -c lune -n "__lune_is_msg; and __lune_msg_subcmd_is new-tab" -s e -l command -r -d "Run CMD instead of the default shell"
 
 # `lune msg split`
-complete -c lune -n "__lune_is_msg; and test (__lune_msg_subcmd) = split" -l right -d "Split into side-by-side columns"
-complete -c lune -n "__lune_is_msg; and test (__lune_msg_subcmd) = split" -l down -d "Split into stacked rows"
-complete -c lune -n "__lune_is_msg; and test (__lune_msg_subcmd) = split" -s d -l working-directory -r -a "(__fish_complete_directories)" -d "Start the split pane in DIR"
-complete -c lune -n "__lune_is_msg; and test (__lune_msg_subcmd) = split" -f -a "right down vertical horizontal" -d "Split direction"
+complete -c lune -n "__lune_is_msg; and __lune_msg_subcmd_is split" -l right -d "Split into side-by-side columns"
+complete -c lune -n "__lune_is_msg; and __lune_msg_subcmd_is split" -l down -d "Split into stacked rows"
+complete -c lune -n "__lune_is_msg; and __lune_msg_subcmd_is split" -s d -l working-directory -r -a "(__fish_complete_directories)" -d "Start the split pane in DIR"
+complete -c lune -n "__lune_is_msg; and __lune_msg_subcmd_is split" -f -a "right down vertical horizontal" -d "Split direction"
 
 # `lune msg set-theme`
-complete -c lune -n "__lune_is_msg; and test (__lune_msg_subcmd) = set-theme" -f -a "(__lune_themes)" -d "Theme name"
+complete -c lune -n "__lune_is_msg; and __lune_msg_subcmd_is set-theme" -f -a "(__lune_themes)" -d "Theme name"
